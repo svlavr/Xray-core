@@ -26,9 +26,6 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
-// TestVlessXtlsVisionConcurrentBidirectionalTraffic keeps the VLESS Vision
-// data path in the test process. The loopback target writes a banner while the
-// client sends its first payloads, exercising both directions concurrently.
 func TestVlessXtlsVisionConcurrentBidirectionalTraffic(t *testing.T) {
 	banner := []byte("vision-send-first-banner")
 	target := tcp.Server{

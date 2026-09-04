@@ -104,9 +104,7 @@ type GetOutbound interface {
 // TrafficState is used to track uplink and downlink of one connection
 // It is used by XTLS to determine if switch to raw copy mode, It is used by Vision to calculate padding
 type TrafficState struct {
-	// TLS classification is shared by the concurrent Vision reader and writer.
-	// Keep the mutable phase serialized and publish an immutable final snapshot
-	// so established connections avoid a mutex on the data path.
+	// filterAccess protects TLS classification until finalTLSState is published.
 	filterAccess           sync.Mutex
 	finalTLSState          atomic.Pointer[trafficStateSnapshot]
 	UserUUID               []byte
