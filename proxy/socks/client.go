@@ -120,7 +120,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx, newCancel = core.ContextWithoutRequestCancellation(ctx)
+		defer newCancel()
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -133,6 +134,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	var requestFunc func() error
 	var responseFunc func() error
+	var udpConn stat.Connection
 	if request.Command == protocol.RequestCommandTCP {
 		requestFunc = func() error {
 			defer timer.SetTimeout(p.Timeouts.DownlinkOnly)
@@ -144,7 +146,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			return buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer))
 		}
 	} else if request.Command == protocol.RequestCommandUDP {
-		udpConn, err := dialer.Dial(ctx, udpRequest.Destination())
+		udpConn, err = dialer.Dial(ctx, udpRequest.Destination())
 		if err != nil {
 			return errors.New("failed to create UDP connection").Base(err)
 		}
@@ -167,7 +169,31 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	}
 
 	responseDonePost := task.OnSuccess(responseFunc, task.Close(link.Writer))
-	if err := task.Run(ctx, requestFunc, responseDonePost); err != nil {
+	if newCtx == nil {
+		err = task.Run(ctx, requestFunc, responseDonePost)
+	} else {
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func() error) func() error {
+			copies.Acquire()
+			return func() error {
+				defer copies.Release()
+				return copyTask()
+			}
+		}
+		err = task.Run(ctx, trackCopy(requestFunc), trackCopy(responseDonePost))
+		cancel()
+		newCancel()
+		_ = conn.Close()
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		copies.Seal()
+		copies.Wait()
+		_ = timer.CloseAndWait()
+	}
+	if err != nil {
 		return errors.New("connection ends").Base(err)
 	}
 

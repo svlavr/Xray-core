@@ -22,6 +22,7 @@ import (
 // ClassicNameServer implemented traditional UDP DNS.
 type ClassicNameServer struct {
 	sync.RWMutex
+	ctx             context.Context
 	cacheController *CacheController
 	address         *net.Destination
 	requests        map[uint16]*udpDnsRequest
@@ -29,6 +30,10 @@ type ClassicNameServer struct {
 	requestsCleanup *task.Periodic
 	reqID           uint32
 	clientIP        net.IP
+	closed          bool
+	stopOnce        sync.Once
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 type udpDnsRequest struct {
@@ -38,13 +43,18 @@ type udpDnsRequest struct {
 
 // NewClassicNameServer creates udp server object for remote resolving.
 func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *ClassicNameServer {
+	return NewClassicNameServerContext(context.Background(), address, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
+}
+
+func NewClassicNameServerContext(ctx context.Context, address net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *ClassicNameServer {
 	// default to 53 if unspecific
 	if address.Port == 0 {
 		address.Port = net.Port(53)
 	}
 
 	s := &ClassicNameServer{
-		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
+		ctx:             ctx,
+		cacheController: NewCacheControllerContext(ctx, strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
 		address:         &address,
 		requests:        make(map[uint16]*udpDnsRequest),
 		clientIP:        clientIP,
@@ -129,9 +139,15 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 			newMsg.Additionals = append(newMsg.Additionals, *opt)
 			newMsg.ID = s.newReqID()
 			newReq.msg = &newMsg
-			s.addPendingRequest(&newReq)
-			b, _ := dns.PackMessage(newReq.msg)
-			s.udpServer.Dispatch(toDnsContext(newReq.ctx, s.address.String()), *s.address, b)
+			if !s.addPendingRequest(&newReq) {
+				return
+			}
+			b, err := dns.PackMessage(newReq.msg)
+			if err != nil {
+				errors.LogErrorInner(ctx, err, "failed to pack truncated DNS retry")
+				return
+			}
+			s.udpServer.Dispatch(toDnsResourceContext(s.ctx, newReq.ctx, s.address.String()), *s.address, b)
 			return
 		}
 	}
@@ -143,13 +159,18 @@ func (s *ClassicNameServer) newReqID() uint16 {
 	return uint16(atomic.AddUint32(&s.reqID, 1))
 }
 
-func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) {
+func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) bool {
 	s.Lock()
+	if s.closed {
+		s.Unlock()
+		return false
+	}
 	id := req.msg.ID
 	req.expire = time.Now().Add(time.Second * 8)
 	s.requests[id] = req
 	s.Unlock()
 	common.Must(s.requestsCleanup.Start())
+	return true
 }
 
 // getCacheController implements CachedNameserver.
@@ -180,7 +201,12 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 			dnsRequest: *req,
 			ctx:        ctx,
 		}
-		s.addPendingRequest(udpReq)
+		if !s.addPendingRequest(udpReq) {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- context.Canceled
+			}
+			return
+		}
 		b, err := dns.PackMessage(req.msg)
 		if err != nil {
 			errors.LogErrorInner(ctx, err, "failed to pack dns query")
@@ -189,11 +215,38 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 			}
 			return
 		}
-		s.udpServer.Dispatch(toDnsContext(ctx, s.address.String()), *s.address, b)
+		s.udpServer.Dispatch(toDnsResourceContext(s.ctx, ctx, s.address.String()), *s.address, b)
 	}
 }
 
 // QueryIP implements Server.
 func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+func (s *ClassicNameServer) SignalStop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.Lock()
+		s.closed = true
+		s.requests = make(map[uint16]*udpDnsRequest)
+		s.Unlock()
+		s.cacheController.SignalStop()
+		_ = s.requestsCleanup.Close()
+		s.udpServer.SignalStop()
+	})
+}
+
+func (s *ClassicNameServer) Close() error {
+	s.SignalStop()
+	s.closeOnce.Do(func() {
+		s.closeErr = errors.Combine(
+			s.requestsCleanup.CloseAndWait(),
+			s.udpServer.CloseAndWait(),
+			s.cacheController.Close(),
+		)
+	})
+	return s.closeErr
 }

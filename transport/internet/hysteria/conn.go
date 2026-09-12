@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -20,13 +21,17 @@ type interConn struct {
 	local  net.Addr
 	remote net.Addr
 
-	client bool
-	user   *protocol.MemoryUser
+	client  bool
+	user    *protocol.MemoryUser
+	handoff *internet.InboundHandoff
 }
 
 func (c *interConn) User() *protocol.MemoryUser {
 	return c.user
 }
+
+func (c *interConn) AcceptInboundHandoff() bool { return c.handoff.Accept() }
+func (c *interConn) RejectInboundHandoff()      { c.handoff.Reject() }
 
 func (c *interConn) Read(b []byte) (int, error) {
 	return c.stream.Read(b)
@@ -77,16 +82,20 @@ type InterConn struct {
 	ch     chan []byte
 	time   time.Time
 	mutex  sync.Mutex
-	closed bool
+	closed atomic.Bool
 
-	write func(p []byte) error
-	close func()
-	user  *protocol.MemoryUser
+	write   func(p []byte) error
+	close   func()
+	user    *protocol.MemoryUser
+	handoff *internet.InboundHandoff
 }
 
 func (i *InterConn) User() *protocol.MemoryUser {
 	return i.user
 }
+
+func (i *InterConn) AcceptInboundHandoff() bool { return i.handoff.Accept() }
+func (i *InterConn) RejectInboundHandoff()      { i.handoff.Reject() }
 
 func (c *InterConn) Time() time.Time {
 	c.mutex.Lock()
@@ -111,7 +120,7 @@ func (c *InterConn) Read(p []byte) (int, error) {
 }
 
 func (c *InterConn) Write(p []byte) (int, error) {
-	if c.closed {
+	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
 	binary.BigEndian.PutUint32(p, c.id)
@@ -158,11 +167,13 @@ type udpSessionManager struct {
 	addConn        internet.ConnHandler
 	udpIdleTimeout time.Duration
 	user           *protocol.MemoryUser
+	ctx            context.Context
+	done           chan struct{}
+	doneOnce       sync.Once
 }
 
 func (m *udpSessionManager) close(udpConn *InterConn) {
-	if !udpConn.closed {
-		udpConn.closed = true
+	if udpConn.closed.CompareAndSwap(false, true) {
 		close(udpConn.ch)
 		delete(m.m, udpConn.id)
 	}
@@ -171,13 +182,23 @@ func (m *udpSessionManager) close(udpConn *InterConn) {
 func (m *udpSessionManager) clean() {
 	ticker := time.NewTicker(idleCleanupInterval)
 	defer ticker.Stop()
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		m.RLock()
 		if m.closed {
+			m.RUnlock()
 			return
 		}
 
-		m.RLock()
 		now := time.Now()
 		timeoutConn := make([]*InterConn, 0, len(m.m))
 		for _, udpConn := range m.m {
@@ -196,8 +217,15 @@ func (m *udpSessionManager) clean() {
 }
 
 func (m *udpSessionManager) run() {
+	if m.done != nil {
+		defer m.doneOnce.Do(func() { close(m.done) })
+	}
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
-		d, err := m.conn.ReceiveDatagram(context.Background())
+		d, err := m.conn.ReceiveDatagram(ctx)
 		if err != nil {
 			break
 		}
@@ -265,17 +293,22 @@ func (m *udpSessionManager) feed(id uint32, d []byte) {
 	}
 
 	m.Lock()
-	defer m.Unlock()
+	if m.closed {
+		m.Unlock()
+		return
+	}
 
 	udpConn, ok = m.m[id]
+	created := false
 	if !ok {
 		udpConn = &InterConn{
 			local:  m.conn.LocalAddr(),
 			remote: m.conn.RemoteAddr(),
 
-			id:   id,
-			ch:   make(chan []byte, udpMessageChanSize),
-			time: time.Now(),
+			id:      id,
+			ch:      make(chan []byte, udpMessageChanSize),
+			time:    time.Now(),
+			handoff: new(internet.InboundHandoff),
 		}
 		udpConn.write = m.conn.SendDatagram
 		udpConn.close = func() {
@@ -285,11 +318,15 @@ func (m *udpSessionManager) feed(id uint32, d []byte) {
 		}
 		udpConn.user = m.user
 		m.m[id] = udpConn
-		m.addConn(udpConn)
+		created = true
 	}
 
 	select {
 	case udpConn.ch <- d:
 	default:
+	}
+	m.Unlock()
+	if created {
+		m.addConn(udpConn)
 	}
 }

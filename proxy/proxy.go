@@ -17,6 +17,7 @@ import (
 
 	"github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/app/dispatcher"
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -751,13 +752,36 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		}
 		if splice {
 			errors.LogDebug(ctx, "CopyRawConn splice")
+			var byteOperation *flow_observation.ByteOperation
+			if handle := flow_observation.HandleFromContext(ctx); handle != nil {
+				if supportsDirectCopySpliceProgress(readerConn) {
+					byteOperation = handle.BeginDeferredBytePath(flow_observation.DirectionDownlink, flow_observation.ByteScopeKernelDirectCopyAccepted)
+				} else {
+					byteOperation = handle.BeginF2RequiredBytePath(flow_observation.DirectionDownlink, flow_observation.ByteScopeKernelDirectCopyAccepted)
+				}
+			}
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 			//runtime.Gosched() // necessary
 			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			w, err := tc.ReadFrom(readerConn)
+			var w int64
+			var err error
+			if byteOperation != nil && supportsDirectCopySpliceProgress(readerConn) {
+				var direct bool
+				w, direct, err = copyRawConnSplice(tc, readerConn, byteOperation)
+				if direct {
+					byteOperation.Prove()
+				} else {
+					byteOperation.RequireF2()
+				}
+			} else {
+				w, err = tc.ReadFrom(readerConn)
+			}
+			if byteOperation != nil {
+				byteOperation.Complete(0)
+			}
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
 			}

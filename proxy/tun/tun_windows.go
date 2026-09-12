@@ -39,6 +39,7 @@ type WindowsTun struct {
 	cbr      winipcfg.ChangeCallback
 	cbi      winipcfg.ChangeCallback
 	closed   bool
+	updater  *InterfaceUpdater
 }
 
 // WindowsTun implements Tun
@@ -192,15 +193,15 @@ startOver:
 		}
 	}
 
-	if updater != nil {
+	if t.updater != nil {
 		t.cbr, err = winipcfg.RegisterRouteChangeCallback(func(notificationType winipcfg.MibNotificationType, route *winipcfg.MibIPforwardRow2) {
-			updater.Update()
+			t.updater.Update()
 		})
 		if err != nil {
 			return err
 		}
 		t.cbi, err = winipcfg.RegisterInterfaceChangeCallback(func(notificationType winipcfg.MibNotificationType, iface *winipcfg.MibIPInterfaceRow) {
-			updater.Update()
+			t.updater.Update()
 		})
 		if err != nil {
 			return err
@@ -208,6 +209,8 @@ startOver:
 	}
 	return nil
 }
+
+func (t *WindowsTun) setInterfaceUpdater(updater *InterfaceUpdater) { t.updater = updater }
 
 func (t *WindowsTun) Close() error {
 	t.Lock()

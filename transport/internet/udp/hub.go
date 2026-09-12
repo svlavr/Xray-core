@@ -2,6 +2,7 @@ package udp
 
 import (
 	"context"
+	"sync"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -30,6 +31,13 @@ type Hub struct {
 	cache        chan *udp.Packet
 	capacity     int
 	recvOrigDest bool
+	lifecycle    *internet.InboundLifecycle
+	mu           sync.Mutex
+	closed       bool
+	activeWrites int
+	writeDone    chan struct{}
+	closeDone    chan struct{}
+	closeErr     error
 }
 
 func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, options ...HubOption) (*Hub, error) {
@@ -37,6 +45,7 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 		capacity:     256,
 		recvOrigDest: false,
 	}
+	hub.lifecycle = internet.InboundLifecycleFromContext(ctx)
 	for _, opt := range options {
 		opt(hub)
 	}
@@ -69,7 +78,7 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 	raw := hub.conn
 
 	if streamSettings.UdpmaskManager != nil {
-		hub.conn, err = streamSettings.UdpmaskManager.WrapPacketConnServer(raw)
+		hub.conn, err = streamSettings.UdpmaskManager.WrapPacketConnServerContext(ctx, raw)
 		if err != nil {
 			raw.Close()
 			return nil, errors.New("mask err").Base(err)
@@ -80,21 +89,80 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 	hub.udpConn, _ = hub.conn.(*net.UDPConn)
 	hub.cache = make(chan *udp.Packet, hub.capacity)
 
-	go hub.start()
+	if !hub.lifecycle.Acquire() {
+		hub.conn.Close()
+		return nil, errors.New("inbound listener is closing")
+	}
+	go func() {
+		defer hub.lifecycle.Release()
+		hub.start()
+	}()
 	return hub, nil
 }
 
 // Close implements net.Listener.
 func (h *Hub) Close() error {
-	h.conn.Close()
-	return nil
+	h.mu.Lock()
+	if h.closed {
+		done := h.closeDone
+		h.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		h.mu.Lock()
+		err := h.closeErr
+		h.mu.Unlock()
+		return err
+	}
+	h.closed = true
+	h.closeDone = make(chan struct{})
+	conn := h.conn
+	h.mu.Unlock()
+	err := conn.Close()
+	h.mu.Lock()
+	h.closeErr = err
+	close(h.closeDone)
+	h.mu.Unlock()
+	return err
 }
 
 func (h *Hub) WriteTo(payload []byte, dest net.Destination) (int, error) {
-	return h.conn.WriteTo(payload, &net.UDPAddr{
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return 0, errors.New("UDP hub is closed")
+	}
+	if h.activeWrites == 0 {
+		h.writeDone = make(chan struct{})
+	}
+	h.activeWrites++
+	conn := h.conn
+	h.mu.Unlock()
+	defer h.releaseWrite()
+	return conn.WriteTo(payload, &net.UDPAddr{
 		IP:   dest.Address.IP(),
 		Port: int(dest.Port),
 	})
+}
+
+func (h *Hub) releaseWrite() {
+	h.mu.Lock()
+	h.activeWrites--
+	if h.activeWrites == 0 {
+		close(h.writeDone)
+		h.writeDone = nil
+	}
+	h.mu.Unlock()
+}
+
+// Wait joins writes admitted before Close without delaying the stop signal.
+func (h *Hub) Wait() {
+	h.mu.Lock()
+	done := h.writeDone
+	h.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 func (h *Hub) start() {

@@ -16,6 +16,8 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 )
 
@@ -50,11 +52,27 @@ type xdnsConnClient struct {
 	readQueue  chan *packet
 	writeQueue chan *packet
 
-	closed bool
-	mutex  sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	tasks  task.Lifecycle
+
+	closed       atomic.Bool
+	mutex        sync.Mutex
+	stopOnce     sync.Once
+	rawCloseOnce sync.Once
+	closeOnce    sync.Once
+	rawCloseDone chan struct{}
+	closeDone    chan struct{}
+	rawCloseErr  error
+	closeErr     error
+	unregister   func()
 }
 
 func NewConnClient(c *Config, raw net.PacketConn) (net.PacketConn, error) {
+	return NewConnClientContext(context.Background(), c, raw)
+}
+
+func NewConnClientContext(ctx context.Context, c *Config, raw net.PacketConn) (net.PacketConn, error) {
 	if len(c.Resolvers) == 0 {
 		return nil, errors.New("empty resolvers")
 	}
@@ -92,6 +110,12 @@ func NewConnClient(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 		resolverSend[addr.String()] = &atomic.Uint32{}
 	}
 
+	owner := internet.ResourceLifecycleFromContext(ctx)
+	parentCtx := ctx
+	if owner != nil {
+		parentCtx = owner.Context()
+	}
+	connCtx, cancel := context.WithCancel(parentCtx)
 	conn := &xdnsConnClient{
 		PacketConn: raw,
 
@@ -106,12 +130,45 @@ func NewConnClient(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 		pollChan:   make(chan struct{}, pollLimit),
 		readQueue:  make(chan *packet, 256),
 		writeQueue: make(chan *packet, 256),
+		ctx:        connCtx,
+		cancel:     cancel,
+
+		rawCloseDone: make(chan struct{}),
+		closeDone:    make(chan struct{}),
 	}
 
 	common.Must2(rand.Read(conn.clientID))
+	for range 3 {
+		if !conn.tasks.Acquire() {
+			panic("fresh xdns client lifecycle rejected loop reservation")
+		}
+	}
+	if owner != nil {
+		if err := owner.RegisterBound(conn, func(unregister func()) { conn.unregister = unregister }); err != nil {
+			conn.tasks.Seal()
+			for range 3 {
+				conn.tasks.Release()
+			}
+			cancel()
+			return nil, err
+		}
+	}
 
-	go conn.recvLoop()
-	go conn.sendLoop()
+	go func() {
+		defer conn.tasks.Release()
+		<-connCtx.Done()
+		if parentCtx.Err() != nil {
+			conn.SignalStop()
+		}
+	}()
+	go func() {
+		defer conn.tasks.Release()
+		conn.recvLoop()
+	}()
+	go func() {
+		defer conn.tasks.Release()
+		conn.sendLoop()
+	}()
 
 	return conn, nil
 }
@@ -120,13 +177,9 @@ func (c *xdnsConnClient) recvLoop() {
 	var buf [finalmask.UDPSize]byte
 
 	for {
-		if c.closed {
-			break
-		}
-
 		n, addr, err := c.PacketConn.ReadFrom(buf[:])
 		if err != nil {
-			if go_errors.Is(err, net.ErrClosed) {
+			if c.ctx.Err() != nil || go_errors.Is(err, net.ErrClosed) {
 				break
 			}
 			continue
@@ -165,6 +218,8 @@ func (c *xdnsConnClient) recvLoop() {
 				p:    buf,
 				addr: addr,
 			}:
+			case <-c.ctx.Done():
+				return
 			default:
 				errors.LogDebug(context.Background(), addr, " mask read err queue full")
 			}
@@ -180,42 +235,44 @@ func (c *xdnsConnClient) recvLoop() {
 	}
 
 	errors.LogDebug(context.Background(), "xdns closed")
-
-	close(c.pollChan)
-	close(c.readQueue)
-
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.closed = true
-	close(c.writeQueue)
 }
 
 func (c *xdnsConnClient) sendLoop() {
 	pollDelay := initPollDelay
 	pollTimer := time.NewTimer(pollDelay)
+	defer pollTimer.Stop()
 	for {
 		var p *packet
 		pollTimerExpired := false
 
 		select {
 		case p = <-c.writeQueue:
+		case <-c.ctx.Done():
+			return
 		default:
 			select {
 			case p = <-c.writeQueue:
 			case <-c.pollChan:
 			case <-pollTimer.C:
 				pollTimerExpired = true
+			case <-c.ctx.Done():
+				return
 			}
 		}
 
 		if p != nil {
 			select {
 			case <-c.pollChan:
+			case <-c.ctx.Done():
+				return
 			default:
 			}
 		} else {
-			encoded, _ := encode(nil, c.clientID, c.domains[c.resolverIdx], c.resolverTypes[c.resolverIdx])
+			c.mutex.Lock()
+			idx := c.resolverIdx
+			domain, resolverType := c.domains[idx], c.resolverTypes[idx]
+			c.mutex.Unlock()
+			encoded, _ := encode(nil, c.clientID, domain, resolverType)
 			p = &packet{
 				p: encoded,
 			}
@@ -234,13 +291,14 @@ func (c *xdnsConnClient) sendLoop() {
 		}
 		pollTimer.Reset(pollDelay)
 
-		if c.closed {
+		if c.closed.Load() {
 			return
 		}
 
+		c.mutex.Lock()
 		cur := c.resolverIdx
 		curSend := c.resolverSend[c.resolverAddrs[cur].String()].Add(1)
-		_, _ = c.PacketConn.WriteTo(p.p, c.resolverAddrs[cur])
+		resolverAddr := c.resolverAddrs[cur]
 		for {
 			c.resolverIdx += 1
 			c.resolverIdx %= uint32(len(c.resolverAddrs))
@@ -251,12 +309,25 @@ func (c *xdnsConnClient) sendLoop() {
 				break
 			}
 		}
+		c.mutex.Unlock()
+		_, _ = c.PacketConn.WriteTo(p.p, resolverAddr)
 	}
 }
 
 func (c *xdnsConnClient) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	packet, ok := <-c.readQueue
-	if !ok {
+	if c.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	var packet *packet
+	var ok bool
+	select {
+	case packet, ok = <-c.readQueue:
+	case <-c.ctx.Done():
+		return 0, nil, net.ErrClosed
+	case <-c.closeDone:
+		return 0, nil, net.ErrClosed
+	}
+	if !ok || packet == nil {
 		return 0, nil, net.ErrClosed
 	}
 	if len(p) < len(packet.p) {
@@ -271,7 +342,7 @@ func (c *xdnsConnClient) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.closed {
+	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
 
@@ -288,15 +359,54 @@ func (c *xdnsConnClient) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		addr: addr,
 	}:
 		return len(p), nil
+	case <-c.ctx.Done():
+		return 0, io.ErrClosedPipe
 	default:
 		errors.LogDebug(context.Background(), addr, " mask write err queue full")
 		return 0, nil
 	}
 }
 
+func (c *xdnsConnClient) SignalStop() {
+	if c == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		c.closed.Store(true)
+		c.tasks.Seal()
+		c.cancel()
+		c.rawCloseOnce.Do(func() {
+			go func() {
+				err := c.PacketConn.Close()
+				c.mutex.Lock()
+				c.rawCloseErr = err
+				c.mutex.Unlock()
+				close(c.rawCloseDone)
+			}()
+		})
+	})
+}
+
 func (c *xdnsConnClient) Close() error {
-	c.closed = true
-	return c.PacketConn.Close()
+	c.SignalStop()
+	c.closeOnce.Do(func() {
+		<-c.rawCloseDone
+		c.tasks.Wait()
+		close(c.readQueue)
+		c.mutex.Lock()
+		c.closeErr = c.rawCloseErr
+		unregister := c.unregister
+		c.unregister = nil
+		c.mutex.Unlock()
+		if unregister != nil {
+			unregister()
+		}
+		close(c.closeDone)
+	})
+	<-c.closeDone
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.closeErr
 }
 
 func encode(p []byte, clientID []byte, domain Name, qtype uint16) ([]byte, error) {

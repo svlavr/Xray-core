@@ -18,10 +18,164 @@ import (
 	"github.com/xtls/xray-core/common/ocsp"
 	"github.com/xtls/xray-core/common/platform/filesystem"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
-var globalSessionCache = tls.NewLRUClientSessionCache(128)
+var (
+	globalSessionCache = tls.NewLRUClientSessionCache(128)
+	configLifecycles   sync.Map
+)
+
+type configLifecycleKey struct {
+	ownerID uint64
+	config  *Config
+}
+
+type configLifecycle struct {
+	mu                sync.Mutex
+	ctx               context.Context
+	cancel            context.CancelFunc
+	tasks             task.Lifecycle
+	sealed            bool
+	files             map[*os.File]struct{}
+	key               configLifecycleKey
+	unregister        func()
+	materialOnce      sync.Once
+	sourceAccess      *sync.RWMutex
+	certificates      []*tls.Certificate
+	certificateAccess *sync.RWMutex
+	customCA          []*Certificate
+	customCAAccess    *sync.RWMutex
+	keyLogOnce        sync.Once
+	keyLogWriter      *os.File
+	closeOnce         sync.Once
+	closeDone         chan struct{}
+	closeErr          error
+}
+
+func newConfigLifecycle(ctx context.Context, config *Config) *configLifecycle {
+	owner := internet.ResourceLifecycleFromContext(ctx)
+	if owner == nil {
+		return nil
+	}
+	key := configLifecycleKey{ownerID: owner.ID(), config: config}
+	if existing, ok := configLifecycles.Load(key); ok {
+		return existing.(*configLifecycle)
+	}
+	resourceCtx, cancel := context.WithCancel(owner.Context())
+	resource := &configLifecycle{
+		ctx:       resourceCtx,
+		cancel:    cancel,
+		files:     make(map[*os.File]struct{}),
+		key:       key,
+		closeDone: make(chan struct{}),
+	}
+	err := owner.RegisterBound(resource, func(unregister func()) {
+		resource.unregister = unregister
+	})
+	if err != nil {
+		resource.sealed = true
+		resource.tasks.Seal()
+		cancel()
+		return resource
+	}
+	actual, loaded := configLifecycles.LoadOrStore(key, resource)
+	if loaded {
+		_ = resource.Close()
+		return actual.(*configLifecycle)
+	}
+	resource.mu.Lock()
+	publishable := !resource.sealed && resource.ctx.Err() == nil
+	resource.mu.Unlock()
+	if !publishable {
+		configLifecycles.CompareAndDelete(key, resource)
+		_ = resource.Close()
+	}
+	return resource
+}
+
+func (r *configLifecycle) SignalStop() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if !r.sealed {
+		r.sealed = true
+		r.tasks.Seal()
+		r.cancel()
+	}
+	r.mu.Unlock()
+}
+
+func (r *configLifecycle) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.SignalStop()
+	r.closeOnce.Do(func() {
+		r.tasks.Wait()
+		r.mu.Lock()
+		files := r.files
+		r.files = nil
+		r.mu.Unlock()
+		var closeErrors []error
+		for file := range files {
+			if err := file.Close(); err != nil {
+				closeErrors = append(closeErrors, err)
+			}
+		}
+		configLifecycles.CompareAndDelete(r.key, r)
+		if r.unregister != nil {
+			r.unregister()
+			r.unregister = nil
+		}
+		r.closeErr = errors.Combine(closeErrors...)
+		close(r.closeDone)
+	})
+	<-r.closeDone
+	return r.closeErr
+}
+
+func (r *configLifecycle) materials(config *Config) ([]*Certificate, *sync.RWMutex, []*tls.Certificate, *sync.RWMutex) {
+	r.materialOnce.Do(func() {
+		r.sourceAccess = new(sync.RWMutex)
+		r.sourceAccess.Lock()
+		r.customCA, r.customCAAccess = config.getCustomCAContext(r, r.sourceAccess)
+		r.certificates, r.certificateAccess = config.buildCertificates(r, r.sourceAccess)
+		r.sourceAccess.Unlock()
+	})
+	return r.customCA, r.customCAAccess, r.certificates, r.certificateAccess
+}
+
+func (r *configLifecycle) keyLog(path string) *os.File {
+	r.keyLogOnce.Do(func() {
+		writer, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+		if err != nil {
+			errors.LogErrorInner(context.Background(), err, "failed to open ", path, " as master key log")
+			return
+		}
+		if r.adoptFile(writer) {
+			r.keyLogWriter = writer
+		}
+	})
+	return r.keyLogWriter
+}
+
+func (r *configLifecycle) adoptFile(file *os.File) bool {
+	if r == nil || file == nil {
+		return r == nil
+	}
+	r.mu.Lock()
+	if r.sealed || r.ctx.Err() != nil || r.files == nil {
+		r.mu.Unlock()
+		_ = file.Close()
+		return false
+	}
+	r.files[file] = struct{}{}
+	r.mu.Unlock()
+	return true
+}
 
 // ParseCertificate converts a cert.Certificate to Certificate.
 func ParseCertificate(c *cert.Certificate) *Certificate {
@@ -47,7 +201,21 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 
 // BuildCertificates builds a list of TLS certificates from proto definition.
 func (c *Config) BuildCertificates() []*tls.Certificate {
+	certificates, _ := c.buildCertificates(nil, nil)
+	return certificates
+}
+
+func (c *Config) buildCertificates(lifecycle *configLifecycle, access *sync.RWMutex) ([]*tls.Certificate, *sync.RWMutex) {
 	certs := make([]*tls.Certificate, 0, len(c.Certificate))
+	if access == nil {
+		access = new(sync.RWMutex)
+	}
+	type reloadEntry struct {
+		entry       *Certificate
+		index       int
+		loadKeyPair func() *tls.Certificate
+	}
+	var reloads []reloadEntry
 	for _, entry := range c.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
@@ -70,33 +238,61 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 		} else {
 			continue
 		}
-		index := len(certs) - 1
-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+		reloads = append(reloads, reloadEntry{entry: entry, index: len(certs) - 1, loadKeyPair: getX509KeyPair})
+	}
+	for _, reload := range reloads {
+		entry := reload.entry
+		index := reload.index
+		getX509KeyPair := reload.loadKeyPair
+		setupOcspTickerContext(lifecycle, entry, access, func(ctx context.Context, isReloaded, isOcspstapling bool) {
+			access.RLock()
 			cert := certs[index]
 			if isReloaded {
 				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
 					cert = newKeyPair
 				} else {
+					access.RUnlock()
 					return
 				}
 			}
+			access.RUnlock()
 			if isOcspstapling {
-				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
+				if newOCSPData, err := ocsp.GetOCSPForCertContext(ctx, cert.Certificate); err != nil {
 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
 				} else if string(newOCSPData) != string(cert.OCSPStaple) {
-					cert.OCSPStaple = newOCSPData
+					updated := *cert
+					updated.OCSPStaple = newOCSPData
+					cert = &updated
 				}
 			}
+			access.Lock()
 			certs[index] = cert
+			access.Unlock()
 		})
 	}
-	return certs
+	return certs, access
 }
 
 func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
-	go func() {
-		if entry.OneTimeLoading {
+	setupOcspTickerContext(nil, entry, new(sync.RWMutex), func(_ context.Context, isReloaded, isOcspstapling bool) {
+		callback(isReloaded, isOcspstapling)
+	})
+}
+
+func setupOcspTickerContext(lifecycle *configLifecycle, entry *Certificate, access *sync.RWMutex, callback func(context.Context, bool, bool)) {
+	if entry.OneTimeLoading {
+		return
+	}
+	ctx := context.Background()
+	if lifecycle != nil {
+		if !lifecycle.tasks.Acquire() {
 			return
+		}
+		ctx = lifecycle.ctx
+	}
+	go func() {
+		if lifecycle != nil {
+			defer lifecycle.tasks.Release()
 		}
 		var isOcspstapling bool
 		hotReloadCertInterval := uint64(3600)
@@ -105,7 +301,11 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 			isOcspstapling = true
 		}
 		t := time.NewTicker(time.Duration(hotReloadCertInterval) * time.Second)
+		defer t.Stop()
 		for {
+			if err := ctx.Err(); err != nil {
+				return
+			}
 			var isReloaded bool
 			if entry.CertificatePath != "" && entry.KeyPath != "" {
 				newCert, err := filesystem.ReadCert(entry.CertificatePath)
@@ -118,14 +318,20 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 					errors.LogErrorInner(context.Background(), err, "failed to parse key")
 					return
 				}
+				access.Lock()
 				if string(newCert) != string(entry.Certificate) || string(newKey) != string(entry.Key) {
 					entry.Certificate = newCert
 					entry.Key = newKey
 					isReloaded = true
 				}
+				access.Unlock()
 			}
-			callback(isReloaded, isOcspstapling)
-			<-t.C
+			callback(ctx, isReloaded, isOcspstapling)
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
 		}
 	}()
 }
@@ -159,17 +365,25 @@ func issueCertificate(rawCA *Certificate, domain string) (*tls.Certificate, erro
 }
 
 func (c *Config) getCustomCA() []*Certificate {
+	certificates, _ := c.getCustomCAContext(nil, nil)
+	return certificates
+}
+
+func (c *Config) getCustomCAContext(lifecycle *configLifecycle, access *sync.RWMutex) ([]*Certificate, *sync.RWMutex) {
 	certs := make([]*Certificate, 0, len(c.Certificate))
+	if access == nil {
+		access = new(sync.RWMutex)
+	}
 	for _, certificate := range c.Certificate {
 		if certificate.Usage == Certificate_AUTHORITY_ISSUE {
 			certs = append(certs, certificate)
-			setupOcspTicker(certificate, func(isReloaded, isOcspstapling bool) {})
+			setupOcspTickerContext(lifecycle, certificate, access, func(context.Context, bool, bool) {})
 		}
 	}
-	return certs
+	return certs, access
 }
 
-func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getGetCertificateFunc(c *tls.Config, ca []*Certificate, caAccess *sync.RWMutex) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	var access sync.RWMutex
 
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -209,7 +423,9 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 		// Create a new certificate from existing CA if possible
 		for _, rawCert := range ca {
 			if rawCert.Usage == Certificate_AUTHORITY_ISSUE {
+				caAccess.RLock()
 				newCert, err := issueCertificate(rawCert, domain)
+				caAccess.RUnlock()
 				if err != nil {
 					errors.LogInfoInner(context.Background(), err, "failed to issue new certificate for ", domain)
 					continue
@@ -243,8 +459,10 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool, access *sync.RWMutex) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		access.RLock()
+		defer access.RUnlock()
 		if len(certs) == 0 {
 			return nil, errNoCertificates
 		}
@@ -365,17 +583,33 @@ func (r *RandCarrier) Read(p []byte) (n int, err error) {
 
 // GetTLSConfig converts this Config into tls.Config.
 func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
-	root, err := c.getCertPool()
-	if err != nil {
-		errors.LogErrorInner(context.Background(), err, "failed to load system root certificate")
-	}
+	return c.GetTLSConfigContext(context.Background(), opts...)
+}
 
+// GetTLSConfigContext preserves the caller's Instance/config-generation
+// lifecycle for ECH lookup and refresh while retaining the legacy wrapper.
+func (c *Config) GetTLSConfigContext(ctx context.Context, opts ...Option) *tls.Config {
 	if c == nil {
 		return &tls.Config{
 			ClientSessionCache:     globalSessionCache,
-			RootCAs:                root,
 			SessionTicketsDisabled: true,
 		}
+	}
+	resources := newConfigLifecycle(ctx, c)
+	var caCerts []*Certificate
+	var caAccess *sync.RWMutex
+	var certificates []*tls.Certificate
+	var certificateAccess *sync.RWMutex
+	if resources != nil {
+		caCerts, caAccess, certificates, certificateAccess = resources.materials(c)
+		resources.sourceAccess.RLock()
+	}
+	root, err := c.getCertPool()
+	if resources != nil {
+		resources.sourceAccess.RUnlock()
+	}
+	if err != nil {
+		errors.LogErrorInner(context.Background(), err, "failed to load system root certificate")
 	}
 
 	randCarrier := &RandCarrier{
@@ -407,11 +641,14 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 		opt(config)
 	}
 
-	caCerts := c.getCustomCA()
+	if resources == nil {
+		caCerts, caAccess = c.getCustomCAContext(nil, nil)
+		certificates, certificateAccess = c.buildCertificates(nil, nil)
+	}
 	if len(caCerts) > 0 {
-		config.GetCertificate = getGetCertificateFunc(config, caCerts)
+		config.GetCertificate = getGetCertificateFunc(config, caCerts, caAccess)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
+		config.GetCertificate = getNewGetCertificateFunc(certificates, c.RejectUnknownSni, certificateAccess)
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {
@@ -465,15 +702,19 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	}
 
 	if len(c.MasterKeyLog) > 0 && c.MasterKeyLog != "none" {
-		writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
-		if err != nil {
-			errors.LogErrorInner(context.Background(), err, "failed to open ", c.MasterKeyLog, " as master key log")
+		if resources != nil {
+			config.KeyLogWriter = resources.keyLog(c.MasterKeyLog)
 		} else {
-			config.KeyLogWriter = writer
+			writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+			if err != nil {
+				errors.LogErrorInner(context.Background(), err, "failed to open ", c.MasterKeyLog, " as master key log")
+			} else {
+				config.KeyLogWriter = writer
+			}
 		}
 	}
 	if len(c.EchConfigList) > 0 || len(c.EchServerKeys) > 0 {
-		err := ApplyECH(c, config)
+		err := ApplyECHContext(ctx, c, config)
 		if err != nil {
 			errors.LogError(context.Background(), err)
 		}

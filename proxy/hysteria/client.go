@@ -70,7 +70,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx, newCancel = core.ContextWithoutRequestCancellation(ctx)
+		defer newCancel()
 	}
 
 	sessionPolicy := c.policyManager.ForLevel(0)
@@ -84,6 +85,31 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	if newCtx != nil {
 		ctx = newCtx
+	}
+	runCopies := func(first, second func() error) error {
+		if newCtx == nil {
+			return task.Run(ctx, first, second)
+		}
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func() error) func() error {
+			copies.Acquire()
+			return func() error {
+				defer copies.Release()
+				return copyTask()
+			}
+		}
+		err := task.Run(ctx, trackCopy(first), trackCopy(second))
+		cancel()
+		if newCancel != nil {
+			newCancel()
+		}
+		_ = conn.Close()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		copies.Seal()
+		copies.Wait()
+		_ = timer.CloseAndWait()
+		return err
 	}
 
 	if target.Network == net.Network_TCP {
@@ -113,7 +139,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		}
 
 		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
+		if err := runCopies(requestDone, responseDoneAndCloseWriter); err != nil {
 			return errors.New("connection ends").Base(err)
 		}
 
@@ -158,7 +184,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		}
 
 		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
+		if err := runCopies(requestDone, responseDoneAndCloseWriter); err != nil {
 			return errors.New("connection ends").Base(err)
 		}
 

@@ -3,6 +3,7 @@ package loopback
 import (
 	"context"
 
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	proxyman "github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -43,6 +44,7 @@ func (l *Loopback) Process(ctx context.Context, link *transport.Link, _ internet
 	inbound.Tag = l.inboundTag
 	ctx = session.ContextWithInbound(ctx, inbound)
 
+	ctx = flow_observation.ContextWithLoopbackContinuation(ctx, link)
 	err := l.dispatcherInstance.DispatchLink(ctx, destination, link)
 	if err != nil {
 		return errors.New(ctx, "failed to process loopback connection").Base(err)

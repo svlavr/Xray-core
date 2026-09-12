@@ -56,9 +56,15 @@ type Handler struct {
 	encryption    *encryption.ClientInstance
 	reverse       *Reverse
 
-	testpre  uint32
-	initpre  sync.Once
-	preConns chan *ConnExpire
+	testpre   uint32
+	initpre   sync.Once
+	preConns  chan *ConnExpire
+	ctx       context.Context
+	cancel    context.CancelFunc
+	producers task.Lifecycle
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 type ConnExpire struct {
@@ -77,11 +83,25 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	}
 
 	v := core.MustFromContext(ctx)
+	ownerCtx := ctx
+	if lifecycle := internet.ResourceLifecycleFromContext(ctx); lifecycle != nil {
+		ownerCtx = lifecycle.Context()
+	}
+	handlerCtx, handlerCancel := context.WithCancel(ownerCtx)
 	handler := &Handler{
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
+		ctx:           handlerCtx,
+		cancel:        handlerCancel,
+		closeDone:     make(chan struct{}),
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			handlerCancel()
+		}
+	}()
 
 	a := handler.server.User.Account.(*vless.MemoryAccount)
 	if a.Encryption != "" && a.Encryption != "none" {
@@ -98,7 +118,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	}
 
 	if a.Reverse != nil {
-		rvsCtx := session.ContextWithInbound(ctx, &session.Inbound{
+		rvsCtx := session.ContextWithInbound(handlerCtx, &session.Inbound{
 			Tag:  a.Reverse.Tag,
 			Name: "vless-reverse",
 			User: handler.server.User, // TODO: email
@@ -122,26 +142,40 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 			Execute:  handler.reverse.monitor,
 			Interval: time.Second * 2,
 		}
-		go func() {
-			time.Sleep(2 * time.Second)
-			handler.reverse.Start()
-		}()
+		if handler.producers.Acquire() {
+			go func() {
+				defer handler.producers.Release()
+				timer := time.NewTimer(2 * time.Second)
+				defer timer.Stop()
+				select {
+				case <-handler.ctx.Done():
+					return
+				case <-timer.C:
+				}
+				_ = handler.reverse.Start()
+			}()
+		}
 	}
 
 	handler.testpre = a.Testpre
 
+	committed = true
 	return handler, nil
 }
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
-	if h.preConns != nil {
-		close(h.preConns)
-	}
-	if h.reverse != nil {
-		return h.reverse.Close()
-	}
-	return nil
+	h.closeOnce.Do(func() {
+		h.producers.Seal()
+		h.cancel()
+		if h.reverse != nil {
+			h.closeErr = h.reverse.Close()
+		}
+		h.producers.Wait()
+		close(h.closeDone)
+	})
+	<-h.closeDone
+	return h.closeErr
 }
 
 // Process implements proxy.Outbound.Process().
@@ -160,25 +194,56 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		h.initpre.Do(func() {
 			h.preConns = make(chan *ConnExpire)
 			for range h.testpre { // TODO: randomize
+				if !h.producers.Acquire() {
+					break
+				}
 				go func() {
-					defer func() { recover() }()
-					ctx := xctx.ContextWithID(context.Background(), session.NewID())
+					defer h.producers.Release()
+					workerCtx := xctx.ContextWithID(h.ctx, session.NewID())
 					for {
-						conn, err := dialer.Dial(ctx, rec.Destination)
+						if err := workerCtx.Err(); err != nil {
+							return
+						}
+						conn, err := dialer.Dial(workerCtx, rec.Destination)
 						if err != nil {
-							errors.LogWarningInner(ctx, err, "pre-connect failed")
+							if workerCtx.Err() != nil {
+								return
+							}
+							errors.LogWarningInner(workerCtx, err, "pre-connect failed")
 							continue
 						}
-						h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(time.Minute * 2)} // TODO: customize & randomize
-						time.Sleep(time.Millisecond * 200)                                             // TODO: customize & randomize
+						select {
+						case h.preConns <- &ConnExpire{Conn: conn, Expire: time.Now().Add(time.Minute * 2)}: // TODO: customize & randomize
+						case <-workerCtx.Done():
+							_ = conn.Close()
+							return
+						}
+						timer := time.NewTimer(time.Millisecond * 200) // TODO: customize & randomize
+						select {
+						case <-timer.C:
+						case <-workerCtx.Done():
+							if !timer.Stop() {
+								select {
+								case <-timer.C:
+								default:
+								}
+							}
+							return
+						}
 					}
 				}()
 			}
 		})
 		for {
-			connTime := <-h.preConns
-			if connTime == nil {
+			var connTime *ConnExpire
+			select {
+			case connTime = <-h.preConns:
+			case <-h.ctx.Done():
 				return errors.New("closed handler").AtWarning()
+			}
+			if err := h.ctx.Err(); err != nil {
+				_ = connTime.Conn.Close()
+				return errors.New("closed handler").Base(err).AtWarning()
 			}
 			if time.Now().Before(connTime.Expire) {
 				conn = connTime.Conn
@@ -295,7 +360,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx, newCancel = core.ContextWithoutRequestCancellation(ctx)
+		defer newCancel()
 	}
 
 	sessionPolicy := h.policyManager.ForLevel(request.User.Level)
@@ -415,7 +481,30 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		ctx = newCtx
 	}
 
-	if err := task.Run(ctx, postRequest, task.OnSuccess(getResponse, task.Close(clientWriter))); err != nil {
+	responseTask := task.OnSuccess(getResponse, task.Close(clientWriter))
+	var err error
+	if newCtx == nil {
+		err = task.Run(ctx, postRequest, responseTask)
+	} else {
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func() error) func() error {
+			copies.Acquire()
+			return func() error {
+				defer copies.Release()
+				return copyTask()
+			}
+		}
+		err = task.Run(ctx, trackCopy(postRequest), trackCopy(responseTask))
+		cancel()
+		newCancel()
+		_ = conn.Close()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		copies.Seal()
+		copies.Wait()
+		_ = timer.CloseAndWait()
+	}
+	if err != nil {
 		return errors.New("connection ends").Base(err).AtInfo()
 	}
 
@@ -423,6 +512,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 }
 
 type Reverse struct {
+	mu          sync.Mutex
+	startMu     sync.Mutex
+	sealed      bool
 	tag         string
 	dispatcher  routing.Dispatcher
 	ctx         context.Context
@@ -432,25 +524,50 @@ type Reverse struct {
 }
 
 func (r *Reverse) monitor() error {
+	r.mu.Lock()
+	if r.sealed {
+		r.mu.Unlock()
+		return nil
+	}
+	workers := append([]*reverse.BridgeWorker(nil), r.workers...)
+	r.mu.Unlock()
 	var activeWorkers []*reverse.BridgeWorker
-	for _, w := range r.workers {
+	for _, w := range workers {
 		if w.IsActive() {
 			activeWorkers = append(activeWorkers, w)
+		} else {
+			_ = w.Close()
 		}
 	}
-	if len(activeWorkers) != len(r.workers) {
+	r.mu.Lock()
+	if r.sealed {
+		r.mu.Unlock()
+		return nil
+	}
+	if len(activeWorkers) != len(workers) {
 		r.workers = activeWorkers
 	}
+	workers = append(workers[:0], r.workers...)
+	r.mu.Unlock()
 
 	var numConnections uint32
 	var numWorker uint32
-	for _, w := range r.workers {
+	for _, w := range workers {
 		if w.IsActive() {
 			numConnections += w.Connections()
 			numWorker++
 		}
 	}
 	if numWorker == 0 || numConnections/numWorker > 16 {
+		if !r.handler.producers.Acquire() {
+			return errors.New("VLESS reverse generation is closed")
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				r.handler.producers.Release()
+			}
+		}()
 		reader1, writer1 := pipe.New(pipe.WithSizeLimit(2 * buf.Size))
 		reader2, writer2 := pipe.New(pipe.WithSizeLimit(2 * buf.Size))
 		link1 := &transport.Link{Reader: reader1, Writer: writer2}
@@ -461,12 +578,28 @@ func (r *Reverse) monitor() error {
 		}
 		worker, err := mux.NewServerWorker(session.ContextWithIsReverseMux(r.ctx, true), w, link1)
 		if err != nil {
+			common.Interrupt(reader1)
+			common.Interrupt(reader2)
+			common.Interrupt(writer1)
+			common.Interrupt(writer2)
 			errors.LogWarningInner(r.ctx, err, "failed to create mux server worker")
 			return nil
 		}
 		w.Worker = worker
+		r.mu.Lock()
+		if r.sealed {
+			r.mu.Unlock()
+			_ = w.Close()
+			common.Interrupt(reader1)
+			common.Interrupt(reader2)
+			common.Interrupt(writer1)
+			common.Interrupt(writer2)
+			return nil
+		}
 		r.workers = append(r.workers, w)
+		r.mu.Unlock()
 		go func() {
+			defer r.handler.producers.Release()
 			ctx := session.ContextWithOutbounds(r.ctx, []*session.Outbound{{
 				Target: net.Destination{Address: net.DomainAddress("v1.rvs.cool")},
 			}})
@@ -474,14 +607,42 @@ func (r *Reverse) monitor() error {
 			common.Interrupt(reader1)
 			common.Interrupt(reader2)
 		}()
+		committed = true
 	}
 	return nil
 }
 
 func (r *Reverse) Start() error {
+	r.startMu.Lock()
+	defer r.startMu.Unlock()
+	r.mu.Lock()
+	if r.sealed {
+		r.mu.Unlock()
+		return errors.New("VLESS reverse generation is closed")
+	}
+	r.mu.Unlock()
 	return r.monitorTask.Start()
 }
 
 func (r *Reverse) Close() error {
-	return r.monitorTask.Close()
+	r.startMu.Lock()
+	r.mu.Lock()
+	r.sealed = true
+	workers := append([]*reverse.BridgeWorker(nil), r.workers...)
+	r.mu.Unlock()
+	_ = r.monitorTask.Close()
+	r.startMu.Unlock()
+	for _, worker := range workers {
+		worker.SignalStop()
+	}
+	var closeErrors []error
+	closeErrors = append(closeErrors, r.monitorTask.CloseAndWait())
+	r.mu.Lock()
+	workers = append(workers[:0], r.workers...)
+	r.workers = nil
+	r.mu.Unlock()
+	for _, worker := range workers {
+		closeErrors = append(closeErrors, worker.Close())
+	}
+	return errors.Combine(closeErrors...)
 }

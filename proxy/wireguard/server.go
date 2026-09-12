@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	c "github.com/xtls/xray-core/common/ctx"
@@ -327,7 +328,14 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
-	defer conn.Close()
+	var ownerScope *flow_observation.ExternalOwnerScope
+	var dispatchErr error
+	defer func() {
+		closeErr := conn.Close()
+		if ownerScope != nil {
+			ownerScope.AfterOwnerClose(dispatchErr, closeErr)
+		}
+	}()
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 	ctx = c.ContextWithID(ctx, session.NewID())
@@ -368,6 +376,14 @@ func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
 	ctx = session.ContextWithContent(ctx, &session.Content{
 		SniffingRequest: s.sniffingRequest,
 	})
+	if dest.Network == net.Network_TCP {
+		ownerScope = flow_observation.NewExternalOwnerScope(flow_observation.ExternalOwnerWireGuardTCP)
+	} else if dest.Network == net.Network_UDP {
+		ownerScope = flow_observation.NewExternalOwnerScope(flow_observation.ExternalOwnerWireGuardUDP)
+	}
+	if ownerScope != nil {
+		ctx = flow_observation.ContextWithExternalOwnerScope(ctx, ownerScope)
+	}
 	ctx = session.SubContextFromMuxInbound(ctx)
 
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
@@ -382,8 +398,9 @@ func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
 		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
 		Writer: buf.NewWriter(conn),
 	}
-	if err := s.dispatcher.DispatchLink(ctx, dest, link); err != nil {
-		errors.LogError(ctx, errors.New("connection closed").Base(err))
+	dispatchErr = s.dispatcher.DispatchLink(ctx, dest, link)
+	if dispatchErr != nil {
+		errors.LogError(ctx, errors.New("connection closed").Base(dispatchErr))
 	}
 }
 

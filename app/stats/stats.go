@@ -6,6 +6,7 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/stats"
 )
 
@@ -32,6 +33,10 @@ func NewManager(ctx context.Context, config *Config) (*Manager, error) {
 // Type implements common.HasType.
 func (*Manager) Type() interface{} {
 	return stats.ManagerType()
+}
+
+func (*Manager) ShutdownPhase() features.ShutdownPhase {
+	return features.ShutdownPhaseStats
 }
 
 // RegisterCounter implements stats.Manager.

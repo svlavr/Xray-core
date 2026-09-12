@@ -78,12 +78,15 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 }
 
-func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
+func (u *udpConnectionHandler) connectionFinished(expected *udpConn) {
+	if expected == nil {
+		return
+	}
 	u.Lock()
-	conn, found := u.udpConns[src]
-	if found {
-		delete(u.udpConns, src)
-		close(conn.egress)
+	conn, found := u.udpConns[expected.src]
+	if found && conn == expected {
+		delete(u.udpConns, expected.src)
+		close(expected.egress)
 	}
 	u.Unlock()
 }
@@ -161,7 +164,7 @@ func (c *udpConn) Write(p []byte) (int, error) {
 }
 
 func (c *udpConn) Close() error {
-	c.handler.connectionFinished(c.src)
+	c.handler.connectionFinished(c)
 
 	return nil
 }

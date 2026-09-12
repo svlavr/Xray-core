@@ -74,7 +74,7 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 	tConfig := tls.ConfigFromStreamSettings(streamSettings)
 	if tConfig != nil {
 		protocol = "wss"
-		tlsConfig := tConfig.GetTLSConfig(tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
+		tlsConfig := tConfig.GetTLSConfigContext(ctx, tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
 		dialer.TLSClientConfig = tlsConfig
 		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
 			dialer.NetDialTLSContext = func(_ context.Context, _, addr string) (net.Conn, error) {
@@ -93,6 +93,12 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 					}
 					pconn = newConn
 				}
+				committed := false
+				defer func() {
+					if !committed {
+						_ = pconn.Close()
+					}
+				}()
 
 				// TLS and apply the handshake
 				cn := tls.UClient(pconn, tlsConfig, fingerprint).(*tls.UConn)
@@ -106,6 +112,7 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 						return nil, err
 					}
 				}
+				committed = true
 				return cn, nil
 			}
 		}
@@ -125,7 +132,7 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 		}
 		uri := protocol + "://" + host + wsSettings.GetNormalizedPath()
 
-		conn, err := browser_dialer.DialWS(uri, ed)
+		conn, err := browser_dialer.DialWSContext(ctx, uri, ed)
 		if err != nil {
 			return nil, err
 		}

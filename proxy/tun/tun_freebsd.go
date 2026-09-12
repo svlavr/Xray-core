@@ -49,6 +49,8 @@ type FreeBSDTun struct {
 	escapeRoutes     []escapeRoute
 	routeMonitor     *os.File
 	routeMonitorOnce sync.Once
+	routeMonitorWG   sync.WaitGroup
+	updater          *InterfaceUpdater
 }
 
 // escapeRoute remembers one route written into the escape FIB, in the exact
@@ -174,6 +176,7 @@ func (t *FreeBSDTun) Start() error {
 			return err
 		}
 		t.routeMonitor = os.NewFile(uintptr(fd), "xray-route-monitor")
+		t.routeMonitorWG.Add(1)
 		go t.monitorRouteChanges()
 	}
 	return nil
@@ -182,6 +185,7 @@ func (t *FreeBSDTun) Start() error {
 // monitorRouteChanges refreshes the outbound interface and the escape FIB
 // mirror whenever the system routing table changes.
 func (t *FreeBSDTun) monitorRouteChanges() {
+	defer t.routeMonitorWG.Done()
 	buffer := make([]byte, 64*1024)
 	for {
 		if _, err := t.routeMonitor.Read(buffer); err != nil {
@@ -190,8 +194,8 @@ func (t *FreeBSDTun) monitorRouteChanges() {
 			}
 			return
 		}
-		if updater != nil {
-			updater.Update()
+		if t.updater != nil {
+			t.updater.Update()
 		}
 		if err := t.syncEscapeFib(); err != nil {
 			xerrors.LogInfoInner(context.Background(), err, "[tun] failed to refresh escape routes")
@@ -205,6 +209,7 @@ func (t *FreeBSDTun) Close() error {
 			_ = t.routeMonitor.Close()
 		}
 	})
+	t.routeMonitorWG.Wait()
 	t.unsetEscapeFib()
 	routeErr := t.unsetSystemRoutes()
 	name, nameErr := t.Name()
@@ -777,8 +782,8 @@ func checkEscapeFib() error {
 // route flap.
 func (t *FreeBSDTun) syncEscapeFib() error {
 	var onlyIndex int
-	if t.options.AutoOutboundsInterface != "" && updater != nil {
-		if iface := updater.Get(); iface != nil {
+	if t.options.AutoOutboundsInterface != "" && t.updater != nil {
+		if iface := t.updater.Get(); iface != nil {
 			onlyIndex = iface.Index
 		}
 	}
@@ -814,6 +819,8 @@ func (t *FreeBSDTun) syncEscapeFib() error {
 	}
 	return nil
 }
+
+func (t *FreeBSDTun) setInterfaceUpdater(updater *InterfaceUpdater) { t.updater = updater }
 
 func (t *FreeBSDTun) unsetEscapeFib() {
 	t.escapeMu.Lock()

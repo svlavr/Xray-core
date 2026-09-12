@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -29,6 +30,8 @@ type Server interface {
 
 // Client is the interface for DNS client.
 type Client struct {
+	mu            sync.RWMutex
+	closed        bool
 	server        Server
 	skipFallback  bool
 	expectedIPs   geodata.IPMatcher
@@ -54,19 +57,19 @@ func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 		case strings.EqualFold(u.String(), "localhost"):
 			return NewLocalNameServer(), nil
 		case strings.EqualFold(u.Scheme, "https"): // DNS-over-HTTPS Remote mode
-			return NewDoHNameServer(u, dispatcher, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServerContext(ctx, u, dispatcher, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 		case strings.EqualFold(u.Scheme, "h2c"): // DNS-over-HTTPS h2c Remote mode
-			return NewDoHNameServer(u, dispatcher, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServerContext(ctx, u, dispatcher, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 		case strings.EqualFold(u.Scheme, "https+local"): // DNS-over-HTTPS Local mode
-			return NewDoHNameServer(u, nil, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServerContext(ctx, u, nil, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 		case strings.EqualFold(u.Scheme, "h2c+local"): // DNS-over-HTTPS h2c Local mode
-			return NewDoHNameServer(u, nil, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServerContext(ctx, u, nil, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 		case strings.EqualFold(u.Scheme, "quic+local"): // DNS-over-QUIC Local mode
-			return NewQUICNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
+			return NewQUICNameServerContext(ctx, u, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.Scheme, "tcp"): // DNS-over-TCP Remote mode
-			return NewTCPNameServer(u, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
+			return NewTCPNameServerContext(ctx, u, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.Scheme, "tcp+local"): // DNS-over-TCP Local mode
-			return NewTCPLocalNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
+			return NewTCPLocalNameServerContext(ctx, u, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.String(), "fakedns"):
 			var fd dns.FakeDNSEngine
 			err = core.RequireFeatures(ctx, func(fdns dns.FakeDNSEngine) {
@@ -82,7 +85,7 @@ func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 		dest.Network = net.Network_UDP
 	}
 	if dest.Network == net.Network_UDP { // UDP classic DNS mode
-		return NewClassicNameServer(dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+		return NewClassicNameServerContext(ctx, dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 	}
 	return nil, errors.New("No available name server could be created from ", dest).AtWarning()
 }
@@ -99,11 +102,22 @@ func NewClient(
 ) (*Client, error) {
 	client := &Client{}
 	err := core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Create a new server for each client for now
 		server, err := NewServer(ctx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
 		if err != nil {
 			return errors.New("failed to create nameserver").Base(err).AtWarning()
 		}
+		adopted := false
+		defer func() {
+			if !adopted {
+				if closer, ok := server.(interface{ Close() error }); ok {
+					_ = closer.Close()
+				}
+			}
+		}()
 
 		_, isLocalDNS := server.(*LocalNameServer)
 		updateRules(isLocalDNS)
@@ -142,6 +156,11 @@ func NewClient(
 
 		checkSystem := ns.QueryStrategy == QueryStrategy_USE_SYS
 
+		client.mu.Lock()
+		if client.closed || ctx.Err() != nil {
+			client.mu.Unlock()
+			return errors.New("DNS client closed during construction")
+		}
 		client.server = server
 		client.skipFallback = ns.SkipFallback
 		client.expectedIPs = expectedMatcher
@@ -154,6 +173,8 @@ func NewClient(
 		client.ipOption = &ipOption
 		client.checkSystem = checkSystem
 		client.policyID = ns.PolicyID
+		client.mu.Unlock()
+		adopted = true
 		return nil
 	})
 	return client, err
@@ -161,11 +182,58 @@ func NewClient(
 
 // Name returns the server name the client manages.
 func (c *Client) Name() string {
-	return c.server.Name()
+	c.mu.RLock()
+	server := c.server
+	c.mu.RUnlock()
+	if server == nil {
+		return "uninitialized DNS client"
+	}
+	return server.Name()
+}
+
+func (c *Client) IsDisableCache() bool {
+	c.mu.RLock()
+	server := c.server
+	c.mu.RUnlock()
+	return server == nil || server.IsDisableCache()
+}
+
+func (c *Client) SignalStop() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.closed = true
+	server := c.server
+	c.mu.Unlock()
+	if signaler, ok := server.(interface{ SignalStop() }); ok {
+		signaler.SignalStop()
+	}
+}
+
+func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.SignalStop()
+	c.mu.RLock()
+	server := c.server
+	c.mu.RUnlock()
+	if closer, ok := server.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 // QueryIP sends DNS query to the name server with the client's IP.
 func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	c.mu.RLock()
+	server := c.server
+	closed := c.closed
+	c.mu.RUnlock()
+	if closed || server == nil {
+		return nil, 0, errors.New("DNS client is not available")
+	}
 	if c.checkSystem {
 		supportIPv4, supportIPv6 := utils.CheckRoutes()
 		option.IPv4Enable = option.IPv4Enable && supportIPv4
@@ -181,7 +249,7 @@ func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption
 
 	ctx, cancel := context.WithTimeout(ctx, c.timeoutMs)
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: c.tag})
-	ips, ttl, err := c.server.QueryIP(ctx, domain, option)
+	ips, ttl, err := server.QueryIP(ctx, domain, option)
 	cancel()
 
 	if err != nil {

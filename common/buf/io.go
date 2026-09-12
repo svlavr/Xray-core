@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -28,12 +29,22 @@ type TimeoutReader interface {
 	ReadMultiBufferTimeout(time.Duration) (MultiBuffer, error)
 }
 
+// ReadLifecycle is a bounded observation seam for reads that may continue in
+// a TimeoutWrapperReader background goroutine. Implementations must not block
+// or change the read result.
+type ReadLifecycle interface {
+	BeginRead() bool
+	CompleteRead(bool, uint64, error)
+}
+
 type TimeoutWrapperReader struct {
 	Reader
 	stats.Counter
-	mb   MultiBuffer
-	err  error
-	done chan struct{}
+	ParticipantTracker task.ParticipantTracker
+	ReadLifecycle      ReadLifecycle
+	mb                 MultiBuffer
+	err                error
+	done               chan struct{}
 }
 
 func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
@@ -45,7 +56,14 @@ func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
 		}
 		return r.mb, r.err
 	}
+	reserved := false
+	if r.ReadLifecycle != nil {
+		reserved = r.ReadLifecycle.BeginRead()
+	}
 	r.mb, r.err = r.Reader.ReadMultiBuffer()
+	if r.ReadLifecycle != nil {
+		r.ReadLifecycle.CompleteRead(reserved, uint64(r.mb.Len()), r.err)
+	}
 	if r.Counter != nil {
 		r.Counter.Add(int64(r.mb.Len()))
 	}
@@ -55,8 +73,22 @@ func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
 func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
 	if r.done == nil {
 		r.done = make(chan struct{})
+		reserved := false
+		if r.ReadLifecycle != nil {
+			reserved = r.ReadLifecycle.BeginRead()
+		}
+		var participant task.ParticipantLease
+		if r.ParticipantTracker != nil {
+			participant = r.ParticipantTracker.AcquireParticipant()
+		}
 		go func() {
+			if participant != nil {
+				defer func() { participant.Release(r.err) }()
+			}
 			r.mb, r.err = r.Reader.ReadMultiBuffer()
+			if r.ReadLifecycle != nil {
+				r.ReadLifecycle.CompleteRead(reserved, uint64(r.mb.Len()), r.err)
+			}
 			close(r.done)
 		}()
 	}

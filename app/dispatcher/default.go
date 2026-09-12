@@ -2,9 +2,13 @@ package dispatcher
 
 import (
 	"context"
+	goerrors "errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -13,7 +17,9 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/policy"
@@ -25,6 +31,18 @@ import (
 )
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
+
+var ErrObservationShutdownOwned = goerrors.New("dispatcher observation shutdown is owned by core.Instance")
+
+type dispatcherShutdownOwner uint8
+
+const (
+	dispatcherShutdownUnowned dispatcherShutdownOwner = iota
+	dispatcherShutdownStandalone
+	dispatcherShutdownInstance
+)
+
+type dispatcherObservationShutdown struct{ dispatcher *DefaultDispatcher }
 
 type cachedReader struct {
 	sync.Mutex
@@ -93,11 +111,23 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm    outbound.Manager
-	router routing.Router
-	policy policy.Manager
-	stats  stats.Manager
-	fdns   dns.FakeDNSEngine
+	ohm       outbound.Manager
+	router    routing.Router
+	policy    policy.Manager
+	stats     stats.Manager
+	fdns      dns.FakeDNSEngine
+	flows     *flow_observation.Registry
+	lifecycle task.Lifecycle
+	joinOnce  sync.Once
+	closeOnce sync.Once
+	joinErr   error
+	closeErr  error
+
+	shutdownMu       sync.Mutex
+	shutdownOwner    dispatcherShutdownOwner
+	shutdownDone     chan struct{}
+	shutdownComplete bool
+	shutdownErr      error
 }
 
 func init() {
@@ -121,6 +151,13 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.router = router
 	d.policy = pm
 	d.stats = sm
+	registry, err := flow_observation.NewRegistry(flow_observation.Config{})
+	if err == nil {
+		d.flows = registry
+		if binder, ok := om.(session.MuxClientCarrierAuthorityBinder); ok {
+			binder.BindMuxClientCarrierAuthority(registry)
+		}
+	}
 	return nil
 }
 
@@ -135,12 +172,162 @@ func (*DefaultDispatcher) Start() error {
 }
 
 // Close implements common.Closable.
-func (*DefaultDispatcher) Close() error { return nil }
+func (d *DefaultDispatcher) Close() error {
+	d.shutdownMu.Lock()
+	switch d.shutdownOwner {
+	case dispatcherShutdownInstance:
+		if d.shutdownComplete {
+			err := d.shutdownErr
+			d.shutdownMu.Unlock()
+			return err
+		}
+		d.shutdownMu.Unlock()
+		return ErrObservationShutdownOwned
+	case dispatcherShutdownStandalone:
+		done := d.shutdownDone
+		d.shutdownMu.Unlock()
+		<-done
+		d.shutdownMu.Lock()
+		err := d.shutdownErr
+		d.shutdownMu.Unlock()
+		return err
+	default:
+		d.shutdownOwner = dispatcherShutdownStandalone
+		d.shutdownDone = make(chan struct{})
+	}
+	d.shutdownMu.Unlock()
 
-func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link) {
+	shutdown := &dispatcherObservationShutdown{dispatcher: d}
+	err := shutdown.FinalizeObservation()
+	return err
+}
+
+// AdoptObservationShutdown transfers exclusive finalization authority to an
+// Instance before the dispatcher is published as a Feature.
+func (d *DefaultDispatcher) AdoptObservationShutdown() (features.ObservationShutdown, error) {
+	if d == nil {
+		return nil, errors.New("cannot adopt nil dispatcher observation shutdown")
+	}
+	d.shutdownMu.Lock()
+	defer d.shutdownMu.Unlock()
+	if d.shutdownOwner != dispatcherShutdownUnowned {
+		return nil, errors.New("dispatcher observation shutdown already has an owner")
+	}
+	d.shutdownOwner = dispatcherShutdownInstance
+	d.shutdownDone = make(chan struct{})
+	return &dispatcherObservationShutdown{dispatcher: d}, nil
+}
+
+// JoinShutdown seals dispatcher publication and waits for every admitted
+// routed-dispatch task while the dependencies and flow registry remain alive.
+func (s *dispatcherObservationShutdown) JoinShutdown() error {
+	if s == nil || s.dispatcher == nil {
+		return errors.New("nil dispatcher observation shutdown")
+	}
+	d := s.dispatcher
+	d.SignalStop()
+	d.joinOnce.Do(func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				d.joinErr = errors.New("dispatcher shutdown join panic: ", recovered)
+			}
+		}()
+		d.lifecycle.Wait()
+	})
+	return d.joinErr
+}
+
+// FinalizeObservation closes the flow registry only after all traffic owners
+// have published their final receipts. Only the adopted capability exposes it.
+func (s *dispatcherObservationShutdown) FinalizeObservation() error {
+	if s == nil || s.dispatcher == nil {
+		return errors.New("nil dispatcher observation shutdown")
+	}
+	d := s.dispatcher
+	joinErr := s.JoinShutdown()
+	if joinErr == nil {
+		d.closeOnce.Do(func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					d.closeErr = errors.New("dispatcher observation finalization panic: ", recovered)
+				}
+			}()
+			if d.flows != nil {
+				d.flows.Close()
+			}
+		})
+	}
+	err := errors.Combine(joinErr, d.closeErr)
+	d.completeShutdown(err)
+	return err
+}
+
+func (d *DefaultDispatcher) completeShutdown(err error) {
+	d.shutdownMu.Lock()
+	defer d.shutdownMu.Unlock()
+	if d.shutdownComplete {
+		return
+	}
+	d.shutdownErr = err
+	d.shutdownComplete = true
+	close(d.shutdownDone)
+}
+
+func (*DefaultDispatcher) ShutdownPhase() features.ShutdownPhase {
+	return features.ShutdownPhaseDispatcher
+}
+
+func (d *DefaultDispatcher) SignalStop() {
+	if d != nil {
+		d.lifecycle.Seal()
+	}
+}
+
+// FlowObserver exposes the bounded raw observation surface when registry
+// initialization succeeded. It does not affect dispatcher availability.
+func (d *DefaultDispatcher) FlowObserver() flow_observation.Observer {
+	if d == nil || d.flows == nil {
+		return nil
+	}
+	return d.flows
+}
+
+func (d *DefaultDispatcher) NewMuxCarrierObservation() session.MuxCarrierObservation {
+	if d == nil || d.flows == nil {
+		return nil
+	}
+	carrier := d.flows.NewMuxCarrierObservation()
+	if carrier == nil {
+		return nil
+	}
+	return carrier
+}
+
+// NewXUDPObservation is the additive nonzero-ID retained-link seam. It only
+// delegates registry authority; it never changes dispatch or carrier traffic.
+func (d *DefaultDispatcher) NewXUDPObservation(destination net.Destination, source string) session.XUDPEpochObservation {
+	if d == nil || d.flows == nil {
+		return nil
+	}
+	return d.flows.NewXUDPObservation(destination, source)
+}
+
+var (
+	_ flow_observation.Provider             = (*DefaultDispatcher)(nil)
+	_ session.MuxCarrierObservationProvider = (*DefaultDispatcher)(nil)
+	_ session.MuxXUDPObservationProvider    = (*DefaultDispatcher)(nil)
+)
+
+func (d *DefaultDispatcher) getLink(ctx context.Context, handle *flow_observation.Handle) (*transport.Link, *transport.Link) {
 	opt := pipe.OptionsFromContext(ctx)
-	uplinkReader, uplinkWriter := pipe.New(opt...)
-	downlinkReader, downlinkWriter := pipe.New(opt...)
+	uplinkOptions := append([]pipe.Option(nil), opt...)
+	downlinkOptions := append([]pipe.Option(nil), opt...)
+	if handle != nil && handle.LogicalRoot() != nil {
+		uplinkOptions = append(uplinkOptions, pipe.WithWriteLifecycle(flow_observation.NativePipeLifecycle(handle.LogicalRoot().Uplink())))
+		downlinkOptions = append(downlinkOptions, pipe.WithWriteLifecycle(flow_observation.NativePipeLifecycle(handle.LogicalRoot().Downlink())))
+	}
+	uplinkReader, uplinkWriter := pipe.New(uplinkOptions...)
+	downlinkReader, downlinkWriter := pipe.New(downlinkOptions...)
 
 	inboundLink := &transport.Link{
 		Reader: downlinkReader,
@@ -188,13 +375,25 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 }
 
 func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager stats.Manager, link *transport.Link) *transport.Link {
+	var readLifecycle buf.ReadLifecycle
+	if scope := flow_observation.ExternalOwnerScopeFromContext(ctx); scope != nil && scope.Handle() != nil {
+		var bound bool
+		readLifecycle, bound = flow_observation.BindExternalLinkIO(ctx, link)
+		if !bound {
+			scope.Handle().MarkAccountingBoundaryUnproven()
+		}
+	}
 	sessionInbound := session.InboundFromContext(ctx)
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
 	}
 
-	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+	link.Reader = &buf.TimeoutWrapperReader{
+		Reader:             link.Reader,
+		ParticipantTracker: task.ParticipantTrackerFromContext(ctx),
+		ReadLifecycle:      readLifecycle,
+	}
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
@@ -268,6 +467,17 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	if !destination.IsValid() {
 		panic("Dispatcher: Invalid destination.")
 	}
+	muxSessionScope := flow_observation.MuxSessionScopeFromContext(ctx)
+	xudpScope := flow_observation.XUDPObservationFromContext(ctx)
+	if flow_observation.HasFlowObservation(ctx) || flow_observation.ExternalOwnerScopeFromContext(ctx) != nil {
+		ctx = flow_observation.ContextWithoutFlowObservation(ctx)
+	}
+	if muxSessionScope != nil {
+		ctx = flow_observation.ContextWithMuxSessionScope(ctx, muxSessionScope)
+	}
+	if xudpScope != nil {
+		ctx = xudpScope.Context(ctx)
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		outbounds = []*session.Outbound{{}}
@@ -283,11 +493,65 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	}
 
 	sniffingRequest := content.SniffingRequest
-	inbound, outbound := d.getLink(ctx)
-	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
-	} else {
+	var flowHandle *flow_observation.Handle
+	if d.flows != nil {
+		switch destination.Network {
+		case net.Network_TCP:
+			if muxSessionScope != nil {
+				flowHandle = d.flows.AdmitMuxTCP(muxSessionScope, destination)
+			} else if !session.IsMultiplexedLogicalSession(ctx) {
+				source := ""
+				if inbound := session.InboundFromContext(ctx); inbound != nil {
+					source = inbound.Source.String()
+				}
+				flowHandle = d.flows.AdmitTCP(ctx, source, destination.String(), content.Protocol, flow_observation.ByteScopeLogicalLinkAccepted)
+			}
+		case net.Network_UDP:
+			if xudpScope != nil {
+				flowHandle = d.flows.AdmitXUDP(xudpScope, destination)
+			} else if muxSessionScope != nil {
+				flowHandle = d.flows.AdmitMuxUDP(muxSessionScope, destination)
+			} else if !session.IsMultiplexedLogicalSession(ctx) {
+				source := ""
+				if inbound := session.InboundFromContext(ctx); inbound != nil {
+					source = inbound.Source.String()
+				}
+				flowHandle = d.flows.AdmitUDPAssociation(ctx, source, destination.String(), content.Protocol)
+			}
+		}
+		if flowHandle != nil {
+			flowHandle.TrackOwnedRootLink()
+			ctx = flow_observation.ContextWithHandle(ctx, flowHandle)
+			if muxSessionScope == nil {
+				ctx = flow_observation.ContextWithRootDispatchOwner(ctx, flowHandle)
+			}
+		}
+	}
+	inbound, outbound := d.getLink(ctx, flowHandle)
+	runAsync := func(action func()) bool {
+		if !d.lifecycle.Acquire() {
+			return false
+		}
+		var participant task.ParticipantLease
+		if muxSessionScope != nil && flowHandle != nil {
+			participant = muxSessionScope.AcquireParticipant()
+		}
 		go func() {
+			defer d.lifecycle.Release()
+			if participant != nil {
+				defer participant.Release(nil)
+			}
+			action()
+		}()
+		return true
+	}
+	if !sniffingRequest.Enabled {
+		if !runAsync(func() { d.routedDispatch(ctx, outbound, destination) }) {
+			common.Close(outbound.Writer)
+			common.Interrupt(outbound.Reader)
+		}
+	} else {
+		if !runAsync(func() {
 			cReader := &cachedReader{
 				reader: outbound.Reader.(*pipe.Reader),
 			}
@@ -315,15 +579,31 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				}
 			}
 			d.routedDispatch(ctx, outbound, destination)
-		}()
+		}) {
+			common.Close(outbound.Writer)
+			common.Interrupt(outbound.Reader)
+		}
 	}
 	return inbound, nil
 }
 
 // DispatchLink implements routing.Dispatcher.
-func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
+func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) (dispatchErr error) {
 	if !destination.IsValid() {
 		return errors.New("Dispatcher: Invalid destination.")
+	}
+	externalOwnerScope := flow_observation.ExternalOwnerScopeFromContext(ctx)
+	redispatchScope, internalContinuation := flow_observation.ConsumeLoopbackContinuation(ctx, outbound)
+	if redispatchScope != nil {
+		externalOwnerScope = nil
+		ctx = redispatchScope.Context(ctx)
+		defer func() { redispatchScope.Release(dispatchErr) }()
+	} else if internalContinuation {
+		externalOwnerScope = nil
+		ctx = flow_observation.ContextWithoutFlowObservation(ctx)
+	} else if flow_observation.HasFlowObservation(ctx) {
+		externalOwnerScope = nil
+		ctx = flow_observation.ContextWithoutUnprovenRedispatch(ctx)
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
@@ -337,6 +617,28 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if content == nil {
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
+	}
+	if externalOwnerScope != nil {
+		var handle *flow_observation.Handle
+		if d.flows != nil && destination.Network == net.Network_TCP {
+			source := ""
+			if inbound := session.InboundFromContext(ctx); inbound != nil {
+				source = inbound.Source.String()
+			}
+			handle = d.flows.AdmitExternalTCP(ctx, source, destination.String(), content.Protocol, externalOwnerScope, outbound)
+		} else if d.flows != nil && destination.Network == net.Network_UDP {
+			source := ""
+			if inbound := session.InboundFromContext(ctx); inbound != nil {
+				source = inbound.Source.String()
+			}
+			handle = d.flows.AdmitExternalUDP(ctx, source, destination.String(), content.Protocol, externalOwnerScope, outbound)
+		}
+		if handle != nil {
+			ctx = flow_observation.ContextWithHandle(ctx, handle)
+		} else {
+			externalOwnerScope = nil
+			ctx = flow_observation.ContextWithoutFlowObservation(ctx)
+		}
 	}
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
@@ -432,17 +734,60 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
+	rootOwner := flow_observation.RootDispatchOwnerFromContext(ctx)
+	redispatchScope := flow_observation.RedispatchScopeFromContext(ctx)
+	externalOwnerScope := flow_observation.ExternalOwnerScopeFromContext(ctx)
+	muxSessionScope := flow_observation.MuxSessionScopeFromContext(ctx)
+	flowHandle := rootOwner
+	flowDepth := uint32(0)
+	if redispatchScope != nil {
+		flowHandle = redispatchScope.Handle()
+		flowDepth = redispatchScope.Depth()
+	} else if externalOwnerScope != nil {
+		flowHandle = externalOwnerScope.Handle()
+	} else if muxSessionScope != nil {
+		flowHandle = flow_observation.HandleFromContext(ctx)
+	}
+	if rootOwner != nil {
+		defer flowHandle.HandlerReturned(ctx, destination.String())
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 
 	var handler outbound.Handler
+	var handlerEntry outbound.HandlerEntry
+	matchedRuleTag := ""
+	enterTagged := func(tag string) outbound.Handler {
+		if manager, ok := d.ohm.(outbound.GenerationManager); ok {
+			entry, err := manager.EnterHandler(ctx, tag)
+			if err != nil {
+				return nil
+			}
+			handlerEntry = entry
+			ctx = entry.Context()
+			return entry.Handler()
+		}
+		return d.ohm.GetHandler(tag)
+	}
+	enterDefault := func() outbound.Handler {
+		if manager, ok := d.ohm.(outbound.GenerationManager); ok {
+			entry, err := manager.EnterDefaultHandler(ctx)
+			if err != nil {
+				return nil
+			}
+			handlerEntry = entry
+			ctx = entry.Context()
+			return entry.Handler()
+		}
+		return d.ohm.GetDefaultHandler()
+	}
 
 	routingLink := routing_session.AsRoutingContext(ctx)
 	inTag := routingLink.GetInboundTag()
 	isPickRoute := 0
 	if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
 		ctx = session.SetForcedOutboundTagToContext(ctx, "")
-		if h := d.ohm.GetHandler(forcedOutboundTag); h != nil {
+		if h := enterTagged(forcedOutboundTag); h != nil {
 			isPickRoute = 1
 			errors.LogInfo(ctx, "taking platform initialized detour [", forcedOutboundTag, "] for [", destination, "]")
 			handler = h
@@ -450,12 +795,22 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			errors.LogError(ctx, "non existing tag for platform initialized detour: ", forcedOutboundTag)
 			common.Close(link.Writer)
 			common.Interrupt(link.Reader)
+			if rootOwner != nil {
+				flowHandle.Rejected("MISSING_FORCED_OUTBOUND")
+			} else if redispatchScope != nil {
+				flowHandle.RecordOutcome(flow_observation.TerminalClassLocalError, "MISSING_FORCED_OUTBOUND")
+			} else if externalOwnerScope != nil && flowHandle != nil {
+				flowHandle.RejectedByExternalOwner("MISSING_FORCED_OUTBOUND")
+			} else if muxSessionScope != nil && flowHandle != nil {
+				flowHandle.RecordOutcome(flow_observation.TerminalClassLocalRejection, "MISSING_FORCED_OUTBOUND")
+			}
 			return
 		}
 	} else if d.router != nil {
 		if route, err := d.router.PickRoute(routingLink); err == nil {
 			outTag := route.GetOutboundTag()
-			if h := d.ohm.GetHandler(outTag); h != nil {
+			matchedRuleTag = route.GetRuleTag()
+			if h := enterTagged(outTag); h != nil {
 				isPickRoute = 2
 				if route.GetRuleTag() == "" {
 					errors.LogInfo(ctx, "taking detour [", outTag, "] for [", destination, "]")
@@ -467,6 +822,15 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 				errors.LogWarning(ctx, "non existing outTag: ", outTag)
 				common.Close(link.Writer)
 				common.Interrupt(link.Reader)
+				if rootOwner != nil {
+					flowHandle.Rejected("MISSING_ROUTED_OUTBOUND")
+				} else if redispatchScope != nil {
+					flowHandle.RecordOutcome(flow_observation.TerminalClassLocalError, "MISSING_ROUTED_OUTBOUND")
+				} else if externalOwnerScope != nil && flowHandle != nil {
+					flowHandle.RejectedByExternalOwner("MISSING_ROUTED_OUTBOUND")
+				} else if muxSessionScope != nil && flowHandle != nil {
+					flowHandle.RecordOutcome(flow_observation.TerminalClassLocalRejection, "MISSING_ROUTED_OUTBOUND")
+				}
 				return // DO NOT CHANGE: the traffic shouldn't be processed by default outbound if the specified outbound tag doesn't exist (yet), e.g., VLESS Reverse Proxy
 			}
 		} else {
@@ -475,17 +839,55 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 
 	if handler == nil {
-		handler = d.ohm.GetDefaultHandler()
+		handler = enterDefault()
 	}
 
 	if handler == nil {
 		errors.LogInfo(ctx, "default outbound handler not exist")
 		common.Close(link.Writer)
 		common.Interrupt(link.Reader)
+		if rootOwner != nil {
+			flowHandle.Rejected("MISSING_DEFAULT_OUTBOUND")
+		} else if redispatchScope != nil {
+			flowHandle.RecordOutcome(flow_observation.TerminalClassLocalError, "MISSING_DEFAULT_OUTBOUND")
+		} else if externalOwnerScope != nil && flowHandle != nil {
+			flowHandle.RejectedByExternalOwner("MISSING_DEFAULT_OUTBOUND")
+		} else if muxSessionScope != nil && flowHandle != nil {
+			flowHandle.RecordOutcome(flow_observation.TerminalClassLocalRejection, "MISSING_DEFAULT_OUTBOUND")
+		}
 		return
+	}
+	if handlerEntry != nil {
+		defer handlerEntry.Release()
 	}
 
 	ob.Tag = handler.Tag()
+	if flowHandle != nil {
+		protocolName := ""
+		if content := session.ContentFromContext(ctx); content != nil {
+			protocolName = content.Protocol
+		}
+		handlerType := fmt.Sprintf("%T", handler)
+		var carrierProof flow_observation.CarrierProof
+		var observationIssues []flow_observation.Issue
+		if muxSessionScope == nil {
+			carrierProof, observationIssues = inspectHandlerCarrier(handler)
+		}
+		if rootOwner != nil {
+			flowHandle.SelectRoot(matchedRuleTag, handler.Tag(), handlerType, ob.Target.String(), protocolName, true, carrierProof, observationIssues...)
+		} else if muxSessionScope != nil {
+			flowHandle.SelectRoot(matchedRuleTag, handler.Tag(), handlerType, ob.Target.String(), "", true, "")
+		} else if externalOwnerScope != nil {
+			if externalOwnerScope.AccountingBound() {
+				flowHandle.SelectRoot(matchedRuleTag, handler.Tag(), handlerType, ob.Target.String(), protocolName, true, carrierProof, observationIssues...)
+			} else {
+				observationIssues = append(observationIssues, flow_observation.IssueExternalLinkUnsupported)
+				flowHandle.SelectRoot(matchedRuleTag, handler.Tag(), handlerType, ob.Target.String(), protocolName, false, carrierProof, observationIssues...)
+			}
+		} else if redispatchScope != nil {
+			flowHandle.BeginRedispatch(handler.Tag(), handlerType, matchedRuleTag, true, carrierProof, observationIssues...)
+		}
+	}
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
 		if tag := handler.Tag(); tag != "" {
 			if inTag == "" {
@@ -501,5 +903,43 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		log.Record(accessMessage)
 	}
 
+	if flowHandle != nil {
+		ctx = flow_observation.ContextWithLinkBinding(ctx, flowHandle, link, flowDepth)
+	}
 	handler.Dispatch(ctx, link)
+}
+
+// inspectHandlerCarrier reads only the immutable descriptor exposed by a
+// cooperating owner class. Unknown/custom handlers fail carrier proof closed;
+// the dispatch path never serializes their settings to obtain telemetry.
+func inspectHandlerCarrier(handler outbound.Handler) (flow_observation.CarrierProof, []flow_observation.Issue) {
+	observation, ok := flow_observation.HandlerCarrierObservation(handler)
+	if !ok {
+		return flow_observation.CarrierProofUnknown, []flow_observation.Issue{flow_observation.IssueCarrierProofUnknown}
+	}
+	return carrierObservationIssues(observation)
+}
+
+func carrierObservationIssues(observation flow_observation.CarrierObservation) (flow_observation.CarrierProof, []flow_observation.Issue) {
+	proof := observation.Proof
+	if proof != flow_observation.CarrierProofProven && proof != flow_observation.CarrierProofNotApplicable && proof != flow_observation.CarrierProofUnknown {
+		proof = flow_observation.CarrierProofUnknown
+	}
+	if observation.MuxF2Required || observation.CarrierF2Required || observation.DialerProxyCarrierUnknown {
+		proof = flow_observation.CarrierProofUnknown
+	}
+	issues := make([]flow_observation.Issue, 0, 3)
+	if observation.MuxF2Required {
+		issues = append(issues, flow_observation.IssueMuxCarrierF2Required)
+	}
+	if observation.CarrierF2Required {
+		issues = append(issues, flow_observation.IssueCarrierF2Required)
+	}
+	if observation.DialerProxyCarrierUnknown {
+		issues = append(issues, flow_observation.IssueDialerProxyCarrierUnknown)
+	}
+	if proof == flow_observation.CarrierProofUnknown && len(issues) == 0 {
+		issues = append(issues, flow_observation.IssueCarrierProofUnknown)
+	}
+	return proof, issues
 }

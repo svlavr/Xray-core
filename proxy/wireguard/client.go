@@ -5,7 +5,6 @@ import (
 	"fmt"
 	gonet "net"
 	"net/netip"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +17,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
@@ -45,10 +43,16 @@ type Handler struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	tun  tun.Device
-	tnet *Net
-	dev  *device.Device
-	mu   sync.Mutex
+	tun       tun.Device
+	tnet      *Net
+	dev       *device.Device
+	mu        sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	tasks     task.Lifecycle
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 
 	// TODO: cache cleanup loop
 	local   bool
@@ -131,7 +135,7 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 	var tnet *Net
 	if !conf.NoKernelTun && kernelTunSupported {
 		errors.LogWarning(context.Background(), "Using kernel TUN")
-		tun, tnet, err = createKernelTun(localAddresses, dnses, int(conf.Mtu))
+		tun, tnet, err = createKernelTun(ctx, localAddresses, dnses, int(conf.Mtu))
 	} else {
 		errors.LogWarning(context.Background(), "Using gVisor TUN")
 		tun, tnet, _, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), true)
@@ -140,6 +144,11 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		return nil, err
 	}
 
+	ownerCtx := ctx
+	if lifecycle := streamSettings.ResourceLifecycle; lifecycle != nil {
+		ownerCtx = lifecycle.Context()
+	}
+	handlerCtx, handlerCancel := context.WithCancel(ownerCtx)
 	return &Handler{
 		conf:          conf,
 		policyManager: p,
@@ -149,8 +158,11 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		uplinkCounter:   uplinkCounter,
 		downlinkCounter: downlinkCounter,
 
-		tun:  tun,
-		tnet: tnet,
+		tun:       tun,
+		tnet:      tnet,
+		ctx:       handlerCtx,
+		cancel:    handlerCancel,
+		closeDone: make(chan struct{}),
 
 		local: local,
 		cache: make(map[string]entry),
@@ -159,6 +171,12 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 
 // Process implements proxy.Outbound.Process.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	ctx, finishProcess, err := h.beginProcess(ctx)
+	if err != nil {
+		return err
+	}
+	defer finishProcess()
+
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() {
@@ -174,7 +192,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	var addr netip.Addr
 	if ob.Target.Address.Family().IsDomain() {
-		ip, err := h.resolveRemote(ob.Target.Address.String())
+		ip, err := h.resolveRemote(ctx, ob.Target.Address.String())
 		if err != nil {
 			return errors.New("failed to resolve domain").Base(err)
 		}
@@ -191,7 +209,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx, newCancel = core.ContextWithoutRequestCancellation(ctx)
+		stopNewContext := context.AfterFunc(h.ctx, newCancel)
+		defer stopNewContext()
+		defer newCancel()
 	}
 
 	sessionPolicy := h.policyManager.ForLevel(0)
@@ -209,6 +230,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	var reader buf.Reader
 	var writer buf.Writer
+	var operationConn interface{ Close() error }
 
 	switch ob.Target.Network {
 	case net.Network_TCP:
@@ -225,17 +247,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return errors.New("failed to create TCP connection").Base(err)
 		}
 		defer conn.Close()
+		operationConn = conn
 		reader = buf.NewReader(conn)
 		writer = buf.NewWriter(conn)
 	case net.Network_UDP:
-		conn, err := h.tnet.DialUDPAddrPort(netip.AddrPort{}, addrPort)
+		conn, err := h.tnet.DialUDPAddrPort(ctx, netip.AddrPort{}, addrPort)
 		if err != nil {
 			return errors.New("failed to create UDP connection").Base(err)
 		}
 		defer conn.Close()
+		operationConn = conn
+		packetConn, _, err := internet.PacketConnView(conn)
+		if err != nil {
+			return errors.New("failed to own UDP connection").Base(err)
+		}
 		c := &udpConnClient{
-			PacketConn:  conn.(*internet.PacketConnWrapper).PacketConn,
+			PacketConn:  packetConn,
 			resolveFunc: h.resolveRemote,
+			ctx:         ctx,
 			dest:        gonet.UDPAddrFromAddrPort(addrPort),
 		}
 		reader = c
@@ -255,30 +284,79 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	responseDonePost := task.OnSuccess(responseFunc, task.Close(link.Writer))
-	if err := task.Run(ctx, requestFunc, responseDonePost); err != nil {
+	if newCtx == nil {
+		err = task.Run(ctx, requestFunc, responseDonePost)
+	} else {
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func() error) func() error {
+			copies.Acquire()
+			return func() error {
+				defer copies.Release()
+				return copyTask()
+			}
+		}
+		err = task.Run(ctx, trackCopy(requestFunc), trackCopy(responseDonePost))
+		cancel()
+		newCancel()
+		_ = operationConn.Close()
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
+		copies.Seal()
+		copies.Wait()
+		_ = timer.CloseAndWait()
+	}
+	if err != nil {
 		return errors.New("connection ends").Base(err)
 	}
 
 	return nil
 }
 
-func (h *Handler) Close() (err error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.dev != nil {
-		h.dev.Close()
-		h.dev = nil
-		h.tun = nil
-	} else if h.tun != nil {
-		h.tun.Close()
-		h.tun = nil
+func (h *Handler) beginProcess(ctx context.Context) (context.Context, func(), error) {
+	if !h.tasks.Acquire() {
+		return nil, nil, errors.New("wireguard handler is closed")
 	}
-	return nil
+	processCtx, processCancel := context.WithCancel(ctx)
+	stopHandlerCancel := context.AfterFunc(h.ctx, processCancel)
+	finish := func() {
+		stopHandlerCancel()
+		processCancel()
+		h.tasks.Release()
+	}
+	return processCtx, finish, nil
 }
 
-func (h *Handler) init(ctx context.Context) error {
+func (h *Handler) Close() error {
+	h.closeOnce.Do(func() {
+		h.tasks.Seal()
+		h.cancel()
+		h.mu.Lock()
+		dev := h.dev
+		tunDevice := h.tun
+		h.dev = nil
+		h.tun = nil
+		h.mu.Unlock()
+		if h.tnet != nil {
+			h.tnet.closeConnections()
+		}
+		h.tasks.Wait()
+		if dev != nil {
+			h.closeErr = closeWireGuardDevice(dev, tunDevice)
+		} else if tunDevice != nil {
+			closeErr := tunDevice.Close()
+			if outcome, ok := tunDevice.(interface{ closeOutcome() error }); ok {
+				h.closeErr = outcome.closeOutcome()
+			} else {
+				h.closeErr = closeErr
+			}
+		}
+		close(h.closeDone)
+	})
+	<-h.closeDone
+	return h.closeErr
+}
+
+func (h *Handler) init(ctx context.Context) (err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.tun == nil {
@@ -289,27 +367,26 @@ func (h *Handler) init(ctx context.Context) error {
 	}
 	resolveFunc := h.resolveLocal
 	listenFunc := func() (net.PacketConn, error) {
+		if !h.tasks.Acquire() {
+			return nil, errors.New("wireguard handler is closed")
+		}
+		defer h.tasks.Release()
 		dest, err := net.ParseDestination("udp:" + h.conf.Peers[0].Endpoint)
 		if err != nil {
 			return nil, err
 		}
-		conn, err := internet.DialSystem(ctx, dest, h.streamSettings.SocketSettings)
+		conn, err := internet.DialSystem(h.ctx, dest, h.streamSettings.SocketSettings)
 		if err != nil {
 			return nil, err
 		}
-		var pktConn net.PacketConn
-		switch c := conn.(type) {
-		case *internet.PacketConnWrapper:
-			pktConn = c.PacketConn
-		case *cnc.Connection:
-			pktConn = &internet.FakePacketConn{Conn: c}
-		default:
-			panic(reflect.TypeOf(c))
+		pktConn, _, err := internet.PacketConnView(conn)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
 		}
 		if h.streamSettings.UdpmaskManager != nil {
-			newConn, err := h.streamSettings.UdpmaskManager.WrapPacketConnClient(pktConn)
+			newConn, err := h.streamSettings.UdpmaskManager.WrapPacketConnClientContext(h.ctx, pktConn)
 			if err != nil {
-				pktConn.Close()
 				return nil, errors.New("mask err").Base(err)
 			}
 			pktConn = newConn
@@ -321,9 +398,21 @@ func (h *Handler) init(ctx context.Context) error {
 				WriteCounter: h.uplinkCounter,
 			}
 		}
+		if err := h.ctx.Err(); err != nil {
+			_ = pktConn.Close()
+			return nil, err
+		}
 		return pktConn, nil
 	}
-	bind := &bind{}
+	bind := &bind{resolveFunc: resolveFunc, listenFunc: listenFunc, reserved: h.conf.Reserved}
+	readyTun := newReadinessTun(h.tun)
+	h.tun = readyTun
+	var dev *device.Device
+	deviceReady := make(chan struct{})
+	bind.downFunc = func() error {
+		<-deviceReady
+		return dev.Down()
+	}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {
 			log.Record(&log.GeneralMessage{
@@ -338,11 +427,15 @@ func (h *Handler) init(ctx context.Context) error {
 			})
 		},
 	}
-	dev := device.NewDevice(h.tun, bind, logger)
-	bind.resolveFunc = resolveFunc
-	bind.listenFunc = listenFunc
-	bind.downFunc = dev.Down
-	bind.reserved = h.conf.Reserved
+	dev = device.NewDevice(readyTun, bind, logger)
+	readyTun.markDeviceOwned()
+	close(deviceReady)
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Combine(err, closeWireGuardDevice(dev, h.tun))
+		}
+	}()
 	var cfg strings.Builder
 	cfg.WriteString("private_key=" + h.conf.SecretKey + "\n")
 	for _, peer := range h.conf.Peers {
@@ -358,7 +451,7 @@ func (h *Handler) init(ctx context.Context) error {
 			cfg.WriteString("persistent_keepalive_interval=" + peer.KeepAlive + "\n")
 		}
 	}
-	err := dev.IpcSet(cfg.String())
+	err = dev.IpcSet(cfg.String())
 	if err != nil {
 		return err
 	}
@@ -366,8 +459,26 @@ func (h *Handler) init(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	readyTun.markReady()
 	h.dev = dev
+	committed = true
 	return nil
+}
+
+func closeWireGuardDevice(dev *device.Device, tunDevice tun.Device) error {
+	if dev == nil {
+		if tunDevice != nil {
+			return tunDevice.Close()
+		}
+		return nil
+	}
+	downErr := dev.Down()
+	dev.Close()
+	<-dev.Wait()
+	if outcome, ok := tunDevice.(interface{ closeOutcome() error }); ok {
+		return errors.Combine(downErr, outcome.closeOutcome())
+	}
+	return downErr
 }
 
 func (h *Handler) resolveLocal(host string) (net.IP, error) {
@@ -376,12 +487,12 @@ func (h *Handler) resolveLocal(host string) (net.IP, error) {
 	})
 }
 
-func (h *Handler) resolveRemote(host string) (net.IP, error) {
+func (h *Handler) resolveRemote(ctx context.Context, host string) (net.IP, error) {
 	return h.resolveDomain(host, h.conf.DomainStrategy, func(host string) ([]net.IP, uint32, error) {
 		if h.local {
 			return h.dns.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
 		}
-		return h.tnet.LookupHost(host)
+		return h.tnet.LookupContextHost(ctx, host)
 	})
 }
 
@@ -450,7 +561,8 @@ func (h *Handler) resolveDomain(host string, strategy DeviceConfig_DomainStrateg
 
 type udpConnClient struct {
 	net.PacketConn
-	resolveFunc func(host string) (net.IP, error)
+	resolveFunc func(context.Context, string) (net.IP, error)
+	ctx         context.Context
 	dest        *net.UDPAddr
 }
 
@@ -478,7 +590,7 @@ func (c *udpConnClient) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		dst := c.dest
 		if b.UDP != nil {
 			if b.UDP.Address.Family().IsDomain() {
-				ip, err := c.resolveFunc(b.UDP.Address.String())
+				ip, err := c.resolveFunc(c.ctx, b.UDP.Address.String())
 				if err != nil {
 					errors.LogErrorInner(context.Background(), err, "drop packet to ", b.UDP, " with size ", len(b.Bytes()))
 					b.Release()

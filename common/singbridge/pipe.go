@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing/common/bufio"
@@ -25,6 +26,7 @@ func CopyConn(ctx context.Context, inboundConn net.Conn, link *transport.Link, s
 	}
 	cancel := func() {
 		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
 		common.Interrupt(serverConn)
 	}
 	conn.T = signal.CancelAfterInactivity(ctx, cancel, 300*time.Second)
@@ -37,11 +39,18 @@ type PipeConnWrapper struct {
 	net.Conn
 
 	// A simple patch to avoid goroutine leak since sing infra cannot awake read block by write err
-	T *signal.ActivityTimer
+	T         *signal.ActivityTimer
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (w *PipeConnWrapper) Close() error {
-	return nil
+	w.closeOnce.Do(func() {
+		if w.T != nil {
+			w.closeErr = w.T.CloseAndWait()
+		}
+	})
+	return w.closeErr
 }
 
 func (w *PipeConnWrapper) Read(b []byte) (n int, err error) {

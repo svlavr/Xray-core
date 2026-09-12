@@ -11,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
+	"github.com/xtls/xray-core/features"
 )
 
 // Instance is a log.Handler that handles logs.
@@ -76,6 +77,10 @@ func (g *Instance) initErrorLogger() error {
 // Type implements common.HasType.
 func (*Instance) Type() interface{} {
 	return (*Instance)(nil)
+}
+
+func (*Instance) ShutdownPhase() features.ShutdownPhase {
+	return features.ShutdownPhaseLogger
 }
 
 func (g *Instance) startInternal() error {

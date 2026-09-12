@@ -4,6 +4,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"strings"
+	"sync"
 	"time"
 
 	goreality "github.com/xtls/reality"
@@ -24,12 +25,18 @@ type Listener struct {
 	authConfig    internet.ConnectionAuthenticator
 	config        *Config
 	addConn       internet.ConnHandler
+	lifecycle     *internet.InboundLifecycle
+	mu            sync.Mutex
+	closed        bool
+	connections   map[net.Conn]struct{}
 }
 
 // ListenTCP creates a new Listener based on configurations.
 func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
 	l := &Listener{
-		addConn: handler,
+		addConn:     handler,
+		lifecycle:   internet.InboundLifecycleFromContext(ctx),
+		connections: make(map[net.Conn]struct{}),
 	}
 	tcpSettings := streamSettings.ProtocolSettings.(*Config)
 	l.config = tcpSettings
@@ -60,9 +67,20 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 		}
 		errors.LogInfo(ctx, "listening TCP on ", address, ":", port)
 	}
+	ownedListener := listener
+	cleanupListener := true
+	defer func() {
+		if cleanupListener && ownedListener != nil {
+			ownedListener.Close()
+		}
+	}()
 
 	if streamSettings.TcpmaskManager != nil {
-		listener, _ = streamSettings.TcpmaskManager.WrapListener(listener)
+		listener, err = streamSettings.TcpmaskManager.WrapListener(listener)
+		if err != nil {
+			return nil, errors.New("failed to wrap TCP listener").Base(err)
+		}
+		ownedListener = listener
 	}
 
 	if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol {
@@ -76,7 +94,6 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 	if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.realityConfig = config.GetREALITYConfig()
-		go goreality.DetectPostHandshakeRecordsLens(l.realityConfig)
 	}
 
 	if tcpSettings.HeaderSettings != nil {
@@ -91,7 +108,17 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 		l.authConfig = auth
 	}
 
-	go l.keepAccepting()
+	if !l.lifecycle.Acquire() {
+		return nil, errors.New("inbound listener is closing")
+	}
+	cleanupListener = false
+	if l.realityConfig != nil {
+		go goreality.DetectPostHandshakeRecordsLens(l.realityConfig)
+	}
+	go func() {
+		defer l.lifecycle.Release()
+		l.keepAccepting()
+	}()
 	return l, nil
 }
 
@@ -110,7 +137,25 @@ func (v *Listener) keepAccepting() {
 			continue
 		}
 
-		go func() {
+		tracked := v.lifecycle != nil
+		if tracked {
+			if !v.register(conn) {
+				conn.Close()
+				continue
+			}
+		}
+		go func(rawConn net.Conn) {
+			conn := rawConn
+			handedOff := false
+			defer func() {
+				if tracked {
+					v.unregister(rawConn)
+					rawConn.Close()
+					v.lifecycle.Release()
+				} else if !handedOff {
+					rawConn.Close()
+				}
+			}()
 			if v.tlsConfig != nil {
 				conn = tls.Server(conn, v.tlsConfig)
 			} else if v.realityConfig != nil {
@@ -123,7 +168,8 @@ func (v *Listener) keepAccepting() {
 				conn = v.authConfig.Server(conn)
 			}
 			v.addConn(stat.Connection(conn))
-		}()
+			handedOff = true
+		}(conn)
 	}
 }
 
@@ -134,8 +180,40 @@ func (v *Listener) Addr() net.Addr {
 
 // Close implements internet.Listener.Close.
 func (v *Listener) Close() error {
-	return v.listener.Close()
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return nil
+	}
+	v.closed = true
+	connections := make([]net.Conn, 0, len(v.connections))
+	for conn := range v.connections {
+		connections = append(connections, conn)
+	}
+	v.mu.Unlock()
+	err := v.listener.Close()
+	for _, conn := range connections {
+		conn.Close()
+	}
+	return err
 }
+
+func (v *Listener) register(conn net.Conn) bool {
+	if !v.lifecycle.Acquire() {
+		return false
+	}
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		v.lifecycle.Release()
+		return false
+	}
+	v.connections[conn] = struct{}{}
+	v.mu.Unlock()
+	return true
+}
+
+func (v *Listener) unregister(conn net.Conn) { v.mu.Lock(); delete(v.connections, conn); v.mu.Unlock() }
 
 func init() {
 	common.Must(internet.RegisterTransportListener(protocolName, ListenTCP))

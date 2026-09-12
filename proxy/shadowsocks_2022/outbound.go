@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/singbridge"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -85,7 +86,9 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	defer connection.Close()
 
 	if session.TimeoutOnlyFromContext(ctx) {
-		ctx, _ = context.WithCancel(context.Background())
+		var cleanup context.CancelFunc
+		ctx, cleanup = core.ContextWithoutRequestCancellation(ctx)
+		defer cleanup()
 	}
 
 	if network == net.Network_TCP {

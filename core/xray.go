@@ -8,7 +8,6 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/platform"
-	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/features"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/dns/localdns"
@@ -82,17 +81,29 @@ func (r *resolution) callbackResolution(allFeatures []features.Feature) error {
 type Instance struct {
 	statusLock                 sync.Mutex
 	features                   []features.Feature
+	featureShutdownPhases      []features.ShutdownPhase
+	featureObservationShutdown []features.ObservationShutdown
 	pendingResolutions         []resolution
 	pendingOptionalResolutions []resolution
 	running                    bool
 	resolveLock                sync.Mutex
+	phase                      instancePhase
+	lifecycleDone              chan struct{}
+	startResult                error
+	closeResult                error
+	startupSealed              bool
+	dialLifecycle              *internet.DialLifecycle
+	retirementLedger           *RetirementLedger
 
 	ctx context.Context
 }
 
 // Instance state
 func (server *Instance) IsRunning() bool {
-	return server.running
+	server.statusLock.Lock()
+	running := server.running
+	server.statusLock.Unlock()
+	return running
 }
 
 func AddInboundHandler(server *Instance, config *InboundHandlerConfig) error {
@@ -127,6 +138,12 @@ func AddOutboundHandler(server *Instance, config *OutboundHandlerConfig) error {
 	if err != nil {
 		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = common.Close(rawHandler)
+		}
+	}()
 	handler, ok := rawHandler.(outbound.Handler)
 	if !ok {
 		return errors.New("not an OutboundHandler")
@@ -134,6 +151,7 @@ func AddOutboundHandler(server *Instance, config *OutboundHandlerConfig) error {
 	if err := outboundManager.AddHandler(server.ctx, handler); err != nil {
 		return err
 	}
+	committed = true
 	return nil
 }
 
@@ -165,10 +183,11 @@ func OptionalFeatures(ctx context.Context, callback interface{}) error {
 // The instance is not started at this point.
 // To ensure Xray instance works properly, the config must contain one Dispatcher, one InboundHandlerManager and one OutboundHandlerManager. Other features are optional.
 func New(config *Config) (*Instance, error) {
-	server := &Instance{ctx: context.Background()}
+	server := newInstance(context.Background())
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
+		_ = server.Close()
 		return nil, err
 	}
 
@@ -176,10 +195,11 @@ func New(config *Config) (*Instance, error) {
 }
 
 func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
-	server := &Instance{ctx: ctx}
+	server := newInstance(ctx)
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
+		_ = server.Close()
 		return nil, err
 	}
 
@@ -234,6 +254,12 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
 			return obm
 		}(),
 	)
+	if err := server.dialLifecycle.Configure(server.GetFeature(dns.ClientType()).(dns.Client), func() outbound.Manager {
+		manager, _ := server.GetFeature(outbound.ManagerType()).(outbound.Manager)
+		return manager
+	}()); err != nil {
+		return true, err
+	}
 
 	server.resolveLock.Lock()
 	if server.pendingResolutions != nil {
@@ -252,29 +278,15 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
 	return false, nil
 }
 
+func newInstance(ctx context.Context) *Instance {
+	server := &Instance{ctx: ctx, dialLifecycle: internet.NewDialLifecycle(), retirementLedger: newInstanceRetirementLedger()}
+	server.ctx = internet.ContextWithDialLifecycle(server.ctx, server.dialLifecycle)
+	return server
+}
+
 // Type implements common.HasType.
 func (s *Instance) Type() interface{} {
 	return ServerType()
-}
-
-// Close shutdown the Xray instance.
-func (s *Instance) Close() error {
-	s.statusLock.Lock()
-	defer s.statusLock.Unlock()
-
-	s.running = false
-
-	var errs []interface{}
-	for _, f := range s.features {
-		if err := f.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) > 0 {
-		return errors.New("failed to close all features").Base(errors.New(serial.Concat(errs...)))
-	}
-
-	return nil
 }
 
 // RequireFeatures registers a callback, which will be called when all dependent features are registered.
@@ -320,15 +332,32 @@ func (s *Instance) RequireFeatures(callback interface{}, optional bool) error {
 
 // AddFeature registers a feature into current Instance.
 func (s *Instance) AddFeature(feature features.Feature) error {
+	shutdownPhase, err := featureShutdownPhase(feature)
+	if err != nil {
+		return errors.Combine(err, closeFeature(feature))
+	}
 	if s.running {
 		if err := feature.Start(); err != nil {
 			errors.LogInfoInner(s.ctx, err, "failed to start feature")
 		}
 		return nil
 	}
+	var observationShutdown features.ObservationShutdown
+	if shutdownPhase == features.ShutdownPhaseDispatcher {
+		if adopter, ok := feature.(features.ObservationShutdownAdopter); ok {
+			observationShutdown, err = adopter.AdoptObservationShutdown()
+			if err != nil {
+				// Adoption failure may mean another owner or a standalone Close
+				// already won. This Instance has no authority to close it.
+				return err
+			}
+		}
+	}
 
 	s.resolveLock.Lock()
 	s.features = append(s.features, feature)
+	s.featureShutdownPhases = append(s.featureShutdownPhases, shutdownPhase)
+	s.featureObservationShutdown = append(s.featureObservationShutdown, observationShutdown)
 
 	var availableResolution []resolution
 	var pending []resolution
@@ -368,7 +397,7 @@ func (s *Instance) AddFeature(feature features.Feature) error {
 	s.pendingOptionalResolutions = pendingOptional
 	s.resolveLock.Unlock()
 
-	var err error
+	err = nil
 	for _, r := range availableResolution {
 		err = r.callbackResolution(s.features) // only return the last error for now
 	}
@@ -384,18 +413,3 @@ func (s *Instance) GetFeature(featureType interface{}) features.Feature {
 // A Xray instance can be started only once. Upon closing, the instance is not guaranteed to start again.
 //
 // xray:api:stable
-func (s *Instance) Start() error {
-	s.statusLock.Lock()
-	defer s.statusLock.Unlock()
-
-	s.running = true
-	for _, f := range s.features {
-		if err := f.Start(); err != nil {
-			return err
-		}
-	}
-
-	errors.LogWarning(s.ctx, "Xray ", Version(), " started")
-
-	return nil
-}

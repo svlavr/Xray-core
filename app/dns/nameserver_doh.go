@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -34,10 +35,17 @@ type DoHNameServer struct {
 	httpClient      *http.Client
 	dohURL          string
 	clientIP        net.IP
+	stopOnce        sync.Once
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
 func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *DoHNameServer {
+	return NewDoHNameServerContext(context.Background(), url, dispatcher, h2c, disableCache, serveStale, serveExpiredTTL, clientIP)
+}
+
+func NewDoHNameServerContext(ctx context.Context, url *url.URL, dispatcher routing.Dispatcher, h2c bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *DoHNameServer {
 	url.Scheme = "https"
 	mode := "DOH"
 	if dispatcher == nil {
@@ -45,7 +53,7 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 	}
 	errors.LogInfo(context.Background(), "DNS: created ", mode, " client for ", url.String(), ", with h2c ", h2c)
 	s := &DoHNameServer{
-		cacheController: NewCacheController(mode+"//"+url.Host, disableCache, serveStale, serveExpiredTTL),
+		cacheController: NewCacheControllerContext(ctx, mode+"//"+url.Host, disableCache, serveStale, serveExpiredTTL),
 		dohURL:          url.String(),
 		clientIP:        clientIP,
 	}
@@ -66,13 +74,15 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 						dnsCtx = session.ContextWithMitmServerName(dnsCtx, url.Hostname())
 					}
 					link, err := dispatcher.Dispatch(dnsCtx, dest)
-					select {
-					case <-ctx.Done():
-						return nil, ctx.Err()
-					default:
-					}
 					if err != nil {
 						return nil, err
+					}
+					select {
+					case <-ctx.Done():
+						common.Interrupt(link.Reader)
+						common.Interrupt(link.Writer)
+						return nil, ctx.Err()
+					default:
 					}
 					cc := common.ChainedClosable{}
 					if cw, ok := link.Writer.(common.Closable); ok {
@@ -101,6 +111,7 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 				if !h2c {
 					conn = utls.UClient(conn, &utls.Config{ServerName: url.Hostname()}, utls.HelloChrome_Auto)
 					if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
+						_ = conn.Close()
 						return nil, err
 					}
 				}
@@ -172,7 +183,14 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
+		if !s.cacheController.AcquireTask() {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- context.Canceled
+			}
+			continue
+		}
 		go func(r *dnsRequest) {
+			defer s.cacheController.ReleaseTask()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
 			dnsCtx := ctx
@@ -254,4 +272,22 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 // QueryIP implements Server.
 func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+func (s *DoHNameServer) SignalStop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() { s.cacheController.SignalStop() })
+}
+
+func (s *DoHNameServer) Close() error {
+	s.SignalStop()
+	s.closeOnce.Do(func() {
+		s.closeErr = s.cacheController.Close()
+		if s.httpClient != nil {
+			s.httpClient.CloseIdleConnections()
+		}
+	})
+	return s.closeErr
 }

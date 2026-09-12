@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	goerrors "errors"
 	"io"
+	"math"
 	mrand "math/rand"
 	gonet "net"
 	"net/netip"
@@ -16,7 +17,6 @@ import (
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 )
@@ -34,7 +34,11 @@ type packet struct {
 }
 
 type udpHopConn struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
 	conn       net.PacketConn
+	localAddr  net.Addr
+	dial       func(context.Context, net.Destination, *internet.SocketConfig) (net.Conn, error)
 	sockopt    *internet.SocketConfig
 	local      bool
 	remote     bool
@@ -49,25 +53,60 @@ type udpHopConn struct {
 	readDeadline  time.Time
 	writeDeadline time.Time
 
-	pre     net.PacketConn
-	cur     net.PacketConn
-	addr    *net.UDPAddr
-	readCh  chan packet
-	closeCh chan struct{}
-	wg      sync.WaitGroup
-	mu      sync.Mutex
+	pre         net.PacketConn
+	cur         net.PacketConn
+	addr        *net.UDPAddr
+	readCh      chan packet
+	closeCh     chan struct{}
+	closeDone   chan struct{}
+	wg          sync.WaitGroup
+	mu          sync.Mutex
+	rotationMu  sync.Mutex
+	signalOnce  sync.Once
+	closeOnce   sync.Once
+	closeErr    error
+	closeErrors []error
+	unregister  func()
+	closing     bool
 }
 
 func NewUDPHopConn(c *Config, raw net.PacketConn) (net.PacketConn, error) {
-	if c.IntervalMin < 5 || c.IntervalMax < 5 {
+	return NewUDPHopConnContext(context.Background(), c, raw)
+}
+
+func NewUDPHopConnContext(ctx context.Context, c *Config, raw net.PacketConn) (net.PacketConn, error) {
+	if c == nil || raw == nil {
+		return nil, errors.New("udphop requires config and packet connection")
+	}
+	maxIntervalSeconds := int64(math.MaxInt64/int64(time.Second)) - 1
+	if c.IntervalMin < 5 || c.IntervalMax < c.IntervalMin || c.IntervalMax > maxIntervalSeconds {
 		return nil, errors.New("invalid interval")
 	}
 	remoteIPs := make([]netip.Prefix, 0, len(c.RemoteIPs))
 	for _, ip := range c.RemoteIPs {
-		remoteIPs = append(remoteIPs, netip.MustParsePrefix(ip))
+		prefix, err := netip.ParsePrefix(ip)
+		if err != nil {
+			return nil, errors.New("invalid remote prefix: ", ip).Base(err)
+		}
+		remoteIPs = append(remoteIPs, prefix)
 	}
+	for _, port := range c.RemotePorts {
+		if port > math.MaxUint16 {
+			return nil, errors.New("invalid remote port: ", port)
+		}
+	}
+	owner := internet.ResourceLifecycleFromContext(ctx)
+	ownerCtx := ctx
+	if owner != nil {
+		ownerCtx = owner.Context()
+	}
+	ownerCtx, cancel := context.WithCancel(ownerCtx)
 	conn := &udpHopConn{
+		ctx:        ownerCtx,
+		cancel:     cancel,
 		conn:       raw,
+		localAddr:  raw.LocalAddr(),
+		dial:       internet.DialSystem,
 		sockopt:    c.Sockopt,
 		local:      c.Local,
 		remote:     c.Remote,
@@ -78,9 +117,23 @@ func NewUDPHopConn(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 		remotePorts: c.RemotePorts,
 		remoteIPs:   remoteIPs,
 
-		readCh:  make(chan packet),
-		closeCh: make(chan struct{}),
+		readCh:    make(chan packet),
+		closeCh:   make(chan struct{}),
+		closeDone: make(chan struct{}),
+		cur:       raw,
 	}
+	if owner != nil {
+		err := owner.RegisterBound(conn, func(unregister func()) {
+			conn.unregister = unregister
+		})
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	conn.wg.Add(2)
+	go conn.recv(raw)
+	go conn.hopLoop()
 	return conn, nil
 }
 
@@ -93,12 +146,22 @@ func (c *udpHopConn) closed() bool {
 	}
 }
 
-func (c *udpHopConn) hop(addr *net.UDPAddr) {
-	if c.closed() {
-		return
+func (c *udpHopConn) hop(addr *net.UDPAddr) error {
+	if addr == nil {
+		return nil
 	}
+	c.rotationMu.Lock()
+	defer c.rotationMu.Unlock()
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return gonet.ErrClosed
+	}
+	c.wg.Add(1)
+	c.mu.Unlock()
+	defer c.wg.Done()
 	newAddr := &net.UDPAddr{IP: addr.IP, Port: addr.Port}
-	newConn := c.conn
+	var newConn net.PacketConn
 	if c.remote || c.remoteOnce && c.addr == nil {
 		if len(c.remotePorts) > 0 {
 			newAddr.Port = int(c.remotePorts[mrand.Intn(len(c.remotePorts))])
@@ -108,31 +171,48 @@ func (c *udpHopConn) hop(addr *net.UDPAddr) {
 		}
 	}
 	if c.local {
-		raw, err := internet.DialSystem(context.Background(), net.UDPDestination(net.IPAddress(newAddr.IP), net.Port(newAddr.Port)), c.sockopt)
+		raw, err := c.dial(c.ctx, net.UDPDestination(net.IPAddress(newAddr.IP), net.Port(newAddr.Port)), c.sockopt)
 		if err != nil {
-			errors.LogErrorInner(context.Background(), err, "hop err")
-			return
+			return errors.New("hop dial failed").Base(err)
 		}
-		switch c := raw.(type) {
-		case *internet.PacketConnWrapper:
-			newConn = c.PacketConn
-		case *cnc.Connection:
-			newConn = &internet.FakePacketConn{Conn: c}
-		default:
-			panic(reflect.TypeOf(c))
+		newConn, _, err = internet.PacketConnView(raw)
+		if err != nil {
+			_ = raw.Close()
+			return err
 		}
-		newConn.SetDeadline(c.deadline)
-		newConn.SetReadDeadline(c.readDeadline)
-		newConn.SetWriteDeadline(c.writeDeadline)
-		if c.pre != nil {
-			_ = c.pre.Close()
+		c.mu.Lock()
+		deadline, readDeadline, writeDeadline := c.deadline, c.readDeadline, c.writeDeadline
+		c.mu.Unlock()
+		if err := newConn.SetDeadline(deadline); err != nil {
+			_ = newConn.Close()
+			return err
 		}
+		_ = newConn.SetReadDeadline(readDeadline)
+		_ = newConn.SetWriteDeadline(writeDeadline)
+	}
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		if newConn != nil {
+			_ = newConn.Close()
+		}
+		return gonet.ErrClosed
+	}
+	oldPre := c.pre
+	if c.local {
 		c.pre = c.cur
+		c.cur = newConn
 		c.wg.Add(1)
-		go c.recv(newConn)
 	}
 	c.addr = newAddr
-	c.cur = newConn
+	c.mu.Unlock()
+	if oldPre != nil {
+		_ = oldPre.Close()
+	}
+	if newConn != nil {
+		go c.recv(newConn)
+	}
+	return nil
 }
 
 func (c *udpHopConn) recv(conn net.PacketConn) {
@@ -170,6 +250,7 @@ func (c *udpHopConn) recv(conn net.PacketConn) {
 }
 
 func (c *udpHopConn) hopLoop() {
+	defer c.wg.Done()
 	ticker := time.NewTicker(time.Second * time.Duration(crypto.RandBetween(c.intervalMin, c.intervalMax+1)))
 	defer ticker.Stop()
 	for {
@@ -177,8 +258,11 @@ func (c *udpHopConn) hopLoop() {
 		case <-ticker.C:
 			ticker.Reset(time.Second * time.Duration(crypto.RandBetween(c.intervalMin, c.intervalMax+1)))
 			c.mu.Lock()
-			c.hop(c.addr)
+			addr := c.addr
 			c.mu.Unlock()
+			if err := c.hop(addr); err != nil && !goerrors.Is(err, gonet.ErrClosed) && !goerrors.Is(err, context.Canceled) {
+				errors.LogErrorInner(c.ctx, err, "hop err")
+			}
 		case <-c.closeCh:
 			return
 		}
@@ -186,30 +270,45 @@ func (c *udpHopConn) hopLoop() {
 }
 
 func (c *udpHopConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	packet, ok := <-c.readCh
-	if ok {
+	select {
+	case packet := <-c.readCh:
 		if packet.p != nil {
 			n = copy(p, packet.p)
 			pool.Put(packet.p[:cap(packet.p)])
 		}
 		return n, packet.addr, packet.err
+	case <-c.closeCh:
+		return 0, nil, io.EOF
 	}
-	return 0, nil, io.EOF
 }
 
 func (c *udpHopConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.cur == nil {
-		c.hop(addr.(*net.UDPAddr))
-		if c.cur == nil {
-			return 0, nil
-		}
-		go c.hopLoop()
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok || udpAddr == nil {
+		return 0, errors.New("udphop requires UDP destination")
 	}
-
-	_, err = c.cur.WriteTo(p, c.addr)
+	c.mu.Lock()
+	first := c.addr == nil
+	closing := c.closing
+	c.mu.Unlock()
+	if closing {
+		return 0, gonet.ErrClosed
+	}
+	if first {
+		if err := c.hop(udpAddr); err != nil {
+			return 0, err
+		}
+	}
+	c.mu.Lock()
+	if c.closing || c.cur == nil || c.addr == nil {
+		c.mu.Unlock()
+		return 0, gonet.ErrClosed
+	}
+	current, target := c.cur, c.addr
+	c.wg.Add(1)
+	c.mu.Unlock()
+	defer c.wg.Done()
+	_, err = current.WriteTo(p, target)
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "send err")
 		return 0, err
@@ -218,72 +317,128 @@ func (c *udpHopConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (c *udpHopConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed() {
-		return nil
-	}
-	close(c.closeCh)
-	if c.pre != nil {
-		_ = c.pre.Close()
-	}
-	if c.cur != nil {
-		_ = c.cur.Close()
-	}
-	_ = c.conn.Close()
-	c.wg.Wait()
-	select {
-	case p := <-c.readCh:
-		if p.p != nil {
-			pool.Put(p.p[:cap(p.p)])
+	c.SignalStop()
+	c.closeOnce.Do(func() {
+		c.wg.Wait()
+		for {
+			select {
+			case pending := <-c.readCh:
+				if pending.p != nil {
+					pool.Put(pending.p[:cap(pending.p)])
+				}
+			default:
+				c.mu.Lock()
+				c.sockopt = nil
+				c.dial = nil
+				c.remoteIPs = nil
+				c.remotePorts = nil
+				c.ctx = nil
+				c.closeErr = errors.Combine(c.closeErrors...)
+				unregister := c.unregister
+				c.unregister = nil
+				c.mu.Unlock()
+				if unregister != nil {
+					unregister()
+				}
+				close(c.closeDone)
+				return
+			}
 		}
-	default:
+	})
+	<-c.closeDone
+	c.mu.Lock()
+	err := c.closeErr
+	c.mu.Unlock()
+	return err
+}
+
+// SignalStop seals work and starts lower I/O closure without joining it.
+func (c *udpHopConn) SignalStop() {
+	if c == nil {
+		return
 	}
-	close(c.readCh)
-	return nil
+	c.signalOnce.Do(func() {
+		c.mu.Lock()
+		c.closing = true
+		close(c.closeCh)
+		connections := uniquePacketConns(c.conn, c.pre, c.cur)
+		c.conn, c.pre, c.cur = nil, nil, nil
+		cancel := c.cancel
+		c.wg.Add(len(connections))
+		c.mu.Unlock()
+		cancel()
+		for _, connection := range connections {
+			go func() {
+				defer c.wg.Done()
+				if err := connection.Close(); err != nil {
+					c.mu.Lock()
+					c.closeErrors = append(c.closeErrors, err)
+					c.mu.Unlock()
+				}
+			}()
+		}
+	})
+}
+
+func uniquePacketConns(connections ...net.PacketConn) []net.PacketConn {
+	unique := make([]net.PacketConn, 0, len(connections))
+	for _, connection := range connections {
+		if connection == nil {
+			continue
+		}
+		duplicate := false
+		for _, existing := range unique {
+			connectionType := reflect.TypeOf(connection)
+			if connectionType == reflect.TypeOf(existing) && connectionType.Comparable() && existing == connection {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			unique = append(unique, connection)
+		}
+	}
+	return unique
 }
 
 func (c *udpHopConn) LocalAddr() net.Addr {
-	return c.conn.LocalAddr()
+	return c.localAddr
 }
 
 func (c *udpHopConn) SetDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.deadline = t
-	if c.pre != nil {
-		_ = c.pre.SetDeadline(t)
+	connections := uniquePacketConns(c.pre, c.cur)
+	c.mu.Unlock()
+	var setErrors []error
+	for _, connection := range connections {
+		setErrors = append(setErrors, connection.SetDeadline(t))
 	}
-	if c.cur != nil {
-		_ = c.cur.SetDeadline(t)
-	}
-	return nil
+	return errors.Combine(setErrors...)
 }
 
 func (c *udpHopConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.readDeadline = t
-	if c.pre != nil {
-		_ = c.pre.SetReadDeadline(t)
+	connections := uniquePacketConns(c.pre, c.cur)
+	c.mu.Unlock()
+	var setErrors []error
+	for _, connection := range connections {
+		setErrors = append(setErrors, connection.SetReadDeadline(t))
 	}
-	if c.cur != nil {
-		_ = c.cur.SetReadDeadline(t)
-	}
-	return nil
+	return errors.Combine(setErrors...)
 }
 
 func (c *udpHopConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.writeDeadline = t
-	if c.pre != nil {
-		_ = c.pre.SetWriteDeadline(t)
+	connections := uniquePacketConns(c.pre, c.cur)
+	c.mu.Unlock()
+	var setErrors []error
+	for _, connection := range connections {
+		setErrors = append(setErrors, connection.SetWriteDeadline(t))
 	}
-	if c.cur != nil {
-		_ = c.cur.SetWriteDeadline(t)
-	}
-	return nil
+	return errors.Combine(setErrors...)
 }
 
 func randPrefix(p netip.Prefix) []byte {

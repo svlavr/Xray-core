@@ -40,7 +40,7 @@ func (*TestDispatcher) Type() interface{} {
 	return routing.DispatcherType()
 }
 
-func TestSameDestinationDispatching(t *testing.T) {
+func TestOneDispatchLinkCarriesChangingPacketDestinations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	uplinkReader, uplinkWriter := pipe.New(pipe.WithSizeLimit(1024))
 	downlinkReader, downlinkWriter := pipe.New(pipe.WithSizeLimit(1024))
@@ -63,28 +63,104 @@ func TestSameDestinationDispatching(t *testing.T) {
 			return &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
 		},
 	}
-	dest := net.UDPDestination(net.LocalHostIP, 53)
-
-	b := buf.New()
-	b.WriteString("abcd")
-
-	var msgCount uint32
-	dispatcher := NewDispatcher(td, func(ctx context.Context, packet *udp.Packet) {
-		atomic.AddUint32(&msgCount, 1)
-	})
-
-	dispatcher.Dispatch(ctx, dest, b)
-	for i := 0; i < 5; i++ {
-		dispatcher.Dispatch(ctx, dest, b)
+	destinations := []net.Destination{
+		net.UDPDestination(net.LocalHostIP, 53),
+		net.UDPDestination(net.ParseAddress("127.0.0.2"), 5353),
+		net.UDPDestination(net.DomainAddress("example.com"), 443),
 	}
 
-	time.Sleep(time.Second)
+	var msgCount uint32
+	sources := make(chan net.Destination, 6)
+	dispatcher := NewDispatcher(td, func(ctx context.Context, packet *udp.Packet) {
+		atomic.AddUint32(&msgCount, 1)
+		sources <- packet.Source
+	})
+	defer dispatcher.CloseAndWait()
+
+	for i := 0; i < 6; i++ {
+		destination := destinations[i%len(destinations)]
+		payload := buf.New()
+		payload.WriteString("abcd")
+		payload.UDP = &destination
+		dispatcher.Dispatch(ctx, destination, payload)
+	}
+
+	for i := 0; i < 6; i++ {
+		select {
+		case source := <-sources:
+			if source != destinations[i%len(destinations)] {
+				t.Fatalf("packet %d source = %s, want %s", i, source, destinations[i%len(destinations)])
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out after %d UDP callbacks", i)
+		}
+	}
 	cancel()
 
-	if count != 1 {
-		t.Error("count: ", count)
+	if v := atomic.LoadUint32(&count); v != 1 {
+		t.Error("count: ", v)
 	}
 	if v := atomic.LoadUint32(&msgCount); v != 6 {
 		t.Error("msgCount: ", v)
+	}
+}
+
+func TestDispatcherCloseAndWaitUnblocksInputAndRejectsLatePayload(t *testing.T) {
+	downlinkReader, downlinkWriter := pipe.New(pipe.WithoutSizeLimit())
+	uplinkReader, uplinkWriter := pipe.New(pipe.WithoutSizeLimit())
+	t.Cleanup(func() {
+		common.Interrupt(downlinkWriter)
+		common.Interrupt(uplinkReader)
+	})
+	dispatched := make(chan struct{}, 1)
+	router := &TestDispatcher{OnDispatch: func(context.Context, net.Destination) (*transport.Link, error) {
+		dispatched <- struct{}{}
+		return &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
+	}}
+	dispatcher := NewDispatcher(router, func(context.Context, *udp.Packet) {})
+	destination := net.UDPDestination(net.LocalHostIP, 53)
+	payload := buf.FromBytes([]byte("query"))
+	payload.UDP = &destination
+	dispatcher.Dispatch(context.Background(), destination, payload)
+	<-dispatched
+	closed := make(chan error, 1)
+	go func() { closed <- dispatcher.CloseAndWait() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseAndWait did not join blocked handleInput")
+	}
+	late := buf.FromBytes([]byte("late"))
+	late.UDP = &destination
+	dispatcher.Dispatch(context.Background(), destination, late)
+}
+
+func TestDispatcherCloseCancelsOpeningOutsideStateLock(t *testing.T) {
+	entered := make(chan struct{})
+	router := &TestDispatcher{OnDispatch: func(ctx context.Context, _ net.Destination) (*transport.Link, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	dispatcher := NewDispatcher(router, func(context.Context, *udp.Packet) {})
+	destination := net.UDPDestination(net.LocalHostIP, 53)
+	dispatchDone := make(chan struct{})
+	go func() {
+		payload := buf.FromBytes([]byte("query"))
+		payload.UDP = &destination
+		dispatcher.Dispatch(context.Background(), destination, payload)
+		close(dispatchDone)
+	}()
+	<-entered
+	if err := dispatcher.CloseAndWait(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-dispatchDone:
+	case <-time.After(time.Second):
+		t.Fatal("CloseAndWait did not cancel and join opening Dispatch")
 	}
 }

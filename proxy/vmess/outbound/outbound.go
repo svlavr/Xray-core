@@ -129,7 +129,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx, newCancel = core.ContextWithoutRequestCancellation(ctx)
+		defer newCancel()
 	}
 
 	session := encoding.NewClientSession(ctx, int64(behaviorSeed))
@@ -212,7 +213,28 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	responseDonePost := task.OnSuccess(responseDone, task.Close(output))
-	if err := task.Run(ctx, requestDone, responseDonePost); err != nil {
+	if newCtx == nil {
+		err = task.Run(ctx, requestDone, responseDonePost)
+	} else {
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func() error) func() error {
+			copies.Acquire()
+			return func() error {
+				defer copies.Release()
+				return copyTask()
+			}
+		}
+		err = task.Run(ctx, trackCopy(requestDone), trackCopy(responseDonePost))
+		cancel()
+		newCancel()
+		_ = conn.Close()
+		common.Interrupt(input)
+		common.Interrupt(output)
+		copies.Seal()
+		copies.Wait()
+		_ = timer.CloseAndWait()
+	}
+	if err != nil {
 		return errors.New("connection ends").Base(err)
 	}
 

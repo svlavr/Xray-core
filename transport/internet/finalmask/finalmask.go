@@ -14,6 +14,14 @@ type Udpmask interface {
 	WrapPacketConnServer(raw net.PacketConn, level int, levelCount int) (net.PacketConn, error)
 }
 
+type contextualClientUdpmask interface {
+	WrapPacketConnClientContext(context.Context, net.PacketConn, int, int) (net.PacketConn, error)
+}
+
+type contextualServerUdpmask interface {
+	WrapPacketConnServerContext(context.Context, net.PacketConn, int, int) (net.PacketConn, error)
+}
+
 type UdpmaskManager struct {
 	udpmasks []Udpmask
 }
@@ -24,12 +32,19 @@ func NewUdpmaskManager(udpmasks []Udpmask) *UdpmaskManager {
 }
 
 func (m *UdpmaskManager) WrapPacketConnClient(raw net.PacketConn) (net.PacketConn, error) {
+	return m.WrapPacketConnClientContext(context.Background(), raw)
+}
+
+// WrapPacketConnClientContext transfers one owned chain through every layer.
+// Any later failure closes the last successful chain before returning.
+func (m *UdpmaskManager) WrapPacketConnClientContext(ctx context.Context, raw net.PacketConn) (net.PacketConn, error) {
 	var sizes []int
 	var conns []net.PacketConn
 	for i, mask := range m.udpmasks {
 		if _, ok := mask.(headerConn); ok {
 			conn, err := mask.WrapPacketConnClient(nil, i, len(m.udpmasks)-1)
 			if err != nil {
+				closePacketChain(raw, conns)
 				return nil, err
 			}
 			sizes = append(sizes, conn.(headerSize).Size())
@@ -41,8 +56,14 @@ func (m *UdpmaskManager) WrapPacketConnClient(raw net.PacketConn) (net.PacketCon
 				conns = nil
 			}
 			var err error
-			raw, err = mask.WrapPacketConnClient(raw, i, len(m.udpmasks)-1)
+			previous := raw
+			if contextual, ok := mask.(contextualClientUdpmask); ok {
+				raw, err = contextual.WrapPacketConnClientContext(ctx, previous, i, len(m.udpmasks)-1)
+			} else {
+				raw, err = mask.WrapPacketConnClient(previous, i, len(m.udpmasks)-1)
+			}
 			if err != nil {
+				closePacketChain(previous, conns)
 				return nil, err
 			}
 		}
@@ -56,13 +77,31 @@ func (m *UdpmaskManager) WrapPacketConnClient(raw net.PacketConn) (net.PacketCon
 	return raw, nil
 }
 
+func closePacketChain(raw net.PacketConn, headers []net.PacketConn) {
+	for _, header := range headers {
+		if header != nil {
+			_ = header.Close()
+		}
+	}
+	if raw != nil {
+		_ = raw.Close()
+	}
+}
+
 func (m *UdpmaskManager) WrapPacketConnServer(raw net.PacketConn) (net.PacketConn, error) {
+	return m.WrapPacketConnServerContext(context.Background(), raw)
+}
+
+// WrapPacketConnServerContext mirrors client ownership: a failed later layer
+// closes the provisional chain instead of leaving a Realm worker behind.
+func (m *UdpmaskManager) WrapPacketConnServerContext(ctx context.Context, raw net.PacketConn) (net.PacketConn, error) {
 	var sizes []int
 	var conns []net.PacketConn
 	for i, mask := range m.udpmasks {
 		if _, ok := mask.(headerConn); ok {
 			conn, err := mask.WrapPacketConnServer(nil, i, len(m.udpmasks)-1)
 			if err != nil {
+				closePacketChain(raw, conns)
 				return nil, err
 			}
 			sizes = append(sizes, conn.(headerSize).Size())
@@ -74,8 +113,14 @@ func (m *UdpmaskManager) WrapPacketConnServer(raw net.PacketConn) (net.PacketCon
 				conns = nil
 			}
 			var err error
-			raw, err = mask.WrapPacketConnServer(raw, i, len(m.udpmasks)-1)
+			previous := raw
+			if contextual, ok := mask.(contextualServerUdpmask); ok {
+				raw, err = contextual.WrapPacketConnServerContext(ctx, previous, i, len(m.udpmasks)-1)
+			} else {
+				raw, err = mask.WrapPacketConnServer(previous, i, len(m.udpmasks)-1)
+			}
 			if err != nil {
+				closePacketChain(previous, conns)
 				return nil, err
 			}
 		}
@@ -106,6 +151,19 @@ type headerManagerConn struct {
 
 	sizes []int
 	conns []net.PacketConn
+}
+
+func (c *headerManagerConn) Close() error {
+	var closeErrors []error
+	for _, header := range c.conns {
+		if header != nil {
+			closeErrors = append(closeErrors, header.Close())
+		}
+	}
+	if c.PacketConn != nil {
+		closeErrors = append(closeErrors, c.PacketConn.Close())
+	}
+	return errors.Combine(closeErrors...)
 }
 
 func (c *headerManagerConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {

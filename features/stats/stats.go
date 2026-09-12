@@ -131,6 +131,10 @@ func (NoopManager) Type() interface{} {
 	return ManagerType()
 }
 
+func (NoopManager) ShutdownPhase() features.ShutdownPhase {
+	return features.ShutdownPhaseStats
+}
+
 // RegisterCounter implements Manager.
 func (NoopManager) RegisterCounter(string) (Counter, error) {
 	return nil, errors.New("not implemented")

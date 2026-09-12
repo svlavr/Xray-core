@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/signal/semaphore"
+	"github.com/xtls/xray-core/common/task"
 )
 
 var (
@@ -126,6 +127,10 @@ type Updater struct {
 	shouldTerminate func() bool
 	updateFunc      func()
 	notifier        *semaphore.Instance
+	mu              sync.Mutex
+	stopped         bool
+	stop            chan struct{}
+	workers         sync.WaitGroup
 }
 
 func NewUpdater(interval uint32, shouldContinue func() bool, shouldTerminate func() bool, updateFunc func()) *Updater {
@@ -135,30 +140,60 @@ func NewUpdater(interval uint32, shouldContinue func() bool, shouldTerminate fun
 		shouldTerminate: shouldTerminate,
 		updateFunc:      updateFunc,
 		notifier:        semaphore.New(1),
+		stop:            make(chan struct{}),
 	}
 	return u
 }
 
 func (u *Updater) WakeUp() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.stopped {
+		return
+	}
 	select {
 	case <-u.notifier.Wait():
+		u.workers.Add(1)
 		go u.run()
 	default:
 	}
 }
 
 func (u *Updater) run() {
+	defer u.workers.Done()
 	defer u.notifier.Signal()
 
 	if u.shouldTerminate() {
 		return
 	}
 	ticker := time.NewTicker(u.Interval())
+	defer ticker.Stop()
 	for u.shouldContinue() {
+		select {
+		case <-u.stop:
+			return
+		default:
+		}
 		u.updateFunc()
-		<-ticker.C
+		select {
+		case <-ticker.C:
+		case <-u.stop:
+			return
+		}
 	}
-	ticker.Stop()
+}
+
+func (u *Updater) Stop() {
+	u.mu.Lock()
+	if !u.stopped {
+		u.stopped = true
+		close(u.stop)
+	}
+	u.mu.Unlock()
+}
+
+func (u *Updater) Wait() {
+	u.workers.Wait()
 }
 
 func (u *Updater) Interval() time.Duration {
@@ -201,6 +236,15 @@ type Connection struct {
 
 	dataUpdater *Updater
 	pingUpdater *Updater
+
+	stateMu sync.Mutex
+	tasks   task.Lifecycle
+
+	stopOnce    sync.Once
+	stopErr     error
+	waitOnce    sync.Once
+	releaseOnce sync.Once
+	releaseHook func()
 }
 
 // NewConnection create a new KCP connection between local and remote.
@@ -429,11 +473,31 @@ func (c *Connection) writeMultiBufferInternal(reader io.Reader) error {
 }
 
 func (c *Connection) SetState(state State) {
+	c.transitionState(func(State) (State, bool) { return state, true }, true)
+}
+
+func (c *Connection) transitionState(next func(State) (State, bool), terminate bool) bool {
+	c.stateMu.Lock()
+	currentState := c.State()
+	if currentState == StateTerminated {
+		c.stateMu.Unlock()
+		return false
+	}
+	state, ok := next(currentState)
+	if !ok || state == currentState {
+		c.stateMu.Unlock()
+		return false
+	}
 	current := c.Elapsed()
 	atomic.StoreInt32((*int32)(&c.state), int32(state))
 	atomic.StoreUint32(&c.stateBeginTime, current)
+	c.stateMu.Unlock()
 	errors.LogDebug(context.Background(), "#", c.meta.Conversation, " entering state ", state, " at ", current)
+	c.onStateChanged(state, terminate)
+	return true
+}
 
+func (c *Connection) onStateChanged(state State, terminate bool) {
 	switch state {
 	case StateReadyToClose:
 		c.receivingWorker.CloseRead()
@@ -447,12 +511,12 @@ func (c *Connection) SetState(state State) {
 		c.sendingWorker.CloseWrite()
 		c.pingUpdater.SetInterval(time.Second)
 	case StateTerminated:
-		c.receivingWorker.CloseRead()
-		c.sendingWorker.CloseWrite()
 		c.pingUpdater.SetInterval(time.Second)
 		c.dataUpdater.WakeUp()
 		c.pingUpdater.WakeUp()
-		go c.Terminate()
+		if terminate {
+			go c.Terminate()
+		}
 	}
 }
 
@@ -465,15 +529,19 @@ func (c *Connection) Close() error {
 	c.dataInput.Signal()
 	c.dataOutput.Signal()
 
-	switch c.State() {
-	case StateReadyToClose, StateTerminating, StateTerminated:
+	if !c.transitionState(func(state State) (State, bool) {
+		switch state {
+		case StateActive:
+			return StateReadyToClose, true
+		case StatePeerClosed:
+			return StateTerminating, true
+		case StatePeerTerminating:
+			return StateTerminated, true
+		default:
+			return state, false
+		}
+	}, true) {
 		return ErrClosedConnection
-	case StateActive:
-		c.SetState(StateReadyToClose)
-	case StatePeerClosed:
-		c.SetState(StateTerminating)
-	case StatePeerTerminating:
-		c.SetState(StateTerminated)
 	}
 
 	errors.LogInfo(context.Background(), "#", c.meta.Conversation, " closing connection to ", c.meta.RemoteAddr)
@@ -528,19 +596,71 @@ func (c *Connection) updateTask() {
 	c.flush()
 }
 
+// Stop seals new connection work and unblocks all owned I/O without waiting.
+func (c *Connection) Stop() error {
+	if c == nil {
+		return ErrClosedConnection
+	}
+	c.stopOnce.Do(func() {
+		c.stateMu.Lock()
+		if c.State() != StateTerminated {
+			current := c.Elapsed()
+			atomic.StoreInt32((*int32)(&c.state), int32(StateTerminated))
+			atomic.StoreUint32(&c.stateBeginTime, current)
+			errors.LogDebug(context.Background(), "#", c.meta.Conversation, " entering state ", StateTerminated, " at ", current)
+		}
+		c.stateMu.Unlock()
+		c.tasks.Seal()
+		c.dataUpdater.Stop()
+		c.pingUpdater.Stop()
+		c.dataInput.Signal()
+		c.dataOutput.Signal()
+		c.stopErr = c.closer.Close()
+		c.receivingWorker.CloseRead()
+		c.sendingWorker.CloseWrite()
+	})
+	return c.stopErr
+}
+
+// Wait returns only after every updater and input worker has stopped.
+func (c *Connection) Wait() error {
+	if c == nil {
+		return ErrClosedConnection
+	}
+	_ = c.Stop()
+	c.waitOnce.Do(func() {
+		c.dataUpdater.Wait()
+		c.pingUpdater.Wait()
+		c.tasks.Wait()
+	})
+	return c.stopErr
+}
+
+// Release drops connection-owned buffers after every external user receipt.
+func (c *Connection) Release() error {
+	if c == nil {
+		return ErrClosedConnection
+	}
+	_ = c.Wait()
+	c.releaseOnce.Do(func() {
+		c.sendingWorker.Release()
+		c.receivingWorker.Release()
+		if output, ok := c.output.(interface{ Release() }); ok {
+			output.Release()
+		}
+		if c.releaseHook != nil {
+			c.releaseHook()
+		}
+	})
+	return c.stopErr
+}
+
 func (c *Connection) Terminate() {
 	if c == nil {
 		return
 	}
 	errors.LogInfo(context.Background(), "#", c.meta.Conversation, " terminating connection to ", c.RemoteAddr())
-
-	// v.SetState(StateTerminated)
-	c.dataInput.Signal()
-	c.dataOutput.Signal()
-
-	c.closer.Close()
-	c.sendingWorker.Release()
-	c.receivingWorker.Release()
+	_ = c.Release()
 }
 
 func (c *Connection) HandleOption(opt SegmentOption) {
@@ -550,21 +670,34 @@ func (c *Connection) HandleOption(opt SegmentOption) {
 }
 
 func (c *Connection) OnPeerClosed() {
-	switch c.State() {
-	case StateReadyToClose:
-		c.SetState(StateTerminating)
-	case StateActive:
-		c.SetState(StatePeerClosed)
-	}
+	c.transitionState(func(state State) (State, bool) {
+		switch state {
+		case StateReadyToClose:
+			return StateTerminating, true
+		case StateActive:
+			return StatePeerClosed, true
+		default:
+			return state, false
+		}
+	}, true)
 }
 
 // Input when you received a low level packet (eg. UDP packet), call it
 func (c *Connection) Input(segments []Segment) {
+	if !c.tasks.Acquire() {
+		for _, seg := range segments {
+			seg.Release()
+		}
+		return
+	}
+	defer c.tasks.Release()
+
 	current := c.Elapsed()
 	atomic.StoreUint32(&c.lastIncomingTime, current)
 
-	for _, seg := range segments {
+	for index, seg := range segments {
 		if seg.Conversation() != c.meta.Conversation {
+			releaseSegments(segments[index:])
 			break
 		}
 
@@ -584,14 +717,18 @@ func (c *Connection) Input(segments []Segment) {
 		case *CmdOnlySegment:
 			c.HandleOption(seg.Option)
 			if seg.Command() == CommandTerminate {
-				switch c.State() {
-				case StateActive, StatePeerClosed:
-					c.SetState(StatePeerTerminating)
-				case StateReadyToClose:
-					c.SetState(StateTerminating)
-				case StateTerminating:
-					c.SetState(StateTerminated)
-				}
+				c.transitionState(func(state State) (State, bool) {
+					switch state {
+					case StateActive, StatePeerClosed:
+						return StatePeerTerminating, true
+					case StateReadyToClose:
+						return StateTerminating, true
+					case StateTerminating:
+						return StateTerminated, true
+					default:
+						return state, false
+					}
+				}, true)
 			}
 			if seg.Option == SegmentOptionClose || seg.Command() == CommandTerminate {
 				c.dataInput.Signal()
@@ -613,10 +750,12 @@ func (c *Connection) flush() {
 		return
 	}
 	if c.State() == StateActive && current-atomic.LoadUint32(&c.lastIncomingTime) >= 30000 {
-		c.Close()
+		_ = c.Close()
 	}
 	if c.State() == StateReadyToClose && c.sendingWorker.IsEmpty() {
-		c.SetState(StateTerminating)
+		c.transitionState(func(state State) (State, bool) {
+			return StateTerminating, state == StateReadyToClose
+		}, true)
 	}
 
 	if c.State() == StateTerminating {
@@ -624,16 +763,22 @@ func (c *Connection) flush() {
 		c.Ping(current, CommandTerminate)
 
 		if current-atomic.LoadUint32(&c.stateBeginTime) > 8000 {
-			c.SetState(StateTerminated)
+			c.transitionState(func(state State) (State, bool) {
+				return StateTerminated, state == StateTerminating
+			}, true)
 		}
 		return
 	}
 	if c.State() == StatePeerTerminating && current-atomic.LoadUint32(&c.stateBeginTime) > 4000 {
-		c.SetState(StateTerminating)
+		c.transitionState(func(state State) (State, bool) {
+			return StateTerminating, state == StatePeerTerminating
+		}, true)
 	}
 
 	if c.State() == StateReadyToClose && current-atomic.LoadUint32(&c.stateBeginTime) > 15000 {
-		c.SetState(StateTerminating)
+		c.transitionState(func(state State) (State, bool) {
+			return StateTerminating, state == StateReadyToClose
+		}, true)
 	}
 
 	// flush acknowledges

@@ -23,6 +23,7 @@ const (
 type pipeOption struct {
 	limit           int32 // maximum buffer size in bytes
 	discardOverflow bool
+	lifecycle       WriteLifecycle
 }
 
 func (o *pipeOption) isFull(curSize int32) bool {
@@ -46,6 +47,8 @@ var (
 )
 
 func (p *pipe) Len() int32 {
+	p.Lock()
+	defer p.Unlock()
 	data := p.data
 	if data == nil {
 		return 0
@@ -75,24 +78,27 @@ func (p *pipe) getState(forRead bool) error {
 	}
 }
 
-func (p *pipe) readMultiBufferInternal() (buf.MultiBuffer, error) {
+func (p *pipe) readMultiBufferInternal() (buf.MultiBuffer, error, bool) {
 	p.Lock()
 	defer p.Unlock()
 
 	if err := p.getState(true); err != nil {
-		return nil, err
+		return nil, err, p.state != open && p.data.IsEmpty()
 	}
 
 	data := p.data
 	p.data = nil
-	return data, nil
+	return data, nil, p.state != open
 }
 
 func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	for {
-		data, err := p.readMultiBufferInternal()
+		data, err, drained := p.readMultiBufferInternal()
 		if data != nil || err != nil {
 			p.writeSignal.Signal()
+			if drained && p.option.lifecycle != nil {
+				p.option.lifecycle.MarkDrained()
+			}
 			return data, err
 		}
 
@@ -110,9 +116,12 @@ func (p *pipe) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) 
 	defer timer.Stop()
 
 	for {
-		data, err := p.readMultiBufferInternal()
+		data, err, drained := p.readMultiBufferInternal()
 		if data != nil || err != nil {
 			p.writeSignal.Signal()
+			if drained && p.option.lifecycle != nil {
+				p.option.lifecycle.MarkDrained()
+			}
 			return data, err
 		}
 
@@ -145,11 +154,31 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if mb.IsEmpty() {
 		return nil
 	}
+	var acceptedBytes uint64
+	for _, buffer := range mb {
+		acceptedBytes += uint64(buffer.Len())
+	}
+	reserved := false
+	if p.option.lifecycle != nil {
+		reserved = p.option.lifecycle.BeginWrite()
+	}
+	accepted := false
+	defer func() {
+		if p.option.lifecycle == nil {
+			return
+		}
+		if accepted {
+			p.option.lifecycle.CompleteWrite(reserved, acceptedBytes)
+		} else {
+			p.option.lifecycle.CompleteWrite(reserved, 0)
+		}
+	}()
 
 	for {
 		err := p.writeMultiBufferInternal(mb)
 		if err == nil {
 			p.readSignal.Signal()
+			accepted = true
 			return nil
 		}
 
@@ -175,21 +204,27 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 func (p *pipe) Close() error {
 	p.Lock()
-	defer p.Unlock()
-
-	if p.state == closed || p.state == errord {
-		return nil
+	alreadyStopped := p.state == closed || p.state == errord
+	if !alreadyStopped {
+		p.state = closed
+		common.Must(p.done.Close())
 	}
+	drained := p.data.IsEmpty()
+	p.Unlock()
 
-	p.state = closed
-	common.Must(p.done.Close())
+	if p.option.lifecycle != nil {
+		p.option.lifecycle.HalfClose()
+		p.option.lifecycle.Seal()
+		if drained {
+			p.option.lifecycle.MarkDrained()
+		}
+	}
 	return nil
 }
 
 // Interrupt implements common.Interruptible.
 func (p *pipe) Interrupt() {
 	p.Lock()
-	defer p.Unlock()
 
 	if !p.data.IsEmpty() {
 		buf.ReleaseMulti(p.data)
@@ -200,10 +235,20 @@ func (p *pipe) Interrupt() {
 	}
 
 	if p.state == closed || p.state == errord {
+		p.Unlock()
+		if p.option.lifecycle != nil {
+			p.option.lifecycle.Seal()
+			p.option.lifecycle.MarkDrained()
+		}
 		return
 	}
 
 	p.state = errord
 
 	common.Must(p.done.Close())
+	p.Unlock()
+	if p.option.lifecycle != nil {
+		p.option.lifecycle.Seal()
+		p.option.lifecycle.MarkDrained()
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	c "github.com/xtls/xray-core/common/ctx"
@@ -29,9 +30,18 @@ import (
 
 type worker interface {
 	Start() error
+	Seal()
+	Stop() error
+	Wait() error
 	Close() error
 	Port() net.Port
 	Proxy() proxy.Inbound
+}
+
+type phasedInboundListener interface {
+	Stop() error
+	Wait() error
+	Release() error
 }
 
 type tcpWorker struct {
@@ -46,7 +56,9 @@ type tcpWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub internet.Listener
+	hub        internet.Listener
+	lifecycle  task.Lifecycle
+	joinDirect bool
 
 	ctx context.Context
 }
@@ -59,6 +71,10 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
 }
 
 func (w *tcpWorker) callback(conn stat.Connection) {
+	if !internet.AcceptInboundHandoff(conn) {
+		conn.Close()
+		return
+	}
 	ctx, cancel := context.WithCancel(w.ctx)
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
@@ -120,11 +136,15 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 	content.SniffingRequest = w.sniffingRequest
 	ctx = session.ContextWithContent(ctx, content)
 
-	if err := w.proxy.Process(ctx, net.Network_TCP, conn, w.dispatcher); err != nil {
-		errors.LogInfoInner(ctx, err, "connection ends")
+	ownerScope := flow_observation.NewExternalOwnerScope(flow_observation.ExternalOwnerListenerTCP)
+	ctx = flow_observation.ContextWithExternalOwnerScope(ctx, ownerScope)
+	processErr := w.proxy.Process(ctx, net.Network_TCP, conn, w.dispatcher)
+	if processErr != nil {
+		errors.LogInfoInner(ctx, processErr, "connection ends")
 	}
 	cancel()
-	conn.Close()
+	closeErr := conn.Close()
+	ownerScope.AfterOwnerClose(processErr, closeErr)
 }
 
 func (w *tcpWorker) Proxy() proxy.Inbound {
@@ -133,14 +153,18 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 
 func (w *tcpWorker) Start() error {
 	ctx := context.Background()
+	handler := func(conn stat.Connection) { go w.callback(conn) }
 
 	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
 		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
 	}
 
-	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
-		go w.callback(conn)
-	})
+	w.joinDirect = tcpStreamJoinSupported(w.stream)
+	if w.joinDirect {
+		ctx = internet.ContextWithInboundLifecycle(ctx, &internet.InboundLifecycle{Tasks: &w.lifecycle})
+		handler = w.callback
+	}
+	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, handler)
 	if err != nil {
 		return errors.New("failed to listen TCP on ", w.port).AtWarning().Base(err)
 	}
@@ -149,12 +173,21 @@ func (w *tcpWorker) Start() error {
 }
 
 func (w *tcpWorker) Close() error {
+	w.Seal()
+	err := w.Stop()
+	return errors.Combine(err, w.Wait())
+}
+
+func (w *tcpWorker) Stop() error {
 	var errs []interface{}
 	if w.hub != nil {
-		if err := common.Close(w.hub); err != nil {
-			errs = append(errs, err)
+		var err error
+		if listener, ok := w.hub.(phasedInboundListener); ok && w.joinDirect {
+			err = listener.Stop()
+		} else {
+			err = common.Close(w.hub)
 		}
-		if err := common.Close(w.proxy); err != nil {
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -165,11 +198,55 @@ func (w *tcpWorker) Close() error {
 	return nil
 }
 
+func (w *tcpWorker) Seal() {
+	if w.joinDirect {
+		w.lifecycle.Seal()
+	}
+}
+
+func (w *tcpWorker) Wait() error {
+	var errs []error
+	listener, phased := w.hub.(phasedInboundListener)
+	if phased && w.joinDirect {
+		errs = append(errs, listener.Wait())
+	}
+	if w.joinDirect {
+		w.lifecycle.Wait()
+	}
+	if phased && w.joinDirect {
+		errs = append(errs, listener.Release())
+	}
+	return errors.Combine(errs...)
+}
+
+func streamJoinSupported(stream *internet.MemoryStreamConfig) bool {
+	if stream == nil || stream.TcpmaskManager != nil || stream.SecurityType == "reality" {
+		return false
+	}
+	switch stream.ProtocolName {
+	case "tcp", "httpupgrade", "websocket", "grpc":
+		return true
+	case "splithttp":
+		return stream.UdpmaskManager == nil
+	default:
+		return false
+	}
+}
+
+func tcpStreamJoinSupported(stream *internet.MemoryStreamConfig) bool {
+	if stream != nil && (stream.ProtocolName == "hysteria" || stream.ProtocolName == "mkcp") {
+		return stream.UdpmaskManager == nil
+	}
+	return streamJoinSupported(stream)
+}
+
 func (w *tcpWorker) Port() net.Port {
 	return w.port
 }
 
 type udpConn struct {
+	closeMu          sync.Mutex
+	closeOnce        sync.Once
 	lastActivityTime int64 // in seconds
 	reader           buf.Reader
 	writer           buf.Writer
@@ -179,12 +256,24 @@ type udpConn struct {
 	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
-	inactive         bool
+	inactive         atomic.Bool
 	cancel           context.CancelFunc
+	closed           bool
+	ownerScope       *flow_observation.ExternalOwnerScope
 }
 
-func (c *udpConn) setInactive() {
-	c.inactive = true
+func (c *udpConn) setInactive() bool {
+	return c.inactive.CompareAndSwap(false, true)
+}
+
+func (c *udpConn) setCancel(cancel context.CancelFunc) {
+	c.closeMu.Lock()
+	closed := c.closed
+	c.cancel = cancel
+	c.closeMu.Unlock()
+	if closed && cancel != nil {
+		cancel()
+	}
 }
 
 func (c *udpConn) updateActivity() {
@@ -223,11 +312,17 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 }
 
 func (c *udpConn) Close() error {
-	if c.cancel != nil {
-		c.cancel()
-	}
-	common.Must(c.done.Close())
-	common.Must(common.Close(c.writer))
+	c.closeOnce.Do(func() {
+		c.closeMu.Lock()
+		c.closed = true
+		cancel := c.cancel
+		c.closeMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		common.Must(c.done.Close())
+		common.Must(common.Close(c.writer))
+	})
 	return nil
 }
 
@@ -273,8 +368,12 @@ type udpWorker struct {
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
 
-	ctx  context.Context
-	cone bool
+	ctx         context.Context
+	cone        bool
+	lifecycle   task.Lifecycle
+	lifecycleMu sync.Mutex
+	joinDirect  bool
+	closing     bool
 }
 
 func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
@@ -286,6 +385,9 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		return conn, true
 	}
 
+	if w.joinDirect && !w.lifecycle.Acquire() {
+		return nil, false
+	}
 	pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))
 	conn := &udpConn{
 		reader: pReader,
@@ -301,9 +403,10 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 			IP:   w.address.IP(),
 			Port: int(w.port),
 		},
-		done:     done.New(),
-		uplink:   w.uplinkCounter,
-		downlink: w.downlinkCounter,
+		done:       done.New(),
+		uplink:     w.uplinkCounter,
+		downlink:   w.downlinkCounter,
+		ownerScope: flow_observation.NewExternalOwnerScope(flow_observation.ExternalOwnerListenerUDP),
 	}
 	w.activeConn[id] = conn
 
@@ -322,16 +425,26 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		b.UDP = &originalDest
 	}
 	conn, existing := w.getConnection(id)
-
-	// payload will be discarded in pipe is full.
-	conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+	if conn == nil {
+		b.Release()
+		return
+	}
 
 	if !existing {
-		common.Must(w.checker.Start())
+		if err := w.startChecker(); err != nil {
+			b.Release()
+			if conn.setInactive() {
+				w.removeConn(id, conn)
+			}
+			_ = conn.Close()
+			w.releaseLifecycle()
+			return
+		}
 
 		go func() {
+			defer w.releaseLifecycle()
 			ctx, cancel := context.WithCancel(w.ctx)
-			conn.cancel = cancel
+			conn.setCancel(cancel)
 			sid := session.NewID()
 			ctx = c.ContextWithID(ctx, sid)
 
@@ -358,22 +471,38 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			content := new(session.Content)
 			content.SniffingRequest = w.sniffingRequest
 			ctx = session.ContextWithContent(ctx, content)
-			if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-				errors.LogInfoInner(ctx, err, "connection ends")
+			ctx = flow_observation.ContextWithExternalOwnerScope(ctx, conn.ownerScope)
+			processErr := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher)
+			if processErr != nil {
+				errors.LogInfoInner(ctx, processErr, "connection ends")
 			}
-			conn.Close()
+			closeErr := conn.Close()
+			conn.ownerScope.AfterOwnerClose(processErr, closeErr)
 			// conn not removed by checker TODO may be lock worker here is better
-			if !conn.inactive {
-				conn.setInactive()
-				w.removeConn(id)
+			if conn.setInactive() {
+				w.removeConn(id, conn)
 			}
 		}()
 	}
+
+	// payload will be discarded in pipe is full.
+	conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 }
 
-func (w *udpWorker) removeConn(id connID) {
+func (w *udpWorker) startChecker() error {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	if w.closing {
+		return errors.New("UDP worker is closing")
+	}
+	return w.checker.Start()
+}
+
+func (w *udpWorker) removeConn(id connID, expected *udpConn) {
 	w.Lock()
-	delete(w.activeConn, id)
+	if w.activeConn[id] == expected {
+		delete(w.activeConn, id)
+	}
 	w.Unlock()
 }
 
@@ -387,24 +516,28 @@ func (w *udpWorker) handlePackets() {
 func (w *udpWorker) clean() error {
 	nowSec := time.Now().Unix()
 	w.Lock()
-	defer w.Unlock()
 
 	if len(w.activeConn) == 0 {
+		w.Unlock()
 		return errors.New("no more connections. stopping...")
 	}
 
+	toClose := make([]*udpConn, 0)
 	for addr, conn := range w.activeConn {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
-			if !conn.inactive {
-				conn.setInactive()
+			if conn.setInactive() {
 				delete(w.activeConn, addr)
+				toClose = append(toClose, conn)
 			}
-			conn.Close()
 		}
 	}
 
 	if len(w.activeConn) == 0 {
 		w.activeConn = make(map[connID]*udpConn, 16)
+	}
+	w.Unlock()
+	for _, conn := range toClose {
+		_ = conn.Close()
 	}
 
 	return nil
@@ -413,6 +546,10 @@ func (w *udpWorker) clean() error {
 func (w *udpWorker) Start() error {
 	w.activeConn = make(map[connID]*udpConn, 16)
 	ctx := context.Background()
+	w.joinDirect = directUDPJoinSupported(w.stream)
+	if w.joinDirect {
+		ctx = internet.ContextWithInboundLifecycle(ctx, &internet.InboundLifecycle{Tasks: &w.lifecycle})
+	}
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {
 		return err
@@ -426,36 +563,93 @@ func (w *udpWorker) Start() error {
 	}
 
 	w.hub = h
-	go w.handlePackets()
+	if w.joinDirect && !w.lifecycle.Acquire() {
+		h.Close()
+		return errors.New("UDP worker is closing")
+	}
+	go func() { defer w.releaseLifecycle(); w.handlePackets() }()
 	return nil
 }
 
+func directUDPJoinSupported(stream *internet.MemoryStreamConfig) bool {
+	return stream == nil || stream.UdpmaskManager == nil
+}
+
 func (w *udpWorker) Close() error {
-	w.Lock()
-	defer w.Unlock()
+	w.Seal()
+	err := w.Stop()
+	return errors.Combine(err, w.Wait())
+}
 
+func (w *udpWorker) Stop() error {
 	var errs []interface{}
+	w.RLock()
+	hub := w.hub
+	checker := w.checker
+	connections := make([]*udpConn, 0, len(w.activeConn))
+	for _, conn := range w.activeConn {
+		connections = append(connections, conn)
+	}
+	w.RUnlock()
 
-	if w.hub != nil {
-		if err := w.hub.Close(); err != nil {
+	if hub != nil {
+		if err := hub.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	if w.checker != nil {
-		if err := w.checker.Close(); err != nil {
+	if checker != nil {
+		if err := checker.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	if err := common.Close(w.proxy); err != nil {
-		errs = append(errs, err)
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-
 	if len(errs) > 0 {
 		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
 	}
 	return nil
+}
+
+func (w *udpWorker) Seal() {
+	w.lifecycleMu.Lock()
+	w.closing = true
+	if w.joinDirect {
+		w.lifecycle.Seal()
+	}
+	if w.checker != nil {
+		_ = w.checker.Close()
+	}
+	w.lifecycleMu.Unlock()
+}
+
+func (w *udpWorker) Wait() error {
+	var errs []interface{}
+	if w.hub != nil && w.joinDirect {
+		w.hub.Wait()
+	}
+	if w.checker != nil {
+		if err := w.checker.CloseAndWait(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if w.joinDirect {
+		w.lifecycle.Wait()
+	}
+	if len(errs) > 0 {
+		return errors.New("failed to join UDP worker").Base(errors.New(serial.Concat(errs...)))
+	}
+	return nil
+}
+
+func (w *udpWorker) releaseLifecycle() {
+	if w.joinDirect {
+		w.lifecycle.Release()
+	}
 }
 
 func (w *udpWorker) Port() net.Port {
@@ -476,12 +670,18 @@ type dsWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub internet.Listener
+	hub        internet.Listener
+	lifecycle  task.Lifecycle
+	joinDirect bool
 
 	ctx context.Context
 }
 
 func (w *dsWorker) callback(conn stat.Connection) {
+	if !internet.AcceptInboundHandoff(conn) {
+		conn.Close()
+		return
+	}
 	ctx, cancel := context.WithCancel(w.ctx)
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
@@ -505,13 +705,18 @@ func (w *dsWorker) callback(conn stat.Connection) {
 	content.SniffingRequest = w.sniffingRequest
 	ctx = session.ContextWithContent(ctx, content)
 
-	if err := w.proxy.Process(ctx, net.Network_UNIX, conn, w.dispatcher); err != nil {
-		errors.LogInfoInner(ctx, err, "connection ends")
+	ownerScope := flow_observation.NewExternalOwnerScope(flow_observation.ExternalOwnerListenerUNIX)
+	ctx = flow_observation.ContextWithExternalOwnerScope(ctx, ownerScope)
+	processErr := w.proxy.Process(ctx, net.Network_UNIX, conn, w.dispatcher)
+	if processErr != nil {
+		errors.LogInfoInner(ctx, processErr, "connection ends")
 	}
 	cancel()
-	if err := conn.Close(); err != nil {
-		errors.LogInfoInner(ctx, err, "failed to close connection")
+	closeErr := conn.Close()
+	if closeErr != nil {
+		errors.LogInfoInner(ctx, closeErr, "failed to close connection")
 	}
+	ownerScope.AfterOwnerClose(processErr, closeErr)
 }
 
 func (w *dsWorker) Proxy() proxy.Inbound {
@@ -524,9 +729,13 @@ func (w *dsWorker) Port() net.Port {
 
 func (w *dsWorker) Start() error {
 	ctx := context.Background()
-	hub, err := internet.ListenUnix(ctx, w.address, w.stream, func(conn stat.Connection) {
-		go w.callback(conn)
-	})
+	handler := func(conn stat.Connection) { go w.callback(conn) }
+	w.joinDirect = streamJoinSupported(w.stream)
+	if w.joinDirect {
+		ctx = internet.ContextWithInboundLifecycle(ctx, &internet.InboundLifecycle{Tasks: &w.lifecycle})
+		handler = w.callback
+	}
+	hub, err := internet.ListenUnix(ctx, w.address, w.stream, handler)
 	if err != nil {
 		return errors.New("failed to listen Unix Domain Socket on ", w.address).AtWarning().Base(err)
 	}
@@ -535,12 +744,15 @@ func (w *dsWorker) Start() error {
 }
 
 func (w *dsWorker) Close() error {
+	w.Seal()
+	err := w.Stop()
+	return errors.Combine(err, w.Wait())
+}
+
+func (w *dsWorker) Stop() error {
 	var errs []interface{}
 	if w.hub != nil {
 		if err := common.Close(w.hub); err != nil {
-			errs = append(errs, err)
-		}
-		if err := common.Close(w.proxy); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -548,6 +760,19 @@ func (w *dsWorker) Close() error {
 		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
 	}
 
+	return nil
+}
+
+func (w *dsWorker) Seal() {
+	if w.joinDirect {
+		w.lifecycle.Seal()
+	}
+}
+
+func (w *dsWorker) Wait() error {
+	if w.joinDirect {
+		w.lifecycle.Wait()
+	}
 	return nil
 }
 

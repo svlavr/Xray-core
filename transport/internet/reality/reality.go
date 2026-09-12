@@ -11,6 +11,7 @@ import (
 	gotls "crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	goerrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,9 +27,11 @@ import (
 	"github.com/xtls/reality"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
@@ -60,6 +63,69 @@ type UConn struct {
 	ServerName string
 	AuthKey    []byte
 	Verified   bool
+}
+
+type invalidPeerSpiderError struct {
+	err *errors.Error
+}
+
+func newInvalidPeerSpiderError() error {
+	return &invalidPeerSpiderError{err: errors.New("REALITY: processed invalid connection").AtWarning()}
+}
+
+func (e *invalidPeerSpiderError) Error() string          { return e.err.Error() }
+func (e *invalidPeerSpiderError) Severity() log.Severity { return e.err.Severity() }
+
+// IsInvalidPeerSpiderError reports that the invalid-peer connection has either
+// been transferred to the registered spider owner or was already closed when
+// that transfer could not be made. A transport caller must not close its old
+// raw alias after this error.
+func IsInvalidPeerSpiderError(err error) bool {
+	var target *invalidPeerSpiderError
+	return goerrors.As(err, &target)
+}
+
+// spiderLifecycle owns the deliberately retained invalid-peer connection and
+// every spider worker derived from it. Its one published root receipt joins
+// children internally, so Close never races a WaitGroup Add.
+type spiderLifecycle struct {
+	conn       net.Conn
+	ctx        context.Context
+	cancel     context.CancelFunc
+	rootDone   chan struct{}
+	unregister func()
+	stopOnce   sync.Once
+	closeOnce  sync.Once
+}
+
+func (s *spiderLifecycle) SignalStop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.cancel()
+		_ = s.conn.Close()
+	})
+}
+
+func (s *spiderLifecycle) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.SignalStop()
+	<-s.rootDone
+	return nil
+}
+
+func waitSpider(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (c *UConn) HandshakeAddress() net.Address {
@@ -182,7 +248,28 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	}
 	if !uConn.Verified {
 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
+		owner := internet.ResourceLifecycleFromContext(ctx)
+		if owner == nil {
+			_ = uConn.Close()
+			return nil, newInvalidPeerSpiderError()
+		}
+		spiderCtx, cancel := context.WithCancel(owner.Context())
+		spider := &spiderLifecycle{conn: uConn, ctx: spiderCtx, cancel: cancel, rootDone: make(chan struct{})}
+		if err := owner.RegisterBound(spider, func(unregister func()) { spider.unregister = unregister }); err != nil {
+			cancel()
+			_ = uConn.Close()
+			return nil, newInvalidPeerSpiderError()
+		}
 		go func() {
+			defer func() {
+				spider.SignalStop()
+				spider.closeOnce.Do(func() {
+					close(spider.rootDone)
+					if spider.unregister != nil {
+						spider.unregister()
+					}
+				})
+			}()
 			client := &http.Client{
 				Transport: &http2.Transport{
 					DialTLSContext: func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
@@ -214,10 +301,10 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					body []byte
 				)
 				if first {
-					req, _ = http.NewRequest("GET", firstURL, nil)
+					req, _ = http.NewRequestWithContext(spider.ctx, "GET", firstURL, nil)
 				} else {
 					maps.Lock()
-					req, _ = http.NewRequest("GET", string(prefix)+getPathLocked(paths), nil)
+					req, _ = http.NewRequestWithContext(spider.ctx, "GET", string(prefix)+getPathLocked(paths), nil)
 					maps.Unlock()
 				}
 				if req == nil {
@@ -232,6 +319,9 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					times = int(crypto.RandBetween(config.SpiderY[4], config.SpiderY[5]))
 				}
 				for j := 0; j < times; j++ {
+					if spider.ctx.Err() != nil {
+						return
+					}
 					if !first && j == 0 {
 						req.Header.Set("Referer", firstURL)
 					}
@@ -239,11 +329,12 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					if resp, err = client.Do(req); err != nil {
 						break
 					}
-					defer resp.Body.Close()
 					req.Header.Set("Referer", req.URL.String())
 					if body, err = io.ReadAll(resp.Body); err != nil {
+						_ = resp.Body.Close()
 						break
 					}
+					_ = resp.Body.Close()
 					maps.Lock()
 					for _, m := range href.FindAllSubmatch(body, -1) {
 						m[1] = bytes.TrimPrefix(m[1], prefix)
@@ -259,19 +350,34 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 					}
 					maps.Unlock()
 					if !first {
-						time.Sleep(time.Duration(crypto.RandBetween(config.SpiderY[6], config.SpiderY[7])) * time.Millisecond) // interval
+						if !waitSpider(spider.ctx, time.Duration(crypto.RandBetween(config.SpiderY[6], config.SpiderY[7]))*time.Millisecond) {
+							return
+						}
 					}
 				}
 			}
 			get(true)
-			concurrency := int(crypto.RandBetween(config.SpiderY[2], config.SpiderY[3]))
-			for i := 0; i < concurrency; i++ {
-				go get(false)
+			if spider.ctx.Err() != nil {
+				return
 			}
-			// Do not close the connection
+			concurrency := int(crypto.RandBetween(config.SpiderY[2], config.SpiderY[3]))
+			var workers sync.WaitGroup
+			for i := 0; i < concurrency; i++ {
+				if spider.ctx.Err() != nil {
+					break
+				}
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					get(false)
+				}()
+			}
+			workers.Wait()
 		}()
-		time.Sleep(time.Duration(crypto.RandBetween(config.SpiderY[8], config.SpiderY[9])) * time.Millisecond) // return
-		return nil, errors.New("REALITY: processed invalid connection").AtWarning()
+		if !waitSpider(spiderCtx, time.Duration(crypto.RandBetween(config.SpiderY[8], config.SpiderY[9]))*time.Millisecond) {
+			return nil, newInvalidPeerSpiderError()
+		}
+		return nil, newInvalidPeerSpiderError()
 	}
 	return uConn, nil
 }

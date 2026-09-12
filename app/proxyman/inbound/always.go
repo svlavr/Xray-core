@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"sync"
 
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
@@ -50,6 +51,16 @@ type AlwaysOnInboundHandler struct {
 	workers        []worker
 	mux            *mux.Server
 	tag            string
+	closeMu        sync.Mutex
+	closePrepared  bool
+	closed         bool
+	closing        bool
+	closeDone      chan struct{}
+	closeErr       error
+	started        []worker
+	starting       bool
+	startDone      chan struct{}
+	startFailed    bool
 }
 
 func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *proxyman.ReceiverConfig, proxyConfig interface{}) (*AlwaysOnInboundHandler, error) {
@@ -172,15 +183,33 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 
 // Start implements common.Runnable.
 func (h *AlwaysOnInboundHandler) Start() error {
+	h.closeMu.Lock()
+	if h.closePrepared || h.closed || h.closing || h.starting || h.startFailed {
+		h.closeMu.Unlock()
+		return errors.New("inbound handler is closing")
+	}
+	h.starting = true
+	h.startDone = make(chan struct{})
+	h.closeMu.Unlock()
+	defer func() {
+		h.closeMu.Lock()
+		h.starting = false
+		close(h.startDone)
+		h.closeMu.Unlock()
+	}()
 	// for inbound without worker (TUN)
 	if run, ok := h.proxy.(common.Runnable); ok {
 		if err := run.Start(); err != nil {
-			return errors.New("failed to start proxy").Base(err)
+			startErr := errors.New("failed to start proxy").Base(err)
+			return errors.Combine(startErr, h.rollbackStart(h.workers))
 		}
 	}
 	for _, worker := range h.workers {
+		h.closeMu.Lock()
+		h.started = append(h.started, worker)
+		h.closeMu.Unlock()
 		if err := worker.Start(); err != nil {
-			return err
+			return errors.Combine(err, h.rollbackStart(h.started))
 		}
 	}
 	return nil
@@ -188,16 +217,115 @@ func (h *AlwaysOnInboundHandler) Start() error {
 
 // Close implements common.Closable.
 func (h *AlwaysOnInboundHandler) Close() error {
-	var errs []error
-	for _, worker := range h.workers {
-		errs = append(errs, worker.Close())
+	h.closeMu.Lock()
+	if h.starting {
+		done := h.startDone
+		h.closeMu.Unlock()
+		<-done
+		return h.Close()
 	}
+	if h.closed {
+		err := h.closeErr
+		h.closeMu.Unlock()
+		return err
+	}
+	if h.closing {
+		done := h.closeDone
+		h.closeMu.Unlock()
+		<-done
+		h.closeMu.Lock()
+		err := h.closeErr
+		h.closeMu.Unlock()
+		return err
+	}
+	h.closing = true
+	h.closeDone = make(chan struct{})
+	if !h.closePrepared {
+		if preparer, ok := h.proxy.(interface{ PrepareClose() error }); ok {
+			if err := preparer.PrepareClose(); err != nil {
+				h.closeErr = err
+				h.closing = false
+				close(h.closeDone)
+				h.closeMu.Unlock()
+				return err
+			}
+		}
+		h.closePrepared = true
+	}
+	workers := append([]worker(nil), h.started...)
+	if len(workers) == 0 {
+		workers = append(workers, h.workers...)
+	}
+	sealWorkers(workers)
+	h.closeMu.Unlock()
+	var errs []error
+	errs = append(errs, stopWorkers(workers)...)
 	errs = append(errs, h.mux.Close())
 	errs = append(errs, common.Close(h.proxy))
-	if err := errors.Combine(errs...); err != nil {
-		return errors.New("failed to close all resources").Base(err)
+	errs = append(errs, waitWorkers(workers)...)
+	err := errors.Combine(errs...)
+	var result error
+	if err != nil {
+		result = errors.New("failed to close all resources").Base(err)
 	}
-	return nil
+	h.closeMu.Lock()
+	h.closed = true
+	h.closing = false
+	h.closeErr = result
+	close(h.closeDone)
+	h.closeMu.Unlock()
+	return result
+}
+
+func (h *AlwaysOnInboundHandler) rollbackStart(workers []worker) error {
+	h.closeMu.Lock()
+	h.startFailed = true
+	if !h.closePrepared {
+		if preparer, ok := h.proxy.(interface{ PrepareClose() error }); ok {
+			if err := preparer.PrepareClose(); err != nil {
+				h.closeErr = err
+				h.closeMu.Unlock()
+				return err
+			}
+		}
+		h.closePrepared = true
+	}
+	workers = append([]worker(nil), workers...)
+	sealWorkers(workers)
+	h.closeMu.Unlock()
+	var errs []error
+	errs = append(errs, stopWorkers(workers)...)
+	errs = append(errs, h.mux.Close())
+	errs = append(errs, common.Close(h.proxy))
+	errs = append(errs, waitWorkers(workers)...)
+	err := errors.Combine(errs...)
+	h.closeMu.Lock()
+	h.closed = true
+	h.closeErr = err
+	h.closeMu.Unlock()
+	return err
+}
+
+func sealWorkers(workers []worker) {
+	for _, worker := range workers {
+		worker.Seal()
+	}
+}
+
+func stopWorkers(workers []worker) []error {
+	errs := make([]error, 0, len(workers))
+	for _, worker := range workers {
+		errs = append(errs, worker.Stop())
+	}
+	return errs
+}
+
+func waitWorkers(workers []worker) []error {
+	errs := make([]error, 0, len(workers))
+	for _, worker := range workers {
+		errs = append(errs, worker.Wait())
+	}
+	return errs
 }
 
 func (h *AlwaysOnInboundHandler) Tag() string {

@@ -13,7 +13,7 @@ func (f *fakeRoundTripper) IsClosed() bool {
 	return false
 }
 
-func TestMaxConnections(t *testing.T) {
+func TestMaxConnectionsBoundsSelectableXmuxClients(t *testing.T) {
 	xmuxConfig := XmuxConfig{
 		MaxConnections: &RangeConfig{From: 4, To: 4},
 	}

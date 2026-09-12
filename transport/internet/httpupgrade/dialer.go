@@ -60,23 +60,33 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
 		}
 		pconn = newConn
 	}
+	ownedConn := pconn
+	committed := false
+	defer func() {
+		if !committed {
+			_ = ownedConn.Close()
+		}
+	}()
 
 	var conn net.Conn
 	var requestURL url.URL
 	tConfig := tls.ConfigFromStreamSettings(streamSettings)
 	if tConfig != nil {
-		tlsConfig := tConfig.GetTLSConfig(tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
+		tlsConfig := tConfig.GetTLSConfigContext(ctx, tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
 		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
 			conn = tls.UClient(pconn, tlsConfig, fingerprint)
+			ownedConn = conn
 			if err := conn.(*tls.UConn).WebsocketHandshakeContext(ctx); err != nil {
 				return nil, err
 			}
 		} else {
 			conn = tls.Client(pconn, tlsConfig)
+			ownedConn = conn
 		}
 		requestURL.Scheme = "https"
 	} else {
 		conn = pconn
+		ownedConn = conn
 		requestURL.Scheme = "http"
 	}
 
@@ -118,6 +128,7 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
 		}
 	}
 
+	committed = true
 	return connRF, nil
 }
 

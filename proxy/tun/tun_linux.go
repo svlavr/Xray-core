@@ -30,6 +30,8 @@ type LinuxTun struct {
 	systemRoutes       []netlink.Route
 	routeMonitorStop   chan struct{}
 	routeMonitorOnce   sync.Once
+	routeMonitorWG     sync.WaitGroup
+	updater            *InterfaceUpdater
 }
 
 // LinuxTun implements Tun
@@ -184,8 +186,9 @@ func (t *LinuxTun) Start() error {
 		return err
 	}
 
-	if updater != nil {
+	if t.updater != nil {
 		t.routeMonitorStop = make(chan struct{})
+		t.routeMonitorWG.Add(1)
 		go t.monitorRouteChanges()
 	}
 
@@ -199,6 +202,7 @@ func (t *LinuxTun) Close() error {
 			close(t.routeMonitorStop)
 		}
 	})
+	t.routeMonitorWG.Wait()
 
 	_ = t.unsetSystemRoutes()
 	_ = t.unsetInterfaceAddresses()
@@ -302,6 +306,7 @@ func (t *LinuxTun) unsetSystemRoutes() error {
 }
 
 func (t *LinuxTun) monitorRouteChanges() {
+	defer t.routeMonitorWG.Done()
 	routeCh := make(chan netlink.RouteUpdate)
 	if err := netlink.RouteSubscribe(routeCh, t.routeMonitorStop); err != nil {
 		errors.LogInfoInner(context.Background(), err, "[tun] failed to subscribe route changes")
@@ -320,21 +325,23 @@ func (t *LinuxTun) monitorRouteChanges() {
 			if !ok {
 				return
 			}
-			if updater != nil {
-				updater.Update()
+			if t.updater != nil {
+				t.updater.Update()
 			}
 		case _, ok := <-linkCh:
 			if !ok {
 				return
 			}
-			if updater != nil {
-				updater.Update()
+			if t.updater != nil {
+				t.updater.Update()
 			}
 		case <-t.routeMonitorStop:
 			return
 		}
 	}
 }
+
+func (t *LinuxTun) setInterfaceUpdater(updater *InterfaceUpdater) { t.updater = updater }
 
 func findOutboundInterface(tunIndex int, fixedName string) (*net.Interface, error) {
 	if fixedName != "" {

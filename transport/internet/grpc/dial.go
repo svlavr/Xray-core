@@ -41,12 +41,87 @@ func init() {
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
+	ownerID uint64
 }
 
 var (
-	globalDialerMap    map[dialerConf]*grpc.ClientConn
+	globalDialerMap    map[dialerConf]*grpcClientResource
 	globalDialerAccess sync.Mutex
 )
+
+type grpcClientResource struct {
+	key        dialerConf
+	conn       *grpc.ClientConn
+	unregister func()
+	sealed     bool
+	mu         sync.Mutex
+	closeOnce  sync.Once
+	closeDone  chan struct{}
+	closeErr   error
+}
+
+func grpcDialContext(gctx, source context.Context, owner *internet.ResourceLifecycle) (context.Context, func()) {
+	base := internet.ContextWithResourceLifecycle(owner.Context(), owner)
+	var linked context.Context
+	var cancel context.CancelFunc
+	if deadline, ok := gctx.Deadline(); ok {
+		linked, cancel = context.WithDeadline(base, deadline)
+	} else {
+		linked, cancel = context.WithCancel(base)
+	}
+	grpcCancelDone := make(chan struct{})
+	stopGRPC := context.AfterFunc(gctx, func() {
+		cancel()
+		close(grpcCancelDone)
+	})
+	if gctx.Err() != nil {
+		cancel()
+	}
+	linked = c.ContextWithID(linked, c.IDFromContext(source))
+	linked = session.ContextWithOutbounds(linked, session.OutboundsFromContext(source))
+	linked = session.ContextWithTimeoutOnly(linked, true)
+	return linked, func() {
+		if !stopGRPC() {
+			<-grpcCancelDone
+		}
+		cancel()
+	}
+}
+
+func (r *grpcClientResource) SignalStop() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.sealed {
+		r.mu.Unlock()
+		return
+	}
+	r.sealed = true
+	r.mu.Unlock()
+	globalDialerAccess.Lock()
+	if globalDialerMap[r.key] == r {
+		delete(globalDialerMap, r.key)
+	}
+	globalDialerAccess.Unlock()
+	go func() { _ = r.Close() }()
+}
+
+func (r *grpcClientResource) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.SignalStop()
+	r.closeOnce.Do(func() {
+		r.closeErr = r.conn.Close()
+		close(r.closeDone)
+		if r.unregister != nil {
+			r.unregister()
+		}
+	})
+	<-r.closeDone
+	return r.closeErr
+}
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
@@ -75,20 +150,38 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
+	owner := streamSettings.ResourceLifecycle
+	if owner == nil {
+		owner = internet.ResourceLifecycleFromContext(ctx)
+	}
+	if owner == nil {
+		return nil, errors.New("gRPC transport resource lifecycle is unavailable")
+	}
+	if err := owner.Context().Err(); err != nil {
+		return nil, err
+	}
+	key := dialerConf{Destination: dest, MemoryStreamConfig: streamSettings, ownerID: owner.ID()}
 	globalDialerAccess.Lock()
-	defer globalDialerAccess.Unlock()
-
 	if globalDialerMap == nil {
-		globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
+		globalDialerMap = make(map[dialerConf]*grpcClientResource)
+	}
+	if resource := globalDialerMap[key]; resource != nil {
+		resource.mu.Lock()
+		usable := !resource.sealed && owner.Context().Err() == nil && resource.conn.GetState() != connectivity.Shutdown
+		resource.mu.Unlock()
+		if usable {
+			globalDialerAccess.Unlock()
+			return resource.conn, nil
+		}
+	}
+	if err := owner.Context().Err(); err != nil {
+		globalDialerAccess.Unlock()
+		return nil, err
 	}
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 	sockopt := streamSettings.SocketSettings
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
-
-	if client, found := globalDialerMap[dialerConf{dest, streamSettings}]; found && client.GetState() != connectivity.Shutdown {
-		return client, nil
-	}
 
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
@@ -101,6 +194,8 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			MinConnectTimeout: 5 * time.Second,
 		}),
 		grpc.WithContextDialer(func(gctx context.Context, s string) (net.Conn, error) {
+			gctx, release := grpcDialContext(gctx, ctx, owner)
+			defer release()
 			select {
 			case <-gctx.Done():
 				return nil, gctx.Err()
@@ -120,10 +215,6 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			}
 			address := net.ParseAddress(rawHost)
 
-			gctx = c.ContextWithID(gctx, c.IDFromContext(ctx))
-			gctx = session.ContextWithOutbounds(gctx, session.OutboundsFromContext(ctx))
-			gctx = session.ContextWithTimeoutOnly(gctx, true)
-
 			c, err := internet.DialSystem(gctx, net.TCPDestination(address, port), sockopt)
 			if err == nil {
 				if streamSettings.TcpmaskManager != nil {
@@ -136,7 +227,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 				}
 
 				if tlsConfig != nil {
-					config := tlsConfig.GetTLSConfig(tls.WithDestination(dest))
+					config := tlsConfig.GetTLSConfigContext(ctx, tls.WithDestination(dest))
 					if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
 						return tls.UClient(c, config, fingerprint), nil
 					} else { // Fallback to normal gRPC TLS
@@ -186,24 +277,44 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		"passthrough:///"+net.JoinHostPort(grpcDestHost, dest.Port.String()),
 		dialOptions...,
 	)
-	if err == nil {
-		userAgent := grpcSettings.UserAgent
-		// It's NOT recommended to set the UA of gRPC connections to that of real browsers, as they are fundamentally incapable of initiating real gRPC connections.
-		switch userAgent {
-		case "chrome", "":
-			userAgent = utils.ChromeUA
-		case "firefox":
-			userAgent = utils.FirefoxUA
-		case "edge":
-			userAgent = utils.MSEdgeUA
-		case "golang":
-			userAgent = ""
-		}
-		setUserAgent(conn, userAgent)
-		conn.Connect()
+	if err != nil {
+		globalDialerAccess.Unlock()
+		return nil, err
 	}
-	globalDialerMap[dialerConf{dest, streamSettings}] = conn
-	return conn, err
+	userAgent := grpcSettings.UserAgent
+	// It's NOT recommended to set the UA of gRPC connections to that of real browsers, as they are fundamentally incapable of initiating real gRPC connections.
+	switch userAgent {
+	case "chrome", "":
+		userAgent = utils.ChromeUA
+	case "firefox":
+		userAgent = utils.FirefoxUA
+	case "edge":
+		userAgent = utils.MSEdgeUA
+	case "golang":
+		userAgent = ""
+	}
+	setUserAgent(conn, userAgent)
+	resource := &grpcClientResource{key: key, conn: conn, closeDone: make(chan struct{})}
+	if err := owner.RegisterBound(resource, func(unregister func()) { resource.unregister = unregister }); err != nil {
+		globalDialerAccess.Unlock()
+		_ = conn.Close()
+		return nil, err
+	}
+	resource.mu.Lock()
+	if resource.sealed || owner.Context().Err() != nil {
+		resource.mu.Unlock()
+		globalDialerAccess.Unlock()
+		_ = resource.Close()
+		return nil, errors.New("gRPC transport resource lifecycle is closed")
+	}
+	// Connect publishes grpc-go resolver/subconnection work. Keep it inside the
+	// exact resource start/stop gate so a winning SignalStop cannot be followed
+	// by new transport work or cache publication.
+	conn.Connect()
+	globalDialerMap[key] = resource
+	resource.mu.Unlock()
+	globalDialerAccess.Unlock()
+	return conn, nil
 }
 
 // setUserAgent overrides the user-agent on a ClientConn to remove the

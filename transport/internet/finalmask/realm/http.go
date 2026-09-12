@@ -25,10 +25,11 @@ const (
 )
 
 type Client struct {
-	scheme     string
-	hostport   string
-	token      string
-	httpClient *http.Client
+	scheme         string
+	hostport       string
+	token          string
+	httpClient     *http.Client
+	ownedTransport *http.Transport
 }
 
 type RegisterResponse struct {
@@ -87,12 +88,19 @@ func NewClient(scheme, host, port, token string, tlsConfig *tls.Config) *Client 
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.TLSClientConfig = tlsConfig.GetTLSConfig()
 		client = &http.Client{Transport: tr}
+		return &Client{scheme: scheme, hostport: net.JoinHostPort(host, port), token: token, httpClient: client, ownedTransport: tr}
 	}
 	return &Client{
 		scheme:     scheme,
 		hostport:   net.JoinHostPort(host, port),
 		token:      token,
 		httpClient: client,
+	}
+}
+
+func (c *Client) Close() {
+	if c.ownedTransport != nil {
+		c.ownedTransport.CloseIdleConnections()
 	}
 }
 

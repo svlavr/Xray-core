@@ -7,12 +7,15 @@ import (
 	"encoding/base64"
 	"io"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/xtls/xray-core/app/dispatcher"
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -58,6 +61,7 @@ func init() {
 		c := config.(*Config)
 
 		validator := new(vless.MemoryValidator)
+		configuredUsers := make([]*protocol.MemoryUser, 0, len(c.Users))
 		for _, user := range c.Users {
 			u, err := user.ToMemoryUser()
 			if err != nil {
@@ -66,9 +70,14 @@ func init() {
 			if err := validator.Add(u); err != nil {
 				return nil, errors.New("failed to initiate user").Base(err).AtError()
 			}
+			configuredUsers = append(configuredUsers, u)
 		}
 
-		return New(ctx, c, dc, validator)
+		handler, err := New(ctx, c, dc, validator, configuredUsers)
+		if err != nil {
+			return nil, err
+		}
+		return handler, nil
 	}))
 }
 
@@ -84,11 +93,31 @@ type Handler struct {
 	defaultDispatcher      routing.Dispatcher
 	ctx                    context.Context
 	fallbacks              map[string]map[string]map[string]*Fallback // or nil
+	reverseMu              sync.Mutex
+	reverseOps             sync.Mutex
+	reverseBindings        map[*protocol.MemoryUser]*reverseBinding
+	pendingReverse         []*protocol.MemoryUser
+	started                bool
+	reversePhase           reverseLifecyclePhase
 	// regexps               map[string]*regexp.Regexp       // or nil
 }
 
+type reverseBinding struct {
+	reverse      *Reverse
+	registration outbound.VLESSReverseRegistration
+}
+
+type reverseLifecyclePhase uint8
+
+const (
+	reverseLifecycleActive reverseLifecyclePhase = iota
+	reverseLifecyclePreparing
+	reverseLifecycleClosing
+	reverseLifecycleClosed
+)
+
 // New creates a new VLess inbound handler.
-func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Validator) (*Handler, error) {
+func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Validator, configuredUsers ...[]*protocol.MemoryUser) (*Handler, error) {
 	v := core.MustFromContext(ctx)
 	handler := &Handler{
 		inboundHandlerManager:  v.GetFeature(feature_inbound.ManagerType()).(feature_inbound.Manager),
@@ -99,8 +128,11 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 		observer:               v.GetFeature(extension.ObservatoryType()),
 		defaultDispatcher:      v.GetFeature(routing.DispatcherType()).(routing.Dispatcher),
 		ctx:                    ctx,
+		reverseBindings:        make(map[*protocol.MemoryUser]*reverseBinding),
 	}
-
+	if len(configuredUsers) != 0 {
+		handler.pendingReverse = append(handler.pendingReverse, configuredUsers[0]...)
+	}
 	if config.Decryption != "" && config.Decryption != "none" {
 		s := strings.Split(config.Decryption, ".")
 		var nfsSKeysBytes [][]byte
@@ -190,61 +222,282 @@ func isMuxAndNotXUDP(request *protocol.RequestHeader, first *buf.Buffer) bool {
 		firstBytes[6] == 2) // Network type: UDP
 }
 
-func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, error) {
+func (h *Handler) GetReverse(a *vless.MemoryAccount) (*Reverse, outbound.VLESSReverseRegistration, error) {
 	u := h.validator.Get(a.ID.UUID())
 	if u == nil {
-		return nil, errors.New("reverse: user " + a.ID.String() + " doesn't exist anymore")
+		return nil, nil, errors.New("reverse: user " + a.ID.String() + " doesn't exist anymore")
 	}
-	a = u.Account.(*vless.MemoryAccount)
-	if a.Reverse == nil || a.Reverse.Tag == "" {
-		return nil, errors.New("reverse: user " + a.ID.String() + " is not allowed to create reverse proxy")
+	a, ok := u.Account.(*vless.MemoryAccount)
+	if !ok || a.Reverse == nil || a.Reverse.Tag == "" {
+		return nil, nil, errors.New("reverse: user " + a.ID.String() + " is not allowed to create reverse proxy")
 	}
-	r := h.outboundHandlerManager.GetHandler(a.Reverse.Tag)
-	if r == nil {
-		picker, _ := reverse.NewStaticMuxPicker()
-		r = &Reverse{tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
-		for len(h.outboundHandlerManager.ListHandlers(h.ctx)) == 0 {
-			time.Sleep(time.Second) // prevents this outbound from becoming the default outbound
-		}
-		if err := h.outboundHandlerManager.AddHandler(h.ctx, r); err != nil {
-			return nil, err
-		}
+	h.reverseMu.Lock()
+	defer h.reverseMu.Unlock()
+	if h.reversePhase != reverseLifecycleActive {
+		return nil, nil, errors.New("vless inbound is closing")
 	}
-	if r, ok := r.(*Reverse); ok {
-		return r, nil
+	binding := h.reverseBindings[u]
+	if binding == nil {
+		return nil, nil, errors.New("reverse binding is not registered")
 	}
-	return nil, errors.New("reverse: outbound " + a.Reverse.Tag + " is not type Reverse")
+	return binding.reverse, binding.registration, nil
 }
 
-func (h *Handler) RemoveReverse(u *protocol.MemoryUser) {
-	if u != nil {
-		a := u.Account.(*vless.MemoryAccount)
-		if a.Reverse != nil && a.Reverse.Tag != "" {
-			h.outboundHandlerManager.RemoveHandler(h.ctx, a.Reverse.Tag)
-		}
+func (h *Handler) newReverseBinding(ctx context.Context, u *protocol.MemoryUser) (*reverseBinding, error) {
+	if u == nil {
+		return nil, nil
 	}
+	a, ok := u.Account.(*vless.MemoryAccount)
+	if !ok || a.Reverse == nil || a.Reverse.Tag == "" {
+		return nil, nil
+	}
+	manager, ok := h.outboundHandlerManager.(outbound.VLESSReverseRegistrationManager)
+	if !ok {
+		return nil, errors.New("reverse: outbound manager lacks shared registration support")
+	}
+	var r *Reverse
+	registration, err := manager.RegisterVLESSReverse(ctx, a.Reverse.Tag, func(context.Context) (outbound.Handler, error) {
+		picker, err := reverse.NewStaticMuxPicker()
+		if err != nil {
+			return nil, err
+		}
+		r = &Reverse{tag: a.Reverse.Tag, picker: picker, client: &mux.ClientManager{Picker: picker}}
+		return r, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if shared, ok := registration.Handler().(*Reverse); ok {
+		if r != nil && shared != r {
+			_ = r.Close()
+		}
+		r = shared
+	} else {
+		_ = registration.Release(ctx)
+		if r != nil {
+			_ = r.Close()
+		}
+		return nil, errors.New("reverse: shared handler has incompatible type")
+	}
+	return &reverseBinding{reverse: r, registration: registration}, nil
+}
+
+// PrepareClose releases reverse registrations before the AlwaysOn owner closes
+// its worker/mux/proxy graph. A refusal leaves an untouched first binding
+// ACTIVE; after one successful release the handler remains closing and is
+// explicitly retryable through Close.
+func (h *Handler) PrepareClose() error {
+	h.reverseOps.Lock()
+	defer h.reverseOps.Unlock()
+	h.reverseMu.Lock()
+	if h.reversePhase == reverseLifecycleClosed {
+		h.reverseMu.Unlock()
+		return nil
+	}
+	wasClosing := h.reversePhase == reverseLifecycleClosing
+	h.reversePhase = reverseLifecyclePreparing
+	bindings := make([]*reverseBinding, 0, len(h.reverseBindings))
+	for _, binding := range h.reverseBindings {
+		bindings = append(bindings, binding)
+	}
+	sort.Slice(bindings, func(i, j int) bool {
+		return bindings[i].registration.Handler().Tag() < bindings[j].registration.Handler().Tag()
+	})
+	h.reverseMu.Unlock()
+	released := 0
+	for _, binding := range bindings {
+		if err := binding.registration.Release(h.ctx); err != nil {
+			h.reverseMu.Lock()
+			if wasClosing || released != 0 {
+				h.reversePhase = reverseLifecycleClosing
+			} else {
+				h.reversePhase = reverseLifecycleActive
+			}
+			h.reverseMu.Unlock()
+			return err
+		}
+		released++
+		h.reverseMu.Lock()
+		for user, current := range h.reverseBindings {
+			if current == binding {
+				delete(h.reverseBindings, user)
+			}
+		}
+		h.reverseMu.Unlock()
+	}
+	h.reverseMu.Lock()
+	h.reversePhase = reverseLifecycleClosing
+	h.reverseMu.Unlock()
+	return nil
 }
 
 // Close implements common.Closable.Close().
 func (h *Handler) Close() error {
+	h.reverseMu.Lock()
+	closed := h.reversePhase == reverseLifecycleClosed
+	h.reverseMu.Unlock()
+	if closed {
+		return nil
+	}
+	if err := h.PrepareClose(); err != nil {
+		return err
+	}
 	if h.decryption != nil {
 		h.decryption.Close()
 	}
-	for _, u := range h.validator.GetAll() {
-		h.RemoveReverse(u)
+	err := errors.Combine(common.Close(h.validator))
+	if err == nil {
+		h.reverseMu.Lock()
+		h.reversePhase = reverseLifecycleClosed
+		h.reverseMu.Unlock()
 	}
-	return errors.Combine(common.Close(h.validator))
+	return err
 }
 
 // AddUser implements proxy.UserManager.AddUser().
 func (h *Handler) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
-	return h.validator.Add(u)
+	h.reverseOps.Lock()
+	defer h.reverseOps.Unlock()
+	h.reverseMu.Lock()
+	active := h.reversePhase == reverseLifecycleActive
+	started := h.started
+	h.reverseMu.Unlock()
+	if !active {
+		return errors.New("vless inbound is closing")
+	}
+	if !started {
+		if err := h.validator.Add(u); err != nil {
+			return err
+		}
+		h.reverseMu.Lock()
+		h.pendingReverse = append(h.pendingReverse, u)
+		h.reverseMu.Unlock()
+		return nil
+	}
+	binding, err := h.newReverseBinding(ctx, u)
+	if err != nil {
+		return err
+	}
+	if err := h.validator.Add(u); err != nil {
+		if binding != nil {
+			if releaseErr := binding.registration.Release(ctx); releaseErr != nil {
+				h.reverseMu.Lock()
+				h.reverseBindings[u] = binding
+				h.reversePhase = reverseLifecycleClosing
+				h.reverseMu.Unlock()
+				return releaseErr
+			}
+		}
+		return err
+	}
+	if binding != nil {
+		h.reverseMu.Lock()
+		h.reverseBindings[u] = binding
+		h.reverseMu.Unlock()
+	}
+	return nil
+}
+
+// Start is delayed until AlwaysOn has been added after all outbound features.
+func (h *Handler) Start() error {
+	h.reverseOps.Lock()
+	defer h.reverseOps.Unlock()
+	h.reverseMu.Lock()
+	if h.started {
+		h.reverseMu.Unlock()
+		return nil
+	}
+	if h.reversePhase != reverseLifecycleActive {
+		h.reverseMu.Unlock()
+		return errors.New("vless inbound is closing")
+	}
+	pending := append([]*protocol.MemoryUser(nil), h.pendingReverse...)
+	h.reverseMu.Unlock()
+	created := make([]*protocol.MemoryUser, 0, len(pending))
+	for _, u := range pending {
+		h.reverseMu.Lock()
+		binding := h.reverseBindings[u]
+		h.reverseMu.Unlock()
+		if binding != nil {
+			continue
+		}
+		binding, err := h.newReverseBinding(h.ctx, u)
+		if err != nil {
+			var rollbackErr error
+			for index := len(created) - 1; index >= 0; index-- {
+				createdUser := created[index]
+				h.reverseMu.Lock()
+				createdBinding := h.reverseBindings[createdUser]
+				h.reverseMu.Unlock()
+				if createdBinding == nil {
+					continue
+				}
+				if releaseErr := createdBinding.registration.Release(h.ctx); releaseErr != nil {
+					rollbackErr = errors.Combine(rollbackErr, releaseErr)
+					continue
+				}
+				h.reverseMu.Lock()
+				delete(h.reverseBindings, createdUser)
+				h.reverseMu.Unlock()
+			}
+			if rollbackErr != nil {
+				h.reverseMu.Lock()
+				h.reversePhase = reverseLifecycleClosing
+				h.reverseMu.Unlock()
+			}
+			return errors.Combine(err, rollbackErr)
+		}
+		if binding != nil {
+			h.reverseMu.Lock()
+			h.reverseBindings[u] = binding
+			h.reverseMu.Unlock()
+			created = append(created, u)
+		}
+	}
+	h.reverseMu.Lock()
+	h.started = true
+	h.pendingReverse = nil
+	h.reverseMu.Unlock()
+	return nil
 }
 
 // RemoveUser implements proxy.UserManager.RemoveUser().
 func (h *Handler) RemoveUser(ctx context.Context, e string) error {
-	h.RemoveReverse(h.validator.GetByEmail(e))
-	return h.validator.Del(e)
+	h.reverseOps.Lock()
+	defer h.reverseOps.Unlock()
+	h.reverseMu.Lock()
+	active := h.reversePhase == reverseLifecycleActive
+	h.reverseMu.Unlock()
+	if !active {
+		return errors.New("vless inbound is closing")
+	}
+	u := h.validator.GetByEmail(e)
+	if u == nil {
+		return h.validator.Del(e)
+	}
+	h.reverseMu.Lock()
+	binding := h.reverseBindings[u]
+	h.reverseMu.Unlock()
+	if binding != nil {
+		if err := binding.registration.Release(ctx); err != nil {
+			return err
+		}
+		h.reverseMu.Lock()
+		delete(h.reverseBindings, u)
+		h.reverseMu.Unlock()
+	}
+	if err := h.validator.Del(e); err != nil {
+		return err
+	}
+	h.reverseMu.Lock()
+	for index, pending := range h.pendingReverse {
+		if pending == u {
+			h.pendingReverse = append(h.pendingReverse[:index], h.pendingReverse[index+1:]...)
+			break
+		}
+	}
+	h.reverseMu.Unlock()
+	return nil
 }
 
 // GetUser implements proxy.UserManager.GetUser().
@@ -269,6 +522,12 @@ func (*Handler) Network() []net.Network {
 
 // Process implements proxy.Inbound.Process().
 func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatch routing.Dispatcher) error {
+	h.reverseMu.Lock()
+	active := h.reversePhase == reverseLifecycleActive
+	h.reverseMu.Unlock()
+	if !active {
+		return errors.New("vless inbound is closing")
+	}
 	iConn := stat.TryUnwrapStatsConn(connection)
 
 	if h.decryption != nil {
@@ -597,6 +856,12 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return errors.New("unknown request flow " + requestAddons.Flow).AtWarning()
 	}
 
+	if request.Command == protocol.RequestCommandUDP {
+		if scope := flow_observation.ExternalOwnerScopeFromContext(ctx); scope != nil {
+			scope.AuthorizeVLESSUDP()
+		}
+	}
+
 	if request.Command != protocol.RequestCommandMux {
 		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 			From:   connection.RemoteAddr(),
@@ -620,14 +885,22 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return errors.New("failed to encode response header").Base(err).AtWarning()
 	}
 	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, ctx, connection, nil)
+	if request.Command == protocol.RequestCommandUDP {
+		clientWriter = &vlessUDPObservationWriter{Writer: clientWriter, scope: flow_observation.ExternalOwnerScopeFromContext(ctx)}
+	}
 	bufferWriter.SetFlushNext()
 
 	if request.Command == protocol.RequestCommandRvs {
-		r, err := h.GetReverse(account)
+		r, registration, err := h.GetReverse(account)
 		if err != nil {
 			return err
 		}
-		return r.NewMux(ctx, dispatcher.WrapLink(ctx, h.policyManager, h.stats, &transport.Link{Reader: clientReader, Writer: clientWriter}), h.observer)
+		entered, err := registration.Enter(ctx)
+		if err != nil {
+			return err
+		}
+		defer entered.Release()
+		return r.NewMux(entered.Context(), dispatcher.WrapLink(entered.Context(), h.policyManager, h.stats, &transport.Link{Reader: clientReader, Writer: clientWriter}), h.observer)
 	}
 
 	if err := dispatch.DispatchLink(
@@ -639,6 +912,21 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return errors.New("failed to dispatch request").Base(err)
 	}
 	return nil
+}
+
+type vlessUDPObservationWriter struct {
+	buf.Writer
+	scope *flow_observation.ExternalOwnerScope
+}
+
+func (w *vlessUDPObservationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	for _, b := range mb {
+		if b != nil && b.Len()+2 > buf.Size {
+			w.scope.MarkVLESSUDPDownlinkUnproven()
+			break
+		}
+	}
+	return w.Writer.WriteMultiBuffer(mb)
 }
 
 type Reverse struct {
@@ -658,9 +946,15 @@ func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer fea
 	}
 	worker, err := reverse.NewPortalWorker(muxClient)
 	if err != nil {
+		_ = muxClient.Close()
+		muxClient.Wait()
 		return errors.New("failed to create portal worker").Base(err).AtWarning()
 	}
-	r.picker.AddWorker(worker)
+	if !r.picker.AddWorker(worker) {
+		_ = worker.Close()
+		return errors.New("reverse mux picker is closed")
+	}
+	defer worker.Close()
 	if burstObs, ok := observer.(extension.BurstObservatory); ok {
 		go burstObs.Check([]string{r.Tag()})
 	}
@@ -688,7 +982,10 @@ func (r *Reverse) Start() error {
 }
 
 func (r *Reverse) Close() error {
-	return nil
+	if r == nil {
+		return nil
+	}
+	return r.picker.Close()
 }
 
 func (r *Reverse) SenderSettings() *serial.TypedMessage {

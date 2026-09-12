@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 // XrayKey is the key type of Instance in Context, exported for test.
@@ -39,6 +41,9 @@ and may break at any time.
 func toContext(ctx context.Context, v *Instance) context.Context {
 	if FromContext(ctx) != v {
 		ctx = context.WithValue(ctx, xrayKey, v)
+	}
+	if v != nil {
+		ctx = internet.ContextWithDialLifecycle(ctx, v.dialLifecycle)
 	}
 	return ctx
 }

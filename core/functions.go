@@ -3,12 +3,14 @@ package core
 import (
 	"bytes"
 	"context"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
@@ -48,14 +50,20 @@ func StartInstance(configFormat string, configBytes []byte) (*Instance, error) {
 // xray:api:stable
 func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, error) {
 	ctx = toContext(ctx, v)
+	ctx, release, err := internet.WithDialOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {
+		release()
 		return nil, errors.New("routing.Dispatcher is not registered in Xray core")
 	}
 
 	r, err := dispatcher.(routing.Dispatcher).Dispatch(ctx, dest)
 	if err != nil {
+		release()
 		return nil, err
 	}
 	var readerOpt cnc.ConnectionOption
@@ -64,7 +72,8 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 	} else {
 		readerOpt = cnc.ConnectionOutputMultiUDP(r.Reader)
 	}
-	return cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt), nil
+	connection := cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt)
+	return newReleaseConnection(ctx, connection, release), nil
 }
 
 // DialUDP provides a way to exchange UDP packets through Xray instance to remote servers.
@@ -75,10 +84,70 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 // xray:api:beta
 func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
 	ctx = toContext(ctx, v)
+	ctx, release, err := internet.WithDialOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {
+		release()
 		return nil, errors.New("routing.Dispatcher is not registered in Xray core")
 	}
-	return udp.DialDispatcher(ctx, dispatcher.(routing.Dispatcher))
+	conn, err := udp.DialDispatcher(ctx, dispatcher.(routing.Dispatcher))
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return newReleasePacketConn(ctx, conn, release), nil
+}
+
+type releaseConnection struct {
+	net.Conn
+	once    sync.Once
+	stop    func() bool
+	release func()
+	err     error
+}
+
+func newReleaseConnection(ctx context.Context, connection net.Conn, release func()) net.Conn {
+	owned := &releaseConnection{Conn: connection, release: release}
+	owned.stop = context.AfterFunc(ctx, func() { _ = owned.Close() })
+	return owned
+}
+
+func (c *releaseConnection) Close() error {
+	c.once.Do(func() {
+		if c.stop != nil {
+			c.stop()
+		}
+		c.err = c.Conn.Close()
+		c.release()
+	})
+	return c.err
+}
+
+type releasePacketConn struct {
+	net.PacketConn
+	once    sync.Once
+	stop    func() bool
+	release func()
+	err     error
+}
+
+func newReleasePacketConn(ctx context.Context, connection net.PacketConn, release func()) net.PacketConn {
+	owned := &releasePacketConn{PacketConn: connection, release: release}
+	owned.stop = context.AfterFunc(ctx, func() { _ = owned.Close() })
+	return owned
+}
+
+func (c *releasePacketConn) Close() error {
+	c.once.Do(func() {
+		if c.stop != nil {
+			c.stop()
+		}
+		c.err = c.PacketConn.Close()
+		c.release()
+	})
+	return c.err
 }

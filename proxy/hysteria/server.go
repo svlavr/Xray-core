@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -120,6 +121,9 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		writer := &UDPWriter{
 			writer: conn,
 			addr:   addr.NetAddr(),
+		}
+		if scope := flow_observation.ExternalOwnerScopeFromContext(ctx); scope != nil {
+			scope.AuthorizeHysteriaUDP()
 		}
 
 		return dispatcher.DispatchLink(ctx, *addr, &transport.Link{

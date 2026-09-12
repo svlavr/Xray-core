@@ -6,6 +6,7 @@ import (
 
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/session"
@@ -63,7 +64,18 @@ func (d *XrayOutboundDialer) DialContext(ctx context.Context, network string, de
 	uplinkReader, uplinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 	conn := cnc.NewConnection(cnc.ConnectionInputMulti(downlinkWriter), cnc.ConnectionOutputMulti(uplinkReader))
-	go d.outbound.Process(ctx, &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, d.dialer)
+	link := &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}
+	if dest.Network == net.Network_TCP {
+		scope := flow_observation.BeginAsyncLink(ctx, link)
+		processCtx := scope.Context(ctx)
+		go func() {
+			var processErr error
+			defer func() { scope.Release(processErr) }()
+			processErr = d.outbound.Process(processCtx, link, d.dialer)
+		}()
+	} else {
+		go d.outbound.Process(ctx, link, d.dialer)
+	}
 	return conn, nil
 }
 

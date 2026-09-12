@@ -16,8 +16,6 @@ type InterfaceUpdater struct {
 	iface     *net.Interface
 }
 
-var updater *InterfaceUpdater
-
 func (updater *InterfaceUpdater) Get() *net.Interface {
 	updater.Lock()
 	defer updater.Unlock()

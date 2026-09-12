@@ -38,9 +38,22 @@ type CacheController struct {
 	cacheCleanup  *task.Periodic
 	highWatermark int
 	requestGroup  singleflight.Group
+	ctx           context.Context
+	cancel        context.CancelFunc
+	tasks         task.Lifecycle
+	stopOnce      sync.Once
+	closeOnce     sync.Once
+	closeErr      error
+	closed        bool
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
+	return NewCacheControllerContext(context.Background(), name, disableCache, serveStale, serveExpiredTTL)
+}
+
+func NewCacheControllerContext(ctx context.Context, name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
+	cacheCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopOwner := context.AfterFunc(ctx, cancel)
 	c := &CacheController{
 		name:            name,
 		disableCache:    disableCache,
@@ -48,6 +61,8 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		serveExpiredTTL: -int32(serveExpiredTTL),
 		ips:             make(map[string]*record),
 		pub:             pubsub.NewService(),
+		ctx:             cacheCtx,
+		cancel:          func() { stopOwner(); cancel() },
 	}
 
 	c.cacheCleanup = &task.Periodic{
@@ -59,6 +74,12 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 
 // CacheCleanup clears expired items from cache
 func (c *CacheController) CacheCleanup() error {
+	c.RLock()
+	closed := c.closed
+	c.RUnlock()
+	if closed {
+		return errors.New("cache is closed")
+	}
 	expiredKeys, err := c.collectExpiredKeys()
 	if err != nil {
 		return err
@@ -165,8 +186,56 @@ func (c *CacheController) writeAndShrink(expiredKeys []string) {
 		c.dirtyips = c.ips
 		c.ips = make(map[string]*record, int(float64(lenAfter)*1.1))
 		c.highWatermark = lenAfter
-		go c.migrate()
+		if c.tasks.Acquire() {
+			go func() {
+				defer c.tasks.Release()
+				c.migrate()
+			}()
+		}
 	}
+}
+
+func (c *CacheController) SignalStop() {
+	if c == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		c.Lock()
+		c.closed = true
+		c.Unlock()
+		c.tasks.Seal()
+		c.cancel()
+		c.pub.SignalStop()
+		_ = c.cacheCleanup.Close()
+	})
+}
+
+func (c *CacheController) AcquireTask() bool { return c != nil && c.tasks.Acquire() }
+func (c *CacheController) ReleaseTask()      { c.tasks.Release() }
+func (c *CacheController) Context() context.Context {
+	if c == nil {
+		return context.Background()
+	}
+	return c.ctx
+}
+
+func (c *CacheController) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.SignalStop()
+	c.closeOnce.Do(func() {
+		var closeErrors []error
+		c.tasks.Wait()
+		closeErrors = append(closeErrors, c.cacheCleanup.CloseAndWait())
+		closeErrors = append(closeErrors, c.pub.CloseAndWait())
+		c.Lock()
+		c.ips = nil
+		c.dirtyips = nil
+		c.Unlock()
+		c.closeErr = errors.Combine(closeErrors...)
+	})
+	return c.closeErr
 }
 
 type migrationEntry struct {
@@ -243,6 +312,11 @@ func (c *CacheController) flush(batch []migrationEntry) {
 }
 
 func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
+	c.RLock()
+	if c.closed {
+		c.RUnlock()
+		return
+	}
 	rtt := time.Since(req.start)
 
 	switch req.reqType {
@@ -251,6 +325,7 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	case dnsmessage.TypeAAAA:
 		c.pub.Publish(req.domain+"6", rep)
 	}
+	c.RUnlock()
 
 	if c.disableCache {
 		errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt)
@@ -258,6 +333,10 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	}
 
 	c.Lock()
+	if c.closed {
+		c.Unlock()
+		return
+	}
 	lockWait := time.Since(req.start) - rtt
 
 	newRec := &record{}
@@ -304,7 +383,11 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt, ", lock: ", lockWait)
 
 	if !c.serveStale || c.serveExpiredTTL != 0 {
-		common.Must(c.cacheCleanup.Start())
+		c.RLock()
+		if !c.closed {
+			common.Must(c.cacheCleanup.Start())
+		}
+		c.RUnlock()
 	}
 }
 

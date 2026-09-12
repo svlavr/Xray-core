@@ -15,8 +15,16 @@ import (
 var (
 	Controllers           []func(network, address string, c syscall.RawConn) error
 	ControllersLock       sync.Mutex
+	dialerLock            sync.RWMutex
 	effectiveSystemDialer SystemDialer = &DefaultSystemDialer{}
 )
+
+func currentSystemDialer() SystemDialer {
+	dialerLock.RLock()
+	dialer := effectiveSystemDialer
+	dialerLock.RUnlock()
+	return dialer
+}
 
 type SystemDialer interface {
 	Dial(ctx context.Context, source net.Address, destination net.Destination, sockopt *SocketConfig) (net.Conn, error)
@@ -68,10 +76,11 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 			}
 		}
 		var lc net.ListenConfig
+		controllers := controllersForContext(ctx)
 		lc.Control = func(network, address string, c syscall.RawConn) error {
-			for _, ctl := range Controllers {
+			for _, ctl := range controllers {
 				if err := ctl(network, address, c); err != nil {
-					errors.LogInfoInner(ctx, err, "failed to apply external controller")
+					return err
 				}
 			}
 			return c.Control(func(fd uintptr) {
@@ -121,14 +130,15 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		KeepAliveConfig: keepAliveConfig,
 	}
 
-	if sockopt != nil || len(Controllers) > 0 {
+	controllers := controllersForContext(ctx)
+	if sockopt != nil || len(controllers) > 0 {
 		if sockopt != nil && sockopt.TcpMptcp {
 			dialer.SetMultipathTCP(true)
 		}
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			for _, ctl := range Controllers {
+			for _, ctl := range controllers {
 				if err := ctl(network, address, c); err != nil {
-					errors.LogInfoInner(ctx, err, "failed to apply external controller")
+					return err
 				}
 			}
 			return c.Control(func(fd uintptr) {
@@ -181,7 +191,15 @@ func WithAdapter(dialer SystemDialerAdapter) SystemDialer {
 }
 
 func (v *SimpleSystemDialer) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
-	return v.adapter.Dial(dest.Network.SystemString(), dest.NetAddr())
+	conn, err := v.adapter.Dial(dest.Network.SystemString(), dest.NetAddr())
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (d *SimpleSystemDialer) DestIpAddress() net.IP {
@@ -196,7 +214,9 @@ func UseAlternativeSystemDialer(dialer SystemDialer) {
 	if dialer == nil {
 		dialer = &DefaultSystemDialer{}
 	}
+	dialerLock.Lock()
 	effectiveSystemDialer = dialer
+	dialerLock.Unlock()
 }
 
 // RegisterDialerController adds a controller to the effective system dialer.
@@ -209,16 +229,28 @@ func RegisterDialerController(ctl func(network, address string, c syscall.RawCon
 		return errors.New("nil listener controller")
 	}
 
+	dialerLock.RLock()
+	_, ok := effectiveSystemDialer.(*DefaultSystemDialer)
+	if !ok {
+		dialerLock.RUnlock()
+		return errors.New("RegisterListenerController not supported in custom dialer")
+	}
 	ControllersLock.Lock()
 	Controllers = append(Controllers, ctl)
 	ControllersLock.Unlock()
-
-	_, ok := effectiveSystemDialer.(*DefaultSystemDialer)
-	if !ok {
-		return errors.New("RegisterListenerController not supported in custom dialer")
-	}
+	dialerLock.RUnlock()
 
 	return nil
+}
+
+func controllersForContext(ctx context.Context) []func(network, address string, c syscall.RawConn) error {
+	if snapshot := snapshotForContext(ctx); snapshot != nil {
+		return snapshot.controllers
+	}
+	ControllersLock.Lock()
+	controllers := append([]func(network, address string, c syscall.RawConn) error(nil), Controllers...)
+	ControllersLock.Unlock()
+	return controllers
 }
 
 type FakePacketConn struct {

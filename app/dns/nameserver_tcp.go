@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,9 @@ type TCPNameServer struct {
 	reqID           uint32
 	dial            func(context.Context) (net.Conn, error)
 	clientIP        net.IP
+	stopOnce        sync.Once
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // NewTCPNameServer creates DNS over TCP server object for remote resolving.
@@ -35,7 +39,11 @@ func NewTCPNameServer(
 	disableCache bool, serveStale bool, serveExpiredTTL uint32,
 	clientIP net.IP,
 ) (*TCPNameServer, error) {
-	s, err := baseTCPNameServer(url, "TCP", disableCache, serveStale, serveExpiredTTL, clientIP)
+	return NewTCPNameServerContext(context.Background(), url, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
+}
+
+func NewTCPNameServerContext(ctx context.Context, url *url.URL, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*TCPNameServer, error) {
+	s, err := baseTCPNameServer(ctx, url, "TCP", disableCache, serveStale, serveExpiredTTL, clientIP)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +66,11 @@ func NewTCPNameServer(
 
 // NewTCPLocalNameServer creates DNS over TCP client object for local resolving
 func NewTCPLocalNameServer(url *url.URL, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*TCPNameServer, error) {
-	s, err := baseTCPNameServer(url, "TCPL", disableCache, serveStale, serveExpiredTTL, clientIP)
+	return NewTCPLocalNameServerContext(context.Background(), url, disableCache, serveStale, serveExpiredTTL, clientIP)
+}
+
+func NewTCPLocalNameServerContext(ctx context.Context, url *url.URL, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*TCPNameServer, error) {
+	s, err := baseTCPNameServer(ctx, url, "TCPL", disableCache, serveStale, serveExpiredTTL, clientIP)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +83,7 @@ func NewTCPLocalNameServer(url *url.URL, disableCache bool, serveStale bool, ser
 	return s, nil
 }
 
-func baseTCPNameServer(url *url.URL, prefix string, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*TCPNameServer, error) {
+func baseTCPNameServer(ctx context.Context, url *url.URL, prefix string, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*TCPNameServer, error) {
 	port := net.Port(53)
 	if url.Port() != "" {
 		var err error
@@ -82,7 +94,7 @@ func baseTCPNameServer(url *url.URL, prefix string, disableCache bool, serveStal
 	dest := net.TCPDestination(net.ParseAddress(url.Hostname()), port)
 
 	s := &TCPNameServer{
-		cacheController: NewCacheController(prefix+"//"+dest.NetAddr(), disableCache, serveStale, serveExpiredTTL),
+		cacheController: NewCacheControllerContext(ctx, prefix+"//"+dest.NetAddr(), disableCache, serveStale, serveExpiredTTL),
 		destination:     &dest,
 		clientIP:        clientIP,
 	}
@@ -135,7 +147,14 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
+		if !s.cacheController.AcquireTask() {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- context.Canceled
+			}
+			continue
+		}
 		go func(r *dnsRequest) {
+			defer s.cacheController.ReleaseTask()
 			dnsCtx := ctx
 
 			if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -168,7 +187,15 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
-			defer conn.Close()
+			var closeConnOnce sync.Once
+			closeConn := func() {
+				closeConnOnce.Do(func() {
+					_ = conn.SetDeadline(time.Now())
+					_ = conn.Close()
+				})
+			}
+			stopConnection := context.AfterFunc(dnsCtx, closeConn)
+			defer func() { stopConnection(); closeConn() }()
 			dnsReqBuf := buf.New()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
@@ -244,4 +271,16 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 // QueryIP implements Server.
 func (s *TCPNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+func (s *TCPNameServer) SignalStop() {
+	if s != nil {
+		s.stopOnce.Do(func() { s.cacheController.SignalStop() })
+	}
+}
+
+func (s *TCPNameServer) Close() error {
+	s.SignalStop()
+	s.closeOnce.Do(func() { s.closeErr = s.cacheController.Close() })
+	return s.closeErr
 }

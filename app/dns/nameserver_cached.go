@@ -35,7 +35,12 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 				if cache.serveStale && (cache.serveExpiredTTL == 0 || cache.serveExpiredTTL < ttl) {
 					errors.LogDebugInner(ctx, err, cache.name, " cache OPTIMISTE ", fqdn, " -> ", ips)
 					log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheOptimiste, Elapsed: 0, Error: err})
-					go pull(ctx, s, fqdn, option)
+					if cache.AcquireTask() {
+						go func() {
+							defer cache.ReleaseTask()
+							pull(cache.Context(), s, fqdn, option)
+						}()
+					}
 					return ips, 1, err
 				}
 			}
@@ -48,7 +53,7 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 }
 
 func pull(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) {
-	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+	nctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
 	fetch(nctx, s, fqdn, option)

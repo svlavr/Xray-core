@@ -8,9 +8,12 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 )
 
@@ -46,10 +49,13 @@ type record struct {
 }
 
 type queue struct {
-	last   time.Time
-	rrType uint16
-	queue  chan []byte
-	stash  chan []byte
+	key        string
+	last       time.Time
+	rrType     uint16
+	queue      chan []byte
+	stash      chan []byte
+	retired    bool
+	retireDone chan struct{}
 }
 
 type xdnsConnServer struct {
@@ -61,11 +67,27 @@ type xdnsConnServer struct {
 	readQueue     chan *packet
 	writeQueueMap map[string]*queue
 
-	closed bool
-	mutex  sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	tasks  task.Lifecycle
+
+	closed       atomic.Bool
+	mutex        sync.Mutex
+	stopOnce     sync.Once
+	rawCloseOnce sync.Once
+	closeOnce    sync.Once
+	rawCloseDone chan struct{}
+	closeDone    chan struct{}
+	rawCloseErr  error
+	closeErr     error
+	unregister   func()
 }
 
 func NewConnServer(c *Config, raw net.PacketConn) (net.PacketConn, error) {
+	return NewConnServerContext(context.Background(), c, raw)
+}
+
+func NewConnServerContext(ctx context.Context, c *Config, raw net.PacketConn) (net.PacketConn, error) {
 	if len(c.Domains) == 0 {
 		return nil, errors.New("empty domains")
 	}
@@ -78,6 +100,12 @@ func NewConnServer(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 		domains = append(domains, domain)
 	}
 
+	owner := internet.ResourceLifecycleFromContext(ctx)
+	parentCtx := ctx
+	if owner != nil {
+		parentCtx = owner.Context()
+	}
+	connCtx, cancel := context.WithCancel(parentCtx)
 	conn := &xdnsConnServer{
 		PacketConn: raw,
 
@@ -86,55 +114,96 @@ func NewConnServer(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 		ch:            make(chan *record, 500),
 		readQueue:     make(chan *packet, 512),
 		writeQueueMap: make(map[string]*queue),
+		ctx:           connCtx,
+		cancel:        cancel,
+
+		rawCloseDone: make(chan struct{}),
+		closeDone:    make(chan struct{}),
+	}
+	for range 4 {
+		if !conn.tasks.Acquire() {
+			panic("fresh xdns server lifecycle rejected loop reservation")
+		}
+	}
+	if owner != nil {
+		if err := owner.RegisterBound(conn, func(unregister func()) { conn.unregister = unregister }); err != nil {
+			conn.tasks.Seal()
+			for range 4 {
+				conn.tasks.Release()
+			}
+			cancel()
+			return nil, err
+		}
 	}
 
-	go conn.clean()
-	go conn.recvLoop()
-	go conn.sendLoop()
+	go func() {
+		defer conn.tasks.Release()
+		<-connCtx.Done()
+		if parentCtx.Err() != nil {
+			conn.SignalStop()
+		}
+	}()
+	go func() {
+		defer conn.tasks.Release()
+		conn.clean()
+	}()
+	go func() {
+		defer conn.tasks.Release()
+		conn.recvLoop()
+	}()
+	go func() {
+		defer conn.tasks.Release()
+		conn.sendLoop()
+	}()
 
 	return conn, nil
 }
 
 func (c *xdnsConnServer) clean() {
-	f := func() bool {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-
-		if c.closed {
-			return true
-		}
-
-		now := time.Now()
-
-		for key, q := range c.writeQueueMap {
-			if now.Sub(q.last) >= idleTimeout {
-				close(q.queue)
-				close(q.stash)
-				delete(c.writeQueueMap, key)
-			}
-		}
-
-		return false
-	}
-
+	timer := time.NewTimer(idleTimeout / 2)
+	defer timer.Stop()
 	for {
-		time.Sleep(idleTimeout / 2)
-		if f() {
+		select {
+		case <-timer.C:
+			c.retireIdleQueues(time.Now())
+			timer.Reset(idleTimeout / 2)
+		case <-c.ctx.Done():
 			return
 		}
 	}
 }
 
+func (c *xdnsConnServer) retireIdleQueues(now time.Time) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	for key, q := range c.writeQueueMap {
+		if now.Sub(q.last) >= idleTimeout {
+			c.retireQueueLocked(key, q)
+		}
+	}
+}
+
+func (c *xdnsConnServer) retireQueueLocked(key string, q *queue) {
+	if q == nil || q.retired || c.writeQueueMap[key] != q {
+		return
+	}
+	q.retired = true
+	delete(c.writeQueueMap, key)
+	close(q.retireDone)
+}
+
 func (c *xdnsConnServer) ensureQueue(addr net.Addr) *queue {
-	if c.closed {
+	if c.closed.Load() {
 		return nil
 	}
 
 	q, ok := c.writeQueueMap[addr.String()]
 	if !ok {
 		q = &queue{
-			queue: make(chan []byte, 512),
-			stash: make(chan []byte, 1),
+			key:        addr.String(),
+			queue:      make(chan []byte, 512),
+			stash:      make(chan []byte, 1),
+			retireDone: make(chan struct{}),
 		}
 		c.writeQueueMap[addr.String()] = q
 	}
@@ -147,7 +216,7 @@ func (c *xdnsConnServer) stash(queue *queue, p []byte) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.closed {
+	if c.closed.Load() || queue.retired || c.writeQueueMap[queue.key] != queue {
 		return
 	}
 
@@ -161,13 +230,9 @@ func (c *xdnsConnServer) recvLoop() {
 	var buf [finalmask.UDPSize]byte
 
 	for {
-		if c.closed {
-			break
-		}
-
 		n, addr, err := c.PacketConn.ReadFrom(buf[:])
 		if err != nil {
-			if go_errors.Is(err, net.ErrClosed) {
+			if c.ctx.Err() != nil || go_errors.Is(err, net.ErrClosed) {
 				break
 			}
 			continue
@@ -199,6 +264,8 @@ func (c *xdnsConnServer) recvLoop() {
 					p:    buf,
 					addr: clientIDToAddr(clientID),
 				}:
+				case <-c.ctx.Done():
+					return
 				default:
 					errors.LogDebug(context.Background(), addr, " ", clientID, " mask read err queue full")
 				}
@@ -212,6 +279,8 @@ func (c *xdnsConnServer) recvLoop() {
 		if resp != nil {
 			select {
 			case c.ch <- &record{resp, addr, clientIDToAddr(clientID)}:
+			case <-c.ctx.Done():
+				return
 			default:
 				errors.LogDebug(context.Background(), addr, " ", clientID, " mask read err record queue full")
 			}
@@ -219,19 +288,6 @@ func (c *xdnsConnServer) recvLoop() {
 	}
 
 	errors.LogDebug(context.Background(), "xdns closed")
-
-	close(c.ch)
-	close(c.readQueue)
-
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.closed = true
-	for key, q := range c.writeQueueMap {
-		close(q.queue)
-		close(q.stash)
-		delete(c.writeQueueMap, key)
-	}
 }
 
 func (c *xdnsConnServer) sendLoop() {
@@ -242,10 +298,10 @@ func (c *xdnsConnServer) sendLoop() {
 		nextRec = nil
 
 		if rec == nil {
-			var ok bool
-			rec, ok = <-c.ch
-			if !ok {
-				break
+			select {
+			case rec = <-c.ch:
+			case <-c.ctx.Done():
+				return
 			}
 		}
 
@@ -261,29 +317,50 @@ func (c *xdnsConnServer) sendLoop() {
 					c.mutex.Unlock()
 					return
 				}
-				q.rrType = rec.Resp.Question[0].Type
+				if !q.retired && c.writeQueueMap[q.key] == q {
+					q.rrType = rec.Resp.Question[0].Type
+				}
 				c.mutex.Unlock()
 
 				var p []byte
 
 				select {
 				case p = <-q.stash:
+				case <-q.retireDone:
 				default:
 					select {
 					case p = <-q.stash:
 					case p = <-q.queue:
+					case <-q.retireDone:
 					default:
 						select {
 						case p = <-q.stash:
 						case p = <-q.queue:
 						case <-timer.C:
 						case nextRec = <-c.ch:
+						case <-q.retireDone:
+						case <-c.ctx.Done():
+							if !timer.Stop() {
+								select {
+								case <-timer.C:
+								default:
+								}
+							}
+							return
 						}
 					}
 				}
 
 				timer.Reset(0)
 
+				if len(p) != 0 {
+					c.mutex.Lock()
+					current := !q.retired && c.writeQueueMap[q.key] == q
+					c.mutex.Unlock()
+					if !current {
+						p = nil
+					}
+				}
 				if len(p) == 0 {
 					break
 				}
@@ -326,21 +403,32 @@ func (c *xdnsConnServer) sendLoop() {
 			buf[2] |= 0x02
 		}
 
-		if c.closed {
+		if c.closed.Load() {
 			return
 		}
 
 		_, err = c.PacketConn.WriteTo(buf, rec.Addr)
 		if go_errors.Is(err, net.ErrClosed) {
-			c.closed = true
+			c.SignalStop()
 			break
 		}
 	}
 }
 
 func (c *xdnsConnServer) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	packet, ok := <-c.readQueue
-	if !ok {
+	if c.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	var packet *packet
+	var ok bool
+	select {
+	case packet, ok = <-c.readQueue:
+	case <-c.ctx.Done():
+		return 0, nil, net.ErrClosed
+	case <-c.closeDone:
+		return 0, nil, net.ErrClosed
+	}
+	if !ok || packet == nil {
 		return 0, nil, net.ErrClosed
 	}
 	if len(p) < len(packet.p) {
@@ -374,15 +462,61 @@ func (c *xdnsConnServer) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	select {
 	case q.queue <- buf:
 		return len(p), nil
+	case <-q.retireDone:
+		return 0, io.ErrClosedPipe
+	case <-c.ctx.Done():
+		return 0, io.ErrClosedPipe
 	default:
 		// errors.LogDebug(context.Background(), addr, " mask write err queue full")
 		return 0, nil
 	}
 }
 
+func (c *xdnsConnServer) SignalStop() {
+	if c == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		c.closed.Store(true)
+		c.tasks.Seal()
+		c.mutex.Lock()
+		for key, q := range c.writeQueueMap {
+			c.retireQueueLocked(key, q)
+		}
+		c.mutex.Unlock()
+		c.cancel()
+		c.rawCloseOnce.Do(func() {
+			go func() {
+				err := c.PacketConn.Close()
+				c.mutex.Lock()
+				c.rawCloseErr = err
+				c.mutex.Unlock()
+				close(c.rawCloseDone)
+			}()
+		})
+	})
+}
+
 func (c *xdnsConnServer) Close() error {
-	c.closed = true
-	return c.PacketConn.Close()
+	c.SignalStop()
+	c.closeOnce.Do(func() {
+		<-c.rawCloseDone
+		c.tasks.Wait()
+		close(c.readQueue)
+		c.mutex.Lock()
+		c.closeErr = c.rawCloseErr
+		unregister := c.unregister
+		c.unregister = nil
+		c.mutex.Unlock()
+		if unregister != nil {
+			unregister()
+		}
+		close(c.closeDone)
+	})
+	<-c.closeDone
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.closeErr
 }
 
 func nextPacketServer(r *bytes.Reader) ([]byte, error) {

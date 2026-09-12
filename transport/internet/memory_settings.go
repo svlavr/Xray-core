@@ -7,16 +7,17 @@ import (
 
 // MemoryStreamConfig is a parsed form of StreamConfig. It is used to reduce the number of Protobuf parses.
 type MemoryStreamConfig struct {
-	Destination      *net.Destination
-	ProtocolName     string
-	ProtocolSettings interface{}
-	SecurityType     string
-	SecuritySettings interface{}
-	TcpmaskManager   *finalmask.TcpmaskManager
-	UdpmaskManager   *finalmask.UdpmaskManager
-	QuicParams       *QuicParams
-	SocketSettings   *SocketConfig
-	DownloadSettings *MemoryStreamConfig
+	Destination       *net.Destination
+	ProtocolName      string
+	ProtocolSettings  interface{}
+	SecurityType      string
+	SecuritySettings  interface{}
+	TcpmaskManager    *finalmask.TcpmaskManager
+	UdpmaskManager    *finalmask.UdpmaskManager
+	QuicParams        *QuicParams
+	SocketSettings    *SocketConfig
+	DownloadSettings  *MemoryStreamConfig
+	ResourceLifecycle *ResourceLifecycle
 }
 
 // ToMemoryStreamConfig converts a StreamConfig to MemoryStreamConfig. It returns a default non-nil MemoryStreamConfig for nil input.

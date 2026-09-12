@@ -59,8 +59,10 @@ type DarwinTun struct {
 
 	routeMonitor     *os.File
 	routeMonitorOnce sync.Once
+	routeMonitorWG   sync.WaitGroup
 	systemRoutes     []netip.Prefix
 	gateway          netip.Prefix
+	updater          *InterfaceUpdater
 }
 
 // waitKqueue owns a kqueue fd used by DarwinTun.Wait() to block on
@@ -210,13 +212,14 @@ func (t *DarwinTun) Start() error {
 		return err
 	}
 
-	if updater != nil {
+	if t.updater != nil {
 		fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, 0)
 		if err != nil {
 			_ = t.unsetSystemRoutes()
 			return err
 		}
 		t.routeMonitor = os.NewFile(uintptr(fd), "xray-route-monitor")
+		t.routeMonitorWG.Add(1)
 		go t.monitorRouteChanges()
 	}
 	return nil
@@ -228,6 +231,7 @@ func (t *DarwinTun) Close() error {
 			_ = t.routeMonitor.Close()
 		}
 	})
+	t.routeMonitorWG.Wait()
 	if t.waitKq != nil {
 		t.waitKq.close()
 	}
@@ -240,6 +244,7 @@ func (t *DarwinTun) Close() error {
 }
 
 func (t *DarwinTun) monitorRouteChanges() {
+	defer t.routeMonitorWG.Done()
 	buffer := make([]byte, 64*1024)
 	for {
 		if _, err := t.routeMonitor.Read(buffer); err != nil {
@@ -248,11 +253,13 @@ func (t *DarwinTun) monitorRouteChanges() {
 			}
 			return
 		}
-		if updater != nil {
-			updater.Update()
+		if t.updater != nil {
+			t.updater.Update()
 		}
 	}
 }
+
+func (t *DarwinTun) setInterfaceUpdater(updater *InterfaceUpdater) { t.updater = updater }
 
 func (t *DarwinTun) Name() (string, error) {
 	return unix.GetsockoptString(t.tunFd, sysprotoControl, UTUN_OPT_IFNAME)

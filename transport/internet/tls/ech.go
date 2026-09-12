@@ -22,12 +22,17 @@ import (
 	"github.com/miekg/dns"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/crypto/cryptobyte"
 )
 
 func ApplyECH(c *Config, config *tls.Config) error {
+	return ApplyECHContext(context.Background(), c, config)
+}
+
+func ApplyECHContext(ctx context.Context, c *Config, config *tls.Config) error {
 	var ECHConfig []byte
 	var err error
 
@@ -69,7 +74,7 @@ func ApplyECH(c *Config, config *tls.Config) error {
 			if nameToQuery == "" {
 				return errors.New("Using DNS for ECH Config needs serverName or use Server format example.com+https://1.1.1.1/dns-query")
 			}
-			ECHConfig, err = QueryRecord(nameToQuery, DNSServer, c.EchSocketSettings)
+			ECHConfig, err = QueryRecordContext(ctx, nameToQuery, DNSServer, c.EchSocketSettings)
 			if err != nil {
 				return errors.New("Failed to query ECH DNS record for domain: ", nameToQuery, " at server: ", DNSServer).Base(err)
 			}
@@ -89,6 +94,20 @@ type ECHConfigCache struct {
 	configRecord atomic.Pointer[echConfigRecord]
 	// updateLock is not for preventing concurrent read/write, but for preventing concurrent update
 	UpdateLock sync.Mutex
+	mu         sync.Mutex
+	sealed     bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	key        string
+	owner      *internet.ResourceLifecycle
+	unregister func()
+	tasks      task.Lifecycle
+	clientsMu  sync.Mutex
+	clients    map[string]*http.Client
+	closeOnce  sync.Once
+	closeDone  chan struct{}
+	closeErr   error
+	query      func(context.Context, *ECHConfigCache, string, string, *internet.SocketConfig) ([]byte, uint32, error)
 }
 
 type echConfigRecord struct {
@@ -108,23 +127,50 @@ func ECHCacheKey(server, domain string, sockopt *internet.SocketConfig) string {
 	return server + "|" + domain + "|" + fmt.Sprintf("%p", sockopt)
 }
 
-// Update updates the ECH config for given domain and server.
-// this method is concurrent safe, only one update request will be sent, others get the cache.
-// if isLockedUpdate is true, it will not try to acquire the lock.
-func (c *ECHConfigCache) Update(domain string, server string, isLockedUpdate bool, sockopt *internet.SocketConfig) ([]byte, error) {
-	if !isLockedUpdate {
-		c.UpdateLock.Lock()
-		defer c.UpdateLock.Unlock()
+func ECHCacheKeyContext(ctx context.Context, server, domain string, sockopt *internet.SocketConfig) string {
+	ownerID := uint64(0)
+	if owner := internet.ResourceLifecycleFromContext(ctx); owner != nil {
+		ownerID = owner.ID()
 	}
+	if ownerID == 0 {
+		return ECHCacheKey(server, domain, sockopt)
+	}
+	return fmt.Sprintf("%d|%s", ownerID, ECHCacheKey(server, domain, sockopt))
+}
+
+func newECHConfigCache(ctx context.Context, key string, owner *internet.ResourceLifecycle) (*ECHConfigCache, error) {
+	ownerCtx := ctx
+	if owner != nil {
+		ownerCtx = owner.Context()
+	}
+	cacheCtx, cancel := context.WithCancel(ownerCtx)
+	cache := &ECHConfigCache{ctx: cacheCtx, cancel: cancel, key: key, owner: owner, clients: make(map[string]*http.Client), closeDone: make(chan struct{}), query: dnsQuery}
+	cache.configRecord.Store(&echConfigRecord{})
+	if owner != nil {
+		err := owner.RegisterBound(cache, func(unregister func()) {
+			cache.unregister = unregister
+		})
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	return cache, nil
+}
+
+func (c *ECHConfigCache) updateLocked(ctx context.Context, domain string, server string, sockopt *internet.SocketConfig) ([]byte, error) {
 	// Double check cache after acquiring lock
 	configRecord := c.configRecord.Load()
 	if configRecord.expire.After(time.Now()) {
-		errors.LogDebug(context.Background(), "Cache hit for domain after double check: ", domain)
-		return configRecord.config, nil
+		if config, ok := c.currentConfig(configRecord); ok {
+			errors.LogDebug(context.Background(), "Cache hit for domain after double check: ", domain)
+			return config, nil
+		}
+		return nil, errors.New("ECH cache retired while waiting for update")
 	}
 	// Query ECH config from DNS server
 	errors.LogDebug(context.Background(), "Trying to query ECH config for domain: ", domain, " with ECH server: ", server)
-	echConfig, ttl, err := dnsQuery(server, domain, sockopt)
+	echConfig, ttl, err := c.query(ctx, c, server, domain, sockopt)
 	if err != nil {
 		return nil, err
 	}
@@ -132,46 +178,191 @@ func (c *ECHConfigCache) Update(domain string, server string, isLockedUpdate boo
 		config: echConfig,
 		expire: time.Now().Add(time.Duration(ttl) * time.Second),
 	}
+	c.mu.Lock()
+	current, currentOK := GlobalECHConfigCache.Load(c.key)
+	if c.sealed || !currentOK || current != c {
+		c.mu.Unlock()
+		return nil, errors.New("ECH cache retired before publication")
+	}
 	c.configRecord.Store(configRecord)
+	c.mu.Unlock()
 	return configRecord.config, nil
+}
+
+func (c *ECHConfigCache) currentConfig(record *echConfigRecord) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current, ok := GlobalECHConfigCache.Load(c.key)
+	if c.sealed || !ok || current != c || c.configRecord.Load() != record {
+		return nil, false
+	}
+	return record.config, true
+}
+
+// Update retains the historical source-compatible entry point.
+func (c *ECHConfigCache) Update(domain string, server string, isLockedUpdate bool, sockopt *internet.SocketConfig) ([]byte, error) {
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if isLockedUpdate {
+		if !c.tasks.Acquire() {
+			return nil, errors.New("ECH cache is closed")
+		}
+		defer c.tasks.Release()
+		if c.query == nil {
+			c.query = dnsQuery
+		}
+		return c.updateLocked(ctx, domain, server, sockopt)
+	}
+	return c.UpdateContext(ctx, domain, server, sockopt)
+}
+
+// UpdateContext runs as one cache-generation task and serializes the exact query.
+func (c *ECHConfigCache) UpdateContext(ctx context.Context, domain string, server string, sockopt *internet.SocketConfig) ([]byte, error) {
+	if !c.tasks.Acquire() {
+		return nil, errors.New("ECH cache is closed")
+	}
+	defer c.tasks.Release()
+	c.UpdateLock.Lock()
+	defer c.UpdateLock.Unlock()
+	queryCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopRequest := context.AfterFunc(ctx, cancel)
+	stopOwner := context.AfterFunc(c.ctx, cancel)
+	defer func() { stopRequest(); stopOwner(); cancel() }()
+	return c.updateLocked(queryCtx, domain, server, sockopt)
 }
 
 // QueryRecord returns the ECH config for given domain.
 // If the record is not in cache or expired, it will query the DNS server and update the cache.
 func QueryRecord(domain string, server string, sockopt *internet.SocketConfig) ([]byte, error) {
-	GlobalECHConfigCacheKey := ECHCacheKey(server, domain, sockopt)
-	echConfigCache, ok := GlobalECHConfigCache.Load(GlobalECHConfigCacheKey)
+	return QueryRecordContext(context.Background(), domain, server, sockopt)
+}
+
+func QueryRecordContext(ctx context.Context, domain string, server string, sockopt *internet.SocketConfig) ([]byte, error) {
+	key := ECHCacheKeyContext(ctx, server, domain, sockopt)
+	owner := internet.ResourceLifecycleFromContext(ctx)
+	echConfigCache, ok := GlobalECHConfigCache.Load(key)
 	if !ok {
-		echConfigCache = &ECHConfigCache{}
-		echConfigCache.configRecord.Store(&echConfigRecord{})
-		echConfigCache, _ = GlobalECHConfigCache.LoadOrStore(GlobalECHConfigCacheKey, echConfigCache)
+		candidate, err := newECHConfigCache(ctx, key, owner)
+		if err != nil {
+			return nil, err
+		}
+		actual, loaded := GlobalECHConfigCache.LoadOrStore(key, candidate)
+		if loaded {
+			_ = candidate.Close()
+			echConfigCache = actual
+		} else {
+			candidate.mu.Lock()
+			publishable := !candidate.sealed && candidate.ctx.Err() == nil
+			candidate.mu.Unlock()
+			if !publishable {
+				GlobalECHConfigCache.CompareAndDelete(key, candidate)
+				_ = candidate.Close()
+				return nil, errors.New("ECH cache owner closed before publication")
+			}
+			echConfigCache = candidate
+		}
 	}
+	if !echConfigCache.tasks.Acquire() {
+		return nil, errors.New("ECH cache is closed")
+	}
+	defer echConfigCache.tasks.Release()
 	configRecord := echConfigCache.configRecord.Load()
 	if configRecord.expire.After(time.Now()) {
-		errors.LogDebug(context.Background(), "Cache hit for domain: ", domain)
-		return configRecord.config, nil
+		if config, ok := echConfigCache.currentConfig(configRecord); ok {
+			errors.LogDebug(context.Background(), "Cache hit for domain: ", domain)
+			return config, nil
+		}
+		return nil, errors.New("ECH cache retired before hit publication")
 	}
 
 	// If expire is zero value, it means we are in initial state, wait for the query to finish
 	// otherwise return old value immediately and update in a goroutine
 	// but if the cache is too old, wait for update
 	if configRecord.expire.IsZero() || configRecord.expire.Add(time.Hour*4).Before(time.Now()) {
-		return echConfigCache.Update(domain, server, false, sockopt)
+		return echConfigCache.UpdateContext(ctx, domain, server, sockopt)
 	} else {
 		// If someone already acquired the lock, it means it is updating, do not start another update goroutine
 		if echConfigCache.UpdateLock.TryLock() {
-			go func() {
-				defer echConfigCache.UpdateLock.Unlock()
-				echConfigCache.Update(domain, server, true, sockopt)
-			}()
+			if echConfigCache.tasks.Acquire() {
+				go func() {
+					defer echConfigCache.tasks.Release()
+					defer echConfigCache.UpdateLock.Unlock()
+					_, _ = echConfigCache.updateLocked(echConfigCache.ctx, domain, server, sockopt)
+				}()
+			} else {
+				echConfigCache.UpdateLock.Unlock()
+			}
 		}
-		return configRecord.config, nil
+		if config, ok := echConfigCache.currentConfig(configRecord); ok {
+			return config, nil
+		}
+		return nil, errors.New("ECH cache retired before stale publication")
 	}
+}
+
+func (c *ECHConfigCache) SignalStop() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if !c.sealed {
+		c.sealed = true
+		c.tasks.Seal()
+		c.cancel()
+	}
+	c.mu.Unlock()
+}
+
+func (c *ECHConfigCache) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.SignalStop()
+	c.closeOnce.Do(func() {
+		c.tasks.Wait()
+		c.clientsMu.Lock()
+		clients := c.clients
+		c.clients = nil
+		c.clientsMu.Unlock()
+		for _, client := range clients {
+			client.CloseIdleConnections()
+		}
+		GlobalECHConfigCache.CompareAndDelete(c.key, c)
+		if c.unregister != nil {
+			c.unregister()
+			c.unregister = nil
+		}
+		close(c.closeDone)
+	})
+	<-c.closeDone
+	return c.closeErr
+}
+
+func (c *ECHConfigCache) loadOrStoreClient(key string, candidate *http.Client) (*http.Client, error) {
+	if c.owner == nil {
+		client, _ := clientForECHDOH.LoadOrStore(key, candidate)
+		return client, nil
+	}
+	c.mu.Lock()
+	if c.sealed {
+		c.mu.Unlock()
+		return nil, errors.New("ECH cache is closed")
+	}
+	c.clientsMu.Lock()
+	c.mu.Unlock()
+	defer c.clientsMu.Unlock()
+	if client := c.clients[key]; client != nil {
+		return client, nil
+	}
+	c.clients[key] = candidate
+	return candidate, nil
 }
 
 // dnsQuery is the real func for sending type65 query for given domain to given DNS server.
 // return ECH config, TTL and error
-func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]byte, uint32, error) {
+func dnsQuery(ctx context.Context, cache *ECHConfigCache, server string, domain string, sockopt *internet.SocketConfig) ([]byte, uint32, error) {
 	m := new(dns.Msg)
 	var dnsResolve []byte
 	m.SetQuestion(dns.Fqdn(domain), dns.TypeHTTPS)
@@ -189,46 +380,48 @@ func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]b
 		if err != nil {
 			return nil, 0, err
 		}
-		var client *http.Client
-		serverKey := ECHCacheKey(server, "", sockopt)
-		if client, _ = clientForECHDOH.Load(serverKey); client == nil {
-			// All traffic sent by core should via xray's internet.DialSystem
-			// This involves the behavior of some Android VPN GUI clients
-			tr := &http2.Transport{
-				IdleConnTimeout: net.ConnIdleTimeout,
-				ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
-				DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-					dest, err := net.ParseDestination(network + ":" + addr)
+		serverKey := ECHCacheKeyContext(cache.ctx, server, "", sockopt)
+		// All traffic sent by core should via xray's internet.DialSystem.
+		tr := &http2.Transport{
+			IdleConnTimeout: net.ConnIdleTimeout,
+			ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				dest, err := net.ParseDestination(network + ":" + addr)
+				if err != nil {
+					return nil, err
+				}
+				var conn net.Conn
+
+				conn, err = internet.DialSystem(ctx, dest, sockopt)
+				if err != nil {
+					return nil, err
+				}
+
+				if !h2c {
+					u, err := url.Parse(server)
 					if err != nil {
+						_ = conn.Close()
 						return nil, err
 					}
-					var conn net.Conn
-
-					conn, err = internet.DialSystem(ctx, dest, sockopt)
-					if err != nil {
+					conn = utls.UClient(conn, &utls.Config{ServerName: u.Hostname()}, utls.HelloChrome_Auto)
+					if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
+						_ = conn.Close()
 						return nil, err
 					}
-
-					if !h2c {
-						u, err := url.Parse(server)
-						if err != nil {
-							return nil, err
-						}
-						conn = utls.UClient(conn, &utls.Config{ServerName: u.Hostname()}, utls.HelloChrome_Auto)
-						if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
-							return nil, err
-						}
-					}
-					return conn, nil
-				},
-			}
-			c := &http.Client{
-				Timeout:   30 * time.Second,
-				Transport: tr,
-			}
-			client, _ = clientForECHDOH.LoadOrStore(serverKey, c)
+				}
+				return conn, nil
+			},
 		}
-		req, err := http.NewRequest("POST", server, bytes.NewReader(msg))
+		candidate := &http.Client{Timeout: 30 * time.Second, Transport: tr}
+		client, err := cache.loadOrStoreClient(serverKey, candidate)
+		if err != nil {
+			tr.CloseIdleConnections()
+			return nil, 0, err
+		}
+		if client != candidate {
+			tr.CloseIdleConnections()
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", server, bytes.NewReader(msg))
 		if err != nil {
 			return nil, 0, err
 		}
@@ -266,7 +459,7 @@ func dnsQuery(server string, domain string, sockopt *internet.SocketConfig) ([]b
 		if err != nil {
 			return nil, 0, errors.New("failed to parse udp dns server ", udpServerURL.Host, " for ECH: ", err)
 		}
-		dnsTimeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		dnsTimeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		// use xray's internet.DialSystem as mentioned above
 		conn, err := internet.DialSystem(dnsTimeoutCtx, dest, sockopt)

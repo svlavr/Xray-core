@@ -54,10 +54,104 @@ type realmConnServer struct {
 	locals     []netip.AddrPort
 	localsMu   sync.Mutex
 	localsLast time.Time
+	lower      *contextCloser
+	closeOnce  sync.Once
+	closeErr   error
+	cleanupMu  sync.Mutex
+	cleanups   []sessionCleanupReceipt
+	cleanupTTL time.Duration
+}
+
+type sessionCleanupReceipt struct {
+	sessionID string
+	confirmed bool
+	err       error
+}
+
+type sessionEpoch struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	err      chan error
+	streamMu sync.Mutex
+	stream   *EventStream
+	sealed   bool
+}
+
+func newSessionEpoch(parent context.Context) *sessionEpoch {
+	ctx, cancel := context.WithCancel(parent)
+	return &sessionEpoch{ctx: ctx, cancel: cancel, err: make(chan error, 1)}
+}
+
+func (e *sessionEpoch) fail(err error) {
+	select {
+	case e.err <- err:
+	default:
+	}
+	e.cancel()
+	e.closeStream()
+}
+
+func (e *sessionEpoch) setStream(s *EventStream) bool {
+	e.streamMu.Lock()
+	if e.sealed {
+		e.streamMu.Unlock()
+		if s != nil {
+			_ = s.Close()
+		}
+		return false
+	}
+	e.stream = s
+	e.streamMu.Unlock()
+	return true
+}
+
+func (e *sessionEpoch) clearStream(s *EventStream) {
+	e.streamMu.Lock()
+	if e.stream == s {
+		e.stream = nil
+	}
+	e.streamMu.Unlock()
+}
+
+func (e *sessionEpoch) closeStream() {
+	e.streamMu.Lock()
+	e.sealed = true
+	stream := e.stream
+	e.stream = nil
+	e.streamMu.Unlock()
+	if stream != nil {
+		_ = stream.Close()
+	}
+}
+
+func (e *sessionEpoch) startChild(run func()) bool {
+	e.streamMu.Lock()
+	if e.sealed {
+		e.streamMu.Unlock()
+		return false
+	}
+	e.wg.Add(1)
+	e.streamMu.Unlock()
+	go func() {
+		defer e.wg.Done()
+		run()
+	}()
+	return true
 }
 
 func NewConnServer(config *Config, raw net.PacketConn) (net.PacketConn, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewConnServerContext(context.Background(), config, raw)
+}
+
+func NewConnServerContext(owner context.Context, config *Config, raw net.PacketConn) (net.PacketConn, error) {
+	ctx, cancel := context.WithCancel(owner)
+	lower := newContextCloser(ctx, raw)
+	rollback := func() {
+		cancel()
+		_ = lower.Close()
+		lower.StopAndJoin()
+	}
 
 	family := Family_Dual
 	switch config.IPMode {
@@ -72,9 +166,20 @@ func NewConnServer(config *Config, raw net.PacketConn) (net.PacketConn, error) {
 	if config.PortMapping != nil && config.PortMapping.Enabled {
 		var err error
 		start := time.Now()
-		mapper, err = NewPortMapper(context.Background(), raw.LocalAddr().(*net.UDPAddr).Port, PortMapConfig{Timeout: time.Duration(config.PortMapping.Timeout) * time.Second, Lifetime: time.Duration(config.PortMapping.Lifetime) * time.Second})
+		portMapConfig, err := portMapConfigFromProto(config.PortMapping)
 		if err != nil {
-			errors.LogErrorInner(context.Background(), err, "[realm] [port mapping] [", raw.LocalAddr().(*net.UDPAddr).Port, "] init failed after ", time.Since(start))
+			rollback()
+			return nil, err
+		}
+		udpAddr, ok := raw.LocalAddr().(*net.UDPAddr)
+		if !ok {
+			rollback()
+			return nil, errors.New("realm requires UDP packet connection")
+		}
+		mapper, err = NewPortMapper(ctx, udpAddr.Port, portMapConfig)
+		if err != nil {
+			rollback()
+			return nil, errors.New("realm port mapping init failed").Base(err)
 		} else {
 			errors.LogDebug(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] gateway ", mapper.GatewayType(), ", external ", mapper.ExternalAddr())
 			errors.LogDebug(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] init success with ", time.Since(start))
@@ -94,9 +199,12 @@ func NewConnServer(config *Config, raw net.PacketConn) (net.PacketConn, error) {
 		stunTimeout:   defaultSTUNTimeout,
 		punchTimeout:  defaultPunchTimeout,
 		punchInterval: defaultPunchInterval,
+		lower:         lower,
 
 		events: make(map[PunchMetadata]chan PunchPacketEvent),
 		stun:   make(chan STUNPacketEvent, defaultEventBuffer),
+
+		cleanupTTL: defaultPortMapTimeout,
 	}
 
 	if mapper != nil {
@@ -156,7 +264,7 @@ func (c *realmConnServer) waitctx(ctx context.Context, t time.Duration) bool {
 	}
 }
 
-func (c *realmConnServer) discover(servers []*net.UDPAddr) []netip.AddrPort {
+func (c *realmConnServer) discover(ctx context.Context, servers []*net.UDPAddr) []netip.AddrPort {
 	transactionIDs := make(map[[stun.TransactionIDSize]byte]struct{}, len(servers))
 	for _, server := range servers {
 		msg := common.Must2(stun.Build(stun.TransactionID, stun.BindingRequest))
@@ -168,7 +276,7 @@ func (c *realmConnServer) discover(servers []*net.UDPAddr) []netip.AddrPort {
 	results := make([]netip.AddrPort, 0, len(servers))
 	for len(transactionIDs) > 0 {
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			goto end
 		case <-deadline.C:
 			goto end
@@ -191,15 +299,15 @@ end:
 	return results
 }
 
-func (c *realmConnServer) getlocals(force bool) []netip.AddrPort {
+func (c *realmConnServer) getlocals(ctx context.Context, force bool) []netip.AddrPort {
 	c.localsMu.Lock()
 	if force || time.Since(c.localsLast) > defaultStunCacheTTL {
 		start := time.Now()
-		servers := resolveSTUNServers(c.PacketConn.LocalAddr().(*net.UDPAddr).IP, c.stunServers, c.family)
+		servers := resolveSTUNServers(ctx, c.PacketConn.LocalAddr().(*net.UDPAddr).IP, c.stunServers, c.family)
 		errors.LogDebug(context.Background(), "[realm] update stun servers ", servers, " with ", time.Since(start))
 		if len(servers) > 0 {
 			start = time.Now()
-			locals := c.discover(servers)
+			locals := c.discover(ctx, servers)
 			errors.LogDebug(context.Background(), "[realm] update stun locals ", locals, " with ", time.Since(start))
 			if len(locals) > 0 {
 				c.locals = locals
@@ -262,13 +370,13 @@ end:
 }
 
 func (c *realmConnServer) run() {
+	defer c.wg.Done()
 	backoff := time.Second
 retry:
-	resp, err := c.realmClient.Register(c.ctx, c.realmID, addrPortStrings(c.getlocals(false)))
+	resp, err := c.realmClient.Register(c.ctx, c.realmID, addrPortStrings(c.getlocals(c.ctx, false)))
 	if err != nil {
 		errors.LogErrorInner(context.Background(), err, "[realm] ", c.realmID, " register session err retry in ", backoff)
 		if c.waitctx(c.ctx, backoff) {
-			c.wg.Done()
 			return
 		}
 		backoff *= 2
@@ -280,46 +388,61 @@ retry:
 	backoff = time.Second
 	errors.LogDebug(context.Background(), "[realm] ", c.realmID, " sesssion ", resp.SessionID, " ", resp.TTL, " registered")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 2)
-	go c.heartbeatLoop(ctx, resp.SessionID, resp.TTL, errCh)
-	go c.eventsLoop(ctx, resp.SessionID, resp.TTL, errCh)
+	e := newSessionEpoch(c.ctx)
+	e.wg.Add(2)
+	go func() { defer e.wg.Done(); c.heartbeatLoop(e, resp.SessionID, resp.TTL) }()
+	go func() { defer e.wg.Done(); c.eventsLoop(e, resp.SessionID, resp.TTL) }()
 	select {
 	case <-c.ctx.Done():
-	case err = <-errCh:
+	case err = <-e.err:
 	}
-	cancel()
+	e.cancel()
+	e.closeStream()
+	e.wg.Wait()
 	errors.LogDebugInner(context.Background(), err, "[realm] session ", resp.SessionID, " end")
+	deregisterErr := c.deregisterSession(resp.SessionID)
+	if deregisterErr != nil {
+		errors.LogDebugInner(context.Background(), deregisterErr, "[realm] ", c.realmID, " ", resp.SessionID, " deregister unconfirmed")
+	} else {
+		errors.LogDebug(context.Background(), "[realm] ", c.realmID, " ", resp.SessionID, " deregistered")
+	}
 
 	select {
 	case <-c.ctx.Done():
-		_ = c.realmClient.Deregister(context.Background(), c.realmID, resp.SessionID)
-		errors.LogDebug(context.Background(), "[realm] ", c.realmID, " ", resp.SessionID, " deregistered")
-		c.wg.Done()
 		return
 	default:
 		goto retry
 	}
 }
 
-func (c *realmConnServer) heartbeatLoop(ctx context.Context, sid string, ttl int, errCh chan<- error) {
+func (c *realmConnServer) deregisterSession(sessionID string) error {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), c.cleanupTTL)
+	err := c.realmClient.Deregister(cleanupCtx, c.realmID, sessionID)
+	cleanupCancel()
+	c.cleanupMu.Lock()
+	c.cleanups = append(c.cleanups, sessionCleanupReceipt{sessionID: sessionID, confirmed: err == nil, err: err})
+	c.cleanupMu.Unlock()
+	return err
+}
+
+func (c *realmConnServer) heartbeatLoop(e *sessionEpoch, sid string, ttl int) {
+	ctx := e.ctx
 	interval := defaultHeartbeatInterval
 	if ttl > 0 {
 		interval = time.Second * time.Duration(ttl) / 2
 	}
 
 	last := time.Now()
-	cur := c.getlocals(false)
+	cur := c.getlocals(ctx, false)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			errCh <- nil
 			return
 		case <-ticker.C:
 			req := HeartbeatRequest{}
-			if new := c.getlocals(false); !slices.Equal(cur, new) {
+			if new := c.getlocals(ctx, false); !slices.Equal(cur, new) {
 				cur = new
 				req.Addresses = addrPortStrings(cur)
 			}
@@ -328,11 +451,11 @@ func (c *realmConnServer) heartbeatLoop(ctx context.Context, sid string, ttl int
 			if err != nil {
 				var statusErr *StatusError
 				if go_errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusNotFound) {
-					errCh <- errors.New("session invalid")
+					e.fail(errors.New("session invalid"))
 					return
 				}
 				if time.Since(last) > time.Second*time.Duration(ttl) {
-					errCh <- errors.New("session lost")
+					e.fail(errors.New("session lost"))
 					return
 				}
 				continue
@@ -347,7 +470,8 @@ func (c *realmConnServer) heartbeatLoop(ctx context.Context, sid string, ttl int
 	}
 }
 
-func (c *realmConnServer) eventsLoop(ctx context.Context, sid string, ttl int, errCh chan<- error) {
+func (c *realmConnServer) eventsLoop(e *sessionEpoch, sid string, ttl int) {
+	ctx := e.ctx
 	backoff := time.Second
 	last := time.Now()
 	for {
@@ -356,16 +480,15 @@ func (c *realmConnServer) eventsLoop(ctx context.Context, sid string, ttl int, e
 		if err != nil {
 			var statusErr *StatusError
 			if go_errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusNotFound) {
-				errCh <- errors.New("session invalid")
+				e.fail(errors.New("session invalid"))
 				return
 			}
 			if time.Since(last) > time.Second*time.Duration(ttl) {
-				errCh <- errors.New("session lost")
+				e.fail(errors.New("session lost"))
 				return
 			}
 			errors.LogDebugInner(context.Background(), err, "[realm] ", sid, " open stream err retry in ", backoff)
 			if c.waitctx(ctx, backoff) {
-				errCh <- nil
 				return
 			}
 			backoff *= 2
@@ -376,15 +499,26 @@ func (c *realmConnServer) eventsLoop(ctx context.Context, sid string, ttl int, e
 		}
 		backoff = time.Second
 		last = start
+		if !e.setStream(stream) {
+			return
+		}
 		errors.LogDebug(context.Background(), "[realm] open stream with ", time.Since(start))
 		for {
 			ev, err := stream.Next()
 			if err != nil {
 				_ = stream.Close()
+				e.clearStream(stream)
 				break
 			}
+			if ctx.Err() != nil {
+				_ = stream.Close()
+				e.clearStream(stream)
+				return
+			}
 			last = time.Now()
-			go c.punchEvent(ctx, sid, ev)
+			if !e.startChild(func() { c.punchEvent(ctx, sid, ev) }) {
+				return
+			}
 		}
 	}
 }
@@ -392,7 +526,7 @@ func (c *realmConnServer) eventsLoop(ctx context.Context, sid string, ttl int, e
 func (c *realmConnServer) punchEvent(ctx context.Context, sid string, ev *PunchEvent) {
 	errors.LogDebug(context.Background(), "[realm] start punch event ", ev.Nonce, " ", ev.Addresses)
 
-	locals := c.getlocals(false)
+	locals := c.getlocals(ctx, false)
 
 	peers, _ := parseAddrPorts(ev.Addresses)
 	errors.LogDebug(context.Background(), "[realm] ", ev.Nonce, " update peers ", peers)
@@ -433,7 +567,12 @@ func (c *realmConnServer) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *realmConnServer) Close() error {
-	c.cancel()
-	c.wg.Wait()
-	return c.PacketConn.Close()
+	c.closeOnce.Do(func() {
+		c.cancel()
+		c.closeErr = c.lower.Close()
+		c.lower.StopAndJoin()
+		c.wg.Wait()
+		c.realmClient.Close()
+	})
+	return c.closeErr
 }

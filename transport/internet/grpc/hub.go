@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	goreality "github.com/xtls/reality"
@@ -25,29 +26,109 @@ type Listener struct {
 	config               *Config
 	trustedXForwardedFor []string
 
-	s *grpc.Server
+	s           *grpc.Server
+	listener    net.Listener
+	lifecycle   *internet.InboundLifecycle
+	cancel      context.CancelFunc
+	mu          sync.Mutex
+	closed      bool
+	connections map[net.Conn]struct{}
 }
 
-func (l Listener) Tun(server encoding.GRPCService_TunServer) error {
+type inboundConnection struct {
+	net.Conn
+	handoff *internet.InboundHandoff
+}
+
+func (c *inboundConnection) AcceptInboundHandoff() bool { return c.handoff.Accept() }
+func (c *inboundConnection) RejectInboundHandoff()      { c.handoff.Reject() }
+
+func (l *Listener) Tun(server encoding.GRPCService_TunServer) error {
+	if l.lifecycle == nil {
+		tunCtx, cancel := context.WithCancel(l.ctx)
+		l.handler(encoding.NewHunkConn(server, cancel, l.trustedXForwardedFor))
+		<-tunCtx.Done()
+		return nil
+	}
+	if !l.register() {
+		return context.Canceled
+	}
 	tunCtx, cancel := context.WithCancel(l.ctx)
-	l.handler(encoding.NewHunkConn(server, cancel, l.trustedXForwardedFor))
+	conn := &inboundConnection{Conn: encoding.NewHunkConn(server, cancel, l.trustedXForwardedFor), handoff: new(internet.InboundHandoff)}
+	if !l.addConnection(conn) {
+		cancel()
+		conn.Close()
+		l.lifecycle.Release()
+		return context.Canceled
+	}
+	defer func() {
+		l.removeConnection(conn)
+		conn.Close()
+		l.lifecycle.Release()
+	}()
+	l.handler(conn)
 	<-tunCtx.Done()
 	return nil
 }
 
-func (l Listener) TunMulti(server encoding.GRPCService_TunMultiServer) error {
+func (l *Listener) TunMulti(server encoding.GRPCService_TunMultiServer) error {
+	if l.lifecycle == nil {
+		tunCtx, cancel := context.WithCancel(l.ctx)
+		l.handler(encoding.NewMultiHunkConn(server, cancel, l.trustedXForwardedFor))
+		<-tunCtx.Done()
+		return nil
+	}
+	if !l.register() {
+		return context.Canceled
+	}
 	tunCtx, cancel := context.WithCancel(l.ctx)
-	l.handler(encoding.NewMultiHunkConn(server, cancel, l.trustedXForwardedFor))
+	conn := &inboundConnection{Conn: encoding.NewMultiHunkConn(server, cancel, l.trustedXForwardedFor), handoff: new(internet.InboundHandoff)}
+	if !l.addConnection(conn) {
+		cancel()
+		conn.Close()
+		l.lifecycle.Release()
+		return context.Canceled
+	}
+	defer func() {
+		l.removeConnection(conn)
+		conn.Close()
+		l.lifecycle.Release()
+	}()
+	l.handler(conn)
 	<-tunCtx.Done()
 	return nil
 }
 
-func (l Listener) Close() error {
+func (l *Listener) Close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	connections := make([]net.Conn, 0, len(l.connections))
+	for conn := range l.connections {
+		connections = append(connections, conn)
+	}
+	l.mu.Unlock()
+	if l.lifecycle != nil && l.cancel != nil {
+		l.cancel()
+	}
+	var closeErrors []error
+	if l.listener != nil {
+		closeErrors = append(closeErrors, l.listener.Close())
+	}
+	if l.lifecycle != nil {
+		for _, conn := range connections {
+			internet.RejectInboundHandoff(conn)
+			closeErrors = append(closeErrors, conn.Close())
+		}
+	}
 	l.s.Stop()
-	return nil
+	return errors.Combine(closeErrors...)
 }
 
-func (l Listener) Addr() net.Addr {
+func (l *Listener) Addr() net.Addr {
 	return l.local
 }
 
@@ -74,7 +155,12 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 		}
 	}
 
+	listener.lifecycle = internet.InboundLifecycleFromContext(ctx)
 	listener.ctx = ctx
+	if listener.lifecycle != nil {
+		listener.ctx, listener.cancel = context.WithCancel(ctx)
+	}
+	listener.connections = make(map[net.Conn]struct{})
 	if settings.SocketSettings != nil {
 		listener.trustedXForwardedFor = settings.SocketSettings.TrustedXForwardedFor
 	}
@@ -101,45 +187,88 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 		errors.LogWarning(ctx, "accepting PROXY protocol")
 	}
 
+	var (
+		streamListener net.Listener
+		err            error
+	)
+	if port == net.Port(0) { // unix
+		streamListener, err = internet.ListenSystem(listener.ctx, &net.UnixAddr{
+			Name: address.Domain(),
+			Net:  "unix",
+		}, settings.SocketSettings)
+	} else { // tcp
+		streamListener, err = internet.ListenSystem(listener.ctx, &net.TCPAddr{
+			IP:   address.IP(),
+			Port: int(port),
+		}, settings.SocketSettings)
+	}
+	if err != nil {
+		if listener.cancel != nil {
+			listener.cancel()
+		}
+		return nil, errors.New("failed to listen gRPC on ", address, ":", port).Base(err)
+	}
+	if settings.TcpmaskManager != nil {
+		boundListener := streamListener
+		streamListener, err = settings.TcpmaskManager.WrapListener(boundListener)
+		if err != nil {
+			boundListener.Close()
+			if listener.cancel != nil {
+				listener.cancel()
+			}
+			return nil, errors.New("failed to wrap gRPC listener").Base(err)
+		}
+	}
+	listener.listener = streamListener
+	encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
+	if config := reality.ConfigFromStreamSettings(settings); config != nil {
+		streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
+		listener.listener = streamListener
+	}
+	if !listener.lifecycle.Acquire() {
+		listener.Close()
+		return nil, errors.New("inbound listener is closing")
+	}
 	go func() {
-		var streamListener net.Listener
-		var err error
-		if port == net.Port(0) { // unix
-			streamListener, err = internet.ListenSystem(ctx, &net.UnixAddr{
-				Name: address.Domain(),
-				Net:  "unix",
-			}, settings.SocketSettings)
-			if err != nil {
-				errors.LogErrorInner(ctx, err, "failed to listen on ", address)
-				return
-			}
-		} else { // tcp
-			streamListener, err = internet.ListenSystem(ctx, &net.TCPAddr{
-				IP:   address.IP(),
-				Port: int(port),
-			}, settings.SocketSettings)
-			if err != nil {
-				errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
-				return
-			}
-		}
-
-		if settings.TcpmaskManager != nil {
-			streamListener, _ = settings.TcpmaskManager.WrapListener(streamListener)
-		}
+		defer listener.lifecycle.Release()
 
 		errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")
-		encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
-
-		if config := reality.ConfigFromStreamSettings(settings); config != nil {
-			streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
-		}
-		if err = s.Serve(streamListener); err != nil {
-			errors.LogInfoInner(ctx, err, "Listener for gRPC ended")
+		if serveErr := s.Serve(streamListener); serveErr != nil {
+			errors.LogInfoInner(ctx, serveErr, "Listener for gRPC ended")
 		}
 	}()
 
 	return listener, nil
+}
+
+func (l *Listener) register() bool {
+	if !l.lifecycle.Acquire() {
+		return false
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		l.lifecycle.Release()
+		return false
+	}
+	l.mu.Unlock()
+	return true
+}
+
+func (l *Listener) addConnection(conn net.Conn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return false
+	}
+	l.connections[conn] = struct{}{}
+	return true
+}
+
+func (l *Listener) removeConnection(conn net.Conn) {
+	l.mu.Lock()
+	delete(l.connections, conn)
+	l.mu.Unlock()
 }
 
 func init() {

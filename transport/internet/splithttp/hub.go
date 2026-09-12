@@ -25,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
@@ -74,19 +75,23 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 		isFullyConnected: done.New(),
 	}
 
+	if !h.ln.acquire() {
+		_ = s.uploadQueue.Close()
+		return nil
+	}
 	h.sessions.Store(sessionId, s)
-
-	shouldReap := done.New()
 	go func() {
-		time.Sleep(30 * time.Second)
-		shouldReap.Close()
-	}()
-	go func() {
+		defer h.ln.release()
+		timer := time.NewTimer(30 * time.Second)
+		defer timer.Stop()
 		select {
-		case <-shouldReap.Wait():
-			h.sessions.Delete(sessionId)
-			s.uploadQueue.Close()
+		case <-timer.C:
+			h.deleteSession(sessionId, s)
+			_ = s.uploadQueue.Close()
 		case <-s.isFullyConnected.Wait():
+		case <-h.ln.stop:
+			h.deleteSession(sessionId, s)
+			_ = s.uploadQueue.Close()
 		}
 	}()
 
@@ -94,6 +99,11 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 }
 
 func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if !h.ln.acquire() {
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	defer h.ln.release()
 	if len(h.host) > 0 && !internet.IsValidHTTPHost(request.Host, h.host) {
 		errors.LogInfo(context.Background(), "failed to validate host, request:", request.Host, ", config:", h.host)
 		writer.WriteHeader(http.StatusNotFound)
@@ -181,6 +191,10 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	var currentSession *httpSession
 	if sessionId != "" {
 		currentSession = h.upsertSession(sessionId)
+		if currentSession == nil {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 	}
 	scMaxEachPostBytes := int(h.ln.config.GetNormalizedScMaxEachPostBytes().To)
 	isUplinkRequest := false
@@ -219,15 +233,20 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 				scStreamUpServerSecs := h.config.GetNormalizedScStreamUpServerSecs()
 				hasLegacyRefererCompatMarker := request.Header.Get("Referer") != ""
 				if (hasLegacyRefererCompatMarker || obfsPaddingAccepted) && scStreamUpServerSecs.To > 0 {
-					go func() {
-						for {
-							_, err := httpSC.Write(bytes.Repeat([]byte{'X'}, int(h.config.GetNormalizedXPaddingBytes().rand())))
-							if err != nil {
-								break
+					if h.ln.acquire() {
+						go func() {
+							defer h.ln.release()
+							for {
+								_, err := httpSC.Write(bytes.Repeat([]byte{'X'}, int(h.config.GetNormalizedXPaddingBytes().rand())))
+								if err != nil {
+									break
+								}
+								if !h.ln.waitPadding(time.Duration(scStreamUpServerSecs.rand())*time.Second, httpSC) {
+									return
+								}
 							}
-							time.Sleep(time.Duration(scStreamUpServerSecs.rand()) * time.Second)
-						}
-					}()
+						}()
+					}
 				}
 				select {
 				case <-request.Context().Done():
@@ -351,7 +370,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
 			currentSession.isFullyConnected.Close()
-			defer h.sessions.Delete(sessionId)
+			defer h.deleteSession(sessionId, currentSession)
 		}
 
 		// magic header instructs nginx + apache to not buffer response body
@@ -431,18 +450,70 @@ func (c *httpServerConn) Close() error {
 
 type Listener struct {
 	sync.Mutex
-	server     http.Server
-	h3server   *http3.Server
-	listener   net.Listener
-	h3listener http3.QUICListener
-	config     *Config
-	addConn    internet.ConnHandler
-	isH3       bool
+	server      http.Server
+	h3server    *http3.Server
+	listener    net.Listener
+	h3listener  http3.QUICListener
+	config      *Config
+	addConn     internet.ConnHandler
+	isH3        bool
+	tasks       task.Lifecycle
+	inbound     *internet.InboundLifecycle
+	stop        chan struct{}
+	stopOnce    sync.Once
+	stopRun     sync.Once
+	stopDone    chan struct{}
+	unblockDone chan struct{}
+	stopErr     error
+	handler     *requestHandler
+}
+
+func (ln *Listener) acquire() bool {
+	if !ln.tasks.Acquire() {
+		return false
+	}
+	if ln.inbound != nil && !ln.inbound.Acquire() {
+		ln.tasks.Release()
+		return false
+	}
+	return true
+}
+
+func (ln *Listener) release() {
+	if ln.inbound != nil {
+		ln.inbound.Release()
+	}
+	ln.tasks.Release()
+}
+
+func (ln *Listener) waitPadding(delay time.Duration, conn *httpServerConn) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ln.stop:
+		return false
+	case <-conn.Wait():
+		return false
+	}
+}
+
+func (h *requestHandler) deleteSession(id string, expected *httpSession) {
+	h.sessionMu.Lock()
+	if actual, ok := h.sessions.Load(id); ok && actual == expected {
+		h.sessions.Delete(id)
+	}
+	h.sessionMu.Unlock()
 }
 
 func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
 	l := &Listener{
-		addConn: addConn,
+		addConn:     addConn,
+		inbound:     internet.InboundLifecycleFromContext(ctx),
+		stop:        make(chan struct{}),
+		stopDone:    make(chan struct{}),
+		unblockDone: make(chan struct{}),
 	}
 	l.config = streamSettings.ProtocolSettings.(*Config)
 	if l.config != nil {
@@ -459,6 +530,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		sessions:       sync.Map{},
 		socketSettings: streamSettings.SocketSettings,
 	}
+	l.handler = handler
 	tlsConfig := getTLSConfig(streamSettings)
 	l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
 
@@ -473,7 +545,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		}
 		errors.LogInfo(ctx, "listening UNIX domain socket for XHTTP on ", address)
 	} else if l.isH3 { // quic
-		Conn, err := internet.ListenSystemPacket(context.Background(), &net.UDPAddr{
+		Conn, err := internet.ListenSystemPacket(ctx, &net.UDPAddr{
 			IP:   address.IP(),
 			Port: int(port),
 		}, streamSettings.SocketSettings)
@@ -481,7 +553,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			return nil, errors.New("failed to listen UDP for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 		if streamSettings.UdpmaskManager != nil {
-			newConn, err := streamSettings.UdpmaskManager.WrapPacketConnServer(Conn)
+			newConn, err := streamSettings.UdpmaskManager.WrapPacketConnServerContext(ctx, Conn)
 			if err != nil {
 				Conn.Close()
 				return nil, errors.New("mask err").Base(err)
@@ -516,6 +588,8 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 
 		l.h3listener, err = tr.ListenEarly(tlsConfig, quicConfig)
 		if err != nil {
+			_ = tr.Close()
+			_ = Conn.Close()
 			return nil, errors.New("failed to listen QUIC for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 		l.h3listener = &QListener{
@@ -529,7 +603,14 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		l.h3server = &http3.Server{
 			Handler: handler,
 		}
+		if !l.acquire() {
+			_ = l.h3listener.Close()
+			_ = tr.Close()
+			_ = Conn.Close()
+			return nil, errors.New("SplitHTTP listener is closing")
+		}
 		go func() {
+			defer l.release()
 			if err := l.h3server.ServeListener(l.h3listener); err != nil {
 				errors.LogErrorInner(ctx, err, "failed to serve HTTP/3 for XHTTP/3")
 			}
@@ -574,7 +655,12 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
 			Protocols:         protocols,
 		}
+		if !l.acquire() {
+			_ = l.listener.Close()
+			return nil, errors.New("SplitHTTP listener is closing")
+		}
 		go func() {
+			defer l.release()
 			if err := l.server.Serve(l.listener); err != nil {
 				errors.LogErrorInner(ctx, err, "failed to serve HTTP for XHTTP")
 			}
@@ -597,12 +683,90 @@ func (ln *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
-	if ln.h3server != nil {
-		return ln.h3server.Close()
-	} else if ln.listener != nil {
-		return ln.listener.Close()
+	ln.Seal()
+	err := ln.Stop()
+	return errors.Combine(err, ln.Wait(), ln.Release())
+}
+
+func (ln *Listener) Seal() {
+	ln.tasks.Seal()
+	ln.stopOnce.Do(func() { close(ln.stop) })
+}
+
+func (ln *Listener) Stop() error {
+	ln.Seal()
+	ln.stopRun.Do(func() {
+		ln.Lock()
+		server, h3server, listener, h3listener, handler := &ln.server, ln.h3server, ln.listener, ln.h3listener, ln.handler
+		ln.Unlock()
+		var queues []*uploadQueue
+		if handler != nil {
+			handler.sessionMu.Lock()
+			handler.sessions.Range(func(_, value any) bool {
+				queues = append(queues, value.(*httpSession).uploadQueue)
+				return true
+			})
+			handler.sessionMu.Unlock()
+		}
+		go func() {
+			results := make(chan error, len(queues)+1)
+			peers := 0
+			if h3server != nil {
+				peers++
+				go func() { results <- h3server.Close() }()
+			} else if server.Handler != nil {
+				peers++
+				go func() { results <- server.Close() }()
+			} else if listener != nil {
+				peers++
+				go func() { results <- listener.Close() }()
+			} else if h3listener != nil {
+				peers++
+				go func() { results <- h3listener.Close() }()
+			}
+			for _, queue := range queues {
+				peers++
+				go func(q *uploadQueue) { results <- q.Close() }(queue)
+			}
+			var closeErrors []error
+			for range peers {
+				closeErrors = append(closeErrors, <-results)
+			}
+			ln.stopErr = errors.Combine(closeErrors...)
+			close(ln.unblockDone)
+		}()
+		close(ln.stopDone)
+	})
+	<-ln.stopDone
+	return nil
+}
+
+func (ln *Listener) Wait() error {
+	_ = ln.Stop()
+	<-ln.unblockDone
+	ln.tasks.Wait()
+	return ln.stopErr
+}
+
+func (ln *Listener) Release() error {
+	if err := ln.Wait(); err != nil {
+		return err
 	}
-	return errors.New("listener does not have an HTTP/3 server or a net.listener")
+	if ln.handler == nil {
+		return nil
+	}
+	ln.handler.sessionMu.Lock()
+	var queues []*uploadQueue
+	ln.handler.sessions.Range(func(key, value any) bool {
+		queues = append(queues, value.(*httpSession).uploadQueue)
+		ln.handler.sessions.Delete(key)
+		return true
+	})
+	ln.handler.sessionMu.Unlock()
+	for _, queue := range queues {
+		_ = queue.Close()
+	}
+	return nil
 }
 
 func getTLSConfig(streamSettings *internet.MemoryStreamConfig) *gotls.Config {

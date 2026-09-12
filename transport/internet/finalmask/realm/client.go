@@ -30,10 +30,29 @@ type realmConnClient struct {
 	stunTimeout   time.Duration
 	punchTimeout  time.Duration
 	punchInterval time.Duration
+	lower         *contextCloser
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 func NewConnClient(config *Config, raw net.PacketConn) (net.PacketConn, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	return NewConnClientContext(context.Background(), config, raw)
+}
+
+func NewConnClientContext(owner context.Context, config *Config, raw net.PacketConn) (net.PacketConn, error) {
+	return newConnClientContext(owner, config, raw, NewPortMapper)
+}
+
+type portMapperFactory func(context.Context, int, PortMapConfig) (*PortMapper, error)
+
+func newConnClientContext(owner context.Context, config *Config, raw net.PacketConn, createMapper portMapperFactory) (net.PacketConn, error) {
+	ctx, cancel := context.WithCancel(owner)
+	lower := newContextCloser(ctx, raw)
+	rollback := func() {
+		cancel()
+		_ = lower.Close()
+		lower.StopAndJoin()
+	}
 
 	family := Family_Dual
 	switch config.IPMode {
@@ -48,9 +67,20 @@ func NewConnClient(config *Config, raw net.PacketConn) (net.PacketConn, error) {
 	if config.PortMapping != nil && config.PortMapping.Enabled {
 		var err error
 		start := time.Now()
-		mapper, err = NewPortMapper(context.Background(), raw.LocalAddr().(*net.UDPAddr).Port, PortMapConfig{Timeout: time.Duration(config.PortMapping.Timeout) * time.Second, Lifetime: time.Duration(config.PortMapping.Lifetime) * time.Second})
+		portMapConfig, err := portMapConfigFromProto(config.PortMapping)
 		if err != nil {
-			errors.LogErrorInner(context.Background(), err, "[realm] [port mapping] [", raw.LocalAddr().(*net.UDPAddr).Port, "] init failed after ", time.Since(start))
+			rollback()
+			return nil, err
+		}
+		udpAddr, ok := raw.LocalAddr().(*net.UDPAddr)
+		if !ok {
+			rollback()
+			return nil, errors.New("realm requires UDP packet connection")
+		}
+		mapper, err = createMapper(ctx, udpAddr.Port, portMapConfig)
+		if err != nil {
+			rollback()
+			return nil, errors.New("realm port mapping init failed").Base(err)
 		} else {
 			errors.LogDebug(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] gateway ", mapper.GatewayType(), ", external ", mapper.ExternalAddr())
 			errors.LogDebug(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] init success with ", time.Since(start))
@@ -70,13 +100,19 @@ func NewConnClient(config *Config, raw net.PacketConn) (net.PacketConn, error) {
 		stunTimeout:   defaultSTUNTimeout,
 		punchTimeout:  defaultPunchTimeout,
 		punchInterval: defaultPunchInterval,
+		lower:         lower,
 	}
-	return conn.getpeer()
+	wrapped, err := conn.getpeer()
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return wrapped, nil
 }
 
 func (c *realmConnClient) getpeer() (net.PacketConn, error) {
 	start := time.Now()
-	servers := resolveSTUNServers(c.PacketConn.LocalAddr().(*net.UDPAddr).IP, c.stunServers, c.family)
+	servers := resolveSTUNServers(c.ctx, c.PacketConn.LocalAddr().(*net.UDPAddr).IP, c.stunServers, c.family)
 	errors.LogDebug(context.Background(), "[realm] update stun servers ", servers, " with ", time.Since(start))
 	if len(servers) == 0 {
 		return nil, errors.New("empty locals")
@@ -92,7 +128,7 @@ func (c *realmConnClient) getpeer() (net.PacketConn, error) {
 	meta := common.Must2(NewPunchMetadata())
 
 	start = time.Now()
-	resp, err := c.realmClient.Connect(context.Background(), c.realmID, ConnectRequest{
+	resp, err := c.realmClient.Connect(c.ctx, c.realmID, ConnectRequest{
 		Addresses:     addrPortStrings(locals),
 		PunchMetadata: meta,
 	})
@@ -211,10 +247,19 @@ func (c *realmConnClient) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (c *realmConnClient) Close() error {
-	// Sadly, closing the core does not first close the sockets created for outbound connections
-	c.cancel()
-	c.wg.Wait()
-	return nil
+	c.closeOnce.Do(func() {
+		c.cancel()
+		lowerErr := c.lower.Close()
+		c.lower.StopAndJoin()
+		var mapperErr error
+		if c.mapper != nil {
+			mapperErr = c.mapper.Close()
+		}
+		c.wg.Wait()
+		c.realmClient.Close()
+		c.closeErr = errors.Combine(lowerErr, mapperErr)
+	})
+	return c.closeErr
 }
 
 func portMapLoop(ctx context.Context, mapper *PortMapper, done func()) {
@@ -223,11 +268,14 @@ func portMapLoop(ctx context.Context, mapper *PortMapper, done func()) {
 		done()
 		errors.LogDebug(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] removed with ", err)
 	}()
-	interval := mapper.Lifetime() / 2
-	if interval <= 0 {
-		interval = time.Minute
+	nextInterval := func() time.Duration {
+		interval := mapper.Lifetime() / 2
+		if interval <= 0 {
+			return time.Minute
+		}
+		return interval
 	}
-	t := time.NewTicker(interval)
+	t := time.NewTimer(nextInterval())
 	defer t.Stop()
 	failing := false
 	for {
@@ -244,6 +292,7 @@ func portMapLoop(ctx context.Context, mapper *PortMapper, done func()) {
 					errors.LogError(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] renewal failed")
 					failing = true
 				}
+				t.Reset(nextInterval())
 				continue
 			}
 			errors.LogDebug(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] external ", mapper.ExternalAddr(), ", changed ", changed)
@@ -251,6 +300,7 @@ func portMapLoop(ctx context.Context, mapper *PortMapper, done func()) {
 				errors.LogError(context.Background(), "[realm] [port mapping] [", mapper.InternalPort(), "] recovered")
 				failing = false
 			}
+			t.Reset(nextInterval())
 		}
 	}
 }

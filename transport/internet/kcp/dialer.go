@@ -3,7 +3,6 @@ package kcp
 import (
 	"context"
 	"io"
-	reflect "reflect"
 	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
@@ -11,7 +10,6 @@ import (
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -46,6 +44,17 @@ func fetchInput(_ context.Context, input io.Reader, reader PacketReader, conn *C
 	}
 }
 
+func (c *Connection) startInput(ctx context.Context, input io.Reader, reader PacketReader) bool {
+	if !c.tasks.Acquire() {
+		return false
+	}
+	go func() {
+		defer c.tasks.Release()
+		fetchInput(ctx, input, reader, c)
+	}()
+	return true
+}
+
 // DialKCP dials a new KCP connections to the specific destination.
 func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	dest.Network = net.Network_UDP
@@ -57,21 +66,14 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 	}
 
 	if streamSettings.UdpmaskManager != nil {
-		var pktConn net.PacketConn
-		var udpAddr *net.UDPAddr
-		switch c := conn.(type) {
-		case *internet.PacketConnWrapper:
-			pktConn = c.PacketConn
-			udpAddr = c.RemoteAddr().(*net.UDPAddr)
-		case *cnc.Connection:
-			pktConn = &internet.FakePacketConn{Conn: c}
-			udpAddr = &net.UDPAddr{IP: c.RemoteAddr().(*net.TCPAddr).IP, Port: c.RemoteAddr().(*net.TCPAddr).Port}
-		default:
-			panic(reflect.TypeOf(c))
-		}
-		newConn, err := streamSettings.UdpmaskManager.WrapPacketConnClient(pktConn)
+		pktConn, udpAddr, err := internet.PacketConnView(conn)
 		if err != nil {
-			pktConn.Close()
+			_ = conn.Close()
+			return nil, err
+		}
+		newConn, err := streamSettings.UdpmaskManager.WrapPacketConnClientContext(ctx, pktConn)
+		if err != nil {
+			_ = conn.Close()
 			return nil, errors.New("mask err").Base(err)
 		}
 		pktConn = newConn
@@ -92,12 +94,16 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 		Conversation: conv,
 	}, conn, conn, kcpSettings)
 
-	go fetchInput(ctx, conn, reader, session)
+	if !session.startInput(ctx, conn, reader) {
+		_ = session.Stop()
+		_ = session.Release()
+		return nil, ErrClosedConnection
+	}
 
 	var iConn stat.Connection = session
 
 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
-		iConn = tls.Client(iConn, config.GetTLSConfig(tls.WithDestination(dest)))
+		iConn = tls.Client(iConn, config.GetTLSConfigContext(ctx, tls.WithDestination(dest)))
 	}
 
 	return iConn, nil

@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -99,13 +100,7 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal 
 		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: 1})
 	}
 
-	tnet := &Net{
-		DialContextTCPAddrPort: dev.DialContextTCPAddrPort,
-		DialUDPAddrPort:        dev.DialUDPAddrPort,
-		dnsServers:             dev.dnsServers,
-		hasV4:                  dev.hasV4,
-		hasV6:                  dev.hasV6,
-	}
+	tnet := newNet(dev.DialContextTCPAddrPort, dev.DialUDPAddrPort, dev.dnsServers, dev.hasV4, dev.hasV6)
 
 	dev.events <- tun.EventUp
 	return dev, tnet, dev.stack, nil
@@ -199,7 +194,7 @@ func (tun *netTun) DialContextTCPAddrPort(ctx context.Context, addr netip.AddrPo
 	return gonet.DialContextTCP(ctx, tun.stack, fa, pn)
 }
 
-func (tun *netTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (net.Conn, error) {
+func (tun *netTun) DialUDPAddrPort(_ context.Context, laddr, raddr netip.AddrPort) (net.Conn, error) {
 	var pn tcpip.NetworkProtocolNumber = ipv6.ProtocolNumber
 	if raddr.IsValid() || raddr.Port() > 0 {
 		_, pn = convertToFullAddr(raddr)
@@ -216,10 +211,106 @@ func (tun *netTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (net.Conn, error
 
 type Net struct {
 	DialContextTCPAddrPort func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
-	DialUDPAddrPort        func(laddr, raddr netip.AddrPort) (net.Conn, error)
+	DialUDPAddrPort        func(ctx context.Context, laddr, raddr netip.AddrPort) (net.Conn, error)
 	dnsServers             []netip.Addr
 	hasV4, hasV6           bool
+	connections            netConnectionRegistry
 }
+
+type netConnectionRegistry struct {
+	mu     sync.Mutex
+	sealed bool
+	items  map[*trackedNetConnection]struct{}
+}
+
+type trackedNetConnection struct {
+	net.Conn
+	owner  *netConnectionRegistry
+	stopMu sync.Mutex
+	stop   func() bool
+	closed bool
+	once   sync.Once
+	err    error
+}
+
+func newNet(tcp func(context.Context, netip.AddrPort) (net.Conn, error), udp func(context.Context, netip.AddrPort, netip.AddrPort) (net.Conn, error), dnsServers []netip.Addr, hasV4, hasV6 bool) *Net {
+	n := &Net{dnsServers: dnsServers, hasV4: hasV4, hasV6: hasV6}
+	n.connections.items = make(map[*trackedNetConnection]struct{})
+	n.DialContextTCPAddrPort = func(ctx context.Context, address netip.AddrPort) (net.Conn, error) {
+		conn, err := tcp(ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return n.connections.adopt(ctx, conn)
+	}
+	n.DialUDPAddrPort = func(ctx context.Context, local, remote netip.AddrPort) (net.Conn, error) {
+		conn, err := udp(ctx, local, remote)
+		if err != nil {
+			return nil, err
+		}
+		return n.connections.adopt(ctx, conn)
+	}
+	return n
+}
+
+func (r *netConnectionRegistry) adopt(ctx context.Context, conn net.Conn) (net.Conn, error) {
+	tracked := &trackedNetConnection{Conn: conn, owner: r}
+	r.mu.Lock()
+	if r.sealed {
+		r.mu.Unlock()
+		return nil, errors.Join(errors.New("WireGuard network is closed"), conn.Close())
+	}
+	r.items[tracked] = struct{}{}
+	r.mu.Unlock()
+	tracked.setStop(context.AfterFunc(ctx, func() { _ = tracked.Close() }))
+	return tracked, nil
+}
+
+func (r *netConnectionRegistry) closeAll() {
+	r.mu.Lock()
+	r.sealed = true
+	connections := make([]*trackedNetConnection, 0, len(r.items))
+	for conn := range r.items {
+		connections = append(connections, conn)
+	}
+	r.mu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+}
+
+func (c *trackedNetConnection) Close() error {
+	c.once.Do(func() {
+		c.stopMu.Lock()
+		stop := c.stop
+		c.stop = nil
+		c.closed = true
+		c.stopMu.Unlock()
+		if stop != nil {
+			stop()
+		}
+		c.err = c.Conn.Close()
+		c.owner.mu.Lock()
+		delete(c.owner.items, c)
+		c.owner.mu.Unlock()
+	})
+	return c.err
+}
+
+func (c *trackedNetConnection) UnwrapConnection() net.Conn { return c.Conn }
+
+func (c *trackedNetConnection) setStop(stop func() bool) {
+	c.stopMu.Lock()
+	if c.closed {
+		c.stopMu.Unlock()
+		stop()
+		return
+	}
+	c.stop = stop
+	c.stopMu.Unlock()
+}
+
+func (n *Net) closeConnections() { n.connections.closeAll() }
 
 func convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {
 	var protoNumber tcpip.NetworkProtocolNumber
@@ -421,7 +512,7 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 		var c net.Conn
 		var err error
 		if useUDP {
-			c, err = tnet.DialUDPAddrPort(netip.AddrPort{}, netip.AddrPortFrom(server, 53))
+			c, err = tnet.DialUDPAddrPort(ctx, netip.AddrPort{}, netip.AddrPortFrom(server, 53))
 		} else {
 			c, err = tnet.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(server, 53))
 		}

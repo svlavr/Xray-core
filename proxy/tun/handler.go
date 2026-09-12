@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/netip"
 	"strings"
+	"sync"
 	"syscall"
 
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	c "github.com/xtls/xray-core/common/ctx"
@@ -25,16 +27,45 @@ import (
 
 // Handler is managing object that tie together tun interface, ip stack and dispatch connections to the routing
 type Handler struct {
-	ctx             context.Context
-	config          *Config
-	stack           Stack
-	tun             Tun
-	policyManager   policy.Manager
-	dispatcher      routing.Dispatcher
-	tag             string
-	sniffingRequest session.SniffingRequest
-	uplinkCounter   stats.Counter
-	downlinkCounter stats.Counter
+	ctx                  context.Context
+	config               *Config
+	stack                Stack
+	tun                  Tun
+	policyManager        policy.Manager
+	dispatcher           routing.Dispatcher
+	tag                  string
+	sniffingRequest      session.SniffingRequest
+	uplinkCounter        stats.Counter
+	downlinkCounter      stats.Counter
+	updater              *InterfaceUpdater
+	unregisterController func()
+	controllerMu         sync.Mutex
+}
+
+// tunUDPStatsWriter preserves the synthetic udpConn buf.Writer boundary while
+// counting only packets accepted by its WriteMultiBuffer implementation.
+type tunUDPStatsWriter struct {
+	writer  buf.Writer
+	counter stats.Counter
+}
+
+func (w *tunUDPStatsWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	accepted := int64(mb.Len())
+	if err := w.writer.WriteMultiBuffer(mb); err != nil {
+		return err
+	}
+	if w.counter != nil {
+		w.counter.Add(accepted)
+	}
+	return nil
+}
+
+func (w *tunUDPStatsWriter) Close() error {
+	return common.Close(w.writer)
+}
+
+func (w *tunUDPStatsWriter) Interrupt() {
+	common.Interrupt(w.writer)
 }
 
 // ConnectionHandler interface with the only method that stack is going to push new connections to
@@ -98,26 +129,36 @@ func (t *Handler) Start() error {
 		if t.config.AutoOutboundsInterface == "auto" {
 			t.config.AutoOutboundsInterface = ""
 		}
-		updater = &InterfaceUpdater{tunIndex: tunIndex, fixedName: t.config.AutoOutboundsInterface}
-		updater.Update()
-		internet.RegisterDialerController(func(network, address string, c syscall.RawConn) error {
-			iface := updater.Get()
+		t.updater = &InterfaceUpdater{tunIndex: tunIndex, fixedName: t.config.AutoOutboundsInterface}
+		t.updater.Update()
+		if owner, ok := tunInterface.(interface{ setInterfaceUpdater(*InterfaceUpdater) }); ok {
+			owner.setInterfaceUpdater(t.updater)
+		}
+		unregister, err := internet.RegisterDialerControllerContext(t.ctx, func(network, address string, c syscall.RawConn) error {
+			iface := t.updater.Get()
 			if iface == nil {
-				errors.LogInfo(context.Background(), "[tun] falied to set interface > iface == nil")
-				return nil
+				return errors.New("[tun] failed to set interface: interface unavailable")
 			}
-			return c.Control(func(fd uintptr) {
+			var controlErr error
+			if err := c.Control(func(fd uintptr) {
 				addrPort, _ := netip.ParseAddrPort(address)
 				// skip loopback
 				if addrPort.Addr().IsLoopback() || strings.HasPrefix(strings.ToLower(address), "localhost:") {
 					return
 				}
-				err := setinterface(network, address, fd, iface)
-				if err != nil {
-					errors.LogInfoInner(context.Background(), err, "[tun] falied to set interface")
-				}
-			})
+				controlErr = setinterface(network, address, fd, iface)
+			}); err != nil {
+				return err
+			}
+			return controlErr
 		})
+		if err != nil {
+			_ = tunInterface.Close()
+			return err
+		}
+		t.controllerMu.Lock()
+		t.unregisterController = unregister
+		t.controllerMu.Unlock()
 	}
 
 	errors.LogInfo(t.ctx, tunName, " created")
@@ -129,6 +170,7 @@ func (t *Handler) Start() error {
 	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
 	if err != nil {
 		_ = tunInterface.Close()
+		t.unregisterDialerController()
 		return err
 	}
 
@@ -136,6 +178,7 @@ func (t *Handler) Start() error {
 	if err != nil {
 		_ = tunStack.Close()
 		_ = tunInterface.Close()
+		t.unregisterDialerController()
 		return err
 	}
 
@@ -143,6 +186,7 @@ func (t *Handler) Start() error {
 	if err != nil {
 		_ = tunStack.Close()
 		_ = tunInterface.Close()
+		t.unregisterDialerController()
 		return err
 	}
 
@@ -157,7 +201,14 @@ func (t *Handler) Start() error {
 func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	// when handling is done with any outcome, always signal back to the incoming connection
 	// to close, send completion packets back to the network, and cleanup
-	defer conn.Close()
+	var ownerScope *flow_observation.ExternalOwnerScope
+	var dispatchErr error
+	defer func() {
+		closeErr := conn.Close()
+		if ownerScope != nil {
+			ownerScope.AfterOwnerClose(dispatchErr, closeErr)
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(t.ctx)
 	defer cancel()
@@ -171,7 +222,7 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 		return
 	}
 	source := net.DestinationFromAddr(remote)
-	if t.uplinkCounter != nil || t.downlinkCounter != nil {
+	if destination.Network != net.Network_UDP && (t.uplinkCounter != nil || t.downlinkCounter != nil) {
 		conn = &stat.CounterConnection{
 			Connection:   conn,
 			ReadCounter:  t.uplinkCounter,
@@ -193,6 +244,14 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	ctx = session.ContextWithContent(ctx, &session.Content{
 		SniffingRequest: t.sniffingRequest,
 	})
+	if destination.Network == net.Network_TCP {
+		ownerScope = flow_observation.NewExternalOwnerScope(flow_observation.ExternalOwnerTUNTCP)
+	} else if destination.Network == net.Network_UDP {
+		ownerScope = flow_observation.NewExternalOwnerScope(flow_observation.ExternalOwnerTUNUDP)
+	}
+	if ownerScope != nil {
+		ctx = flow_observation.ContextWithExternalOwnerScope(ctx, ownerScope)
+	}
 	ctx = session.SubContextFromMuxInbound(ctx)
 
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
@@ -203,18 +262,38 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	})
 	errors.LogInfo(ctx, "processing from ", source, " to ", destination)
 
-	link := &transport.Link{
-		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
-		Writer: buf.NewWriter(conn),
+	reader := buf.NewReader(conn)
+	writer := buf.NewWriter(conn)
+	var readCounter stats.Counter
+	if destination.Network == net.Network_UDP {
+		writer = &tunUDPStatsWriter{writer: writer, counter: t.downlinkCounter}
+		readCounter = t.uplinkCounter
 	}
-	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
-		errors.LogError(ctx, errors.New("connection closed").Base(err))
+	link := &transport.Link{
+		Reader: &buf.TimeoutWrapperReader{Reader: reader, Counter: readCounter},
+		Writer: writer,
+	}
+	dispatchErr = t.dispatcher.DispatchLink(ctx, destination, link)
+	if dispatchErr != nil {
+		errors.LogError(ctx, errors.New("connection closed").Base(dispatchErr))
 	}
 }
 
 // Close implements common.Closable.
 func (t *Handler) Close() error {
-	return errors.Combine(common.CloseIfExists(t.stack), common.CloseIfExists(t.tun))
+	err := errors.Combine(common.CloseIfExists(t.stack), common.CloseIfExists(t.tun))
+	t.unregisterDialerController()
+	return err
+}
+
+func (t *Handler) unregisterDialerController() {
+	t.controllerMu.Lock()
+	unregister := t.unregisterController
+	t.unregisterController = nil
+	t.controllerMu.Unlock()
+	if unregister != nil {
+		unregister()
+	}
 }
 
 // Network implements proxy.Inbound

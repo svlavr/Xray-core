@@ -10,6 +10,7 @@ import (
 
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/features/routing"
 )
 
@@ -30,7 +31,10 @@ type HealthPing struct {
 	cancelPending atomic.Pointer[context.CancelFunc]
 	dispatcher    routing.Dispatcher
 	access        sync.Mutex
+	lifecycleMu   sync.Mutex
+	lifecycle     task.Lifecycle
 	ticker        *time.Ticker
+	started       bool
 
 	Settings *HealthPingSettings
 	Results  map[string]*HealthPingRTTS
@@ -89,44 +93,40 @@ func NewHealthPing(ctx context.Context, dispatcher routing.Dispatcher, config *H
 
 // StartScheduler implements the HealthChecker
 func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
-	if h.ticker != nil {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if h.started || h.lifecycle.Sealed() {
 		return
 	}
+	h.started = true
 	interval := h.Settings.Interval * time.Duration(h.Settings.SamplingCount)
 	ticker := time.NewTicker(interval)
 	h.ticker = ticker
+	if !h.lifecycle.Acquire() {
+		ticker.Stop()
+		h.ticker = nil
+		return
+	}
 
 	// init run to get a fast check result
-	go func() {
-		tags, err := selector()
-		if err != nil {
-			errors.LogWarning(h.ctx, "error select outbounds for initial health check: ", err)
-			return
-		}
-		h.Check(tags)
-	}()
+	if h.lifecycle.Acquire() {
+		go func() {
+			defer h.lifecycle.Release()
+			tags, err := selector()
+			if err != nil {
+				errors.LogWarning(h.ctx, "error select outbounds for initial health check: ", err)
+				return
+			}
+			h.Check(tags)
+		}()
+	}
 
 	go func() {
+		defer h.lifecycle.Release()
 		for {
-			go func() {
-				tags, err := selector()
-				if err != nil {
-					errors.LogWarning(h.ctx, "error select outbounds for scheduled health check: ", err)
-					return
-				}
-				subCtx, cancel := context.WithCancel(h.ctx)
-				old := h.cancelPending.Swap(&cancel)
-				if old != nil {
-					errors.LogDebug(h.ctx, "scheduled health check not finished before next round, canceling previous one")
-					(*old)()
-				}
-				h.doCheck(subCtx, tags, interval, h.Settings.SamplingCount)
-				h.cancelPending.CompareAndSwap(&cancel, nil)
-				h.Cleanup(tags)
-			}()
 			select {
 			case <-ticker.C:
-				continue
+				h.startScheduled(selector, interval)
 			case <-h.ctx.Done():
 				return
 			}
@@ -136,12 +136,19 @@ func (h *HealthPing) StartScheduler(selector func() ([]string, error)) {
 
 // StopScheduler implements the HealthChecker
 func (h *HealthPing) StopScheduler() {
-	if h.ticker == nil {
-		return
-	}
-	h.ticker.Stop()
+	h.lifecycleMu.Lock()
+	h.lifecycle.Seal()
+	ticker := h.ticker
 	h.ticker = nil
+	h.lifecycleMu.Unlock()
+	if ticker != nil {
+		ticker.Stop()
+	}
 	h.cancelCtx()
+	if pending := h.cancelPending.Swap(nil); pending != nil {
+		(*pending)()
+	}
+	h.lifecycle.Wait()
 }
 
 // Check implements the HealthChecker
@@ -149,9 +156,44 @@ func (h *HealthPing) Check(tags []string) error {
 	if len(tags) == 0 {
 		return nil
 	}
+	h.lifecycleMu.Lock()
+	admitted := h.lifecycle.Acquire()
+	h.lifecycleMu.Unlock()
+	if !admitted {
+		return context.Canceled
+	}
+	defer h.lifecycle.Release()
 	errors.LogInfo(h.ctx, "perform one-time health check for tags ", tags)
 	h.doCheck(h.ctx, tags, 0, 1)
 	return nil
+}
+
+func (h *HealthPing) startScheduled(selector func() ([]string, error), interval time.Duration) {
+	h.lifecycleMu.Lock()
+	admitted := h.lifecycle.Acquire()
+	h.lifecycleMu.Unlock()
+	if !admitted {
+		return
+	}
+	go func() {
+		defer h.lifecycle.Release()
+		tags, err := selector()
+		if err != nil {
+			errors.LogWarning(h.ctx, "error select outbounds for scheduled health check: ", err)
+			return
+		}
+		subCtx, cancel := context.WithCancel(h.ctx)
+		old := h.cancelPending.Swap(&cancel)
+		if old != nil {
+			errors.LogDebug(h.ctx, "scheduled health check not finished before next round, canceling previous one")
+			(*old)()
+		}
+		h.doCheck(subCtx, tags, interval, h.Settings.SamplingCount)
+		h.cancelPending.CompareAndSwap(&cancel, nil)
+		if h.ctx.Err() == nil && !h.lifecycle.Sealed() {
+			h.Cleanup(tags)
+		}
+	}()
 }
 
 type rtt struct {
@@ -168,11 +210,16 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 		return
 	}
 	ch := make(chan *rtt, count)
-	timers := make([]*time.Timer, 0, count)
+	type pendingTimer struct {
+		timer   *time.Timer
+		release func()
+	}
+	timers := make([]pendingTimer, 0, count)
 	for _, tag := range tags {
 		handler := tag
 		client := newPingClient(
-			h.ctx,
+			ctx,
+			&h.lifecycle,
 			h.dispatcher,
 			h.Settings.Destination,
 			h.Settings.Timeout,
@@ -183,7 +230,16 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 			if duration > 0 {
 				delay = time.Duration(dice.RollInt63n(int64(duration)))
 			}
-			timers = append(timers, time.AfterFunc(delay, func() {
+			h.lifecycleMu.Lock()
+			admitted := h.lifecycle.Acquire()
+			h.lifecycleMu.Unlock()
+			if !admitted {
+				return
+			}
+			var release sync.Once
+			releaseTimer := func() { release.Do(h.lifecycle.Release) }
+			timers = append(timers, pendingTimer{timer: time.AfterFunc(delay, func() {
+				defer releaseTimer()
 				errors.LogDebug(h.ctx, "checking ", handler)
 				delay, err := client.MeasureDelay(h.Settings.HttpMethod)
 				if err == nil {
@@ -193,7 +249,7 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 					}
 					return
 				}
-				if !h.checkConnectivity() {
+				if !h.checkConnectivity(ctx) {
 					errors.LogWarning(h.ctx, "network is down")
 					ch <- &rtt{
 						handler: handler,
@@ -211,7 +267,7 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 					handler: handler,
 					value:   rttFailed,
 				}
-			}))
+			}), release: releaseTimer})
 		}
 	}
 	for i := 0; i < count; i++ {
@@ -222,8 +278,10 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 				h.PutResult(rtt.handler, rtt.value)
 			}
 		case <-ctx.Done():
-			for _, timer := range timers {
-				timer.Stop()
+			for _, pending := range timers {
+				if pending.timer.Stop() {
+					pending.release()
+				}
 			}
 			return
 		}
@@ -232,6 +290,11 @@ func (h *HealthPing) doCheck(ctx context.Context, tags []string, duration time.D
 
 // PutResult put a ping rtt to results
 func (h *HealthPing) PutResult(tag string, rtt time.Duration) {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if h.lifecycle.Sealed() {
+		return
+	}
 	h.access.Lock()
 	defer h.access.Unlock()
 	if h.Results == nil {
@@ -253,6 +316,11 @@ func (h *HealthPing) PutResult(tag string, rtt time.Duration) {
 // Cleanup removes results of removed handlers,
 // tags should be all valid tags of the Balancer now
 func (h *HealthPing) Cleanup(tags []string) {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if h.lifecycle.Sealed() {
+		return
+	}
 	h.access.Lock()
 	defer h.access.Unlock()
 	for tag := range h.Results {
@@ -271,11 +339,11 @@ func (h *HealthPing) Cleanup(tags []string) {
 
 // checkConnectivity checks the network connectivity, it returns
 // true if network is good or "connectivity check url" not set
-func (h *HealthPing) checkConnectivity() bool {
+func (h *HealthPing) checkConnectivity(ctx context.Context) bool {
 	if h.Settings.Connectivity == "" {
 		return true
 	}
-	tester := newDirectPingClient(
+	tester := newDirectPingClient(ctx, &h.lifecycle,
 		h.Settings.Connectivity,
 		h.Settings.Timeout,
 	)

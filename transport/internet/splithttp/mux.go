@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"math"
 	"math/big"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 type XmuxConn interface {
@@ -23,6 +25,7 @@ type XmuxClient struct {
 	LeftRequests atomic.Int32
 	UnreusableAt time.Time
 	NotUsed      atomic.Bool
+	manager      *XmuxManager
 }
 
 func (c *XmuxClient) AddRunning() {
@@ -32,6 +35,26 @@ func (c *XmuxClient) AddRunning() {
 func (c *XmuxClient) DoneRunning() {
 	c.Running.Add(-1)
 	c.maybeClose()
+	if c.manager != nil {
+		if c.NotUsed.Load() && c.Running.Load() <= 0 {
+			c.manager.removeRetiring(c)
+		}
+		select {
+		case c.manager.notify <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (m *XmuxManager) removeRetiring(expected *XmuxClient) {
+	globalDialerAccess.Lock()
+	for i, client := range m.retiring {
+		if client == expected {
+			m.retiring = append(m.retiring[:i], m.retiring[i+1:]...)
+			break
+		}
+	}
+	globalDialerAccess.Unlock()
 }
 
 // close the XmuxConn if it is not used and has no running requests
@@ -44,9 +67,18 @@ func (c *XmuxClient) maybeClose() {
 type XmuxManager struct {
 	xmuxConfig  XmuxConfig
 	concurrency int32
-	connections int32
+	connections int32 // selectable XmuxClient domains, not a physical carrier bound
 	newConnFunc func() XmuxConn
 	xmuxClients []*XmuxClient
+	retiring    []*XmuxClient
+	sealed      atomic.Bool
+	lifecycle   *internet.ResourceLifecycle
+	unregister  func()
+	key         dialerConf
+	notify      chan struct{}
+	closeOnce   sync.Once
+	closeDone   chan struct{}
+	closeErr    error
 }
 
 func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
@@ -56,6 +88,8 @@ func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxMan
 		connections: xmuxConfig.GetNormalizedMaxConnections().rand(),
 		newConnFunc: newConnFunc,
 		xmuxClients: make([]*XmuxClient, 0),
+		notify:      make(chan struct{}, 1),
+		closeDone:   make(chan struct{}),
 	}
 }
 
@@ -63,6 +97,7 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 	xmuxClient := &XmuxClient{
 		XmuxConn:  m.newConnFunc(),
 		leftUsage: -1,
+		manager:   m,
 	}
 	if x := m.xmuxConfig.GetNormalizedCMaxReuseTimes().rand(); x > 0 {
 		xmuxClient.leftUsage = x - 1
@@ -79,6 +114,9 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 }
 
 func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when locking
+	if m.sealed.Load() {
+		return nil
+	}
 	for i := 0; i < len(m.xmuxClients); {
 		xmuxClient := m.xmuxClients[i]
 		if xmuxClient.XmuxConn.IsClosed() ||
@@ -92,6 +130,9 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 				", UnreusableAt = ", xmuxClient.UnreusableAt)
 			xmuxClient.NotUsed.Store(true)
 			xmuxClient.maybeClose()
+			if xmuxClient.Running.Load() > 0 {
+				m.retiring = append(m.retiring, xmuxClient)
+			}
 			m.xmuxClients = append(m.xmuxClients[:i], m.xmuxClients[i+1:]...)
 		} else {
 			i++
@@ -130,4 +171,78 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 		xmuxClient.leftUsage -= 1
 	}
 	return xmuxClient
+}
+
+func (m *XmuxManager) SignalStop() {
+	if m == nil || !m.sealed.CompareAndSwap(false, true) {
+		return
+	}
+	globalDialerAccess.Lock()
+	clients := append(append([]*XmuxClient(nil), m.xmuxClients...), m.retiring...)
+	for _, client := range clients {
+		client.NotUsed.Store(true)
+	}
+	globalDialerAccess.Unlock()
+	var stopWG sync.WaitGroup
+	for _, client := range clients {
+		if signaler, ok := client.XmuxConn.(interface{ SignalStop() }); ok {
+			stopWG.Add(1)
+			go func() {
+				defer stopWG.Done()
+				signaler.SignalStop()
+			}()
+		}
+	}
+	stopWG.Wait()
+	for _, client := range clients {
+		client.maybeClose()
+	}
+}
+
+func (m *XmuxManager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.SignalStop()
+	m.closeOnce.Do(func() {
+		globalDialerAccess.Lock()
+		clients := append(append([]*XmuxClient(nil), m.xmuxClients...), m.retiring...)
+		m.xmuxClients = nil
+		m.retiring = nil
+		globalDialerAccess.Unlock()
+		results := make(chan error, len(clients))
+		for _, client := range clients {
+			go func() { results <- common.Close(client.XmuxConn) }()
+		}
+		var closeErrors []error
+		for range clients {
+			closeErrors = append(closeErrors, <-results)
+		}
+		for {
+			active := false
+			for _, client := range clients {
+				if client.Running.Load() > 0 {
+					active = true
+					break
+				}
+			}
+			if !active {
+				break
+			}
+			<-m.notify
+		}
+		globalDialerAccess.Lock()
+		if globalDialerMap[m.key] == m {
+			delete(globalDialerMap, m.key)
+		}
+		globalDialerAccess.Unlock()
+		if m.unregister != nil {
+			m.unregister()
+			m.unregister = nil
+		}
+		m.closeErr = errors.Combine(closeErrors...)
+		close(m.closeDone)
+	})
+	<-m.closeDone
+	return m.closeErr
 }

@@ -4,15 +4,14 @@ on:
   workflow_dispatch:
   release:
     types: [published]
-  push:
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 jobs:
   check-assets:
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
     steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+
       - name: Restore Geodat Cache
         uses: actions/cache/restore@v6
         with:
@@ -25,53 +24,21 @@ jobs:
           path: resources
           key: xray-wintun-
 
-      - name: Check Assets Existence
-        id: check-assets
-        run: |
-          [ -d 'resources' ] || mkdir resources
-          LIST=('geoip.dat' 'geosite.dat')
-          for FILE_NAME in "${LIST[@]}"
-          do
-            echo -e "Checking ${FILE_NAME}..."
-            if [ -s "./resources/${FILE_NAME}" ]; then
-              echo -e "${FILE_NAME} exists."
-            else
-              echo -e "${FILE_NAME} does not exist."
-              echo "missing=true" >> $GITHUB_OUTPUT
-              break
-            fi
-          done
-          LIST=('amd64' 'x86' 'arm64')
-          for ARCHITECTURE in "${LIST[@]}"
-          do
-            echo -e "Checking wintun.dll for ${ARCHITECTURE}..."
-            if [ -s "./resources/wintun/bin/${ARCHITECTURE}/wintun.dll" ]; then
-              echo -e "wintun.dll for ${ARCHITECTURE} exists."
-            else
-              echo -e "wintun.dll for ${ARCHITECTURE} is missing."
-              echo "missing=true" >> $GITHUB_OUTPUT
-              break
-            fi
-          done
+      - name: Prepare and verify release assets
+        shell: pwsh
+        run: ./.github/build/prepare-assets.ps1 -IncludeWintun
 
-      - name: Trigger Asset Update Workflow if Assets Missing
-        if: steps.check-assets.outputs.missing == 'true'
-        uses: actions/github-script@v9
+      - name: Save Geodat Cache
+        uses: actions/cache/save@v6
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            await github.rest.actions.createWorkflowDispatch({
-              owner,
-              repo,
-              workflow_id: 'scheduled-assets-update.yml',
-              ref: context.ref
-            });
-            console.log('Triggered scheduled-assets-update.yml due to missing assets on branch:', context.ref);
+          path: resources
+          key: xray-geodat-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Sleep for 90 seconds if Assets Missing
-        if: steps.check-assets.outputs.missing == 'true'
-        run: sleep 90
+      - name: Save Wintun Cache
+        uses: actions/cache/save@v6
+        with:
+          path: resources
+          key: xray-wintun-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   build:
     needs: check-assets
@@ -176,6 +143,7 @@ jobs:
         if: matrix.goos == 'android'
         run: |
           wget -qO android-ndk.zip https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          echo "f574d3165405bd59ffc5edaadac02689075a729f  android-ndk.zip" | sha1sum --check --strict
           unzip android-ndk.zip
           rm android-ndk.zip
           declare -A arches=(

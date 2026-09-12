@@ -23,14 +23,21 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if err != nil {
 		return nil, err
 	}
+	ownedConn := conn
+	committed := false
+	defer func() {
+		if !committed {
+			_ = ownedConn.Close()
+		}
+	}()
 
 	if streamSettings.TcpmaskManager != nil {
 		newConn, err := streamSettings.TcpmaskManager.WrapConnClient(conn)
 		if err != nil {
-			conn.Close()
 			return nil, errors.New("mask err").Base(err)
 		}
 		conn = newConn
+		ownedConn = conn
 	}
 
 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
@@ -38,9 +45,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		mitmAlpn11 := session.MitmAlpn11FromContext(ctx)
 		var tlsConfig *gotls.Config
 		if tls.IsFromMitm(config.ServerName) {
-			tlsConfig = config.GetTLSConfig(tls.WithOverrideName(mitmServerName))
+			tlsConfig = config.GetTLSConfigContext(ctx, tls.WithOverrideName(mitmServerName))
 		} else {
-			tlsConfig = config.GetTLSConfig(tls.WithDestination(dest))
+			tlsConfig = config.GetTLSConfigContext(ctx, tls.WithDestination(dest))
 		}
 
 		isFromMitmVerify := false
@@ -75,6 +82,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		if fingerprint := tls.GetFingerprint(config.Fingerprint); fingerprint != nil {
 			conn = tls.UClient(conn, tlsConfig, fingerprint)
+			ownedConn = conn
 			if len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "http/1.1" { // allow manually specify
 				err = conn.(*tls.UConn).WebsocketHandshakeContext(ctx)
 			} else {
@@ -82,6 +90,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			}
 		} else {
 			conn = tls.Client(conn, tlsConfig)
+			ownedConn = conn
 			err = conn.(*tls.Conn).HandshakeContext(ctx)
 		}
 		if err != nil {
@@ -96,9 +105,15 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			return nil, errors.New("MITM freedom RAW TLS: unexpected Negotiated Protocol (" + negotiatedProtocol + ") with " + mitmServerName).AtWarning()
 		}
 	} else if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
-		if conn, err = reality.UClient(conn, config, ctx, dest); err != nil {
+		newConn, err := reality.UClient(conn, config, ctx, dest)
+		if err != nil {
+			if reality.IsInvalidPeerSpiderError(err) {
+				committed = true
+			}
 			return nil, err
 		}
+		conn = newConn
+		ownedConn = conn
 	}
 
 	tcpSettings := streamSettings.ProtocolSettings.(*Config)
@@ -112,7 +127,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			return nil, errors.New("failed to create header authenticator").Base(err).AtError()
 		}
 		conn = auth.Client(conn)
+		ownedConn = conn
 	}
+	committed = true
 	return stat.Connection(conn), nil
 }
 

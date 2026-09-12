@@ -6,9 +6,12 @@ import (
 	goerrors "errors"
 	"io"
 	"math/big"
+	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/dice"
 
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -65,16 +68,34 @@ type Handler struct {
 	udp443          string
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
+	flowCarrier     flow_observation.CarrierObservation
+	generation      atomic.Pointer[core.RetirementGeneration]
+	stopOnce        sync.Once
+	waitOnce        sync.Once
+	proxyCloseDone  chan struct{}
+	closeErr        error
+	lifecycleCtx    context.Context
+	resources       *internet.ResourceLifecycle
 }
 
 // NewHandler creates a new Handler based on the given configuration.
 func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbound.Handler, error) {
 	v := core.MustFromContext(ctx)
 	uplinkCounter, downlinkCounter := getStatCounter(v, config.Tag)
+	resourceLifecycle := internet.NewResourceLifecycle(ctx)
+	ctx = internet.ContextWithResourceLifecycle(ctx, resourceLifecycle)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = resourceLifecycle.CloseAndWait()
+		}
+	}()
 	h := &Handler{
 		tag:             config.Tag,
 		uplinkCounter:   uplinkCounter,
 		downlinkCounter: downlinkCounter,
+		lifecycleCtx:    ctx,
+		resources:       resourceLifecycle,
 	}
 
 	if config.SenderSettings != nil {
@@ -90,6 +111,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				return nil, errors.New("failed to parse stream settings").Base(err).AtWarning()
 			}
 			h.streamSettings = mss
+			h.streamSettings.ResourceLifecycle = resourceLifecycle
 		default:
 			return nil, errors.New("settings is not SenderConfig")
 		}
@@ -130,8 +152,9 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 					Enabled: true,
 					Picker: &mux.IncrementalWorkerPicker{
 						Factory: &mux.DialingWorkerFactory{
-							Proxy:  proxyHandler,
-							Dialer: h,
+							Proxy:   proxyHandler,
+							Dialer:  h,
+							Context: ctx,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.Concurrency),
 								MaxConnection:  128,
@@ -151,8 +174,9 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 					Enabled: true,
 					Picker: &mux.IncrementalWorkerPicker{
 						Factory: &mux.DialingWorkerFactory{
-							Proxy:  proxyHandler,
-							Dialer: h,
+							Proxy:   proxyHandler,
+							Dialer:  h,
+							Context: ctx,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.XudpConcurrency),
 								MaxConnection:  128,
@@ -166,7 +190,36 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 	}
 
 	h.proxy = proxyHandler
+	h.flowCarrier = classifyFlowCarrierObservation(h.streamSettings, h.mux != nil && h.mux.Enabled)
+	committed = true
 	return h, nil
+}
+
+func classifyFlowCarrierObservation(stream *internet.MemoryStreamConfig, muxEnabled bool) flow_observation.CarrierObservation {
+	observation := flow_observation.CarrierObservation{Proof: flow_observation.CarrierProofNotApplicable}
+	markUnknown := func() {
+		observation.Proof = flow_observation.CarrierProofUnknown
+	}
+	if muxEnabled {
+		markUnknown()
+		observation.MuxF2Required = true
+	}
+	if stream == nil {
+		return observation
+	}
+	switch stream.ProtocolName {
+	case "tcp", "websocket", "httpupgrade":
+	case "udp", "mkcp", "hysteria", "splithttp", "grpc":
+		markUnknown()
+		observation.CarrierF2Required = true
+	default:
+		markUnknown()
+	}
+	if stream.SocketSettings != nil && stream.SocketSettings.GetDialerProxy() != "" {
+		markUnknown()
+		observation.DialerProxyCarrierUnknown = true
+	}
+	return observation
 }
 
 // Tag implements outbound.Handler.
@@ -176,6 +229,28 @@ func (h *Handler) Tag() string {
 
 // Dispatch implements proxy.Outbound.Dispatch.
 func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
+	ctx = internet.ContextWithResourceLifecycle(ctx, h.resources)
+	if generation := h.generation.Load(); generation != nil {
+		if right := core.RetirementRightFromContext(ctx); right == nil || !right.LiveFor(generation) {
+			enteredCtx, entered, err := core.EnterRetirement(ctx, generation)
+			if err != nil {
+				common.Interrupt(link.Writer)
+				common.Interrupt(link.Reader)
+				return
+			}
+			ctx = enteredCtx
+			defer entered.Release()
+		} else if ctx.Err() != nil {
+			common.Interrupt(link.Writer)
+			common.Interrupt(link.Reader)
+			return
+		}
+	}
+	stopOnGenerationSeal := context.AfterFunc(ctx, func() {
+		common.Interrupt(link.Writer)
+		common.Interrupt(link.Reader)
+	})
+	defer stopOnGenerationSeal()
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	content := session.ContentFromContext(ctx)
@@ -184,12 +259,12 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
 			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
 		}
-		ips, err := internet.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
+		ips, err := internet.LookupForIPContext(ctx, ob.Target.Address.Domain(), strategy, nil)
 		if err != nil {
 			errors.LogInfoInner(ctx, err, "failed to resolve ip for target ", ob.Target.Address.Domain())
 			if h.senderSettings.TargetStrategy.ForceIP() {
 				err := errors.New("failed to resolve ip for target ", ob.Target.Address.Domain()).Base(err)
-				session.SubmitOutboundErrorToOriginator(ctx, err)
+				submitOutboundError(ctx, err)
 				common.Interrupt(link.Writer)
 				common.Interrupt(link.Reader)
 				return
@@ -208,7 +283,7 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 		test := func(err error) {
 			if err != nil {
 				err := errors.New("failed to process mux outbound traffic").Base(err)
-				session.SubmitOutboundErrorToOriginator(ctx, err)
+				submitOutboundError(ctx, err)
 				errors.LogInfo(ctx, err.Error())
 				common.Interrupt(link.Writer)
 				common.Interrupt(link.Reader)
@@ -231,7 +306,8 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 			return
 		}
 		if h.mux.Enabled {
-			test(h.mux.Dispatch(ctx, link))
+			muxCtx := flow_observation.ContextWithMuxClientSessionObservation(ctx, h.tag)
+			test(h.mux.Dispatch(muxCtx, link))
 			return
 		}
 	}
@@ -247,7 +323,7 @@ out:
 	if err != nil {
 		// Ensure outbound ray is properly closed.
 		err := errors.New("failed to process outbound traffic").Base(err)
-		session.SubmitOutboundErrorToOriginator(ctx, err)
+		submitOutboundError(ctx, err)
 		errors.LogInfo(ctx, err.Error())
 		common.Interrupt(link.Writer)
 	} else {
@@ -260,8 +336,13 @@ out:
 	common.Interrupt(link.Reader)
 }
 
+func submitOutboundError(ctx context.Context, err error) {
+	flow_observation.SubmitErrorFromContext(ctx, err)
+	session.SubmitOutboundErrorToOriginator(ctx, err)
+}
+
 func (h *Handler) DestIpAddress() net.IP {
-	return internet.DestIpAddress()
+	return internet.DestIpAddressForContext(h.lifecycleCtx)
 }
 
 // Dial implements internet.Dialer.
@@ -329,14 +410,74 @@ func (h *Handler) Start() error {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
-	common.Close(h.mux)
-	common.Close(h.proxy)
-	return nil
+	h.SignalStop()
+	h.waitOnce.Do(func() {
+		// Proxy close has already been issued asynchronously, so either pool
+		// may wait without preventing another handler's unblock phase.
+		h.mux.Wait()
+		h.xudp.Wait()
+		<-h.proxyCloseDone
+		if err := h.resources.CloseAndWait(); err != nil {
+			h.closeErr = errors.Combine(h.closeErr, err)
+		}
+	})
+	return h.closeErr
+}
+
+// SignalStop is the non-joining half of Handler shutdown. Manager invokes it
+// for every exact generation before any closer waits.
+func (h *Handler) SignalStop() {
+	if h == nil {
+		return
+	}
+	h.stopOnce.Do(func() {
+		h.resources.SignalStop()
+		h.mux.SignalStop()
+		h.xudp.SignalStop()
+		h.proxyCloseDone = make(chan struct{})
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					h.closeErr = errors.New("outbound proxy close panic: ", recovered)
+				}
+				close(h.proxyCloseDone)
+			}()
+			h.closeErr = common.Close(h.proxy)
+		}()
+	})
+}
+
+// Retire seals new picker invocations but does not cancel admitted work.
+func (h *Handler) Retire() {
+	if h == nil {
+		return
+	}
+	h.mux.Retire()
+	h.xudp.Retire()
+}
+
+func (h *Handler) BindRetirementGeneration(generation *core.RetirementGeneration) bool {
+	return h != nil && generation != nil && h.generation.CompareAndSwap(nil, generation)
+}
+
+// BindMuxClientCarrierAuthority is write-once and deliberately affects only
+// standard mux; xudp retains its existing unbound behavior.
+func (h *Handler) BindMuxClientCarrierAuthority(provider session.MuxClientCarrierAuthorityProvider) bool {
+	if h == nil || h.mux == nil || !h.mux.Enabled {
+		return false
+	}
+	return h.mux.BindMuxClientCarrierAuthority(provider)
 }
 
 // SenderSettings implements outbound.Handler.
 func (h *Handler) SenderSettings() *serial.TypedMessage {
 	return serial.ToTypedMessage(h.senderSettings)
+}
+
+// FlowCarrierObservation returns the immutable carrier descriptor prepared at
+// construction time. It intentionally performs no serialization or I/O.
+func (h *Handler) FlowCarrierObservation() flow_observation.CarrierObservation {
+	return h.flowCarrier
 }
 
 // ProxySettings implements outbound.Handler.

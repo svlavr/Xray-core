@@ -23,7 +23,7 @@ const (
 	symmetricNATMaxPortsPerHost = 32
 )
 
-func resolveSTUNServers(local net.IP, servers []string, family Family) []*net.UDPAddr {
+func resolveSTUNServers(ctx context.Context, local net.IP, servers []string, family Family) []*net.UDPAddr {
 	var network string
 	if family == Family_Dual {
 		if local.IsUnspecified() {
@@ -55,7 +55,7 @@ func resolveSTUNServers(local net.IP, servers []string, family Family) []*net.UD
 		if err != nil {
 			continue
 		}
-		ips, err := net.DefaultResolver.LookupIP(context.Background(), network, h)
+		ips, err := net.DefaultResolver.LookupIP(ctx, network, h)
 		if err != nil {
 			continue
 		}

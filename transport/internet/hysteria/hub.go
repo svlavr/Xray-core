@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
+	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
@@ -34,8 +35,8 @@ type httpHandler struct {
 	config      *Config
 	masqHandler http.Handler
 	quicParams  *internet.QuicParams
-	addConn     internet.ConnHandler
 	conn        *quic.Conn
+	listener    *Listener
 
 	auth bool
 	user *protocol.MemoryUser
@@ -88,16 +89,37 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 			}
 
 			if h.validator != nil {
+				managerCtx, managerCancel := context.WithCancel(h.listener.ctx)
 				udpSM := &udpSessionManager{
 					conn: h.conn,
 					m:    make(map[uint32]*InterConn),
 
-					addConn:        h.addConn,
+					addConn:        h.listener.dispatch,
 					udpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
 					user:           h.user,
+					ctx:            managerCtx,
 				}
-				go udpSM.clean()
-				go udpSM.run()
+				if h.listener.acquireBackground(3) {
+					go func() {
+						defer h.listener.lifecycle.Release()
+						select {
+						case <-h.conn.Context().Done():
+							managerCancel()
+						case <-managerCtx.Done():
+						}
+					}()
+					go func() {
+						defer h.listener.lifecycle.Release()
+						defer managerCancel()
+						udpSM.clean()
+					}()
+					go func() {
+						defer h.listener.lifecycle.Release()
+						udpSM.run()
+					}()
+				} else {
+					managerCancel()
+				}
 			}
 
 			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
@@ -128,12 +150,13 @@ func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, 
 			return false, err
 		}
 
-		h.addConn(&interConn{
+		h.listener.dispatch(&interConn{
 			stream: stream,
 			local:  h.conn.LocalAddr(),
 			remote: h.conn.RemoteAddr(),
 
-			user: h.user,
+			user:    h.user,
+			handoff: new(internet.InboundHandoff),
 		})
 		return true, nil
 	default:
@@ -148,19 +171,28 @@ type Listener struct {
 	quicParams  *internet.QuicParams
 	addConn     internet.ConnHandler
 
-	pktConn  net.PacketConn
-	tr       *quic.Transport
-	listener *quic.Listener
+	pktConn   net.PacketConn
+	tr        *quic.Transport
+	listener  *quic.Listener
+	lifecycle *internet.InboundLifecycle
+	ctx       context.Context
+	cancel    context.CancelFunc
+
+	mu          sync.Mutex
+	closed      bool
+	connections map[*quic.Conn]struct{}
+	callbacks   map[net.Conn]*internet.InboundHandoff
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
+	defer l.unregisterConnection(conn)
 	handler := &httpHandler{
 		validator:   l.validator,
 		config:      l.config,
 		masqHandler: l.masqHandler,
 		quicParams:  l.quicParams,
-		addConn:     l.addConn,
 		conn:        conn,
+		listener:    l,
 	}
 	h3s := http3.Server{
 		Handler:          handler,
@@ -173,12 +205,16 @@ func (l *Listener) handleClient(conn *quic.Conn) {
 
 func (l *Listener) keepAccepting() {
 	for {
-		conn, err := l.listener.Accept(context.Background())
+		conn, err := l.listener.Accept(l.ctx)
 		if err != nil {
 			if err != quic.ErrServerClosed {
 				errors.LogErrorInner(context.Background(), err, "failed to serve hysteria")
 			}
 			break
+		}
+		if !l.registerConnection(conn) {
+			_ = conn.CloseWithError(closeErrCodeOK, "")
+			continue
 		}
 		go l.handleClient(conn)
 	}
@@ -189,7 +225,117 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	type callbackReceipt struct {
+		conn    net.Conn
+		handoff *internet.InboundHandoff
+	}
+	callbacks := make([]callbackReceipt, 0, len(l.callbacks))
+	for conn, handoff := range l.callbacks {
+		callbacks = append(callbacks, callbackReceipt{conn: conn, handoff: handoff})
+	}
+	l.mu.Unlock()
+	l.cancel()
+	for _, callback := range callbacks {
+		callback.handoff.Reject()
+		_ = callback.conn.Close()
+	}
 	return errors.Combine(l.listener.Close(), l.tr.Close(), l.pktConn.Close())
+}
+
+func (l *Listener) registerConnection(conn *quic.Conn) bool {
+	if !l.lifecycle.Acquire() {
+		return false
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		l.lifecycle.Release()
+		return false
+	}
+	l.connections[conn] = struct{}{}
+	l.mu.Unlock()
+	return true
+}
+
+func (l *Listener) unregisterConnection(conn *quic.Conn) {
+	l.mu.Lock()
+	delete(l.connections, conn)
+	l.mu.Unlock()
+	l.lifecycle.Release()
+}
+
+func (l *Listener) dispatch(conn stat.Connection) {
+	if l.lifecycle == nil {
+		l.addConn(conn)
+		return
+	}
+	if !l.registerCallback(conn) {
+		internet.RejectInboundHandoff(conn)
+		_ = conn.Close()
+		return
+	}
+	go func() {
+		defer l.unregisterCallback(conn)
+		l.addConn(conn)
+	}()
+}
+
+func (l *Listener) registerCallback(conn stat.Connection) bool {
+	if !l.lifecycle.Acquire() {
+		return false
+	}
+	handoff := inboundHandoff(conn)
+	if handoff == nil {
+		l.lifecycle.Release()
+		return false
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		l.lifecycle.Release()
+		return false
+	}
+	l.callbacks[conn] = handoff
+	l.mu.Unlock()
+	return true
+}
+
+func (l *Listener) unregisterCallback(conn stat.Connection) {
+	l.mu.Lock()
+	delete(l.callbacks, conn)
+	l.mu.Unlock()
+	l.lifecycle.Release()
+}
+
+func (l *Listener) acquireBackground(count int) bool {
+	acquired := 0
+	for acquired < count && l.lifecycle.Acquire() {
+		acquired++
+	}
+	if acquired == count {
+		return true
+	}
+	for range acquired {
+		l.lifecycle.Release()
+	}
+	return false
+}
+
+func inboundHandoff(conn stat.Connection) *internet.InboundHandoff {
+	switch conn := conn.(type) {
+	case *interConn:
+		return conn.handoff
+	case *InterConn:
+		return conn.handoff
+	default:
+		return nil
+	}
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
@@ -316,15 +462,18 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		quicConfig.MaxIncomingStreams = 1024
 	}
 
-	pktConn, err := internet.ListenSystemPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings.SocketSettings)
+	listenerCtx, cancel := context.WithCancel(ctx)
+	pktConn, err := internet.ListenSystemPacket(listenerCtx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings.SocketSettings)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	if streamSettings.UdpmaskManager != nil {
-		newConn, err := streamSettings.UdpmaskManager.WrapPacketConnServer(pktConn)
+		newConn, err := streamSettings.UdpmaskManager.WrapPacketConnServerContext(listenerCtx, pktConn)
 		if err != nil {
 			pktConn.Close()
+			cancel()
 			return nil, errors.New("mask err").Base(err)
 		}
 		pktConn = newConn
@@ -342,6 +491,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	if err != nil {
 		_ = tr.Close()
 		_ = pktConn.Close()
+		cancel()
 		return nil, err
 	}
 
@@ -352,12 +502,24 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		quicParams:  quicParams,
 		addConn:     handler,
 
-		pktConn:  pktConn,
-		tr:       tr,
-		listener: listener,
+		pktConn:     pktConn,
+		tr:          tr,
+		listener:    listener,
+		lifecycle:   internet.InboundLifecycleFromContext(ctx),
+		ctx:         listenerCtx,
+		cancel:      cancel,
+		connections: make(map[*quic.Conn]struct{}),
+		callbacks:   make(map[net.Conn]*internet.InboundHandoff),
 	}
 
-	go l.keepAccepting()
+	if !l.lifecycle.Acquire() {
+		_ = l.Close()
+		return nil, errors.New("inbound listener is closing")
+	}
+	go func() {
+		defer l.lifecycle.Release()
+		l.keepAccepting()
+	}()
 
 	return l, nil
 }

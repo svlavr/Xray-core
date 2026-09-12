@@ -7,7 +7,6 @@ import (
 	"github.com/xtls/xray-core/app/observatory"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/extension"
 	"github.com/xtls/xray-core/features/outbound"
@@ -21,8 +20,6 @@ type Observer struct {
 
 	statusLock sync.Mutex
 	hp         *HealthPing
-
-	finished *done.Instance
 
 	ohm outbound.Manager
 }
@@ -67,7 +64,6 @@ func (o *Observer) Type() interface{} {
 
 func (o *Observer) Start() error {
 	if o.config != nil && len(o.config.SubjectSelector) != 0 {
-		o.finished = done.New()
 		o.hp.StartScheduler(func() ([]string, error) {
 			hs, ok := o.ohm.(outbound.HandlerSelector)
 			if !ok {
@@ -82,10 +78,7 @@ func (o *Observer) Start() error {
 }
 
 func (o *Observer) Close() error {
-	if o.finished != nil {
-		o.hp.StopScheduler()
-		return o.finished.Close()
-	}
+	o.hp.StopScheduler()
 	return nil
 }
 

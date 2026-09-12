@@ -61,9 +61,16 @@ func TestRegressionOutboundLeak(t *testing.T) {
 	serverCtx := session.ContextWithOutbounds(context.Background(), originalOutbounds)
 
 	websiteUplink, websiteDownlink := newLinkPair()
+	defer common.Interrupt(websiteUplink.Reader)
+	defer common.Interrupt(websiteUplink.Writer)
+	defer common.Interrupt(websiteDownlink.Reader)
+	defer common.Interrupt(websiteDownlink.Writer)
 
 	dispatcher := TestDispatcher{
 		OnDispatch: func(ctx context.Context, dest net.Destination) (*transport.Link, error) {
+			if !session.IsMultiplexedLogicalSession(ctx) {
+				t.Error("decoded MUX child was not marked for PR-F2 admission")
+			}
 			// emulate what DefaultRouter.Dispatch does, and mutate something on the context
 			ob := session.OutboundsFromContext(ctx)[0]
 			ob.Target = dest
@@ -72,17 +79,29 @@ func TestRegressionOutboundLeak(t *testing.T) {
 	}
 
 	muxServerUplink, muxServerDownlink := newLinkPair()
-	_, err := mux.NewServerWorker(serverCtx, &dispatcher, muxServerUplink)
+	server, err := mux.NewServerWorker(serverCtx, &dispatcher, muxServerUplink)
 	common.Must(err)
+	defer func() {
+		_ = server.Close()
+		<-server.WaitClosed()
+	}()
 
 	client, err := mux.NewClientWorker(*muxServerDownlink, mux.ClientStrategy{})
 	common.Must(err)
+	defer func() {
+		_ = client.Close()
+		<-client.WaitClosed()
+	}()
 
 	clientCtx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
 		Target: net.TCPDestination(net.DomainAddress("www.example.com"), 80),
 	}})
 
 	muxClientUplink, muxClientDownlink := newLinkPair()
+	defer common.Interrupt(muxClientUplink.Reader)
+	defer common.Interrupt(muxClientUplink.Writer)
+	defer common.Interrupt(muxClientDownlink.Reader)
+	defer common.Interrupt(muxClientDownlink.Writer)
 
 	ok := client.Dispatch(clientCtx, muxClientUplink)
 	if !ok {

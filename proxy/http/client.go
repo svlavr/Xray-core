@@ -35,6 +35,10 @@ type Client struct {
 	server        *protocol.ServerSpec
 	policyManager policy.Manager
 	header        []*Header
+	h2Mu          sync.Mutex
+	h2Conns       map[net.Destination]*h2Conn
+	h2Retired     []*h2Conn
+	closed        bool
 }
 
 type h2Conn struct {
@@ -42,10 +46,33 @@ type h2Conn struct {
 	h2Conn  *http2.ClientConn
 }
 
-var (
-	cachedH2Mutex sync.Mutex
-	cachedH2Conns map[net.Destination]h2Conn
-)
+type h2PayloadWrite struct {
+	done sync.WaitGroup
+	err  error
+}
+
+func startH2PayloadWrite(ctx context.Context, trackTCP bool, writer *io.PipeWriter, payload []byte) *h2PayloadWrite {
+	write := new(h2PayloadWrite)
+	write.done.Add(1)
+	ownedPayload := bytes.Clone(payload)
+	var participant task.ParticipantLease
+	if trackTCP {
+		participant = task.AcquireParticipant(ctx)
+	}
+	go func() {
+		defer write.done.Done()
+		if participant != nil {
+			defer func() { participant.Release(write.err) }()
+		}
+		_, write.err = writer.Write(ownedPayload)
+	}()
+	return write
+}
+
+func (w *h2PayloadWrite) Wait() error {
+	w.done.Wait()
+	return w.err
+}
 
 // NewClient create a new http client based on the given config.
 func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
@@ -62,7 +89,40 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		header:        config.Header,
+		h2Conns:       make(map[net.Destination]*h2Conn),
 	}, nil
+}
+
+func (c *Client) Close() error {
+	c.h2Mu.Lock()
+	if c.closed {
+		c.h2Mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	connections := c.h2Conns
+	retired := c.h2Retired
+	c.h2Conns = nil
+	c.h2Retired = nil
+	c.h2Mu.Unlock()
+	var closeErrors []error
+	for _, connection := range connections {
+		if connection.h2Conn != nil {
+			closeErrors = append(closeErrors, connection.h2Conn.Close())
+		}
+		if connection.rawConn != nil {
+			closeErrors = append(closeErrors, connection.rawConn.Close())
+		}
+	}
+	for _, connection := range retired {
+		if connection.h2Conn != nil {
+			closeErrors = append(closeErrors, connection.h2Conn.Close())
+		}
+		if connection.rawConn != nil {
+			closeErrors = append(closeErrors, connection.rawConn.Close())
+		}
+	}
+	return errors.Combine(closeErrors...)
 }
 
 // Process implements proxy.Outbound.Process. We first create a socket tunnel via HTTP CONNECT method, then redirect all inbound traffic to that tunnel.
@@ -101,7 +161,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	}
 
 	if err := retry.ExponentialBackoff(5, 100).On(func() error {
-		netConn, err := setUpHTTPTunnel(ctx, dest, targetAddr, user, dialer, header, firstPayload)
+		netConn, err := c.setUpHTTPTunnel(ctx, dest, targetAddr, user, dialer, header, firstPayload)
 		if netConn != nil {
 			if _, ok := netConn.(*http2Conn); !ok {
 				if _, err := netConn.Write(firstPayload); err != nil {
@@ -130,7 +190,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx, newCancel = core.ContextWithoutRequestCancellation(ctx)
+		defer newCancel()
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -156,7 +217,28 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	}
 
 	responseDonePost := task.OnSuccess(responseFunc, task.Close(link.Writer))
-	if err := task.Run(ctx, requestFunc, responseDonePost); err != nil {
+	if newCtx == nil {
+		err = task.Run(ctx, requestFunc, responseDonePost)
+	} else {
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func() error) func() error {
+			copies.Acquire()
+			return func() error {
+				defer copies.Release()
+				return copyTask()
+			}
+		}
+		err = task.Run(ctx, trackCopy(requestFunc), trackCopy(responseDonePost))
+		cancel()
+		newCancel()
+		_ = conn.Close()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		copies.Seal()
+		copies.Wait()
+		_ = timer.CloseAndWait()
+	}
+	if err != nil {
 		return errors.New("connection ends").Base(err)
 	}
 
@@ -206,7 +288,7 @@ func fillRequestHeader(ctx context.Context, header []*Header) ([]*Header, error)
 }
 
 // setUpHTTPTunnel will create a socket tunnel via HTTP CONNECT method
-func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, user *protocol.MemoryUser, dialer internet.Dialer, header []*Header, firstPayload []byte) (net.Conn, error) {
+func (c *Client) setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, user *protocol.MemoryUser, dialer internet.Dialer, header []*Header, firstPayload []byte) (net.Conn, error) {
 	req := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: target},
@@ -252,44 +334,77 @@ func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, u
 		pr, pw := io.Pipe()
 		req.Body = pr
 
-		var pErr error
-		var wg sync.WaitGroup
-		wg.Add(1)
-
-		go func() {
-			_, pErr = pw.Write(firstPayload)
-			wg.Done()
-		}()
+		payloadWrite := startH2PayloadWrite(ctx, !session.TimeoutOnlyFromContext(ctx), pw, firstPayload)
 
 		resp, err := h2clientConn.RoundTrip(req)
 		if err != nil {
-			rawConn.Close()
+			_ = pr.CloseWithError(err)
+			_ = pw.CloseWithError(err)
+			_ = rawConn.Close()
+			_ = payloadWrite.Wait()
 			return nil, err
 		}
 
-		wg.Wait()
-		if pErr != nil {
-			rawConn.Close()
-			return nil, pErr
+		if err := payloadWrite.Wait(); err != nil {
+			_ = pr.CloseWithError(err)
+			_ = pw.CloseWithError(err)
+			_ = resp.Body.Close()
+			_ = rawConn.Close()
+			return nil, err
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			rawConn.Close()
+			_ = pr.Close()
+			_ = pw.Close()
+			_ = resp.Body.Close()
+			_ = rawConn.Close()
 			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
 		}
 		return newHTTP2Conn(rawConn, pw, resp.Body), nil
 	}
 
-	cachedH2Mutex.Lock()
-	cachedConn, cachedConnFound := cachedH2Conns[dest]
-	cachedH2Mutex.Unlock()
+	c.h2Mu.Lock()
+	var idleRetired []*h2Conn
+	retained := c.h2Retired[:0]
+	for _, connection := range c.h2Retired {
+		state := connection.h2Conn.State()
+		if state.StreamsActive == 0 && state.StreamsReserved == 0 && state.StreamsPending == 0 {
+			idleRetired = append(idleRetired, connection)
+		} else {
+			retained = append(retained, connection)
+		}
+	}
+	c.h2Retired = retained
+	cachedConn, cachedConnFound := c.h2Conns[dest]
+	closed := c.closed
+	c.h2Mu.Unlock()
+	for _, connection := range idleRetired {
+		_ = connection.h2Conn.Close()
+		_ = connection.rawConn.Close()
+	}
+	if closed {
+		return nil, errors.New("HTTP outbound is closed")
+	}
 
 	if cachedConnFound {
 		rc, cc := cachedConn.rawConn, cachedConn.h2Conn
 		if cc.CanTakeNewRequest() {
 			proxyConn, err := connectHTTP2(rc, cc)
 			if err != nil {
+				c.h2Mu.Lock()
+				if c.h2Conns[dest] == cachedConn {
+					delete(c.h2Conns, dest)
+					c.h2Retired = append(c.h2Retired, cachedConn)
+				}
+				c.h2Mu.Unlock()
 				return nil, err
+			}
+			c.h2Mu.Lock()
+			current := !c.closed && c.h2Conns[dest] == cachedConn
+			c.h2Mu.Unlock()
+			if !current {
+				_ = proxyConn.Close()
+				return nil, errors.New("HTTP outbound closed or replaced during HTTP/2 reuse")
 			}
 
 			return proxyConn, nil
@@ -335,19 +450,27 @@ func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, u
 			return nil, err
 		}
 
-		cachedH2Mutex.Lock()
-		if cachedH2Conns == nil {
-			cachedH2Conns = make(map[net.Destination]h2Conn)
-		}
-
-		cachedH2Conns[dest] = h2Conn{
+		candidate := &h2Conn{
 			rawConn: rawConn,
 			h2Conn:  h2clientConn,
 		}
-		cachedH2Mutex.Unlock()
+		c.h2Mu.Lock()
+		if c.closed {
+			c.h2Mu.Unlock()
+			_ = h2clientConn.Close()
+			_ = rawConn.Close()
+			return nil, errors.New("HTTP outbound closed during HTTP/2 publication")
+		}
+		previous := c.h2Conns[dest]
+		c.h2Conns[dest] = candidate
+		if previous != nil {
+			c.h2Retired = append(c.h2Retired, previous)
+		}
+		c.h2Mu.Unlock()
 
 		return proxyConn, err
 	default:
+		_ = rawConn.Close()
 		return nil, errors.New("negotiated unsupported application layer protocol: " + nextProto)
 	}
 }

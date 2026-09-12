@@ -11,6 +11,17 @@ import (
 // Option for creating new Pipes.
 type Option func(*pipeOption)
 
+// WriteLifecycle is the internal dispatcher lifecycle seam for one pipe
+// direction. Implementations must be bounded and non-blocking. It is not a
+// general traffic callback API.
+type WriteLifecycle interface {
+	BeginWrite() bool
+	CompleteWrite(bool, uint64)
+	HalfClose()
+	Seal()
+	MarkDrained()
+}
+
 // WithoutSizeLimit returns an Option for Pipe to have no size limit.
 func WithoutSizeLimit() Option {
 	return func(opt *pipeOption) {
@@ -29,6 +40,14 @@ func WithSizeLimit(limit int32) Option {
 func DiscardOverflow() Option {
 	return func(opt *pipeOption) {
 		opt.discardOverflow = true
+	}
+}
+
+// WithWriteLifecycle binds one dispatcher-owned lifecycle gate to this pipe.
+// It preserves the native Reader and Writer endpoint types.
+func WithWriteLifecycle(lifecycle WriteLifecycle) Option {
+	return func(opt *pipeOption) {
+		opt.lifecycle = lifecycle
 	}
 }
 

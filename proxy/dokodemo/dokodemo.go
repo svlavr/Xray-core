@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	flow_observation "github.com/xtls/xray-core/app/dispatcher/flow"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -133,6 +134,11 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 	}
 	if !dest.IsValid() || dest.Address == nil {
 		return errors.New("unable to get destination")
+	}
+	if network == net.Network_UDP {
+		if scope := flow_observation.ExternalOwnerScopeFromContext(ctx); scope != nil {
+			scope.AuthorizeDokodemoUDP()
+		}
 	}
 
 	inbound := session.InboundFromContext(ctx)

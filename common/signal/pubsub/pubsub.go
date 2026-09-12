@@ -36,8 +36,11 @@ func (s *Subscriber) IsClosed() bool {
 
 type Service struct {
 	sync.RWMutex
-	subs  map[string][]*Subscriber
-	ctask *task.Periodic
+	subs      map[string][]*Subscriber
+	ctask     *task.Periodic
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func NewService() *Service {
@@ -87,6 +90,11 @@ func (s *Service) Subscribe(name string) *Subscriber {
 		done:   done.New(),
 	}
 	s.Lock()
+	if s.closed {
+		s.Unlock()
+		_ = sub.Close()
+		return sub
+	}
 	s.subs[name] = append(s.subs[name], sub)
 	s.Unlock()
 	common.Must(s.ctask.Start())
@@ -96,10 +104,46 @@ func (s *Service) Subscribe(name string) *Subscriber {
 func (s *Service) Publish(name string, message interface{}) {
 	s.RLock()
 	defer s.RUnlock()
+	if s.closed {
+		return
+	}
 
 	for _, sub := range s.subs[name] {
 		if !sub.IsClosed() {
 			sub.push(message)
 		}
 	}
+}
+
+func (s *Service) SignalStop() {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	if s.closed {
+		s.Unlock()
+		return
+	}
+	s.closed = true
+	var subscribers []*Subscriber
+	for _, group := range s.subs {
+		subscribers = append(subscribers, group...)
+	}
+	s.subs = make(map[string][]*Subscriber)
+	s.Unlock()
+	for _, subscriber := range subscribers {
+		_ = subscriber.Close()
+	}
+	_ = s.ctask.Close()
+}
+
+func (s *Service) CloseAndWait() error {
+	if s == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.SignalStop()
+		s.closeErr = s.ctask.CloseAndWait()
+	})
+	return s.closeErr
 }

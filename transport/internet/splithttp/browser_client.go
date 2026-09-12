@@ -33,7 +33,7 @@ func (c *BrowserDialerClient) OpenStream(ctx context.Context, url string, sessio
 
 	c.transportConfig.FillStreamRequest(request, sessionId, "")
 
-	conn, err := browser_dialer.DialGet(request.URL.String(), request.Header, request.Cookies())
+	conn, err := browser_dialer.DialGetContext(ctx, request.URL.String(), request.Header, request.Cookies())
 	dummyAddr := &net.IPAddr{}
 	if err != nil {
 		return nil, dummyAddr, dummyAddr, err
@@ -62,7 +62,7 @@ func (c *BrowserDialerClient) PostPacket(ctx context.Context, url string, sessio
 		}
 	}
 
-	err = browser_dialer.DialPacket(method, request.URL.String(), request.Header, request.Cookies(), bytes)
+	err = browser_dialer.DialPacketContext(ctx, method, request.URL.String(), request.Header, request.Cookies(), bytes)
 	if err != nil {
 		return err
 	}

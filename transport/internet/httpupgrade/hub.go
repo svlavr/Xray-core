@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -23,10 +24,34 @@ type server struct {
 	addConn        internet.ConnHandler
 	innnerListener net.Listener
 	socketSettings *internet.SocketConfig
+	lifecycle      *internet.InboundLifecycle
+	mu             sync.Mutex
+	closed         bool
+	connections    map[net.Conn]*internet.InboundHandoff
 }
 
 func (s *server) Close() error {
-	return s.innnerListener.Close()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	type acceptedConnection struct {
+		conn    net.Conn
+		handoff *internet.InboundHandoff
+	}
+	connections := make([]acceptedConnection, 0, len(s.connections))
+	for conn, handoff := range s.connections {
+		connections = append(connections, acceptedConnection{conn: conn, handoff: handoff})
+	}
+	s.mu.Unlock()
+	err := s.innnerListener.Close()
+	for _, accepted := range connections {
+		accepted.handoff.Reject()
+		accepted.conn.Close()
+	}
+	return err
 }
 
 func (s *server) Addr() net.Addr {
@@ -34,7 +59,18 @@ func (s *server) Addr() net.Addr {
 }
 
 func (s *server) Handle(conn net.Conn) {
-	upgradedConn, err := s.upgrade(conn)
+	s.handle(conn, false, nil)
+}
+
+func (s *server) handle(conn net.Conn, tracked bool, handoff *internet.InboundHandoff) {
+	if tracked {
+		defer func() {
+			s.unregister(conn)
+			conn.Close()
+			s.lifecycle.Release()
+		}()
+	}
+	upgradedConn, err := s.upgrade(conn, handoff)
 	if err != nil {
 		common.CloseIfExists(conn)
 		errors.LogInfoInner(context.Background(), err, "failed to handle request")
@@ -44,7 +80,7 @@ func (s *server) Handle(conn net.Conn) {
 }
 
 // upgrade execute a fake websocket upgrade process and return the available connection
-func (s *server) upgrade(conn net.Conn) (stat.Connection, error) {
+func (s *server) upgrade(conn net.Conn, handoff *internet.InboundHandoff) (stat.Connection, error) {
 	// timeout and header limit are the same as websocket
 	conn.SetReadDeadline(time.Now().Add(time.Second * 4))
 	defer conn.SetReadDeadline(time.Time{})
@@ -93,7 +129,7 @@ func (s *server) upgrade(conn net.Conn) (stat.Connection, error) {
 	}
 	remoteAddr = http_proto.ApplyTrustedXForwardedFor(req.Header, trustedXFF, remoteAddr)
 
-	return stat.Connection(newConnection(conn, remoteAddr)), nil
+	return stat.Connection(newConnection(conn, remoteAddr, handoff)), nil
 }
 
 func (s *server) keepAccepting() {
@@ -110,8 +146,40 @@ func (s *server) keepAccepting() {
 			}
 			continue
 		}
-		go s.Handle(conn)
+		tracked := s.lifecycle != nil
+		var handoff *internet.InboundHandoff
+		if tracked {
+			var registered bool
+			handoff, registered = s.register(conn)
+			if !registered {
+				conn.Close()
+				continue
+			}
+		}
+		go s.handle(conn, tracked, handoff)
 	}
+}
+
+func (s *server) register(conn net.Conn) (*internet.InboundHandoff, bool) {
+	if !s.lifecycle.Acquire() {
+		return nil, false
+	}
+	handoff := new(internet.InboundHandoff)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.lifecycle.Release()
+		return nil, false
+	}
+	s.connections[conn] = handoff
+	s.mu.Unlock()
+	return handoff, true
+}
+
+func (s *server) unregister(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.connections, conn)
+	s.mu.Unlock()
 }
 
 func ListenHTTPUpgrade(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -163,8 +231,17 @@ func ListenHTTPUpgrade(ctx context.Context, address net.Address, port net.Port, 
 		addConn:        addConn,
 		innnerListener: listener,
 		socketSettings: streamSettings.SocketSettings,
+		lifecycle:      internet.InboundLifecycleFromContext(ctx),
+		connections:    make(map[net.Conn]*internet.InboundHandoff),
 	}
-	go serverInstance.keepAccepting()
+	if !serverInstance.lifecycle.Acquire() {
+		listener.Close()
+		return nil, errors.New("inbound listener is closing")
+	}
+	go func() {
+		defer serverInstance.lifecycle.Release()
+		serverInstance.keepAccepting()
+	}()
 	return serverInstance, nil
 }
 

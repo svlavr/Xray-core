@@ -33,10 +33,17 @@ type QUICNameServer struct {
 	destination     *net.Destination
 	connection      *quic.Conn
 	clientIP        net.IP
+	stopOnce        sync.Once
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // NewQUICNameServer creates DNS-over-QUIC client object for local resolving
 func NewQUICNameServer(url *url.URL, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*QUICNameServer, error) {
+	return NewQUICNameServerContext(context.Background(), url, disableCache, serveStale, serveExpiredTTL, clientIP)
+}
+
+func NewQUICNameServerContext(ctx context.Context, url *url.URL, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (*QUICNameServer, error) {
 	var err error
 	port := net.Port(853)
 	if url.Port() != "" {
@@ -48,7 +55,7 @@ func NewQUICNameServer(url *url.URL, disableCache bool, serveStale bool, serveEx
 	dest := net.UDPDestination(net.ParseAddress(url.Hostname()), port)
 
 	s := &QUICNameServer{
-		cacheController: NewCacheController(url.String(), disableCache, serveStale, serveExpiredTTL),
+		cacheController: NewCacheControllerContext(ctx, url.String(), disableCache, serveStale, serveExpiredTTL),
 		destination:     &dest,
 		clientIP:        clientIP,
 	}
@@ -100,7 +107,14 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 	}
 
 	for _, req := range reqs {
+		if !s.cacheController.AcquireTask() {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- context.Canceled
+			}
+			continue
+		}
 		go func(r *dnsRequest) {
+			defer s.cacheController.ReleaseTask()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
 			dnsCtx := ctx
@@ -155,6 +169,17 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
+			var closeStreamOnce sync.Once
+			closeStream := func() {
+				closeStreamOnce.Do(func() {
+					_ = conn.SetDeadline(time.Now())
+					conn.CancelRead(0)
+					conn.CancelWrite(0)
+					_ = conn.Close()
+				})
+			}
+			stopStream := context.AfterFunc(dnsCtx, closeStream)
+			defer func() { stopStream(); closeStream() }()
 
 			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
@@ -223,7 +248,7 @@ func isActive(s *quic.Conn) bool {
 	}
 }
 
-func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
+func (s *QUICNameServer) getConnection(ctx context.Context) (*quic.Conn, error) {
 	var conn *quic.Conn
 	s.RLock()
 	conn = s.connection
@@ -233,37 +258,43 @@ func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
 	}
 	if conn != nil {
 		// we're recreating the connection, let's create a new one
-		_ = conn.CloseWithError(0, "")
 	}
 	s.RUnlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, "")
+	}
 
 	s.Lock()
 	defer s.Unlock()
 
 	var err error
-	conn, err = s.openConnection()
+	conn, err = s.openConnection(ctx)
 	if err != nil {
 		// This does not look too nice, but QUIC (or maybe quic-go)
 		// doesn't seem stable enough.
 		// Maybe retransmissions aren't fully implemented in quic-go?
 		// Anyways, the simple solution is to make a second try when
 		// it fails to open the QUIC connection.
-		conn, err = s.openConnection()
+		conn, err = s.openConnection(ctx)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if err := s.cacheController.Context().Err(); err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, err
 	}
 	s.connection = conn
 	return conn, nil
 }
 
-func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
+func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error) {
 	tlsConfig := tls.Config{}
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout: handshakeTimeout,
 	}
 	tlsConfig.ServerName = s.destination.Address.String()
-	conn, err := quic.DialAddr(context.Background(), s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	conn, err := quic.DialAddr(ctx, s.destination.NetAddr(), tlsConfig.GetTLSConfigContext(ctx, tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
 	log.Record(&log.AccessMessage{
 		From:   "DNS",
 		To:     s.destination,
@@ -278,11 +309,33 @@ func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
 }
 
 func (s *QUICNameServer) openStream(ctx context.Context) (*quic.Stream, error) {
-	conn, err := s.getConnection()
+	conn, err := s.getConnection(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// open a new stream
 	return conn.OpenStreamSync(ctx)
+}
+
+func (s *QUICNameServer) SignalStop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.cacheController.SignalStop()
+		s.Lock()
+		connection := s.connection
+		s.connection = nil
+		s.Unlock()
+		if connection != nil {
+			_ = connection.CloseWithError(0, "")
+		}
+	})
+}
+
+func (s *QUICNameServer) Close() error {
+	s.SignalStop()
+	s.closeOnce.Do(func() { s.closeErr = s.cacheController.Close() })
+	return s.closeErr
 }

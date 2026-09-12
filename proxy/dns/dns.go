@@ -214,19 +214,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		}
 	}
 
+	var timeoutCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		ctx = context.Background()
+		ctx, timeoutCancel = core.ContextWithoutRequestCancellation(ctx)
+		defer timeoutCancel()
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
+	var terminateOnce sync.Once
 	terminate := func() {
-		cancel()
-		conn.Close()
+		terminateOnce.Do(func() {
+			cancel()
+			_ = conn.Close()
+		})
 	}
 	timer := signal.CancelAfterInactivity(ctx, terminate, h.timeout)
-	defer timer.SetTimeout(0)
+	defer func() { _ = timer.CloseAndWait() }()
 
-	request := func() error {
+	request := func(requestCtx context.Context) error {
 		defer timer.SetTimeout(0)
 		for {
 			b, err := reader.ReadMessage()
@@ -239,7 +244,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 
 			timer.Update()
 
-			if h.isOwnLink(ctx) {
+			if h.isOwnLink(requestCtx) {
 				if err := connWriter.WriteMessage(b); err != nil {
 					return err
 				}
@@ -271,7 +276,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 						return err
 					}
 				} else {
-					go h.handleIPQuery(id, qType, domain, writer, timer)
+					h.startIPQueryWorkerContext(requestCtx, func(workerCtx context.Context) {
+						h.handleIPQuery(workerCtx, id, qType, domain, writer, timer)
+					})
 				}
 			case RuleAction_Direct:
 				if err := connWriter.WriteMessage(b); err != nil {
@@ -283,7 +290,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		}
 	}
 
-	response := func() error {
+	response := func(context.Context) error {
 		defer timer.SetTimeout(0)
 		for {
 			b, err := connReader.ReadMessage()
@@ -303,27 +310,86 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		}
 	}
 
-	if err := task.Run(ctx, request, response); err != nil {
+	var err error
+	if timeoutCancel == nil {
+		err = task.RunWithContext(ctx, request, response)
+	} else {
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func(context.Context) error) func(context.Context) error {
+			copies.Acquire()
+			return func(copyCtx context.Context) error {
+				defer copies.Release()
+				return copyTask(copyCtx)
+			}
+		}
+		err = task.RunWithContext(ctx, trackCopy(request), trackCopy(response))
+		terminate()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		copies.Seal()
+		copies.Wait()
+	}
+	if err != nil {
 		return errors.New("connection ends").Base(err)
 	}
 
 	return nil
 }
 
-func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter, timer *signal.ActivityTimer) {
+func (h *Handler) startIPQueryWorker(ctx context.Context, query func()) {
+	h.startIPQueryWorkerContext(ctx, func(context.Context) { query() })
+}
+
+func (h *Handler) startIPQueryWorkerContext(ctx context.Context, query func(context.Context)) {
+	right := core.RetirementRightFromContext(ctx)
+	if right == nil {
+		participant := task.AcquireParticipant(ctx)
+		go func() {
+			if participant != nil {
+				defer participant.Release(nil)
+			}
+			query(ctx)
+		}()
+		return
+	}
+	continuation, ok := right.AcquireContinuation()
+	if !ok {
+		return
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	stopGeneration := context.AfterFunc(continuation.GenerationContext(), cancel)
+	workerCtx = core.ContextWithRetirementRight(workerCtx, continuation)
+	participant := task.AcquireParticipant(workerCtx)
+	go func() {
+		defer continuation.Release()
+		defer func() { stopGeneration(); cancel() }()
+		if participant != nil {
+			defer participant.Release(nil)
+		}
+		query(workerCtx)
+	}()
+}
+
+func (h *Handler) handleIPQuery(ctx context.Context, id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter, timer *signal.ActivityTimer) {
 	var ips []net.IP
 	var ttl uint32
 	var err error
 
+	lookup := h.client.LookupIP
+	if contextual, ok := h.client.(dns.ContextClient); ok {
+		lookup = func(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+			return contextual.LookupIPContext(ctx, domain, option)
+		}
+	}
 	switch qType {
 	case dnsmessage.TypeA:
-		ips, ttl, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl, err = lookup(domain, dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: false,
 			FakeEnable: true,
 		})
 	case dnsmessage.TypeAAAA:
-		ips, ttl, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl, err = lookup(domain, dns.IPOption{
 			IPv4Enable: false,
 			IPv6Enable: true,
 			FakeEnable: true,

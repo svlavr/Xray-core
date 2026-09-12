@@ -15,6 +15,10 @@ type result struct {
 }
 
 func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig, domain string) (net.Conn, error) {
+	return tcpRaceDialWithDialer(ctx, src, ips, port, sockopt, domain, systemDialerForContext(ctx))
+}
+
+func tcpRaceDialWithDialer(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig, domain string, dialer SystemDialer) (net.Conn, error) {
 	if len(ips) < 2 {
 		panic("at least 2 ips is required to race dial")
 	}
@@ -84,7 +88,7 @@ func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Po
 			if nextTryIndex == len(ips) || activeNum == maxConcurrentTry {
 				panic("impossible situation")
 			}
-			go tcpTryDial(newCtx, src, sockopt, ips[nextTryIndex], port, nextTryIndex, resultCh)
+			go tcpTryDial(newCtx, src, sockopt, ips[nextTryIndex], port, nextTryIndex, resultCh, dialer)
 			activeNum++
 			nextTryIndex++
 			if nextTryIndex == len(ips) || activeNum == maxConcurrentTry {
@@ -156,8 +160,8 @@ func sortIPs(ips []net.IP, prioritizeIPv6 bool, interleave uint32) []net.IP {
 	return newIPs
 }
 
-func tcpTryDial(ctx context.Context, src net.Address, sockopt *SocketConfig, ip net.IP, port net.Port, index int, resultCh chan<- *result) {
-	conn, err := effectiveSystemDialer.Dial(ctx, src, net.Destination{Address: net.IPAddress(ip), Network: net.Network_TCP, Port: port}, sockopt)
+func tcpTryDial(ctx context.Context, src net.Address, sockopt *SocketConfig, ip net.IP, port net.Port, index int, resultCh chan<- *result, dialer SystemDialer) {
+	conn, err := dialer.Dial(ctx, src, net.Destination{Address: net.IPAddress(ip), Network: net.Network_TCP, Port: port}, sockopt)
 	select {
 	case <-ctx.Done():
 		if conn != nil {

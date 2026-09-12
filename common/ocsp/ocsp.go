@@ -2,6 +2,7 @@ package ocsp
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"io"
@@ -49,6 +50,22 @@ func GetOCSPStapling(cert [][]byte, path string) ([]byte, error) {
 }
 
 func GetOCSPForCert(cert [][]byte) ([]byte, error) {
+	return getOCSPForCert(context.Background(), cert, http.DefaultClient)
+}
+
+// GetOCSPForCertContext retrieves the issuer and OCSP response under the
+// caller's lifecycle while preserving GetOCSPForCert for legacy callers.
+func GetOCSPForCertContext(ctx context.Context, cert [][]byte) ([]byte, error) {
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true}
+	if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = defaultTransport.Clone()
+	}
+	client := &http.Client{Transport: transport}
+	defer transport.CloseIdleConnections()
+	return getOCSPForCert(ctx, cert, client)
+}
+
+func getOCSPForCert(ctx context.Context, cert [][]byte, client *http.Client) ([]byte, error) {
 	bundle := new(bytes.Buffer)
 	for _, derBytes := range cert {
 		err := pem.Encode(bundle, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
@@ -70,9 +87,13 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 		if len(issuedCert.IssuingCertificateURL) == 0 {
 			return nil, errors.New("no issuing certificate URL")
 		}
-		resp, errC := http.Get(issuedCert.IssuingCertificateURL[0])
+		issuerRequest, errC := http.NewRequestWithContext(ctx, http.MethodGet, issuedCert.IssuingCertificateURL[0], nil)
 		if errC != nil {
-			return nil, errors.New("no issuing certificate URL")
+			return nil, errors.New("invalid issuing certificate URL").Base(errC)
+		}
+		resp, errC := client.Do(issuerRequest)
+		if errC != nil {
+			return nil, errors.New("failed to retrieve issuing certificate").Base(errC)
 		}
 		defer resp.Body.Close()
 
@@ -94,10 +115,14 @@ func GetOCSPForCert(cert [][]byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	reader := bytes.NewReader(ocspReq)
-	req, err := http.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, issuedCert.OCSPServer[0], bytes.NewReader(ocspReq))
 	if err != nil {
 		return nil, errors.New(err)
+	}
+	request.Header.Set("Content-Type", "application/ocsp-request")
+	req, err := client.Do(request)
+	if err != nil {
+		return nil, errors.New("failed to retrieve OCSP response").Base(err)
 	}
 	defer req.Body.Close()
 	ocspResBytes, err := io.ReadAll(req.Body)

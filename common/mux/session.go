@@ -3,7 +3,6 @@ package mux
 import (
 	"context"
 	"io"
-	"runtime"
 	"sync"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -52,6 +52,12 @@ func (m *SessionManager) Count() int {
 }
 
 func (m *SessionManager) Allocate(Strategy *ClientStrategy) *Session {
+	return m.AllocateWithLink(Strategy, nil, nil, protocol.TransferTypeStream, nil)
+}
+
+// AllocateWithLink publishes a complete, gated client session atomically.
+// Input/output and the post-commit release are installed before map visibility.
+func (m *SessionManager) AllocateWithLink(Strategy *ClientStrategy, input buf.Reader, output buf.Writer, transferType protocol.TransferType, release func()) *Session {
 	m.Lock()
 	defer m.Unlock()
 
@@ -64,9 +70,15 @@ func (m *SessionManager) Allocate(Strategy *ClientStrategy) *Session {
 
 	m.count++
 	s := &Session{
-		ID:     m.count,
-		parent: m,
-		done:   done.New(),
+		ID:           m.count,
+		parent:       m,
+		done:         done.New(),
+		input:        input,
+		output:       output,
+		transferType: transferType,
+		gated:        true,
+		gateDone:     make(chan struct{}),
+		release:      release,
 	}
 	m.sessions[s.ID] = s
 	return s
@@ -76,12 +88,41 @@ func (m *SessionManager) Add(s *Session) bool {
 	m.Lock()
 	defer m.Unlock()
 
-	if m.closed {
+	if s == nil || m.closed || m.sessions[s.ID] != nil {
 		return false
 	}
 
 	m.count++
 	m.sessions[s.ID] = s
+	return true
+}
+
+// addAndPublishXUDP makes a carrier-local XUDP session visible to both its
+// session manager and the global XUDP entry as one lock-ordered transition.
+// SessionManager always precedes XUDPManager in this package.
+func (m *SessionManager) addAndPublishXUDP(s *Session, x *XUDP, expected *Session) bool {
+	if s == nil || x == nil {
+		return false
+	}
+	m.Lock()
+	defer m.Unlock()
+	if m.closed || m.sessions[s.ID] != nil {
+		return false
+	}
+	XUDPManager.Lock()
+	defer XUDPManager.Unlock()
+	if XUDPManager.Map[x.GlobalID] != x || x.Status != Initializing || x.Mux != expected {
+		return false
+	}
+	s.inputStarted = true
+	m.count++
+	m.sessions[s.ID] = s
+	x.Mux = s
+	x.Status = Active
+	if s.xudpBinding != nil && !s.xudpBinding.Install() {
+		s.xudpBinding.Abort()
+		s.xudpBinding = nil
+	}
 	return true
 }
 
@@ -103,6 +144,22 @@ func (m *SessionManager) Remove(locked bool, id uint16) {
 			m.sessions = make(map[uint16]*Session, 16)
 		}
 	*/
+}
+
+// removeExact removes only the session instance that the manager still owns.
+// A rejected duplicate must not remove its already-live sibling by ID.
+func (m *SessionManager) removeExact(locked bool, s *Session) {
+	if s == nil {
+		return
+	}
+	if !locked {
+		m.Lock()
+		defer m.Unlock()
+	}
+	if m.closed || m.sessions[s.ID] != s {
+		return
+	}
+	delete(m.sessions, s.ID)
 }
 
 func (m *SessionManager) Get(id uint16) (*Session, bool) {
@@ -137,67 +194,195 @@ func (m *SessionManager) CloseIfNoSessionAndIdle(checkSize int, checkCount int) 
 
 func (m *SessionManager) Close() error {
 	m.Lock()
-	defer m.Unlock()
-
 	if m.closed {
+		m.Unlock()
 		return nil
 	}
-
 	m.closed = true
-
+	sessions := make([]*Session, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		s.Close(true)
+		sessions = append(sessions, s)
 	}
-
 	m.sessions = nil
+	m.Unlock()
+	for _, s := range sessions {
+		s.Close(false)
+	}
 	return nil
 }
 
 // Session represents a client connection in a Mux connection.
 type Session struct {
-	input        buf.Reader
-	output       buf.Writer
-	parent       *SessionManager
-	ID           uint16
-	transferType protocol.TransferType
-	closed       bool
-	done         *done.Instance
-	XUDP         *XUDP
+	input         buf.Reader
+	output        buf.Writer
+	parent        *SessionManager
+	ID            uint16
+	transferType  protocol.TransferType
+	closed        bool
+	done          *done.Instance
+	XUDP          *XUDP
+	inputDone     chan struct{}
+	inputStarted  bool
+	inputStop     sync.Once
+	inputFinish   sync.Once
+	flowScope     session.MuxSessionObservation
+	xudpRebinding bool
+	xudpBinding   session.XUDPBindingObservation
+	stateMu       sync.Mutex
+	gated         bool
+	gateDone      chan struct{}
+	release       func()
+	releaseOnce   sync.Once
+}
+
+func (s *Session) startInput() bool {
+	s.stateMu.Lock()
+	if s.closed || !s.gated {
+		s.stateMu.Unlock()
+		s.releaseClaim()
+		return false
+	}
+	s.gated = false
+	s.inputStarted = true
+	close(s.gateDone)
+	s.stateMu.Unlock()
+	return true
+}
+
+func (s *Session) waitForStart() bool {
+	s.stateMu.Lock()
+	done := s.gateDone
+	if done == nil {
+		started := s.inputStarted
+		s.stateMu.Unlock()
+		return started
+	}
+	s.stateMu.Unlock()
+	<-done
+	s.stateMu.Lock()
+	started := s.inputStarted
+	s.stateMu.Unlock()
+	return started
+}
+
+func (s *Session) releaseClaim() {
+	s.releaseOnce.Do(func() {
+		if s.release != nil {
+			s.release()
+		}
+	})
+}
+
+func (s *Session) inputComplete() {
+	if s.inputDone != nil {
+		s.inputFinish.Do(func() { close(s.inputDone) })
+	}
+	if s.xudpBinding != nil {
+		s.xudpBinding.ReaderExited()
+	}
+}
+
+func (s *Session) stopXUDPInputContext(ctx context.Context, wait bool) error {
+	if !s.inputStarted {
+		return nil
+	}
+	reader, ok := s.input.(*pipe.Reader)
+	if !ok {
+		return errXUDPReaderUnsupported
+	}
+	s.inputStop.Do(func() { reader.ReturnAnError(io.EOF) })
+	if wait && s.inputStarted && s.inputDone != nil {
+		select {
+		case <-s.inputDone:
+			// If buf.Copy stopped because the response writer failed, the EOF
+			// was never consumed. Drain only after the receipt, before this
+			// retained reader is published to a new binding.
+			reader.Recover()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // Close closes all resources associated with this session.
 func (s *Session) Close(locked bool) error {
-	if !locked {
-		s.parent.Lock()
-		defer s.parent.Unlock()
+	return s.close(context.Background(), locked)
+}
+
+func (s *Session) close(ctx context.Context, locked bool) error {
+	managerShutdown := s.parent.Closed()
+	// Map ownership is linearized under the parent only. All externally
+	// re-enterable actions happen after it is released.
+	s.parent.Lock()
+	s.stateMu.Lock()
+	alreadyClosed := s.closed
+	if !alreadyClosed {
+		s.closed = true
+		if s.gated {
+			s.gated = false
+			close(s.gateDone)
+		}
+		if s.done != nil {
+			s.done.Close()
+		}
 	}
-	locked = true
-	if s.closed {
-		return nil
+	s.stateMu.Unlock()
+	if !alreadyClosed {
+		if s.parent.sessions != nil && s.parent.sessions[s.ID] == s {
+			delete(s.parent.sessions, s.ID)
+		}
 	}
-	s.closed = true
-	if s.done != nil {
-		s.done.Close()
-	}
-	if s.XUDP == nil {
+	s.parent.Unlock()
+	if !alreadyClosed && s.XUDP == nil {
 		common.Interrupt(s.input)
 		common.Close(s.output)
-	} else {
-		// Stop existing handle(), then trigger writer.Close().
-		// Note that s.output may be dispatcher.SizeStatWriter.
-		s.input.(*pipe.Reader).ReturnAnError(io.EOF)
-		runtime.Gosched()
-		// If the error set by ReturnAnError still exists, clear it.
-		s.input.(*pipe.Reader).Recover()
-		XUDPManager.Lock()
+	}
+	if !alreadyClosed && s.flowScope != nil {
+		s.flowScope.AfterClose()
+	}
+	if s.XUDP == nil {
+		return nil
+	}
+	// A rebinding caller waits only after releasing SessionManager. Manager
+	// shutdown sends the stop signal but must not wait while it holds that lock.
+	if err := s.stopXUDPInputContext(ctx, true); err != nil {
+		if managerShutdown && err == errXUDPReaderUnsupported {
+			var observation session.XUDPEpochObservation
+			XUDPManager.Lock()
+			if XUDPManager.Map[s.XUDP.GlobalID] == s.XUDP && s.XUDP.Mux == s {
+				delete(XUDPManager.Map, s.XUDP.GlobalID)
+				observation = s.XUDP.observation
+				if s.xudpBinding != nil {
+					s.xudpBinding.RevokeUnproven()
+				}
+			}
+			XUDPManager.Unlock()
+			common.Interrupt(s.input)
+			common.Close(s.output)
+			if observation != nil {
+				observation.Terminalize()
+			}
+		}
+		return err
+	}
+	XUDPManager.Lock()
+	if XUDPManager.Map[s.XUDP.GlobalID] == s.XUDP && s.XUDP.Mux == s &&
+		(s.XUDP.Status == Active || (s.XUDP.Status == Initializing && s.xudpRebinding)) {
 		if s.XUDP.Status == Active {
 			s.XUDP.Expire = time.Now().Add(time.Minute)
 			s.XUDP.Status = Expiring
-			errors.LogDebug(context.Background(), "XUDP put ", s.XUDP.GlobalID)
 		}
-		XUDPManager.Unlock()
+		transition := session.XUDPDetachToExpiring
+		if s.xudpRebinding {
+			transition = session.XUDPDetachForRebind
+		}
+		if s.xudpBinding != nil {
+			s.xudpBinding.Deactivate(transition)
+		}
+		errors.LogDebug(context.Background(), "XUDP put ", s.XUDP.GlobalID)
 	}
-	s.parent.Remove(locked, s.ID)
+	XUDPManager.Unlock()
 	return nil
 }
 
@@ -215,16 +400,25 @@ const (
 	Expiring     = 2
 )
 
+var errXUDPReaderUnsupported = errors.New("XUDP retained reader is not a pipe reader")
+
 type XUDP struct {
-	GlobalID [8]byte
-	Status   uint64
-	Expire   time.Time
-	Mux      *Session
+	GlobalID    [8]byte
+	Status      uint64
+	Expire      time.Time
+	Mux         *Session
+	observation session.XUDPEpochObservation
 }
 
 func (x *XUDP) Interrupt() {
-	common.Interrupt(x.Mux.input)
-	common.Close(x.Mux.output)
+	XUDPManager.Lock()
+	mux := x.Mux
+	XUDPManager.Unlock()
+	if mux == nil {
+		return
+	}
+	common.Interrupt(mux.input)
+	common.Close(mux.output)
 }
 
 var XUDPManager struct {
@@ -237,16 +431,40 @@ func init() {
 	go func() {
 		for {
 			time.Sleep(time.Minute)
-			now := time.Now()
-			XUDPManager.Lock()
-			for id, x := range XUDPManager.Map {
-				if x.Status == Expiring && now.After(x.Expire) {
-					x.Interrupt()
-					delete(XUDPManager.Map, id)
-					errors.LogDebug(context.Background(), "XUDP del ", id)
-				}
-			}
-			XUDPManager.Unlock()
+			expireXUDP(time.Now())
 		}
 	}()
+}
+
+// expireXUDP removes expired XUDP entries while retaining the manager lock for
+// the exact duration of the stock sweep.
+func expireXUDP(now time.Time) {
+	XUDPManager.Lock()
+	type expiredBinding struct {
+		session     *Session
+		observation session.XUDPEpochObservation
+	}
+	var expired []expiredBinding
+	for id, x := range XUDPManager.Map {
+		if x.Status == Expiring && now.After(x.Expire) {
+			// The lock proves this is still the exact expiring binding. The
+			// retained transport is captured before deleting the authority.
+			mux := x.Mux
+			delete(XUDPManager.Map, id)
+			if mux != nil {
+				expired = append(expired, expiredBinding{session: mux, observation: x.observation})
+			}
+			errors.LogDebug(context.Background(), "XUDP del ", id)
+		}
+	}
+	XUDPManager.Unlock()
+	for _, expired := range expired {
+		common.Interrupt(expired.session.input)
+		common.Close(expired.session.output)
+		// The exact map entry was removed under XUDPManager and both retained
+		// endpoints have completed their local close actions.
+		if expired.observation != nil {
+			expired.observation.Terminalize()
+		}
+	}
 }

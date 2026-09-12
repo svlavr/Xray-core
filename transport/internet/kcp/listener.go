@@ -24,23 +24,47 @@ type ConnectionID struct {
 // Listener defines a server listening for connections
 type Listener struct {
 	sync.Mutex
-	sessions  map[ConnectionID]*Connection
-	hub       *udp.Hub
-	tlsConfig *gotls.Config
-	config    *Config
-	reader    PacketReader
-	addConn   internet.ConnHandler
+	sessions    map[ConnectionID]*Connection
+	owned       map[*Connection]struct{}
+	handoffs    map[*Connection]*internet.InboundHandoff
+	hub         *udp.Hub
+	tlsConfig   *gotls.Config
+	config      *Config
+	reader      PacketReader
+	addConn     internet.ConnHandler
+	lifecycle   *internet.InboundLifecycle
+	joined      bool
+	closed      bool
+	packetDone  chan struct{}
+	stopOnce    sync.Once
+	stopDone    chan struct{}
+	stopErr     error
+	closing     []*Connection
+	waitOnce    sync.Once
+	waitDone    chan struct{}
+	waitErr     error
+	releaseOnce sync.Once
+	releaseDone chan struct{}
+	releaseErr  error
 }
 
 func NewListener(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (*Listener, error) {
 	kcpSettings := streamSettings.ProtocolSettings.(*Config)
 
 	l := &Listener{
-		reader:   &KCPPacketReader{},
-		sessions: make(map[ConnectionID]*Connection),
-		config:   kcpSettings,
-		addConn:  addConn,
+		reader:      &KCPPacketReader{},
+		sessions:    make(map[ConnectionID]*Connection),
+		owned:       make(map[*Connection]struct{}),
+		handoffs:    make(map[*Connection]*internet.InboundHandoff),
+		config:      kcpSettings,
+		addConn:     addConn,
+		lifecycle:   internet.InboundLifecycleFromContext(ctx),
+		packetDone:  make(chan struct{}),
+		stopDone:    make(chan struct{}),
+		waitDone:    make(chan struct{}),
+		releaseDone: make(chan struct{}),
 	}
+	l.joined = l.lifecycle != nil && l.lifecycle.Tasks != nil
 
 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.tlsConfig = config.GetTLSConfig()
@@ -55,7 +79,17 @@ func NewListener(ctx context.Context, address net.Address, port net.Port, stream
 	l.Unlock()
 	errors.LogInfo(ctx, "listening on ", address, ":", port)
 
-	go l.handlePackets()
+	if l.joined && !l.lifecycle.Acquire() {
+		_ = hub.Close()
+		return nil, errors.New("inbound listener is closing")
+	}
+	go func() {
+		if l.joined {
+			defer l.lifecycle.Release()
+		}
+		defer close(l.packetDone)
+		l.handlePackets()
+	}()
 
 	return l, nil
 }
@@ -86,12 +120,23 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 	}
 
 	l.Lock()
-	defer l.Unlock()
+	if l.closed {
+		l.Unlock()
+		releaseSegments(segments)
+		return
+	}
 
 	conn, found := l.sessions[id]
 
 	if !found {
 		if cmd == CommandTerminate {
+			l.Unlock()
+			releaseSegments(segments)
+			return
+		}
+		if l.joined && !l.lifecycle.Acquire() {
+			l.Unlock()
+			releaseSegments(segments)
 			return
 		}
 		writer := &Writer{
@@ -110,35 +155,147 @@ func (l *Listener) OnReceive(payload *buf.Buffer, src net.Destination) {
 			RemoteAddr:   remoteAddr,
 			Conversation: conv,
 		}, writer, writer, l.config)
+		writer.connection = conn
+		conn.releaseHook = func() { l.removeOwned(conn) }
 		var netConn stat.Connection = conn
 		if l.tlsConfig != nil {
 			netConn = tls.Server(conn, l.tlsConfig)
 		}
-
-		l.addConn(netConn)
+		if !l.joined {
+			l.addConn(netConn)
+			l.sessions[id] = conn
+			l.owned[conn] = struct{}{}
+			l.Unlock()
+			conn.Input(segments)
+			return
+		}
+		handoff := new(internet.InboundHandoff)
+		netConn = &inboundConnection{Connection: netConn, handoff: handoff}
+		if !conn.tasks.Acquire() {
+			l.lifecycle.Release()
+			l.Unlock()
+			releaseSegments(segments)
+			_ = conn.Release()
+			return
+		}
 		l.sessions[id] = conn
+		l.owned[conn] = struct{}{}
+		l.handoffs[conn] = handoff
+		conn.Input(segments)
+		l.Unlock()
+		go func() {
+			defer l.lifecycle.Release()
+			defer conn.tasks.Release()
+			defer l.removeHandoff(conn)
+			l.addConn(netConn)
+		}()
+		return
 	}
+	l.Unlock()
 	conn.Input(segments)
 }
 
-func (l *Listener) Remove(id ConnectionID) {
+func releaseSegments(segments []Segment) {
+	for _, seg := range segments {
+		seg.Release()
+	}
+}
+
+func (l *Listener) Remove(id ConnectionID, conn *Connection) {
 	l.Lock()
-	delete(l.sessions, id)
+	if l.sessions[id] == conn {
+		delete(l.sessions, id)
+	}
 	l.Unlock()
 }
 
-// Close stops listening on the UDP address. Already Accepted connections are not closed.
-func (l *Listener) Close() error {
-	l.hub.Close()
-
+func (l *Listener) removeHandoff(conn *Connection) {
 	l.Lock()
-	defer l.Unlock()
+	delete(l.handoffs, conn)
+	l.Unlock()
+}
 
-	for _, conn := range l.sessions {
-		go conn.Terminate()
+func (l *Listener) removeOwned(conn *Connection) {
+	l.Lock()
+	delete(l.owned, conn)
+	l.Unlock()
+}
+
+// Stop seals ingress and unblocks every KCP-owned peer without waiting.
+func (l *Listener) Stop() error {
+	l.stopOnce.Do(func() {
+		l.Lock()
+		l.closed = true
+		l.closing = make([]*Connection, 0, len(l.owned))
+		for conn := range l.owned {
+			l.closing = append(l.closing, conn)
+		}
+		for _, handoff := range l.handoffs {
+			handoff.Reject()
+		}
+		l.Unlock()
+
+		hubErr := l.hub.Close()
+		closeErrs := []error{hubErr}
+		for _, conn := range l.closing {
+			if err := conn.Stop(); err != nil {
+				closeErrs = append(closeErrs, err)
+			}
+		}
+		l.stopErr = errors.Combine(closeErrs...)
+		close(l.stopDone)
+	})
+	<-l.stopDone
+	return l.stopErr
+}
+
+// Wait joins listener/session work but retains buffers needed by callbacks.
+func (l *Listener) Wait() error {
+	_ = l.Stop()
+	l.waitOnce.Do(func() {
+		l.hub.Wait()
+		<-l.packetDone
+		for _, conn := range l.closing {
+			_ = conn.Wait()
+		}
+		l.waitErr = l.stopErr
+		close(l.waitDone)
+	})
+	<-l.waitDone
+	return l.waitErr
+}
+
+// Release drops session buffers after the external callback barrier has joined.
+func (l *Listener) Release() error {
+	_ = l.Wait()
+	l.releaseOnce.Do(func() {
+		for _, conn := range l.closing {
+			_ = conn.Release()
+		}
+		l.Lock()
+		clear(l.sessions)
+		clear(l.owned)
+		clear(l.handoffs)
+		l.Unlock()
+		l.releaseErr = l.waitErr
+		close(l.releaseDone)
+	})
+	<-l.releaseDone
+	return l.releaseErr
+}
+
+// Close is the standalone seal/stop/join/release path. Proxyman uses the
+// phased methods so every worker is stopped before any callback join begins.
+func (l *Listener) Close() error {
+	if err := l.Stop(); !l.joined {
+		for _, conn := range l.closing {
+			go conn.Terminate()
+		}
+		return err
 	}
-
-	return nil
+	_ = l.Wait()
+	l.lifecycle.Tasks.Wait()
+	return l.Release()
 }
 
 func (l *Listener) ActiveConnections() int {
@@ -154,10 +311,11 @@ func (l *Listener) Addr() net.Addr {
 }
 
 type Writer struct {
-	id       ConnectionID
-	dest     net.Destination
-	hub      *udp.Hub
-	listener *Listener
+	id         ConnectionID
+	dest       net.Destination
+	hub        *udp.Hub
+	listener   *Listener
+	connection *Connection
 }
 
 func (w *Writer) Write(payload []byte) (int, error) {
@@ -165,9 +323,18 @@ func (w *Writer) Write(payload []byte) (int, error) {
 }
 
 func (w *Writer) Close() error {
-	w.listener.Remove(w.id)
+	w.listener.Remove(w.id, w.connection)
 	return nil
 }
+
+type inboundConnection struct {
+	stat.Connection
+	handoff *internet.InboundHandoff
+}
+
+func (c *inboundConnection) AcceptInboundHandoff() bool { return c.handoff.Accept() }
+func (c *inboundConnection) RejectInboundHandoff()      { c.handoff.Reject() }
+func (c *inboundConnection) UnwrapConnection() net.Conn { return c.Connection }
 
 func ListenKCP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
 	return NewListener(ctx, address, port, streamSettings, addConn)

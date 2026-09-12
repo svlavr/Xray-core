@@ -30,6 +30,8 @@ const (
 	streamSettingsKey ctx.SessionKey = 13
 )
 
+type multiplexedLogicalSessionContextKey struct{}
+
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
 	return context.WithValue(ctx, inboundSessionKey, inbound)
 }
@@ -201,4 +203,22 @@ func ContextWithStreamSettings(ctx context.Context, streamSettings any) context.
 
 func StreamSettingsFromContext(ctx context.Context) any {
 	return ctx.Value(streamSettingsKey)
+}
+
+// ContextWithMultiplexedLogicalSession marks a decoded MUX/XUDP child whose
+// lifecycle and carrier identity belong to PR-F2. It preserves every existing
+// context value; the dispatcher uses it only to exclude PR-F1 TCP admission.
+func ContextWithMultiplexedLogicalSession(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, multiplexedLogicalSessionContextKey{}, true)
+}
+
+func IsMultiplexedLogicalSession(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	marked, _ := ctx.Value(multiplexedLogicalSessionContextKey{}).(bool)
+	return marked
 }

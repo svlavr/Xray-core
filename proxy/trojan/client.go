@@ -84,7 +84,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		newCtx, newCancel = context.WithCancel(context.Background())
+		newCtx, newCancel = core.ContextWithoutRequestCancellation(ctx)
+		defer newCancel()
 	}
 
 	sessionPolicy := c.policyManager.ForLevel(user.Level)
@@ -155,7 +156,28 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	}
 
 	responseDoneAndCloseWriter := task.OnSuccess(getResponse, task.Close(link.Writer))
-	if err := task.Run(ctx, postRequest, responseDoneAndCloseWriter); err != nil {
+	if newCtx == nil {
+		err = task.Run(ctx, postRequest, responseDoneAndCloseWriter)
+	} else {
+		var copies task.Lifecycle
+		trackCopy := func(copyTask func() error) func() error {
+			copies.Acquire()
+			return func() error {
+				defer copies.Release()
+				return copyTask()
+			}
+		}
+		err = task.Run(ctx, trackCopy(postRequest), trackCopy(responseDoneAndCloseWriter))
+		cancel()
+		newCancel()
+		_ = conn.Close()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		copies.Seal()
+		copies.Wait()
+		_ = timer.CloseAndWait()
+	}
+	if err != nil {
 		return errors.New("connection ends").Base(err)
 	}
 

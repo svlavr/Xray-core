@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/dns"
 )
@@ -28,6 +29,12 @@ type DNS struct {
 	hosts                  *StaticHosts
 	clients                []*Client
 	ctx                    context.Context
+	cancel                 context.CancelFunc
+	lifecycle              task.Lifecycle
+	stopOnce               sync.Once
+	closeOnce              sync.Once
+	closeDone              chan struct{}
+	closeErr               error
 	domainMatcher          geodata.DomainMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
@@ -41,6 +48,19 @@ type DomainMatcherInfo struct {
 
 // New creates a new DNS server with given configuration.
 func New(ctx context.Context, config *Config) (*DNS, error) {
+	generationCtx, generationCancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopInstance := context.AfterFunc(ctx, generationCancel)
+	committed := false
+	var clients []*Client
+	defer func() {
+		if !committed {
+			stopInstance()
+			generationCancel()
+			for _, client := range clients {
+				_ = client.Close()
+			}
+		}
+	}()
 	var clientIP net.IP
 	switch len(config.ClientIp) {
 	case 0, net.IPv4len, net.IPv6len:
@@ -91,7 +111,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		defaultTag = generateRandomTag()
 	}
 
-	clients := make([]*Client, 0, len(config.NameServer))
+	clients = make([]*Client, 0, len(config.NameServer))
 	matcherInfos := make([]*DomainMatcherInfo, 0)
 	effectiveRules := make([]*geodata.DomainRule, 0)
 
@@ -149,7 +169,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			return nil, errors.New("no QueryStrategy available for ", ns.Address)
 		}
 
-		client, err := NewClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, updateRules)
+		client, err := NewClient(generationCtx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, updateRules)
 		if err != nil {
 			return nil, errors.New("failed to create client").Base(err)
 		}
@@ -169,18 +189,22 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		clients = append(clients, NewLocalDNSClient(ipOption))
 	}
 
-	return &DNS{
+	server := &DNS{
 		hosts:                  hosts,
 		ipOption:               &ipOption,
 		clients:                clients,
-		ctx:                    ctx,
+		ctx:                    generationCtx,
+		cancel:                 func() { stopInstance(); generationCancel() },
+		closeDone:              make(chan struct{}),
 		domainMatcher:          domainMatcher,
 		matcherInfos:           matcherInfos,
 		disableFallback:        config.DisableFallback,
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
-	}, nil
+	}
+	committed = true
+	return server, nil
 }
 
 // Type implements common.HasType.
@@ -195,7 +219,35 @@ func (s *DNS) Start() error {
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
-	return nil
+	s.SignalStop()
+	s.closeOnce.Do(func() {
+		s.lifecycle.Wait()
+		results := make(chan error, len(s.clients))
+		for _, client := range s.clients {
+			go func() { results <- client.Close() }()
+		}
+		var closeErrors []error
+		for range s.clients {
+			closeErrors = append(closeErrors, <-results)
+		}
+		s.closeErr = errors.Combine(closeErrors...)
+		close(s.closeDone)
+	})
+	<-s.closeDone
+	return s.closeErr
+}
+
+func (s *DNS) SignalStop() {
+	if s == nil {
+		return
+	}
+	s.stopOnce.Do(func() {
+		s.lifecycle.Seal()
+		s.cancel()
+		for _, client := range s.clients {
+			client.SignalStop()
+		}
+	})
 }
 
 // IsOwnLink implements proxy.dns.ownLinkVerifier
@@ -214,6 +266,22 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 
 // LookupIP implements dns.Client.
 func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	return s.LookupIPContext(s.ctx, domain, option)
+}
+
+func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	if !s.lifecycle.Acquire() {
+		return nil, 0, errors.New("DNS generation is closed")
+	}
+	defer s.lifecycle.Release()
+	lookupCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopRequest := context.AfterFunc(ctx, cancel)
+	stopGeneration := context.AfterFunc(s.ctx, cancel)
+	defer func() { stopRequest(); stopGeneration(); cancel() }()
+	return s.lookupIP(lookupCtx, domain, option)
+}
+
+func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	// Normalize the FQDN form query
 	domain = strings.TrimSuffix(domain, ".")
 	if domain == "" {
@@ -258,9 +326,9 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 
 	// Name servers lookup
 	if s.enableParallelQuery {
-		return s.parallelQuery(domain, option)
+		return s.parallelQuery(ctx, domain, option)
 	} else {
-		return s.serialQuery(domain, option)
+		return s.serialQuery(ctx, domain, option)
 	}
 }
 
@@ -360,7 +428,7 @@ func mergeQueryErrors(domain string, errs []error) error {
 	return errors.New("returning nil for domain ", domain).Base(noRNF)
 }
 
-func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *DNS) serialQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	for _, client := range s.sortClients(domain) {
 		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
@@ -368,7 +436,7 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 			continue
 		}
 
-		ips, ttl, err := client.QueryIP(s.ctx, domain, option)
+		ips, ttl, err := client.QueryIP(ctx, domain, option)
 
 		if len(ips) > 0 {
 			return ips, ttl, nil
@@ -383,11 +451,11 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 	return nil, 0, mergeQueryErrors(domain, errs)
 }
 
-func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *DNS) parallelQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	clients := s.sortClients(domain)
 
-	resultsChan := asyncQueryAll(domain, option, clients, s.ctx)
+	resultsChan := s.asyncQueryAll(domain, option, clients, ctx)
 
 	groups, groupOf := makeGroups( /*s.ctx,*/ clients)
 	results := make([]*queryResult, len(clients))
@@ -444,7 +512,7 @@ type queryResult struct {
 	index int
 }
 
-func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context) chan queryResult {
+func (s *DNS) asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context) chan queryResult {
 	if len(clients) == 0 {
 		ch := make(chan queryResult)
 		close(ch)
@@ -459,12 +527,19 @@ func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx co
 			continue
 		}
 
+		if !s.lifecycle.Acquire() {
+			ch <- queryResult{err: context.Canceled, index: i}
+			continue
+		}
 		go func(i int, c *Client) {
+			defer s.lifecycle.Release()
 			qctx := ctx
-			if !c.server.IsDisableCache() {
-				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeoutMs*2)
+			if !c.IsDisableCache() {
+				detached, detachCancel := context.WithCancel(context.WithoutCancel(ctx))
+				stopGeneration := context.AfterFunc(s.ctx, detachCancel)
+				nctx, cancel := context.WithTimeout(detached, c.timeoutMs*2)
 				qctx = nctx
-				defer cancel()
+				defer func() { stopGeneration(); cancel(); detachCancel() }()
 			}
 			ips, ttl, err := c.QueryIP(qctx, domain, option)
 			ch <- queryResult{ips: ips, ttl: ttl, err: err, index: i}

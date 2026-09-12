@@ -2,6 +2,8 @@ package singbridge
 
 import (
 	"context"
+	"io"
+	"sync"
 	"time"
 
 	B "github.com/sagernet/sing/common/buf"
@@ -11,12 +13,14 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/transport"
 )
 
 func CopyPacketConn(ctx context.Context, inboundConn net.Conn, link *transport.Link, destination net.Destination, serverConn net.PacketConn) error {
 	cancel := func() {
 		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
 		common.Interrupt(serverConn)
 	}
 	conn := &PacketConnWrapper{
@@ -37,10 +41,17 @@ type PacketConnWrapper struct {
 	cached buf.MultiBuffer
 
 	// A simple patch to avoid goroutine leak since sing infra cannot awake read block by write err
-	T *signal.ActivityTimer
+	T         *signal.ActivityTimer
+	reads     task.Lifecycle
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (w *PacketConnWrapper) ReadPacket(buffer *B.Buffer) (addr M.Socksaddr, err error) {
+	if !w.reads.Acquire() {
+		return M.Socksaddr{}, io.ErrClosedPipe
+	}
+	defer w.reads.Release()
 	w.T.Update()
 	defer func() {
 		if err != nil {
@@ -102,6 +113,14 @@ func (w *PacketConnWrapper) WritePacket(buffer *B.Buffer, destination M.Socksadd
 }
 
 func (w *PacketConnWrapper) Close() error {
-	buf.ReleaseMulti(w.cached)
-	return nil
+	w.closeOnce.Do(func() {
+		w.reads.Seal()
+		if w.T != nil {
+			w.closeErr = w.T.CloseAndWait()
+		}
+		w.reads.Wait()
+		buf.ReleaseMulti(w.cached)
+		w.cached = nil
+	})
+	return w.closeErr
 }
