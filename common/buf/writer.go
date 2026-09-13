@@ -14,7 +14,8 @@ import (
 type BufferToBytesWriter struct {
 	io.Writer
 
-	counter stats.Counter
+	// Counter receives bytes accepted by the underlying writer, including partial errors.
+	Counter stats.Counter
 	cache   [][]byte
 }
 
@@ -28,7 +29,7 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	}
 
 	if len(mb) == 1 {
-		return WriteAllBytes(w.Writer, mb[0].Bytes(), w.counter)
+		return WriteAllBytes(w.Writer, mb[0].Bytes(), w.Counter)
 	}
 
 	if cap(w.cache) < len(mb) {
@@ -49,8 +50,8 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	nb := net.Buffers(bs)
 	wc := int64(0)
 	defer func() {
-		if w.counter != nil {
-			w.counter.Add(wc)
+		if w.Counter != nil {
+			w.Counter.Add(wc)
 		}
 	}()
 	for size > 0 {

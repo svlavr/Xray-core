@@ -347,6 +347,7 @@ func (d *DefaultDispatcher) dispatchLink(ctx context.Context, destination net.De
 		ctx = session.ContextWithContent(ctx, content)
 	}
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
+	d.connections.observeLink(connectionID, outbound)
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
 		d.routedDispatch(ctx, outbound, destination, connectionID)

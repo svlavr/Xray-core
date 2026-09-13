@@ -757,6 +757,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
+			countConnection := dispatcher.BeginConnectionRawCopy(writer)
 			w, err := tc.ReadFrom(readerConn)
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
@@ -766,6 +767,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			if statWriter != nil {
 				statWriter.Counter.Add(w) // user stats
+			}
+			if countConnection != nil {
+				countConnection(w)
 			}
 			if err != nil && errors.Cause(err) != io.EOF {
 				return err

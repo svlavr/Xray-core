@@ -191,6 +191,6 @@ func NewWriter(writer io.Writer) Writer {
 	}
 	return &BufferToBytesWriter{
 		Writer:  iConn,
-		counter: counter,
+		Counter: counter,
 	}
 }

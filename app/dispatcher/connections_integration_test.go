@@ -3,6 +3,7 @@ package dispatcher_test
 import (
 	"bytes"
 	"io"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -166,6 +167,20 @@ func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
 				for i, tag := range []string{"A", "B"} {
 					if !rows[i].OutboundSelected || rows[i].OutboundTag != tag || rows[i].RuleTag != "choose-"+tag || rows[i].InboundTag != "user-socks" || rows[i].Source == "" {
 						t.Fatalf("wrong selected facts: %+v", rows)
+					}
+					want := int64(len("live user TCP payload"))
+					if i == 0 {
+						want *= 2
+					}
+					if rows[i].UplinkCoverage != dispatcher.BytesExact || rows[i].UplinkReadBytes != want {
+						t.Fatalf("uplink payload accounting: %+v, want %d", rows[i], want)
+					}
+					if (runtime.GOOS == "linux" || runtime.GOOS == "android") && !(name == "native-mux" && i == 0) {
+						if rows[i].DownlinkCoverage != dispatcher.BytesDeferredRawCopy {
+							t.Fatalf("active native raw copy must report deferred bytes: %+v", rows[i])
+						}
+					} else if rows[i].DownlinkCoverage != dispatcher.BytesExact || rows[i].DownlinkWrittenBytes != want {
+						t.Fatalf("downlink accepted accounting: %+v, want %d", rows[i], want)
 					}
 				}
 				a.Close()
