@@ -93,11 +93,12 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm    outbound.Manager
-	router routing.Router
-	policy policy.Manager
-	stats  stats.Manager
-	fdns   dns.FakeDNSEngine
+	ohm         outbound.Manager
+	router      routing.Router
+	policy      policy.Manager
+	stats       stats.Manager
+	fdns        dns.FakeDNSEngine
+	connections connectionTracker
 }
 
 func init() {
@@ -135,7 +136,10 @@ func (*DefaultDispatcher) Start() error {
 }
 
 // Close implements common.Closable.
-func (*DefaultDispatcher) Close() error { return nil }
+func (d *DefaultDispatcher) Close() error {
+	d.connections.close()
+	return nil
+}
 
 func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link) {
 	opt := pipe.OptionsFromContext(ctx)
@@ -285,7 +289,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	sniffingRequest := content.SniffingRequest
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
+		go d.routedDispatch(ctx, outbound, destination, 0)
 	} else {
 		go func() {
 			cReader := &cachedReader{
@@ -314,7 +318,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 					ob.Target = destination
 				}
 			}
-			d.routedDispatch(ctx, outbound, destination)
+			d.routedDispatch(ctx, outbound, destination, 0)
 		}()
 	}
 	return inbound, nil
@@ -322,6 +326,10 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 
 // DispatchLink implements routing.Dispatcher.
 func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
+	return d.dispatchLink(ctx, destination, outbound, 0)
+}
+
+func (d *DefaultDispatcher) dispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link, connectionID uint64) error {
 	if !destination.IsValid() {
 		return errors.New("Dispatcher: Invalid destination.")
 	}
@@ -341,7 +349,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
-		d.routedDispatch(ctx, outbound, destination)
+		d.routedDispatch(ctx, outbound, destination, connectionID)
 	} else {
 		cReader := &cachedReader{
 			reader: outbound.Reader.(buf.TimeoutReader),
@@ -369,7 +377,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 				ob.Target = destination
 			}
 		}
-		d.routedDispatch(ctx, outbound, destination)
+		d.routedDispatch(ctx, outbound, destination, connectionID)
 	}
 
 	return nil
@@ -431,11 +439,12 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 	return contentResult, contentErr
 }
 
-func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
+func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination, connectionID uint64) {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 
 	var handler outbound.Handler
+	var ruleTag string
 
 	routingLink := routing_session.AsRoutingContext(ctx)
 	inTag := routingLink.GetInboundTag()
@@ -463,6 +472,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 					errors.LogInfo(ctx, "Hit route rule: [", route.GetRuleTag(), "] so taking detour [", outTag, "] for [", destination, "]")
 				}
 				handler = h
+				ruleTag = route.GetRuleTag()
 			} else {
 				errors.LogWarning(ctx, "non existing outTag: ", outTag)
 				common.Close(link.Writer)
@@ -486,6 +496,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 
 	ob.Tag = handler.Tag()
+	d.connections.selected(connectionID, ob.Tag, ruleTag, destination)
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
 		if tag := handler.Tag(); tag != "" {
 			if inTag == "" {

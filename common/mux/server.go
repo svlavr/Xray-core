@@ -74,6 +74,18 @@ func (s *Server) DispatchLink(ctx context.Context, dest net.Destination, link *t
 	return nil
 }
 
+// DispatchUserLink preserves explicit user admission through the inbound wrapper.
+// A request for the MUX carrier address retains native handling without tracking
+// the carrier as a user connection. Implementations without observation still work.
+func (s *Server) DispatchUserLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
+	if dest.Address != muxCoolAddress {
+		if d, ok := s.dispatcher.(routing.UserDispatcher); ok {
+			return d.DispatchUserLink(ctx, dest, link)
+		}
+	}
+	return s.DispatchLink(ctx, dest, link)
+}
+
 // Start implements common.Runnable.
 func (s *Server) Start() error {
 	return nil
