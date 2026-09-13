@@ -211,7 +211,7 @@ func TestUserConnectionCloseRacesAndExhaustion(t *testing.T) {
 	}
 	d.connections.next = math.MaxUint64
 	d.connections.dropped = math.MaxUint64
-	if id := d.connections.begin(context.Background(), dest); id != 0 {
+	if id := d.connections.begin(context.Background(), dest); id.ID != 0 {
 		t.Fatal("ID reused on overflow")
 	}
 	if d.ConnectionSnapshot().Dropped != math.MaxUint64 {
@@ -219,7 +219,7 @@ func TestUserConnectionCloseRacesAndExhaustion(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if id := d.connections.begin(ctx, dest); id != 0 {
+	if id := d.connections.begin(ctx, dest); id != nil {
 		t.Fatal("registered canceled request")
 	}
 }
@@ -253,10 +253,10 @@ func TestUserConnectionInstanceIsolation(t *testing.T) {
 	}
 	dest := net.TCPDestination(net.LocalHostIP, 80)
 	aID, bID := a.connections.begin(context.Background(), dest), b.connections.begin(context.Background(), dest)
-	if aID != 1 || bID != 1 {
+	if aID.ID != 1 || bID.ID != 1 {
 		t.Fatal("IDs unexpectedly shared across instances")
 	}
-	if a.connections.begin(context.Background(), dest) != 0 {
+	if a.connections.begin(context.Background(), dest).ID != 0 {
 		t.Fatal("limit not enforced")
 	}
 	if err := a.Close(); err != nil {
@@ -272,7 +272,7 @@ func TestUserConnectionInstanceIsolation(t *testing.T) {
 		t.Fatalf("cross-instance mutation: %+v", s)
 	}
 	b.connections.end(bID)
-	if id := b.connections.begin(context.Background(), dest); id != 2 {
+	if id := b.connections.begin(context.Background(), dest); id.ID != 2 {
 		t.Fatal("ID reused")
 	}
 	_ = b.Close()

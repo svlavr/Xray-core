@@ -188,6 +188,9 @@ func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
 				if left[0].ID != rows[1].ID {
 					t.Fatal("wrong request retired")
 				}
+				if totals := d.ConnectionSnapshot().OutboundTotals; len(totals) != 2 || totals[0].OutboundTag != "A" || totals[0].UplinkReadBytes != int64(2*len("live user TCP payload")) {
+					t.Fatalf("retirement erased A totals: %+v", totals)
+				}
 				exchange(b)
 			} else if len(d.ConnectionSnapshot().Connections) != 0 {
 				t.Fatal("disabled tracker registered traffic")
@@ -195,6 +198,28 @@ func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
 			b.Close()
 			a.Close()
 			waitUserConnections(t, d, 0)
+			if enabled {
+				// Dispatch return may precede raw-copy return. Totals must receive
+				// that late result while remaining independent of the live index.
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					totals := d.ConnectionSnapshot().OutboundTotals
+					complete := len(totals) == 2
+					for i, total := range totals {
+						want := int64(2 * len("live user TCP payload"))
+						complete = complete && total.OutboundTag == []string{"A", "B"}[i] && total.UplinkReadBytes == want && total.DownlinkWrittenBytes == want && total.UplinkCoverage == dispatcher.BytesExact && total.DownlinkCoverage == dispatcher.BytesExact
+					}
+					if complete {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("final per-outbound totals: %+v", totals)
+					}
+					time.Sleep(time.Millisecond)
+				}
+			} else if len(d.ConnectionSnapshot().OutboundTotals) != 0 {
+				t.Fatal("disabled observation counted USER totals")
+			}
 		})
 	}
 }

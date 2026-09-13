@@ -69,6 +69,10 @@ func TestConnectionBytesNativeWriterBoundary(t *testing.T) {
 			if err := d.DispatchUserLink(context.Background(), net.TCPDestination(net.LocalHostIP, 80), link); err != nil {
 				t.Fatal(err)
 			}
+			total := outboundTotals(t, d, "")
+			if total.DownlinkCoverage != BytesExact || total.DownlinkWrittenBytes != tc.want || len(d.ConnectionSnapshot().Connections) != 0 {
+				t.Fatalf("retired partial/error total: %+v", total)
+			}
 		})
 	}
 }

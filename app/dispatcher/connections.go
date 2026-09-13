@@ -52,9 +52,23 @@ type flowByteCounter struct {
 	forward  stats.Counter
 	deferred atomic.Bool
 	overflow atomic.Bool
+	tracker  *connectionTracker
+	total    atomic.Pointer[outboundByteTotal]
+	// Resolved also covers a selected request omitted by totals capacity.
+	totalBindingResolved atomic.Bool
 }
 
 func (c *flowByteCounter) addOwn(n int64) int64 {
+	if c.tracker != nil && !c.totalBindingResolved.Load() {
+		c.tracker.Lock()
+		defer c.tracker.Unlock()
+		if c.tracker.closed {
+			c.totalBindingResolved.Store(true)
+		}
+	}
+	if total := c.total.Load(); total != nil {
+		total.add(n)
+	}
 	value := c.Counter.Add(n)
 	if n < 0 || value < 0 {
 		c.overflow.Store(true)
@@ -110,29 +124,27 @@ func BeginConnectionRawCopy(writer buf.Writer) func(int64) {
 	if !ok {
 		return nil
 	}
-	c.deferred.Store(true)
-	return func(n int64) { c.addOwn(n); c.deferred.Store(false) }
+	c.setDeferred(true)
+	return func(n int64) { c.addOwn(n); c.setDeferred(false) }
 }
 
-func (t *connectionTracker) observeLink(id uint64, link *transport.Link) {
-	if id == 0 {
+func (t *connectionTracker) observeLink(row *connectionEntry, link *transport.Link) {
+	if row == nil {
 		return
 	}
 	t.Lock()
 	defer t.Unlock()
-	row, ok := t.live[id]
-	if !ok {
+	if t.closed {
 		return
 	}
 	if r, ok := link.Reader.(*buf.TimeoutWrapperReader); ok {
-		row.uplink = &flowByteCounter{forward: r.Counter}
+		row.uplink = &flowByteCounter{forward: r.Counter, tracker: t}
 		r.Counter = row.uplink
 	}
 	if w := connectionBufferWriter(link.Writer); w != nil {
-		row.downlink = &flowByteCounter{forward: w.Counter}
+		row.downlink = &flowByteCounter{forward: w.Counter, tracker: t}
 		w.Counter = row.downlink
 	}
-	t.live[id] = row
 }
 
 // ConnectionSnapshot covers explicit DispatchUserLink calls only. The native
@@ -144,20 +156,29 @@ type ConnectionSnapshot struct {
 	Limit       int
 	Dropped     uint64
 	Connections []UserConnection
+	// Totals have the same USER TCP and byte boundaries as Connections, but
+	// include retired requests and requests omitted from the live index.
+	OutboundTotals []UserOutboundTotal
+	// TotalsDropped counts selected requests omitted by distinct-tag capacity.
+	// An absent bucket never proves zero traffic. Limit caps each map separately.
+	TotalsDropped uint64
 }
 
 type connectionTracker struct {
 	sync.Mutex
-	enabled bool
-	closed  bool
-	limit   int
-	next    uint64
-	dropped uint64
-	live    map[uint64]connectionEntry
+	enabled       bool
+	closed        bool
+	limit         int
+	next          uint64
+	dropped       uint64
+	live          map[uint64]*connectionEntry
+	totals        map[string]*outboundTotal
+	totalsDropped uint64
 }
 
 // EnableConnectionTracking enables this dispatcher's bounded user TCP snapshot
-// once. It does not discover already running requests. Tracking is off by default.
+// once. Limit separately caps live rows and historical outbound tags. It does
+// not discover already running requests. Tracking is off by default.
 func (d *DefaultDispatcher) EnableConnectionTracking(limit int) error {
 	if limit <= 0 {
 		return errors.New("connection tracking limit must be positive")
@@ -169,7 +190,8 @@ func (d *DefaultDispatcher) EnableConnectionTracking(limit int) error {
 		return errors.New("connection tracking already enabled or dispatcher closed")
 	}
 	t.enabled, t.limit = true, limit
-	t.live = make(map[uint64]connectionEntry)
+	t.live = make(map[uint64]*connectionEntry)
+	t.totals = make(map[string]*outboundTotal)
 	return nil
 }
 
@@ -177,7 +199,7 @@ func (d *DefaultDispatcher) EnableConnectionTracking(limit int) error {
 func (d *DefaultDispatcher) ConnectionSnapshot() ConnectionSnapshot {
 	t := &d.connections
 	t.Lock()
-	s := ConnectionSnapshot{Enabled: t.enabled, Closed: t.closed, Limit: t.limit, Dropped: t.dropped}
+	s := ConnectionSnapshot{Enabled: t.enabled, Closed: t.closed, Limit: t.limit, Dropped: t.dropped, TotalsDropped: t.totalsDropped}
 	s.Connections = make([]UserConnection, 0, len(t.live))
 	for _, row := range t.live {
 		copy := row.UserConnection
@@ -185,8 +207,15 @@ func (d *DefaultDispatcher) ConnectionSnapshot() ConnectionSnapshot {
 		copy.DownlinkWrittenBytes, copy.DownlinkCoverage = row.downlink.sample()
 		s.Connections = append(s.Connections, copy)
 	}
+	for tag, total := range t.totals {
+		copy := UserOutboundTotal{OutboundTag: tag}
+		copy.UplinkReadBytes, copy.UplinkCoverage = total.uplink.sample()
+		copy.DownlinkWrittenBytes, copy.DownlinkCoverage = total.downlink.sample()
+		s.OutboundTotals = append(s.OutboundTotals, copy)
+	}
 	t.Unlock()
 	sort.Slice(s.Connections, func(i, j int) bool { return s.Connections[i].ID < s.Connections[j].ID })
+	sort.Slice(s.OutboundTotals, func(i, j int) bool { return s.OutboundTotals[i].OutboundTag < s.OutboundTotals[j].OutboundTag })
 	return s
 }
 
@@ -197,27 +226,28 @@ func (d *DefaultDispatcher) DispatchUserLink(ctx context.Context, dest net.Desti
 	if !dest.IsValid() || dest.Network != net.Network_TCP {
 		return errors.New("user connection observation requires a valid TCP destination")
 	}
-	id := d.connections.begin(ctx, dest)
-	if id != 0 {
-		defer d.connections.end(id)
+	row := d.connections.begin(ctx, dest)
+	if row != nil {
+		defer d.connections.end(row)
 	}
-	return d.dispatchLink(ctx, dest, link, id)
+	return d.dispatchLink(ctx, dest, link, row)
 }
 
-func (t *connectionTracker) begin(ctx context.Context, dest net.Destination) uint64 {
+func (t *connectionTracker) begin(ctx context.Context, dest net.Destination) *connectionEntry {
 	t.Lock()
 	defer t.Unlock()
 	if !t.enabled || t.closed || ctx.Err() != nil {
-		return 0
+		return nil
 	}
+	row := &connectionEntry{}
 	if len(t.live) >= t.limit || t.next == math.MaxUint64 {
 		if t.dropped != math.MaxUint64 {
 			t.dropped++
 		}
-		return 0
+		return row // Request-owned counters still contribute to totals.
 	}
 	t.next++
-	row := connectionEntry{UserConnection: UserConnection{ID: t.next, Started: time.Now(), Destination: dest.String()}}
+	row.UserConnection = UserConnection{ID: t.next, Started: time.Now(), Destination: dest.String()}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		if inbound.Source.IsValid() {
 			row.Source = inbound.Source.String()
@@ -225,25 +255,28 @@ func (t *connectionTracker) begin(ctx context.Context, dest net.Destination) uin
 		row.InboundTag = inbound.Tag
 	}
 	t.live[row.ID] = row
-	return row.ID
+	return row
 }
 
-func (t *connectionTracker) selected(id uint64, tag, rule string, target net.Destination) {
-	if id == 0 {
+func (t *connectionTracker) selected(row *connectionEntry, tag, rule string, target net.Destination) {
+	if row == nil {
 		return
 	}
 	t.Lock()
 	defer t.Unlock()
-	if row, ok := t.live[id]; ok {
+	if !t.closed && !row.OutboundSelected {
 		row.OutboundTag, row.RuleTag, row.RouteTarget = tag, rule, target.String()
 		row.OutboundSelected = true
-		t.live[id] = row
+		t.bindTotals(row, tag)
 	}
 }
 
-func (t *connectionTracker) end(id uint64) {
+func (t *connectionTracker) end(row *connectionEntry) {
+	if row == nil {
+		return
+	}
 	t.Lock()
-	delete(t.live, id)
+	delete(t.live, row.ID)
 	t.Unlock()
 }
 
@@ -251,5 +284,6 @@ func (t *connectionTracker) close() {
 	t.Lock()
 	t.closed = true
 	t.live = nil
+	t.totals = nil
 	t.Unlock()
 }
