@@ -100,9 +100,11 @@ jobs:
         shell: bash
         run: |
           COMMIT=$(git describe --always --dirty)
-          go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}${GOARM}" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
           if [ "${GOOS}" = linux ] && { [ "${GOARCH}" = mips ] || [ "${GOARCH}" = mipsle ]; }; then
+            go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}${GOARM}" -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
             GOMIPS=softfloat go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}-softfloat" -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
+          else
+            go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}${GOARM}" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
           fi
 
   windows-7-build:
