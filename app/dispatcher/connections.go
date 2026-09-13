@@ -125,7 +125,10 @@ func BeginConnectionRawCopy(writer buf.Writer) func(int64) {
 		return nil
 	}
 	c.setDeferred(true)
-	return func(n int64) { c.addOwn(n); c.setDeferred(false) }
+	return func(n int64) {
+		c.addOwn(n)
+		c.setDeferred(false)
+	}
 }
 
 func (t *connectionTracker) observeLink(row *connectionEntry, link *transport.Link) {
@@ -197,6 +200,10 @@ func (d *DefaultDispatcher) EnableConnectionTracking(limit int) error {
 
 // ConnectionSnapshot returns detached metadata sorted by admission ID.
 func (d *DefaultDispatcher) ConnectionSnapshot() ConnectionSnapshot {
+	return d.connectionSnapshot(time.Now)
+}
+
+func (d *DefaultDispatcher) connectionSnapshot(sampleTime func() time.Time) ConnectionSnapshot {
 	t := &d.connections
 	t.Lock()
 	s := ConnectionSnapshot{Enabled: t.enabled, Closed: t.closed, Limit: t.limit, Dropped: t.dropped, TotalsDropped: t.totalsDropped}
@@ -208,10 +215,7 @@ func (d *DefaultDispatcher) ConnectionSnapshot() ConnectionSnapshot {
 		s.Connections = append(s.Connections, copy)
 	}
 	for tag, total := range t.totals {
-		copy := UserOutboundTotal{OutboundTag: tag}
-		copy.UplinkReadBytes, copy.UplinkCoverage = total.uplink.sample()
-		copy.DownlinkWrittenBytes, copy.DownlinkCoverage = total.downlink.sample()
-		s.OutboundTotals = append(s.OutboundTotals, copy)
+		s.OutboundTotals = append(s.OutboundTotals, total.snapshot(tag, sampleTime))
 	}
 	t.Unlock()
 	sort.Slice(s.Connections, func(i, j int) bool { return s.Connections[i].ID < s.Connections[j].ID })

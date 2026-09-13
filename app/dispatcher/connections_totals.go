@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"math"
 	"sync/atomic"
+	"time"
 )
 
 // UserOutboundTotal accumulates observed USER TCP bytes for one selected tag
@@ -15,12 +16,27 @@ type UserOutboundTotal struct {
 	DownlinkWrittenBytes int64
 	UplinkCoverage       ByteCoverage
 	DownlinkCoverage     ByteCoverage
+	// Rate fields describe the cached historical window, while byte totals and
+	// coverage above describe this snapshot. Invalid zero is not zero traffic.
+	// Snapshot reads establish the first baseline (zero window, invalid rates)
+	// and refresh after at least one second. Rates divide compatible byte deltas
+	// by the actual elapsed time; there is no background sampler. Multiple
+	// readers share the same window, and infrequent reads produce longer windows.
+	// Raw-copy transitions and pre-selection transfers invalidate an interval;
+	// later compatible samples can recover. Directions are sampled independently.
+	RateWindowStart        time.Time
+	RateWindowEnd          time.Time
+	UplinkBytesPerSecond   float64
+	DownlinkBytesPerSecond float64
+	UplinkRateValid        bool
+	DownlinkRateValid      bool
 }
 
 // Binding uses the tracker mutex; bound I/O updates use only atomics.
 // Buckets retain no request, counter, link, handler or context references.
 type outboundTotal struct {
 	uplink, downlink outboundByteTotal
+	rate             outboundRateState
 }
 
 type outboundByteTotal struct {
@@ -28,6 +44,16 @@ type outboundByteTotal struct {
 	deferred    atomic.Int64
 	unavailable atomic.Bool
 	overflow    atomic.Bool
+	continuity  atomic.Uint64
+}
+
+func (b *outboundByteTotal) markDiscontinuity() {
+	for {
+		old := b.continuity.Load()
+		if old == math.MaxUint64 || b.continuity.CompareAndSwap(old, old+1) {
+			return
+		}
+	}
 }
 
 func (b *outboundByteTotal) add(n int64) {
@@ -68,11 +94,17 @@ func (b *outboundByteTotal) bind(c *flowByteCounter) {
 		return
 	}
 	value, coverage := c.sample()
+	deferred := c.deferred.Load()
+	if value != 0 || deferred {
+		// Binding holds the tracker lock. Invalidate an existing sampling
+		// interval before publishing pre-selection bytes or deferred state.
+		b.markDiscontinuity()
+	}
 	b.add(value)
 	if coverage == BytesOverflow {
 		b.overflow.Store(true)
 	}
-	if c.deferred.Load() {
+	if deferred {
 		b.deferred.Add(1)
 	}
 	// Publish only after the pre-selection value/state has transferred. An
@@ -115,6 +147,7 @@ func (c *flowByteCounter) setDeferred(deferred bool) {
 	if previous == deferred || total == nil {
 		return
 	}
+	total.markDiscontinuity()
 	if deferred {
 		total.deferred.Add(1)
 	} else {
