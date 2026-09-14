@@ -10,11 +10,9 @@ import (
 	"time"
 
 	appstats "github.com/xtls/xray-core/app/stats"
-	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/transport"
 )
 
 // UserConnection is one explicitly admitted TCP dispatch, not a carrier or
@@ -104,26 +102,9 @@ type connectionEntry struct {
 	uplink, downlink *flowByteCounter
 }
 
-func connectionBufferWriter(writer buf.Writer) *buf.BufferToBytesWriter {
-	if sw, ok := writer.(*SizeStatWriter); ok {
-		writer = sw.Writer
-	}
-	w, _ := writer.(*buf.BufferToBytesWriter)
-	return w
-}
-
-// BeginConnectionRawCopy marks the native writer bypass as deferred. The caller
-// must pass ReadFrom's returned n to the returned function even on partial error.
-// Native connection/user counters are updated separately by the existing path.
-func BeginConnectionRawCopy(writer buf.Writer) func(int64) {
-	w := connectionBufferWriter(writer)
-	if w == nil {
-		return nil
-	}
-	c, ok := w.Counter.(*flowByteCounter)
-	if !ok {
-		return nil
-	}
+// BeginRawCopy marks the bypass as deferred and counts only this observation's
+// final n. Native connection counters are updated separately, without forwarding.
+func (c *flowByteCounter) BeginRawCopy() func(int64) {
 	c.setDeferred(true)
 	return func(n int64) {
 		c.addOwn(n)
@@ -131,26 +112,7 @@ func BeginConnectionRawCopy(writer buf.Writer) func(int64) {
 	}
 }
 
-func (t *connectionTracker) observeLink(row *connectionEntry, link *transport.Link) {
-	if row == nil {
-		return
-	}
-	t.Lock()
-	defer t.Unlock()
-	if t.closed {
-		return
-	}
-	if r, ok := link.Reader.(*buf.TimeoutWrapperReader); ok {
-		row.uplink = &flowByteCounter{forward: r.Counter, tracker: t}
-		r.Counter = row.uplink
-	}
-	if w := connectionBufferWriter(link.Writer); w != nil {
-		row.downlink = &flowByteCounter{forward: w.Counter, tracker: t}
-		w.Counter = row.downlink
-	}
-}
-
-// ConnectionSnapshot covers explicit DispatchUserLink calls only. The native
+// ConnectionSnapshot covers explicit DispatchUserStream calls only. The native
 // caller currently covered is SOCKS TCP CONNECT; empty is not proof of no other
 // traffic. Dropped counts admissions omitted due to capacity or ID exhaustion.
 type ConnectionSnapshot struct {
@@ -221,20 +183,6 @@ func (d *DefaultDispatcher) connectionSnapshot(sampleTime func() time.Time) Conn
 	sort.Slice(s.Connections, func(i, j int) bool { return s.Connections[i].ID < s.Connections[j].ID })
 	sort.Slice(s.OutboundTotals, func(i, j int) bool { return s.OutboundTotals[i].OutboundTag < s.OutboundTotals[j].OutboundTag })
 	return s
-}
-
-// DispatchUserLink observes an explicit USER TCP admission around synchronous
-// DispatchLink. Metadata/markers in context never infer USER for ordinary calls.
-// Observation reuses native counters without altering I/O, cancellation or routing.
-func (d *DefaultDispatcher) DispatchUserLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	if !dest.IsValid() || dest.Network != net.Network_TCP {
-		return errors.New("user connection observation requires a valid TCP destination")
-	}
-	row := d.connections.begin(ctx, dest)
-	if row != nil {
-		defer d.connections.end(row)
-	}
-	return d.dispatchLink(ctx, dest, link, row)
 }
 
 func (t *connectionTracker) begin(ctx context.Context, dest net.Destination) *connectionEntry {

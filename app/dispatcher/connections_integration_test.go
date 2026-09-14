@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func waitUserConnections(t *testing.T, d *dispatcher.DefaultDispatcher, count in
 }
 
 func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
-	for _, name := range []string{"disabled", "enabled", "native-mux"} {
+	for _, name := range []string{"disabled", "enabled", "native-mux", "native-mux-sniff"} {
 		enabled := name != "disabled"
 		t.Run(name, func(t *testing.T) {
 			echo, err := net.Listen("tcp", "127.0.0.1:0")
@@ -72,7 +73,7 @@ func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
 				}}}
 			}
 			firstOutbound := &core.OutboundHandlerConfig{Tag: "A", ProxySettings: serial.ToTypedMessage(&freedom.Config{FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}}})}
-			if name == "native-mux" {
+			if strings.HasPrefix(name, "native-mux") {
 				gatewayPort := testtcp.PickPort()
 				account := serial.ToTypedMessage(&vmess.Account{Id: "f7304539-6863-4d7d-a59e-71d6a57c5011", SecuritySettings: &protocol.SecurityConfig{Type: protocol.SecurityType_AES128_GCM}})
 				gateway, err := core.New(&core.Config{
@@ -103,8 +104,9 @@ func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
 				Inbound: []*core.InboundHandlerConfig{{
 					Tag: "user-socks",
 					ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-						Listen:   net.NewIPOrDomain(net.LocalHostIP),
-						PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(port)}},
+						Listen:           net.NewIPOrDomain(net.LocalHostIP),
+						PortList:         &net.PortList{Range: []*net.PortRange{net.SinglePortRange(port)}},
+						SniffingSettings: &proxyman.SniffingConfig{Enabled: strings.HasSuffix(name, "-sniff")},
 					}),
 					ProxySettings: serial.ToTypedMessage(&socks.ServerConfig{Address: net.NewIPOrDomain(net.LocalHostIP)}),
 				}},
@@ -164,6 +166,26 @@ func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
 			exchange(a)
 			if enabled {
 				rows := waitUserConnections(t, d, 2)
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					complete := true
+					for i, row := range rows {
+						want := int64(len("live user TCP payload"))
+						if i == 0 {
+							want *= 2
+						}
+						rawDeferred := (runtime.GOOS == "linux" || runtime.GOOS == "android") && !(strings.HasPrefix(name, "native-mux") && i == 0)
+						complete = complete && row.UplinkReadBytes == want && (rawDeferred || row.DownlinkWrittenBytes == want)
+					}
+					if complete {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("completed I/O counters not published: %+v", rows)
+					}
+					time.Sleep(time.Millisecond)
+					rows = waitUserConnections(t, d, 2)
+				}
 				for i, tag := range []string{"A", "B"} {
 					if !rows[i].OutboundSelected || rows[i].OutboundTag != tag || rows[i].RuleTag != "choose-"+tag || rows[i].InboundTag != "user-socks" || rows[i].Source == "" {
 						t.Fatalf("wrong selected facts: %+v", rows)
@@ -175,7 +197,7 @@ func TestUserConnectionsSOCKSRouteSwitch(t *testing.T) {
 					if rows[i].UplinkCoverage != dispatcher.BytesExact || rows[i].UplinkReadBytes != want {
 						t.Fatalf("uplink payload accounting: %+v, want %d", rows[i], want)
 					}
-					if (runtime.GOOS == "linux" || runtime.GOOS == "android") && !(name == "native-mux" && i == 0) {
+					if (runtime.GOOS == "linux" || runtime.GOOS == "android") && !(strings.HasPrefix(name, "native-mux") && i == 0) {
 						if rows[i].DownlinkCoverage != dispatcher.BytesDeferredRawCopy {
 							t.Fatalf("active native raw copy must report deferred bytes: %+v", rows[i])
 						}

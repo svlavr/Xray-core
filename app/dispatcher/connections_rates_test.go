@@ -3,7 +3,6 @@ package dispatcher
 import (
 	"context"
 	"math"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -64,7 +63,7 @@ func TestOutboundRatesFirstReadCacheElapsedAndDirections(t *testing.T) {
 		t.Fatalf("directions/tags not independent: %+v", other)
 	}
 	a.uplink.Add(25)
-	finish := BeginConnectionRawCopy(aLink.Writer)
+	finish := buf.BeginRawCopy(aLink.Writer)
 	cached := rateTotalAt(t, d, "A", start.Add(3*time.Second))
 	if cached.UplinkReadBytes != 145 || cached.DownlinkCoverage != BytesDeferredRawCopy || !cached.UplinkRateValid || !cached.DownlinkRateValid || cached.UplinkBytesPerSecond != 48 || !cached.RateWindowEnd.Equal(windowEnd) {
 		t.Fatalf("current totals altered historical cache: %+v", cached)
@@ -84,7 +83,7 @@ func TestOutboundRatesRawTransitionsAndRecovery(t *testing.T) {
 	_, link := selectRateRequest(t, d, "A")
 	start := time.Date(2026, 9, 13, 13, 0, 0, 0, time.UTC)
 	_ = rateTotalAt(t, d, "A", start)
-	finish := BeginConnectionRawCopy(link.Writer)
+	finish := buf.BeginRawCopy(link.Writer)
 	finish(40)
 	invalid := rateTotalAt(t, d, "A", start.Add(time.Second))
 	if invalid.DownlinkRateValid || invalid.DownlinkWrittenBytes != 40 || invalid.DownlinkCoverage != BytesExact || !invalid.UplinkRateValid {
@@ -96,7 +95,7 @@ func TestOutboundRatesRawTransitionsAndRecovery(t *testing.T) {
 	}
 
 	row, activeLink := totalsRequest(t, d)
-	finish = BeginConnectionRawCopy(activeLink.Writer)
+	finish = buf.BeginRawCopy(activeLink.Writer)
 	d.connections.selected(row, "A", "", net.TCPDestination(net.LocalHostIP, 80))
 	d.connections.end(row)
 	active := rateTotalAt(t, d, "A", start.Add(3*time.Second))
@@ -155,10 +154,7 @@ func TestOutboundRatesUnavailableOverflowAndSaturation(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := d.connections.begin(context.Background(), net.TCPDestination(net.LocalHostIP, 80))
-	d.connections.observeLink(row, &transport.Link{
-		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(strings.NewReader(""))},
-		Writer: buf.Discard,
-	})
+	row.uplink = &flowByteCounter{tracker: &d.connections}
 	d.connections.selected(row, "A", "", net.TCPDestination(net.LocalHostIP, 80))
 	start := time.Date(2026, 9, 13, 15, 0, 0, 0, time.UTC)
 	_ = rateTotalAt(t, d, "A", start)
@@ -220,7 +216,7 @@ func TestOutboundRatesBoundsIsolationCloseAndConcurrency(t *testing.T) {
 	})
 	wg.Go(func() {
 		for range 500 {
-			finish := BeginConnectionRawCopy(link.Writer)
+			finish := buf.BeginRawCopy(link.Writer)
 			finish(1)
 		}
 	})

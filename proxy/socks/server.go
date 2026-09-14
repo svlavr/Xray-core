@@ -154,16 +154,21 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 		if inbound.CanSpliceCopy == 2 {
 			inbound.CanSpliceCopy = 1
 		}
-		dispatch := dispatcher.DispatchLink
-		if userDispatcher, ok := dispatcher.(routing.UserDispatcher); ok {
-			dispatch = userDispatcher.DispatchUserLink
+		if streamDispatcher, ok := dispatcher.(routing.UserStreamDispatcher); ok {
+			stream := routing.UserStream{
+				Connection: conn,
+				Retained:   reader.Buffer,
+			}
+			reader.Buffer = nil
+			if err := streamDispatcher.DispatchUserStream(ctx, dest, stream); err != nil {
+				return errors.New("failed to dispatch request").Base(err)
+			}
+			return nil
 		}
-		if err := dispatch(
-			ctx, dest, &transport.Link{
-				Reader: reader,
-				Writer: buf.NewWriter(conn),
-			},
-		); err != nil {
+		if err := dispatcher.DispatchLink(ctx, dest, &transport.Link{
+			Reader: reader,
+			Writer: buf.NewWriter(conn),
+		}); err != nil {
 			return errors.New("failed to dispatch request").Base(err)
 		}
 		return nil

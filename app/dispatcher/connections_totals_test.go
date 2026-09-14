@@ -21,10 +21,10 @@ func totalsRequest(t *testing.T, d *DefaultDispatcher) (*connectionEntry, *trans
 		t.Fatal("admission unexpectedly disabled")
 	}
 	link := &transport.Link{
-		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(strings.NewReader("prefetch"))},
-		Writer: &buf.BufferToBytesWriter{Writer: io.Discard},
+		Reader: buf.NewReader(strings.NewReader("prefetch")),
+		Writer: buf.Discard,
 	}
-	d.connections.observeLink(row, link)
+	link = preparedObservationLink(d, row, link.Reader, io.Discard)
 	return row, link
 }
 
@@ -63,7 +63,7 @@ func TestOutboundTotalsRetirementAndLiveCapacity(t *testing.T) {
 	if before.UplinkReadBytes != 13 || before.DownlinkWrittenBytes != 3 || before.UplinkCoverage != BytesExact || before.DownlinkCoverage != BytesExact {
 		t.Fatalf("live totals: %+v", before)
 	}
-	finish := BeginConnectionRawCopy(link.Writer)
+	finish := buf.BeginRawCopy(link.Writer)
 	d.connections.end(a)
 	d.connections.end(b)
 	if s := d.ConnectionSnapshot(); len(s.Connections) != 0 || s.Dropped != 1 || s.TotalsDropped != 0 {
@@ -111,7 +111,7 @@ func TestOutboundTotalsSelectionCapacityAndCoverage(t *testing.T) {
 			})
 			wg.Go(func() {
 				for range 100 {
-					finish := BeginConnectionRawCopy(link.Writer)
+					finish := buf.BeginRawCopy(link.Writer)
 					finish(1)
 				}
 			})
@@ -137,7 +137,7 @@ func TestOutboundTotalsSelectionCapacityAndCoverage(t *testing.T) {
 	}
 	// Unsupported writers leave sticky partial coverage even after retirement.
 	row = d.connections.begin(context.Background(), dest)
-	d.connections.observeLink(row, &transport.Link{Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(strings.NewReader(""))}, Writer: buf.Discard})
+	row.uplink = &flowByteCounter{tracker: &d.connections}
 	d.connections.selected(row, "B", "", dest)
 	d.connections.end(row)
 	if got := outboundTotals(t, d, "B"); got.DownlinkCoverage != BytesUnavailable {
@@ -167,15 +167,14 @@ func TestOutboundTotalsOrdinaryAndUnselectedExcluded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	link := &transport.Link{Reader: buf.NewReader(strings.NewReader("")), Writer: &buf.BufferToBytesWriter{Writer: io.Discard}}
-	if err := d.DispatchUserLink(ctx, dest, link); err != nil {
+	if err := d.DispatchUserStream(ctx, dest, observationStream()); err != nil {
 		t.Fatal(err)
 	}
 	if got := outboundTotals(t, d, "A"); got.DownlinkWrittenBytes != 4 {
 		t.Fatalf("helper included in USER totals: %+v", got)
 	}
 	d.ohm = observationManager{}
-	if err := d.DispatchUserLink(context.Background(), dest, observationLink()); err != nil {
+	if err := d.DispatchUserStream(context.Background(), dest, observationStream()); err != nil {
 		t.Fatal(err)
 	}
 	if len(d.ConnectionSnapshot().OutboundTotals) != 1 {
@@ -191,12 +190,12 @@ func TestOutboundTotalsOverflowAndMultipleDeferred(t *testing.T) {
 	a, aLink := totalsRequest(t, d)
 	b, bLink := totalsRequest(t, d)
 	a.uplink.Add(math.MaxInt64)
-	first := BeginConnectionRawCopy(aLink.Writer) // Begin before selection.
+	first := buf.BeginRawCopy(aLink.Writer) // Begin before selection.
 	for _, row := range []*connectionEntry{a, b} {
 		d.connections.selected(row, "A", "", net.TCPDestination(net.LocalHostIP, 80))
 	}
 	b.uplink.Add(1) // Individual counters valid, sum overflows.
-	second := BeginConnectionRawCopy(bLink.Writer)
+	second := buf.BeginRawCopy(bLink.Writer)
 	first(3)
 	got := outboundTotals(t, d, "A")
 	if got.UplinkCoverage != BytesOverflow || got.UplinkReadBytes != math.MaxInt64 || got.DownlinkCoverage != BytesDeferredRawCopy {
@@ -230,7 +229,7 @@ func TestOutboundTotalsConcurrentBindingRetirementAndClose(t *testing.T) {
 	wg.Go(func() {
 		for range 1000 {
 			row.uplink.Add(1)
-			finish := BeginConnectionRawCopy(link.Writer)
+			finish := buf.BeginRawCopy(link.Writer)
 			finish(1)
 		}
 	})
@@ -252,7 +251,7 @@ func TestOutboundTotalsConcurrentBindingRetirementAndClose(t *testing.T) {
 	wg.Go(func() {
 		for range 1000 {
 			row.uplink.Add(1)
-			finish := BeginConnectionRawCopy(link.Writer)
+			finish := buf.BeginRawCopy(link.Writer)
 			finish(1)
 			_ = d.ConnectionSnapshot()
 		}

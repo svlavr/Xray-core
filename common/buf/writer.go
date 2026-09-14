@@ -8,15 +8,68 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 // BufferToBytesWriter is a Writer that writes alloc.Buffer into underlying writer.
 type BufferToBytesWriter struct {
 	io.Writer
 
-	// Counter receives bytes accepted by the underlying writer, including partial errors.
-	Counter stats.Counter
-	cache   [][]byte
+	nativeCounter   stats.Counter
+	offeredCounter  stats.Counter
+	acceptedCounter stats.Counter
+	cache           [][]byte
+}
+
+// NewBufferToBytesWriter builds the stream writer and its counters together.
+// offered preserves legacy user stats; accepted observes returned lower writes.
+func NewBufferToBytesWriter(writer io.Writer, offered, accepted stats.Counter) *BufferToBytesWriter {
+	iWriter := writer
+	var native stats.Counter
+	if statConn, ok := writer.(*stat.CounterConnection); ok {
+		iWriter = statConn.Connection
+		native = statConn.WriteCounter
+	}
+	return newBufferToBytesWriter(iWriter, native, offered, accepted)
+}
+
+func newBufferToBytesWriter(writer io.Writer, native, offered, accepted stats.Counter) *BufferToBytesWriter {
+	return &BufferToBytesWriter{
+		Writer:          writer,
+		nativeCounter:   native,
+		offeredCounter:  offered,
+		acceptedCounter: accepted,
+	}
+}
+
+func addAccepted(n int64, counters ...stats.Counter) {
+	for _, counter := range counters {
+		if counter != nil {
+			counter.Add(n)
+		}
+	}
+}
+
+// BeginRawCopy accounts the bypass once. Native connection counters are
+// updated separately by CopyRawConnIfExist.
+func (w *BufferToBytesWriter) BeginRawCopy() func(int64) {
+	if w.offeredCounter == nil && w.acceptedCounter == nil {
+		return nil
+	}
+	var finish func(int64)
+	if counter, ok := w.acceptedCounter.(interface{ BeginRawCopy() func(int64) }); ok {
+		finish = counter.BeginRawCopy()
+	}
+	return func(n int64) {
+		if w.offeredCounter != nil {
+			w.offeredCounter.Add(n)
+		}
+		if finish != nil {
+			finish(n)
+		} else if w.acceptedCounter != nil {
+			w.acceptedCounter.Add(n)
+		}
+	}
 }
 
 // WriteMultiBuffer implements Writer. This method takes ownership of the given buffer.
@@ -24,12 +77,17 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	defer ReleaseMulti(mb)
 
 	size := mb.Len()
+	if w.offeredCounter != nil {
+		w.offeredCounter.Add(int64(size))
+	}
 	if size == 0 {
 		return nil
 	}
 
 	if len(mb) == 1 {
-		return WriteAllBytes(w.Writer, mb[0].Bytes(), w.Counter)
+		var accepted int64
+		defer func() { addAccepted(accepted, w.nativeCounter, w.acceptedCounter) }()
+		return writeAllBytes(w.Writer, mb[0].Bytes(), &accepted)
 	}
 
 	if cap(w.cache) < len(mb) {
@@ -49,11 +107,7 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 
 	nb := net.Buffers(bs)
 	wc := int64(0)
-	defer func() {
-		if w.Counter != nil {
-			w.Counter.Add(wc)
-		}
-	}()
+	defer func() { addAccepted(wc, w.nativeCounter, w.acceptedCounter) }()
 	for size > 0 {
 		n, err := nb.WriteTo(w.Writer)
 		wc += n

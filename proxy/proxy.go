@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/pires/go-proxyproto"
-	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -751,13 +750,12 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 		}
 		if splice {
 			errors.LogDebug(ctx, "CopyRawConn splice")
-			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 			//runtime.Gosched() // necessary
 			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			countConnection := dispatcher.BeginConnectionRawCopy(writer)
+			finishRawCopy := buf.BeginRawCopy(writer)
 			w, err := tc.ReadFrom(readerConn)
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
@@ -765,11 +763,8 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if writeCounter != nil {
 				writeCounter.Add(w) // inbound stats
 			}
-			if statWriter != nil {
-				statWriter.Counter.Add(w) // user stats
-			}
-			if countConnection != nil {
-				countConnection(w)
+			if finishRawCopy != nil {
+				finishRawCopy(w)
 			}
 			if err != nil && errors.Cause(err) != io.EOF {
 				return err

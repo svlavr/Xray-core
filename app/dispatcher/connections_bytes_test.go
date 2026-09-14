@@ -13,6 +13,7 @@ import (
 	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 )
 
@@ -20,6 +21,13 @@ type partialByteWriter struct {
 	remaining int
 	terminal  error
 }
+
+type partialStreamConn struct {
+	directUserConn
+	writer *partialByteWriter
+}
+
+func (c *partialStreamConn) Write(p []byte) (int, error) { return c.writer.Write(p) }
 
 func (w *partialByteWriter) Write(p []byte) (int, error) {
 	n := min(len(p), w.remaining)
@@ -45,8 +53,7 @@ func TestConnectionBytesNativeWriterBoundary(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			terminal := errors.New("partial writer failure")
-			legacy := new(appstats.Counter)
-			w := &buf.BufferToBytesWriter{Writer: &partialByteWriter{remaining: tc.limit, terminal: terminal}, Counter: legacy}
+			conn := &partialStreamConn{writer: &partialByteWriter{remaining: tc.limit, terminal: terminal}}
 			d := new(DefaultDispatcher)
 			if err := d.EnableConnectionTracking(1); err != nil {
 				t.Fatal(err)
@@ -61,12 +68,13 @@ func TestConnectionBytesNativeWriterBoundary(t *testing.T) {
 					t.Fatalf("write result: %v", err)
 				}
 				row := d.ConnectionSnapshot().Connections[0]
-				if row.DownlinkCoverage != BytesExact || row.DownlinkWrittenBytes != tc.want || legacy.Value() != tc.want {
-					t.Fatalf("accepted bytes: row=%+v legacy=%d", row, legacy.Value())
+				if row.DownlinkCoverage != BytesExact || row.DownlinkWrittenBytes != tc.want {
+					t.Fatalf("accepted bytes: row=%+v", row)
 				}
 			}}}
-			link := &transport.Link{Reader: buf.NewReader(strings.NewReader("")), Writer: w}
-			if err := d.DispatchUserLink(context.Background(), net.TCPDestination(net.LocalHostIP, 80), link); err != nil {
+			if err := d.DispatchUserStream(context.Background(), net.TCPDestination(net.LocalHostIP, 80), routing.UserStream{
+				Connection: conn,
+			}); err != nil {
 				t.Fatal(err)
 			}
 			total := outboundTotals(t, d, "")
@@ -92,10 +100,9 @@ func TestConnectionBytesReaderCountsAndRawState(t *testing.T) {
 		dest := net.TCPDestination(net.LocalHostIP, 80)
 		id := d.connections.begin(context.Background(), dest)
 		oldRead, oldWrite := new(appstats.Counter), new(appstats.Counter)
-		r := &buf.TimeoutWrapperReader{Reader: payloadWithEOF{payload: "body"}, Counter: oldRead}
-		w := &buf.BufferToBytesWriter{Writer: io.Discard, Counter: oldWrite}
-		link := &transport.Link{Reader: r, Writer: w}
-		d.connections.observeLink(id, link)
+		uplink, downlink := d.connections.prepareUserStream(id, oldRead)
+		r := newUserStreamReader(payloadWithEOF{payload: "body"}, nil, io.NopCloser(strings.NewReader("")), uplink)
+		w := buf.NewBufferToBytesWriter(io.Discard, oldWrite, downlink)
 		var mb buf.MultiBuffer
 		var err error
 		if timed {
@@ -115,7 +122,7 @@ func TestConnectionBytesReaderCountsAndRawState(t *testing.T) {
 			t.Fatal(err)
 		}
 		// The outer legacy user stats wrapper must not hide the byte counter.
-		finish := BeginConnectionRawCopy(&SizeStatWriter{Writer: w, Counter: new(appstats.Counter)})
+		finish := buf.BeginRawCopy(&SizeStatWriter{Writer: w, Counter: new(appstats.Counter)})
 		if finish == nil {
 			t.Fatal("raw-copy hook missing")
 		}
@@ -123,8 +130,8 @@ func TestConnectionBytesReaderCountsAndRawState(t *testing.T) {
 		if row.DownlinkCoverage != BytesDeferredRawCopy || row.DownlinkWrittenBytes != 2 {
 			t.Fatalf("raw interval falsely exact: %+v", row)
 		}
-		// Simulate stock native accounting and a ReadFrom returning n>0 + error.
-		oldWrite.Add(7)
+		// Simulate ReadFrom returning n>0 + error. The direct writer owns legacy
+		// user accounting; native connection counters stay in the copy path.
 		finish(7)
 		row = d.ConnectionSnapshot().Connections[0]
 		if row.DownlinkCoverage != BytesExact || row.DownlinkWrittenBytes != 9 || oldWrite.Value() != 9 {
@@ -142,9 +149,8 @@ func TestConnectionBytesPrefetchedPayloadCountedOnce(t *testing.T) {
 	dest := net.TCPDestination(net.LocalHostIP, 80)
 	id := d.connections.begin(context.Background(), dest)
 	legacy := new(appstats.Counter)
-	r := &buf.TimeoutWrapperReader{Reader: &buf.BufferedReader{Reader: buf.NewReader(strings.NewReader("")), Buffer: buf.MultiBuffer{buf.FromBytes([]byte("prefetched payload"))}}, Counter: legacy}
-	link := &transport.Link{Reader: r, Writer: buf.Discard}
-	d.connections.observeLink(id, link)
+	uplink, _ := d.connections.prepareUserStream(id, legacy)
+	r := newUserStreamReader(buf.NewReader(strings.NewReader("")), buf.MultiBuffer{buf.FromBytes([]byte("prefetched payload"))}, io.NopCloser(strings.NewReader("")), uplink)
 	cache := &cachedReader{reader: r}
 	b := buf.New()
 	defer b.Release()
@@ -160,10 +166,10 @@ func TestConnectionBytesPrefetchedPayloadCountedOnce(t *testing.T) {
 	if row.UplinkReadBytes != int64(len("prefetched payload")) || legacy.Value() != row.UplinkReadBytes {
 		t.Fatalf("sniff cache double count: %+v", row)
 	}
-	if row.DownlinkCoverage != BytesUnavailable {
-		t.Fatal("unsupported writer falsely exact")
+	if row.DownlinkCoverage != BytesExact || row.DownlinkWrittenBytes != 0 {
+		t.Fatal("constructed writer boundary not exact")
 	}
-	if BeginConnectionRawCopy(buf.Discard) != nil {
+	if buf.BeginRawCopy(buf.Discard) != nil {
 		t.Fatal("unsupported raw writer counted")
 	}
 	d.connections.end(id)
@@ -185,9 +191,8 @@ func TestConnectionBytesOverflowAndConcurrentClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := d.connections.begin(context.Background(), net.TCPDestination(net.LocalHostIP, 80))
-	link := &transport.Link{Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(strings.NewReader(""))}, Writer: &buf.BufferToBytesWriter{Writer: io.Discard}}
-	d.connections.observeLink(id, link)
-	up := link.Reader.(*buf.TimeoutWrapperReader).Counter
+	link := preparedObservationLink(d, id, buf.NewReader(strings.NewReader("")), io.Discard)
+	up := id.uplink
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		for range 1000 {
@@ -196,7 +201,7 @@ func TestConnectionBytesOverflowAndConcurrentClose(t *testing.T) {
 	})
 	wg.Go(func() {
 		for range 1000 {
-			finish := BeginConnectionRawCopy(link.Writer)
+			finish := buf.BeginRawCopy(link.Writer)
 			finish(1)
 		}
 	})

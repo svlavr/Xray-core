@@ -28,7 +28,7 @@ var errSniffingTimeout = errors.New("timeout on sniffing")
 
 type cachedReader struct {
 	sync.Mutex
-	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
+	reader buf.TimeoutReader // pipe, stock wrapper or canonical USER reader
 	cache  buf.MultiBuffer
 }
 
@@ -86,9 +86,7 @@ func (r *cachedReader) Interrupt() {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	if p, ok := r.reader.(*pipe.Reader); ok {
-		p.Interrupt()
-	}
+	common.Interrupt(r.reader)
 }
 
 // DefaultDispatcher is a default implementation of Dispatcher.
@@ -192,37 +190,34 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 }
 
 func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager stats.Manager, link *transport.Link) *transport.Link {
-	sessionInbound := session.InboundFromContext(ctx)
-	var user *protocol.MemoryUser
-	if sessionInbound != nil {
-		user = sessionInbound.User
-	}
-
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
-
-	if user != nil && len(user.Email) > 0 {
-		p := policyManager.ForLevel(user.Level)
-		if p.Stats.UserUplink {
-			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
-				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
-			}
-		}
-		if p.Stats.UserDownlink {
-			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
-				link.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  link.Writer,
-				}
-			}
-		}
-		if p.Stats.UserOnline {
-			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String())
-		}
+	uplink, downlink := userCounters(ctx, policyManager, statsManager)
+	link.Reader.(*buf.TimeoutWrapperReader).Counter = uplink
+	if downlink != nil {
+		link.Writer = &SizeStatWriter{Counter: downlink, Writer: link.Writer}
 	}
 
 	return link
+}
+
+func userCounters(ctx context.Context, policyManager policy.Manager, statsManager stats.Manager) (stats.Counter, stats.Counter) {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil || inbound.User == nil || len(inbound.User.Email) == 0 {
+		return nil, nil
+	}
+	user := inbound.User
+	p := policyManager.ForLevel(user.Level)
+	var uplink, downlink stats.Counter
+	if p.Stats.UserUplink {
+		uplink, _ = statsManager.GetOrRegisterCounter("user>>>" + user.Email + ">>>traffic>>>uplink")
+	}
+	if p.Stats.UserDownlink {
+		downlink, _ = statsManager.GetOrRegisterCounter("user>>>" + user.Email + ">>>traffic>>>downlink")
+	}
+	if p.Stats.UserOnline {
+		trackOnlineIP(ctx, statsManager, user.Email, inbound.Source.Address.String())
+	}
+	return uplink, downlink
 }
 
 func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip string) {
@@ -330,6 +325,14 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 }
 
 func (d *DefaultDispatcher) dispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link, connection *connectionEntry) error {
+	return d.dispatchLinkInternal(ctx, destination, outbound, connection, false)
+}
+
+func (d *DefaultDispatcher) dispatchPreparedUserStream(ctx context.Context, destination net.Destination, outbound *transport.Link, connection *connectionEntry) error {
+	return d.dispatchLinkInternal(ctx, destination, outbound, connection, true)
+}
+
+func (d *DefaultDispatcher) dispatchLinkInternal(ctx context.Context, destination net.Destination, outbound *transport.Link, connection *connectionEntry, prepared bool) error {
 	if !destination.IsValid() {
 		return errors.New("Dispatcher: Invalid destination.")
 	}
@@ -346,8 +349,9 @@ func (d *DefaultDispatcher) dispatchLink(ctx context.Context, destination net.De
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
 	}
-	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
-	d.connections.observeLink(connection, outbound)
+	if !prepared {
+		outbound = WrapLink(ctx, d.policy, d.stats, outbound)
+	}
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
 		d.routedDispatch(ctx, outbound, destination, connection)

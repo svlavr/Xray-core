@@ -85,16 +85,19 @@ type Writer interface {
 
 // WriteAllBytes ensures all bytes are written into the given writer.
 func WriteAllBytes(writer io.Writer, payload []byte, c stats.Counter) error {
-	wc := 0
+	var wc int64
 	defer func() {
 		if c != nil {
-			c.Add(int64(wc))
+			c.Add(wc)
 		}
 	}()
+	return writeAllBytes(writer, payload, &wc)
+}
 
+func writeAllBytes(writer io.Writer, payload []byte, wc *int64) error {
 	for len(payload) > 0 {
 		n, err := writer.Write(payload)
-		wc += n
+		*wc += int64(n)
 		if err != nil {
 			return err
 		}
@@ -189,8 +192,15 @@ func NewWriter(writer io.Writer) Writer {
 	if statConn, ok := writer.(*stat.CounterConnection); ok {
 		counter = statConn.WriteCounter
 	}
-	return &BufferToBytesWriter{
-		Writer:  iConn,
-		Counter: counter,
+	return newBufferToBytesWriter(iConn, counter, nil, nil)
+}
+
+// BeginRawCopy notifies the writer owner that native copy will bypass its
+// ordinary WriteMultiBuffer path. If non-nil, call the result exactly once with
+// ReadFrom's final returned n, including on error.
+func BeginRawCopy(writer Writer) func(int64) {
+	if w, ok := writer.(interface{ BeginRawCopy() func(int64) }); ok {
+		return w.BeginRawCopy()
 	}
+	return nil
 }

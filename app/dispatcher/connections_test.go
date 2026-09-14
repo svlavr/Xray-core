@@ -78,7 +78,7 @@ func TestUserConnectionDispatchBoundary(t *testing.T) {
 		}
 	}
 	ctx := session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "socks", Source: net.TCPDestination(net.LocalHostIP, 1234)})
-	if err := d.DispatchUserLink(ctx, dest, observationLink()); err != nil {
+	if err := d.DispatchUserStream(ctx, dest, observationStream()); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 || len(d.ConnectionSnapshot().Connections) != 0 {
@@ -119,7 +119,7 @@ func TestUserConnectionNestedDispatchDoesNotInherit(t *testing.T) {
 			t.Fatalf("helper changed rows: %+v", rows)
 		}
 	}
-	if err := d.DispatchUserLink(context.Background(), net.TCPDestination(net.DomainAddress("example.test"), 443), observationLink()); err != nil {
+	if err := d.DispatchUserStream(context.Background(), net.TCPDestination(net.DomainAddress("example.test"), 443), observationStream()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -134,7 +134,7 @@ func TestUserConnectionLimitAndFailure(t *testing.T) {
 			t.Fatal("tracking enabled by default")
 		}
 	}
-	if err := d.DispatchUserLink(context.Background(), dest, observationLink()); err != nil {
+	if err := d.DispatchUserStream(context.Background(), dest, observationStream()); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.EnableConnectionTracking(0); err == nil {
@@ -152,23 +152,23 @@ func TestUserConnectionLimitAndFailure(t *testing.T) {
 			t.Fatalf("capacity result: %+v", s)
 		}
 	}
-	if err := d.DispatchUserLink(context.Background(), dest, observationLink()); err != nil {
+	if err := d.DispatchUserStream(context.Background(), dest, observationStream()); err != nil {
 		t.Fatal(err)
 	}
 	d.connections.end(held)
 	// Missing selected handler is native dispatch failure, not a persistent row.
 	d.ohm = observationManager{}
-	if err := d.DispatchUserLink(context.Background(), dest, observationLink()); err != nil {
+	if err := d.DispatchUserStream(context.Background(), dest, observationStream()); err != nil {
 		t.Fatal(err)
 	}
 	if len(d.ConnectionSnapshot().Connections) != 0 {
 		t.Fatal("missing-handler leak")
 	}
-	if err := d.DispatchUserLink(context.Background(), net.UDPDestination(net.LocalHostIP, 53), observationLink()); err == nil {
+	if err := d.DispatchUserStream(context.Background(), net.UDPDestination(net.LocalHostIP, 53), observationStream()); err == nil {
 		t.Fatal("accepted UDP")
 	}
 	ctx := session.SetForcedOutboundTagToContext(context.Background(), "missing")
-	if err := d.DispatchUserLink(ctx, dest, observationLink()); err != nil {
+	if err := d.DispatchUserStream(ctx, dest, observationStream()); err != nil {
 		t.Fatal(err)
 	}
 	if len(d.ConnectionSnapshot().Connections) != 0 {
@@ -237,7 +237,7 @@ func TestUserConnectionPanicCleanup(t *testing.T) {
 				t.Error("panic changed")
 			}
 		}()
-		_ = d.DispatchUserLink(context.Background(), net.TCPDestination(net.LocalHostIP, 80), observationLink())
+		_ = d.DispatchUserStream(context.Background(), net.TCPDestination(net.LocalHostIP, 80), observationStream())
 	}()
 	if len(d.ConnectionSnapshot().Connections) != 0 {
 		t.Fatal("panic retained row")
