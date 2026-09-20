@@ -22,7 +22,7 @@ func (d *DefaultDispatcher) DispatchUserStream(ctx context.Context, dest net.Des
 		return errors.New("user stream requires valid TCP destination and connection owner")
 	}
 
-	row := d.connections.begin(ctx, dest)
+	row := d.connections.beginUserStream(ctx, dest, stream.Stop)
 	if row != nil {
 		defer d.connections.end(row)
 	}

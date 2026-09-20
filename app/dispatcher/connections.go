@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"math"
 	"sort"
@@ -15,11 +16,43 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 )
 
+// RuntimeInstanceID is an opaque per-enable identity. Callers compare or carry
+// it unchanged; it has no product meaning.
+type RuntimeInstanceID [16]byte
+
+// FlowRef is an opaque identity for one live indexed flow. Its zero value is
+// invalid, and a reference is valid only for the dispatcher that issued it.
+type FlowRef struct {
+	RuntimeID RuntimeInstanceID
+	ID        uint64
+}
+
+// CloseFlowOutcome is the immediate result of requesting a local flow stop.
+// ACCEPTED does not mean the flow has retired from ConnectionSnapshot yet.
+type CloseFlowOutcome string
+
+const (
+	CloseFlowAccepted         CloseFlowOutcome = "ACCEPTED"
+	CloseFlowAlreadyRequested CloseFlowOutcome = "ALREADY_REQUESTED"
+	CloseFlowStaleRuntime     CloseFlowOutcome = "STALE_RUNTIME"
+	CloseFlowNotFound         CloseFlowOutcome = "NOT_FOUND"
+	CloseFlowUnsupportedOwner CloseFlowOutcome = "UNSUPPORTED_OWNER"
+	CloseFlowFailed           CloseFlowOutcome = "FAILED"
+)
+
+// CloseFlowResult reports command acceptance separately from its raw local
+// stop error. Later row retirement is the observation of completion.
+type CloseFlowResult struct {
+	Outcome CloseFlowOutcome
+	Err     error
+}
+
 // UserConnection is one explicitly admitted TCP dispatch, not a carrier or
 // remote session. IDs are unique only within this dispatcher. Byte counts use
 // the declared reader/writer boundary; they are not transport-completion receipts.
 type UserConnection struct {
 	ID                   uint64
+	FlowRef              FlowRef
 	Started              time.Time
 	Source               string
 	InboundTag           string
@@ -100,6 +133,8 @@ func (c *flowByteCounter) sample() (int64, ByteCoverage) {
 type connectionEntry struct {
 	UserConnection
 	uplink, downlink *flowByteCounter
+	stop             func() error
+	stopRequested    bool
 }
 
 // BeginRawCopy marks the bypass as deferred and counts only this observation's
@@ -112,9 +147,10 @@ func (c *flowByteCounter) BeginRawCopy() func(int64) {
 	}
 }
 
-// ConnectionSnapshot covers explicit DispatchUserStream calls only. The native
-// caller currently covered is SOCKS TCP CONNECT; empty is not proof of no other
-// traffic. Dropped counts admissions omitted due to capacity or ID exhaustion.
+// ConnectionSnapshot covers explicit DispatchUserStream calls only. Native
+// callers currently covered are SOCKS TCP CONNECT and TUN TCP; empty is not
+// proof of no other traffic. Dropped counts admissions omitted due to capacity
+// or ID exhaustion.
 type ConnectionSnapshot struct {
 	Enabled     bool
 	Closed      bool
@@ -134,6 +170,7 @@ type connectionTracker struct {
 	enabled       bool
 	closed        bool
 	limit         int
+	runtimeID     RuntimeInstanceID
 	next          uint64
 	dropped       uint64
 	live          map[uint64]*connectionEntry
@@ -154,6 +191,11 @@ func (d *DefaultDispatcher) EnableConnectionTracking(limit int) error {
 	if t.closed || t.enabled {
 		return errors.New("connection tracking already enabled or dispatcher closed")
 	}
+	for t.runtimeID == (RuntimeInstanceID{}) {
+		if _, err := rand.Read(t.runtimeID[:]); err != nil {
+			return err
+		}
+	}
 	t.enabled, t.limit = true, limit
 	t.live = make(map[uint64]*connectionEntry)
 	t.totals = make(map[string]*outboundTotal)
@@ -163,6 +205,12 @@ func (d *DefaultDispatcher) EnableConnectionTracking(limit int) error {
 // ConnectionSnapshot returns detached metadata sorted by admission ID.
 func (d *DefaultDispatcher) ConnectionSnapshot() ConnectionSnapshot {
 	return d.connectionSnapshot(time.Now)
+}
+
+// CloseFlow requests cancellation and local resource close for one indexed
+// flow. The owner action runs outside the tracker lock.
+func (d *DefaultDispatcher) CloseFlow(ref FlowRef) CloseFlowResult {
+	return d.connections.stopFlow(ref)
 }
 
 func (d *DefaultDispatcher) connectionSnapshot(sampleTime func() time.Time) ConnectionSnapshot {
@@ -186,12 +234,16 @@ func (d *DefaultDispatcher) connectionSnapshot(sampleTime func() time.Time) Conn
 }
 
 func (t *connectionTracker) begin(ctx context.Context, dest net.Destination) *connectionEntry {
+	return t.beginUserStream(ctx, dest, nil)
+}
+
+func (t *connectionTracker) beginUserStream(ctx context.Context, dest net.Destination, stop func() error) *connectionEntry {
 	t.Lock()
 	defer t.Unlock()
 	if !t.enabled || t.closed || ctx.Err() != nil {
 		return nil
 	}
-	row := &connectionEntry{}
+	row := &connectionEntry{stop: stop}
 	if len(t.live) >= t.limit || t.next == math.MaxUint64 {
 		if t.dropped != math.MaxUint64 {
 			t.dropped++
@@ -199,7 +251,12 @@ func (t *connectionTracker) begin(ctx context.Context, dest net.Destination) *co
 		return row // Request-owned counters still contribute to totals.
 	}
 	t.next++
-	row.UserConnection = UserConnection{ID: t.next, Started: time.Now(), Destination: dest.String()}
+	row.UserConnection = UserConnection{
+		ID:          t.next,
+		FlowRef:     FlowRef{RuntimeID: t.runtimeID, ID: t.next},
+		Started:     time.Now(),
+		Destination: dest.String(),
+	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		if inbound.Source.IsValid() {
 			row.Source = inbound.Source.String()
@@ -208,6 +265,35 @@ func (t *connectionTracker) begin(ctx context.Context, dest net.Destination) *co
 	}
 	t.live[row.ID] = row
 	return row
+}
+
+func (t *connectionTracker) stopFlow(ref FlowRef) CloseFlowResult {
+	t.Lock()
+	if ref.RuntimeID != t.runtimeID {
+		t.Unlock()
+		return CloseFlowResult{Outcome: CloseFlowStaleRuntime}
+	}
+	row, found := t.live[ref.ID]
+	if !found || ref.ID == 0 {
+		t.Unlock()
+		return CloseFlowResult{Outcome: CloseFlowNotFound}
+	}
+	if row.stop == nil {
+		t.Unlock()
+		return CloseFlowResult{Outcome: CloseFlowUnsupportedOwner}
+	}
+	if row.stopRequested {
+		t.Unlock()
+		return CloseFlowResult{Outcome: CloseFlowAlreadyRequested}
+	}
+	row.stopRequested = true
+	stop := row.stop
+	t.Unlock()
+
+	if err := stop(); err != nil {
+		return CloseFlowResult{Outcome: CloseFlowFailed, Err: err}
+	}
+	return CloseFlowResult{Outcome: CloseFlowAccepted}
 }
 
 func (t *connectionTracker) selected(row *connectionEntry, tag, rule string, target net.Destination) {

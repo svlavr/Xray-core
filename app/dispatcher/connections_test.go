@@ -66,7 +66,7 @@ func TestUserConnectionDispatchBoundary(t *testing.T) {
 			t.Fatalf("live rows: %+v", snapshot)
 		}
 		row := snapshot.Connections[0]
-		if row.ID == 0 || row.Started.IsZero() || row.Destination != dest.String() || !row.OutboundSelected || row.OutboundTag != "selected" || row.InboundTag != "socks" {
+		if row.ID == 0 || row.FlowRef == (FlowRef{}) || row.FlowRef.RuntimeID != d.connections.runtimeID || row.FlowRef.ID != row.ID || row.Started.IsZero() || row.Destination != dest.String() || !row.OutboundSelected || row.OutboundTag != "selected" || row.InboundTag != "socks" {
 			t.Fatalf("wrong metadata: %+v", row)
 		}
 		// Real outbound code can mutate session facts after selection. The
@@ -93,6 +93,122 @@ func TestUserConnectionDispatchBoundary(t *testing.T) {
 	}
 	if err := d.DispatchLink(ctx, dest, observationLink()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCloseFlowOutcomesAndIsolation(t *testing.T) {
+	d := new(DefaultDispatcher)
+	if err := d.EnableConnectionTracking(8); err != nil {
+		t.Fatal(err)
+	}
+	dest := net.TCPDestination(net.LocalHostIP, 443)
+	var firstStops, siblingStops int
+	first := d.connections.beginUserStream(context.Background(), dest, func() error {
+		firstStops++
+		return nil
+	})
+	sibling := d.connections.beginUserStream(context.Background(), dest, func() error {
+		siblingStops++
+		return nil
+	})
+
+	if got := d.CloseFlow(first.FlowRef); got.Outcome != CloseFlowAccepted || got.Err != nil {
+		t.Fatalf("first close: %+v", got)
+	}
+	if firstStops != 1 || siblingStops != 0 {
+		t.Fatalf("wrong owner stopped: first=%d sibling=%d", firstStops, siblingStops)
+	}
+	if rows := d.ConnectionSnapshot().Connections; len(rows) != 2 {
+		t.Fatalf("acceptance retired row synchronously: %+v", rows)
+	}
+	if got := d.CloseFlow(first.FlowRef); got.Outcome != CloseFlowAlreadyRequested || got.Err != nil {
+		t.Fatalf("repeated close: %+v", got)
+	}
+
+	other := new(DefaultDispatcher)
+	if err := other.EnableConnectionTracking(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := other.CloseFlow(first.FlowRef); got.Outcome != CloseFlowStaleRuntime || got.Err != nil {
+		t.Fatalf("cross-runtime close: %+v", got)
+	}
+
+	d.connections.end(first)
+	if got := d.CloseFlow(first.FlowRef); got.Outcome != CloseFlowNotFound || got.Err != nil {
+		t.Fatalf("retired close: %+v", got)
+	}
+	unsupported := d.connections.begin(context.Background(), dest)
+	if got := d.CloseFlow(unsupported.FlowRef); got.Outcome != CloseFlowUnsupportedOwner || got.Err != nil {
+		t.Fatalf("unsupported owner: %+v", got)
+	}
+
+	sentinel := errors.New("stop failed")
+	failed := d.connections.beginUserStream(context.Background(), dest, func() error { return sentinel })
+	if got := d.CloseFlow(failed.FlowRef); got.Outcome != CloseFlowFailed || !errors.Is(got.Err, sentinel) {
+		t.Fatalf("failed stop: %+v", got)
+	}
+	if got := d.CloseFlow(failed.FlowRef); got.Outcome != CloseFlowAlreadyRequested || got.Err != nil {
+		t.Fatalf("repeated failed stop: %+v", got)
+	}
+
+	d.connections.end(sibling)
+	d.connections.end(unsupported)
+	d.connections.end(failed)
+	_ = other.Close()
+	_ = d.Close()
+}
+
+func TestNestedUserStreamDoesNotInheritOuterStop(t *testing.T) {
+	d := new(DefaultDispatcher)
+	if err := d.EnableConnectionTracking(2); err != nil {
+		t.Fatal(err)
+	}
+	d.ohm = observationManager{h: &observationHandler{tag: "selected"}}
+	outerDest := net.TCPDestination(net.DomainAddress("outer.test"), 443)
+	innerDest := net.TCPDestination(net.DomainAddress("inner.test"), 443)
+	outerStops := 0
+	depth := 0
+	d.ohm.(observationManager).h.run = func(ctx context.Context, _ *transport.Link) {
+		if depth != 0 {
+			rows := d.ConnectionSnapshot().Connections
+			if len(rows) != 2 {
+				t.Fatalf("nested rows: %+v", rows)
+			}
+			var outer, inner UserConnection
+			for _, row := range rows {
+				switch row.Destination {
+				case outerDest.String():
+					outer = row
+				case innerDest.String():
+					inner = row
+				}
+			}
+			if got := d.CloseFlow(inner.FlowRef); got.Outcome != CloseFlowUnsupportedOwner {
+				t.Fatalf("nested inherited outer owner: %+v", got)
+			}
+			if outerStops != 0 {
+				t.Fatalf("nested close stopped outer owner: %d", outerStops)
+			}
+			if got := d.CloseFlow(outer.FlowRef); got.Outcome != CloseFlowAccepted {
+				t.Fatalf("outer close: %+v", got)
+			}
+			return
+		}
+		depth++
+		if err := d.DispatchUserStream(ctx, innerDest, observationStream()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outerStream := observationStream()
+	outerStream.Stop = func() error {
+		outerStops++
+		return nil
+	}
+	if err := d.DispatchUserStream(context.Background(), outerDest, outerStream); err != nil {
+		t.Fatal(err)
+	}
+	if outerStops != 1 {
+		t.Fatalf("outer stop calls: got %d, want 1", outerStops)
 	}
 }
 

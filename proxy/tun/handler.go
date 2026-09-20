@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/xtls/xray-core/common"
@@ -40,6 +41,19 @@ type Handler struct {
 type tunUDPStatsWriter struct {
 	writer  buf.Writer
 	counter stats.Counter
+}
+
+type closeOnceConn struct {
+	net.Conn
+	once sync.Once
+	err  error
+}
+
+func (c *closeOnceConn) Close() error {
+	c.once.Do(func() {
+		c.err = c.Conn.Close()
+	})
+	return c.err
 }
 
 func (w *tunUDPStatsWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -176,7 +190,13 @@ func (t *Handler) Start() error {
 func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	// when handling is done with any outcome, always signal back to the incoming connection
 	// to close, send completion packets back to the network, and cleanup
-	defer conn.Close()
+	ownedConn := conn
+	ownedByDispatcher := false
+	defer func() {
+		if !ownedByDispatcher {
+			_ = ownedConn.Close()
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(t.ctx)
 	defer cancel()
@@ -191,6 +211,12 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	}
 	source := net.DestinationFromAddr(remote)
 	isUDP := destination.Network == net.Network_UDP
+	userDispatcher, hasUserDispatcher := t.dispatcher.(routing.UserStreamDispatcher)
+	var canonicalOwner *closeOnceConn
+	if !isUDP && hasUserDispatcher {
+		canonicalOwner = &closeOnceConn{Conn: conn}
+		conn = canonicalOwner
+	}
 	if !isUDP && (t.uplinkCounter != nil || t.downlinkCounter != nil) {
 		conn = &stat.CounterConnection{
 			Connection:   conn,
@@ -222,6 +248,19 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 		Reason: "",
 	})
 	errors.LogInfo(ctx, "processing from ", source, " to ", destination)
+	if !isUDP && hasUserDispatcher {
+		ownedByDispatcher = true
+		if err := userDispatcher.DispatchUserStream(ctx, destination, routing.UserStream{
+			Connection: conn,
+			Stop: func() error {
+				cancel()
+				return canonicalOwner.Close()
+			},
+		}); err != nil {
+			errors.LogError(ctx, errors.New("connection closed").Base(err))
+		}
+		return
+	}
 
 	reader := &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)}
 	writer := buf.NewWriter(conn)

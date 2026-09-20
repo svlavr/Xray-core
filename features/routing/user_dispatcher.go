@@ -14,6 +14,9 @@ import (
 type UserStream struct {
 	Connection stat.Connection
 	Retained   buf.MultiBuffer
+	// Stop cancels and closes this stream's exact local owner. It is optional;
+	// when present, the dispatcher may invoke it once for targeted close.
+	Stop func() error
 }
 
 // UserStreamDispatcher admits a USER TCP stream before transport.Link is built.
