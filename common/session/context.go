@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"sync"
 	_ "unsafe"
 
 	"github.com/xtls/xray-core/common/ctx"
@@ -27,7 +28,9 @@ const (
 	mitmAlpn11Key             ctx.SessionKey = 11 // used by TLS dialer
 	mitmServerNameKey         ctx.SessionKey = 12 // used by TLS dialer
 
-	streamSettingsKey ctx.SessionKey = 13
+	streamSettingsKey          ctx.SessionKey = 13
+	forcedOutboundSelectionKey ctx.SessionKey = 14
+	trafficOriginKey           ctx.SessionKey = 15
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -112,6 +115,82 @@ func SetForcedOutboundTagToContext(ctx context.Context, tag string) context.Cont
 	}
 	ContentFromContext(ctx).SetAttribute("forcedOutboundTag", tag)
 	return ctx
+}
+
+// ForcedOutboundSelection reports the one top-level result of a forced-tag
+// dispatch. It does not prove a terminal handler, physical carrier or delivery.
+type ForcedOutboundSelection struct {
+	RequestedTag string
+	SelectedTag  string
+	Found        bool
+	Origin       TrafficOrigin
+}
+
+// ForcedOutboundSelectionMailbox is a non-blocking one-shot receipt. Its
+// private channel cannot be closed by callers while dispatch is still running.
+type ForcedOutboundSelectionMailbox struct {
+	initOnce   sync.Once
+	submitOnce sync.Once
+	receipt    chan ForcedOutboundSelection
+}
+
+func NewForcedOutboundSelectionMailbox() *ForcedOutboundSelectionMailbox {
+	return new(ForcedOutboundSelectionMailbox)
+}
+
+func (m *ForcedOutboundSelectionMailbox) receiptChannel() chan ForcedOutboundSelection {
+	m.initOnce.Do(func() { m.receipt = make(chan ForcedOutboundSelection, 1) })
+	return m.receipt
+}
+
+func (m *ForcedOutboundSelectionMailbox) submit(selection ForcedOutboundSelection) {
+	if m == nil {
+		return
+	}
+	m.submitOnce.Do(func() { m.receiptChannel() <- selection })
+}
+
+func (m *ForcedOutboundSelectionMailbox) Wait(ctx context.Context) (ForcedOutboundSelection, bool) {
+	if m == nil {
+		return ForcedOutboundSelection{}, false
+	}
+	select {
+	case selection := <-m.receiptChannel():
+		return selection, true
+	case <-ctx.Done():
+		return ForcedOutboundSelection{}, false
+	}
+}
+
+func ContextWithForcedOutboundSelection(ctx context.Context, mailbox *ForcedOutboundSelectionMailbox) context.Context {
+	return context.WithValue(ctx, forcedOutboundSelectionKey, mailbox)
+}
+
+// SubmitForcedOutboundSelection publishes at most one forced-tag selection
+// without blocking dispatch.
+func SubmitForcedOutboundSelection(ctx context.Context, selection ForcedOutboundSelection) {
+	mailbox, _ := ctx.Value(forcedOutboundSelectionKey).(*ForcedOutboundSelectionMailbox)
+	mailbox.submit(selection)
+}
+
+// TrafficOrigin is a technical admission fact. Unknown must never be promoted
+// to USER or CONTROLLED_MEASUREMENT by inference.
+type TrafficOrigin uint8
+
+const (
+	TrafficOriginUnknown TrafficOrigin = iota
+	TrafficOriginUser
+	TrafficOriginInternal
+	TrafficOriginControlledMeasurement
+)
+
+func ContextWithTrafficOrigin(ctx context.Context, origin TrafficOrigin) context.Context {
+	return context.WithValue(ctx, trafficOriginKey, origin)
+}
+
+func TrafficOriginFromContext(ctx context.Context) TrafficOrigin {
+	origin, _ := ctx.Value(trafficOriginKey).(TrafficOrigin)
+	return origin
 }
 
 type TrackedRequestErrorFeedback interface {

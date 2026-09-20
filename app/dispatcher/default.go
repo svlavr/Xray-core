@@ -457,10 +457,21 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
 		ctx = session.SetForcedOutboundTagToContext(ctx, "")
 		if h := d.ohm.GetHandler(forcedOutboundTag); h != nil {
+			session.SubmitForcedOutboundSelection(ctx, session.ForcedOutboundSelection{
+				RequestedTag: forcedOutboundTag,
+				SelectedTag:  h.Tag(),
+				Found:        true,
+				Origin:       session.TrafficOriginFromContext(ctx),
+			})
 			isPickRoute = 1
 			errors.LogInfo(ctx, "taking platform initialized detour [", forcedOutboundTag, "] for [", destination, "]")
 			handler = h
 		} else {
+			session.SubmitForcedOutboundSelection(ctx, session.ForcedOutboundSelection{
+				RequestedTag: forcedOutboundTag,
+				Found:        false,
+				Origin:       session.TrafficOriginFromContext(ctx),
+			})
 			errors.LogError(ctx, "non existing tag for platform initialized detour: ", forcedOutboundTag)
 			common.Close(link.Writer)
 			common.Interrupt(link.Reader)
