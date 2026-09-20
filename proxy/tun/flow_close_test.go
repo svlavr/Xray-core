@@ -43,9 +43,11 @@ func (c *flowTestConn) Close() error {
 	atomic.AddInt32(&c.closed, 1)
 	return nil
 }
+
 func (*flowTestConn) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1080}
 }
+
 func (*flowTestConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 12345}
 }
@@ -65,6 +67,7 @@ func (*flowFallbackDispatcher) Close() error      { return nil }
 func (*flowFallbackDispatcher) Dispatch(context.Context, xnet.Destination) (*transport.Link, error) {
 	return nil, nil
 }
+
 func (d *flowFallbackDispatcher) DispatchLink(_ context.Context, _ xnet.Destination, link *transport.Link) error {
 	atomic.AddInt32(&d.linkCalls, 1)
 	mb, err := link.Reader.ReadMultiBuffer()
@@ -193,6 +196,7 @@ func (c *blockingFlowTestConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return nil
 }
+
 func (*blockingFlowTestConn) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1080}
 }
