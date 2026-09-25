@@ -160,6 +160,50 @@ func TestInspectionAuthenticationBufferingAndNativeBatch(t *testing.T) {
 	}
 }
 
+func TestInspectionAuthenticationFailedEmptyControlPreservesPayloadFacts(t *testing.T) {
+	for _, ended := range []bool{false, true} {
+		t.Run(strconv.FormatBool(ended), func(t *testing.T) {
+			flow, view := authenticationFlow(t)
+			output := &authenticationOutput{limit: -1}
+			native, buffered := authenticationWriter(output, false, protocol.TransferTypeStream)
+			writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
+			if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("known"))); err != nil {
+				t.Fatal(err)
+			}
+			if err := buffered.SetBuffered(false); err != nil {
+				t.Fatal(err)
+			}
+			if ended {
+				flow.Finish()
+			}
+			output.limit, output.fail = output.Len(), io.ErrClosedPipe
+			if err := writer.WriteMultiBuffer(nil); !errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("native empty-control error: %v", err)
+			}
+			finish()
+			totals, err := view.ReadTotals(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found bool
+			for _, row := range totals.Rows {
+				if row.Outbound.Serial == 1 && row.Origin == fs.TrafficOriginUser {
+					found = true
+					if row.Downlink != (fs.ByteFact{Known: 5}) {
+						t.Fatalf("empty control contaminated payload facts: %+v", row.Downlink)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("missing payload bucket")
+			}
+			if !ended && authenticationFact(t, view) != (fs.ByteFact{Known: 5}) {
+				t.Fatal("live bytes were contaminated")
+			}
+		})
+	}
+}
+
 type authenticationSealFailure struct {
 	crypto.Authenticator
 	calls, failAt int

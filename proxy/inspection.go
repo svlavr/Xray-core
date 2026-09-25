@@ -315,7 +315,7 @@ func RecordPacketOutcome(receipt stats.Exchange, payload uint64, complete, parti
 	switch {
 	case complete:
 		receipt.AddDownlink(payload)
-	case partial:
+	case partial && payload != 0:
 		receipt.MarkDownlinkIncomplete()
 	}
 	if err != nil {

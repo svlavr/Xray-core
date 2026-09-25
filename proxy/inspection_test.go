@@ -29,6 +29,35 @@ func (c *inspectionCloseResultConn) Close() error {
 	return c.result
 }
 
+func TestRecordPacketWritePartialZeroPayload(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload uint64
+	}{{"empty", 0}, {"nonempty", 7}} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := new(appstats.Manager)
+			view, err := manager.EnableInspection(fs.ObservationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer manager.Close()
+			flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}})
+			flow.BindRoute()
+			proxy.RecordPacketWrite(flow, test.payload, 10, 3, io.ErrClosedPipe)
+			flow.Finish()
+			page, err := view.ReadTerminals(context.Background())
+			if err != nil || len(page.Rows) != 1 {
+				t.Fatalf("packet terminal: %+v %v", page, err)
+			}
+			want := fs.ByteFact{Incomplete: test.payload != 0}
+			if page.Rows[0].Flow.Downlink != want || page.Rows[0].Reason != fs.EndReasonWriteError {
+				t.Fatalf("partial packet facts: %+v", page.Rows[0])
+			}
+		})
+	}
+}
+
 func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 	for _, mode := range []string{"direct", "deferred"} {
 		for _, test := range []struct {

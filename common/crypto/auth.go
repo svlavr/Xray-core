@@ -373,7 +373,9 @@ func (w *AuthenticationWriter) writeBatch(mb buf.MultiBuffer, receipt stats.Exch
 				receipt.AddDownlink(payload)
 			}
 		} else {
-			receipt.MarkDownlinkIncomplete()
+			if payload != 0 {
+				receipt.MarkDownlinkIncomplete()
+			}
 			receipt.SetEndReason(stats.EndReasonWriteError)
 		}
 	}
