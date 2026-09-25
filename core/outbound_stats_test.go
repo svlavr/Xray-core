@@ -191,6 +191,7 @@ func TestReadOutboundStatsCountsRealFreedomTCP(t *testing.T) {
 
 	want.Uplink.Bytes = int64(len(request))
 	want.Downlink.Bytes = int64(len(response))
+	waitRealOutboundStats(t, instance, tag, want)
 	if got := core.ReadOutboundStats(instance, tag); got != want {
 		t.Fatalf("outbound stats after real TCP exchange: got %+v want %+v", got, want)
 	}
@@ -214,6 +215,7 @@ func TestReadOutboundStatsAccumulatesRealTCPPerInstance(t *testing.T) {
 		response := exchangeRealFreedomTCP(t, instance, destination, request)
 		want.Uplink.Bytes += int64(len(request))
 		want.Downlink.Bytes += int64(len(response))
+		waitRealOutboundStats(t, instance, tag, want)
 		for read := 1; read <= 2; read++ {
 			if got := core.ReadOutboundStats(instance, tag); got != want {
 				t.Fatalf("connection %d read %d: got %+v want %+v", connection+1, read, got, want)
@@ -293,9 +295,26 @@ func TestReadOutboundStatsCountsRealFreedomUDPAssociation(t *testing.T) {
 
 		want.Uplink.Bytes += int64(len(request))
 		want.Downlink.Bytes += int64(len(response))
+		waitRealOutboundStats(t, instance, tag, want)
 		if got := core.ReadOutboundStats(instance, tag); got != want {
 			t.Fatalf("UDP packet %d outbound stats: got %+v want %+v", packet+1, got, want)
 		}
+	}
+}
+
+func waitRealOutboundStats(t *testing.T, instance *core.Instance, tag string, want core.OutboundStats) {
+	t.Helper()
+	// Peer receipt can precede return from the native counted Write call.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got := core.ReadOutboundStats(instance, tag)
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("outbound stats did not settle: got %+v want %+v", got, want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

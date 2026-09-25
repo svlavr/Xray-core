@@ -315,7 +315,7 @@ func BenchmarkControlStatsP5TCPExchange(b *testing.B) {
 		if enabled {
 			name = "enabled"
 		}
-		b.Run(name, func(b *testing.B) {
+		if !b.Run(name, func(b *testing.B) {
 			destination := acceptanceEcho(b)
 			instance, _ := acceptanceCore(b, enabled)
 			payload, response := bytes.Repeat([]byte{0x5a}, 1024), make([]byte, 1024)
@@ -330,6 +330,8 @@ func BenchmarkControlStatsP5TCPExchange(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-		})
+		}) {
+			b.Fail()
+		}
 	}
 }

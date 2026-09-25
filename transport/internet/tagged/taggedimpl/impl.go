@@ -21,6 +21,7 @@ type taggedObservation struct {
 	conn     net.Conn
 	exchange stats.Exchange
 	closed   bool
+	cancel   context.CancelFunc
 }
 
 func beginTaggedObservation(ctx context.Context, instance *core.Instance, destination net.Destination) (context.Context, *taggedObservation) {
@@ -38,22 +39,32 @@ func beginTaggedObservation(ctx context.Context, instance *core.Instance, destin
 	if store == nil {
 		return ctx, nil
 	}
-	owner := new(taggedObservation)
+	ownedCtx, cancel := context.WithCancel(ctx)
+	owner := &taggedObservation{cancel: cancel}
 	var source net.Destination
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		source = inbound.Source
 	}
+	var exchange stats.Exchange
 	if destination.Network == net.Network_TCP {
-		owner.exchange = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
+		exchange = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
 	} else {
-		owner.exchange = store.Begin(stats.FlowKindUDPAssociation, session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
+		exchange = store.Begin(stats.FlowKindUDPAssociation, session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
 	}
-	if owner.exchange == nil {
+	owner.mu.Lock()
+	owner.exchange = exchange
+	closed := owner.closed
+	owner.mu.Unlock()
+	if exchange == nil {
+		cancel()
 		return ctx, nil
 	}
-	observation := &session.LogicalObservation{Exchange: owner.exchange, InputAtExecution: true}
+	if closed {
+		exchange.Finish()
+	}
+	observation := &session.LogicalObservation{Exchange: exchange, InputAtExecution: true}
 	observation.ReturnedLink.Store(true)
-	return session.ContextWithLogicalObservation(ctx, observation), owner
+	return session.ContextWithLogicalObservation(ownedCtx, observation), owner
 }
 
 func (o *taggedObservation) attach(conn net.Conn) {
@@ -74,12 +85,18 @@ func (o *taggedObservation) Close() error {
 	}
 	o.closed = true
 	conn := o.conn
+	exchange, cancel := o.exchange, o.cancel
 	o.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	var err error
 	if conn != nil {
 		err = conn.Close()
 	}
-	o.exchange.Finish()
+	if exchange != nil {
+		exchange.Finish()
+	}
 	return err
 }
 

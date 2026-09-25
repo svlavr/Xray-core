@@ -258,6 +258,9 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 	inspectionMasqueExchange(t, first, firstPayload)
 	inspectionMasqueExchange(t, sibling, siblingPayload)
 	var firstRef fs.FlowRef
+	firstSource := xnet.DestinationFromAddr(first.LocalAddr())
+	siblingSource := xnet.DestinationFromAddr(sibling.LocalAddr())
+	wantBytes := map[xnet.Destination]uint64{firstSource: uint64(len(firstPayload)), siblingSource: uint64(len(siblingPayload))}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		live, err := view.ReadLive(context.Background())
@@ -265,15 +268,25 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(live.Rows) == 2 {
+			ready := true
+			// Receiving socket data can precede the writer's returned-byte receipt.
+			// Wait for both directions, then keep the complete strict row assertions.
 			for _, row := range live.Rows {
-				if row.Kind != fs.FlowKindTCP || row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Tag != "masque-inspected" || row.AccountingRoute.Outbound.Serial == 0 || row.AccountingRoute.Effective != tcpTarget || row.Downlink.Known != row.Uplink.Known {
-					t.Fatalf("logical MASQUE TCP flow: %+v", row)
+				want, ok := wantBytes[row.Source]
+				if !ok {
+					t.Fatalf("unexpected MASQUE source: %+v", row)
 				}
-				if row.Uplink.Known == uint64(len(firstPayload)) {
-					firstRef = row.Ref
+				if row.Uplink.Known != want || row.Downlink.Known != want {
+					ready = false
 				}
 			}
-			if firstRef.ID != 0 {
+			if ready {
+				for _, row := range live.Rows {
+					inspectionMasqueTCPRow(t, row, tcpTarget, wantBytes[row.Source])
+					if row.Source == firstSource {
+						firstRef = row.Ref
+					}
+				}
 				break
 			}
 		}
@@ -308,7 +321,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
-			if row.Kind == fs.FlowKindUDPAssociation && row.Uplink.Known == uint64(len(udpPayload)) {
+			if row.Kind == fs.FlowKindUDPAssociation && row.Uplink.Known == uint64(len(udpPayload)) && row.Downlink.Known == uint64(len(udpPayload)) {
 				if row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Tag != "masque-inspected" || row.AccountingRoute.Effective != udpTarget || row.Downlink.Known != row.Uplink.Known {
 					t.Fatalf("logical MASQUE UDP flow: %+v", row)
 				}

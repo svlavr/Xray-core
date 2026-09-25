@@ -127,3 +127,25 @@ func TestSOCKSTempUDPConnCloseIsIdempotent(t *testing.T) {
 		t.Fatalf("recursive/concurrent close: TCP=%d UDP=%d", tcp.calls.Load(), udp.calls.Load())
 	}
 }
+
+func TestSOCKSTempUDPConnTimeoutInitialization(t *testing.T) {
+	for _, timeout := range []time.Duration{0, time.Nanosecond} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			for range 16 {
+				tcp, udp := &inspectionCloseConn{}, &inspectionClosePacketConn{}
+				conn := NewTempUDPConn(udp, tcp, &net.UDPAddr{})
+				conn.SetTimeout(timeout)
+				deadline := time.Now().Add(time.Second)
+				for udp.calls.Load() == 0 && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+				}
+				if err := conn.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if tcp.calls.Load() != 1 || udp.calls.Load() != 1 {
+					t.Fatalf("timeout/native cleanup: TCP=%d UDP=%d", tcp.calls.Load(), udp.calls.Load())
+				}
+			}
+		})
+	}
+}

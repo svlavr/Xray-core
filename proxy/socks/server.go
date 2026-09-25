@@ -190,6 +190,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 		if tempUDPConn == nil {
 			return errors.New("UDP associate with listen port failed")
 		}
+		tempUDPConn.SetTimeout(plcy.Timeouts.ConnectionIdle)
 		store := proxy.ObservationStore(s.statsManager)
 		var flow stats.Exchange
 		if store != nil {
@@ -209,7 +210,6 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 				defer flow.Finish()
 			}
 		}
-		tempUDPConn.SetTimeout(plcy.Timeouts.ConnectionIdle)
 		errCh := make(chan error, 1)
 		go func() {
 			errCh <- s.handleUDPPayload(ctx, tempUDPConn, dispatcher, flow)

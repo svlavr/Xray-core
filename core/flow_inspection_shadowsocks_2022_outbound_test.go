@@ -11,7 +11,6 @@ import (
 	fs "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/testing/servers/tcp"
-	"github.com/xtls/xray-core/testing/servers/udp"
 )
 
 const (
@@ -35,7 +34,7 @@ func inspectionShadowsocks2022MultiReceiver(t *testing.T, enabled, sniff bool) (
 func inspectionShadowsocks2022ReceiverMode(t *testing.T, enabled, sniff, multi bool) (*core.Instance, fs.FlowInspection, *core.OutboundHandlerConfig) {
 	t.Helper()
 	remote, view, _ := inspectionCore(t, enabled, false)
-	port := udp.PickPort()
+	port := inspectionPickTCPUDPPort(t)
 	settings := serial.ToTypedMessage(&shadowsocks_2022.ServerConfig{
 		Method: inspectionShadowsocks2022Method, Key: inspectionShadowsocks2022Key,
 		Network: []cnet.Network{cnet.Network_TCP, cnet.Network_UDP},

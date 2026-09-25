@@ -62,15 +62,20 @@ func (c *TempUDPConn) RemoteAddr() net.Addr {
 
 func (c *TempUDPConn) SetTimeout(d time.Duration) {
 	c.Timer = signal.CancelAfterInactivity(context.Background(), func() {
-		c.Close()
+		// The callback may run before CancelAfterInactivity returns the timer.
+		c.close(false)
 	}, d)
 }
 
 func (c *TempUDPConn) Close() error {
+	return c.close(true)
+}
+
+func (c *TempUDPConn) close(stopTimer bool) error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-	if c.Timer != nil {
+	if stopTimer && c.Timer != nil {
 		c.Timer.SetTimeout(0)
 	}
 	c.AssociatedTCPConn.Close()

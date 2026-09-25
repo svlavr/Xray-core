@@ -3,7 +3,9 @@ package core_test
 import (
 	"bytes"
 	"context"
+	stdnet "net"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/app/proxyman"
 	cnet "github.com/xtls/xray-core/common/net"
@@ -71,10 +73,19 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 		if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
 			t.Fatalf("supplied TCP exact stop: %+v %v", outcomes, err)
 		}
+		if pendingPeerEOF {
+			// The local native close is not a remote half-close completion receipt.
+			first.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		}
 		if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
 			t.Fatalf("stopped endpoint returned %d, %v", n, err)
+		} else if timeout, ok := err.(stdnet.Error); ok && timeout.Timeout() && !pendingPeerEOF {
+			t.Fatal("stopped endpoint did not close before deadline")
 		}
 		extra := []byte("sibling after supplied TCP stop")
+		if err := sibling.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := sibling.Write(extra); err != nil {
 			t.Fatal(err)
 		}

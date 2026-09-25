@@ -106,6 +106,20 @@ jobs:
           ./common/buf ./common/crypto ./common/mux ./common/session ./common/singbridge
           ./features/dns/... ./features/routing/... ./app/proxyman/inbound
           ./proxy/shadowsocks_2022 ./transport/pipe ./transport/internet/udp
+      - name: Test legacy HTTP2 pool ownership
+        if: ${{ !cancelled() }}
+        env:
+          GODEBUG: http2legacy=1
+        run: >-
+          go test -mod=readonly -race -timeout 1h -count=2
+          -run '^(TestRoutedDoH|TestH2CPooledResolverReplacement)'
+          ./app/dns
+      - name: Smoke test enabled and disabled API benchmark
+        if: ${{ !cancelled() }}
+        run: >-
+          go test -mod=readonly ./core -run '^$'
+          -bench '^BenchmarkControlStatsP5TCPExchange$'
+          -benchtime=100x -count=1 -timeout=2m
 
   race-tests:
     name: Race Tests / Linux
