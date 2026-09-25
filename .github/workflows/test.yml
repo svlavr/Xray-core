@@ -1,47 +1,32 @@
-name: Tests and Checkings
+name: CI / Tests and Checks
 
 on:
   push:
+    branches: [codex/clean-control-stats-ci]
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  check-assets:
+  format-and-proto:
+    name: Upstream Checks / Format and Proto
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
-    steps:
-      - name: Restore Geodat Cache
-        uses: actions/cache/restore@v6
-        with:
-          path: resources
-          key: xray-geodat-
-      - name: Check Assets Existence
-        id: check-assets
-        run: |
-          [ -d 'resources' ] || mkdir resources
-          LIST=('geoip.dat' 'geosite.dat')
-          for FILE_NAME in "${LIST[@]}"
-          do
-            echo -e "Checking ${FILE_NAME}..."
-            if [ -s "./resources/${FILE_NAME}" ]; then
-              echo -e "${FILE_NAME} exists."
-            else
-              echo -e "${FILE_NAME} does not exist."
-              echo "missing=true" >> $GITHUB_OUTPUT
-              break
-            fi
-          done
-      - name: Sleep for 90 seconds if Assets Missing
-        if: steps.check-assets.outputs.missing == 'true'
-        run: sleep 90
-
-  check-proto:
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
     steps:
       - name: Checkout codebase
         uses: actions/checkout@v7
-      - name: Check Proto Version Header
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Check format
+        run: go run ./infra/vformat/main.go -mode check -pwd ./
+      - name: Check proto version headers
+        if: ${{ !cancelled() }}
+        shell: bash
         run: |
           head -n 4 core/config.pb.go > ref.txt
           find . -name "*.pb.go" ! -name "*_grpc.pb.go" -print0 | while IFS= read -r -d '' file; do
@@ -51,34 +36,25 @@ jobs:
               exit 1
             fi
           done
+      - name: Verify modules and bundled source
+        if: ${{ !cancelled() }}
+        run: |
+          go mod verify
+          python third_party/check_sing.py
 
-  check-format:
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout codebase
-        uses: actions/checkout@v7
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          check-latest: true
-          cache: false
-      - name: Check Format
-        run: go run ./infra/vformat/main.go -mode check -pwd ./
-
-  test:
-    needs: check-assets
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
-    permissions:
-      contents: read
+  upstream-tests:
+    name: Upstream Tests / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
     steps:
       - name: Checkout codebase
         uses: actions/checkout@v7
@@ -93,5 +69,84 @@ jobs:
           path: resources
           key: xray-geodat-
           enableCrossOsArchive: true
+      - name: Restore and verify geodat
+        shell: pwsh
+        run: ./.github/build/prepare-assets.ps1
       - name: Test
-        run: go test -timeout 1h -v ./...
+        run: go test -mod=readonly -timeout 1h -v ./...
+
+  fork-regression-tests:
+    name: Fork Regression Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Restore Geodat Cache
+        uses: actions/cache/restore@v6
+        with:
+          path: resources
+          key: xray-geodat-
+      - name: Restore and verify geodat
+        shell: pwsh
+        run: ./.github/build/prepare-assets.ps1
+      - name: Repeat control, statistics and DNS ownership regressions
+        run: >-
+          go test -mod=readonly -race -timeout 1h -count=2
+          -run '^(TestInspection|TestFlowInspection|TestControlStats|TestCleanControlStats|TestDNSPreparation|TestApplyConfig|TestApplyPublication|TestRetirementTerminal|TestBoundLookup|TestDNSClose|TestObservedUDP|TestRoutedDNS|TestRoutedDoH|TestGenerationSeal|TestOwnedPeriodic|TestCacheClose|TestTCPResolver|TestH2CPooled|TestUDPTruncated)'
+          ./app/stats ./app/dns ./core
+      - name: Test shared transport and endpoint mechanisms
+        if: ${{ !cancelled() }}
+        run: >-
+          go test -mod=readonly -race -timeout 1h -count=1
+          ./common/buf ./common/crypto ./common/mux ./common/session ./common/singbridge
+          ./features/dns/... ./features/routing/... ./app/proxyman/inbound
+          ./proxy/shadowsocks_2022 ./transport/pipe ./transport/internet/udp
+
+  race-tests:
+    name: Race Tests / Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Restore Geodat Cache
+        uses: actions/cache/restore@v6
+        with:
+          path: resources
+          key: xray-geodat-
+      - name: Restore and verify geodat
+        shell: pwsh
+        run: ./.github/build/prepare-assets.ps1
+      - name: Race test
+        run: go test -mod=readonly -race -timeout 1h ./...
+
+  dependency-tests:
+    name: Bundled Dependency Tests / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-latest, flags: '' }
+          - { name: Windows, os: windows-latest, flags: '' }
+          - { name: macOS, os: macos-latest, flags: '' }
+          - { name: Linux race, os: ubuntu-latest, flags: '-race' }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Verify source snapshot
+        run: python third_party/check_sing.py
+      - name: Test complete nested module
+        run: go -C third_party/sing test -mod=readonly ${{ matrix.flags }} -timeout 1h ./...

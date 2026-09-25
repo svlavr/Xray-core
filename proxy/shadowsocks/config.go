@@ -163,6 +163,9 @@ func (c *AEADCipher) EncodePacket(key []byte, b *buf.Buffer) error {
 	payloadLen := b.Len()
 	auth := c.createAuthenticator(key, b.BytesTo(ivLen))
 
+	if b.Available() < int32(auth.Overhead()) {
+		return buf.ErrBufferFull
+	}
 	b.Extend(int32(auth.Overhead()))
 	_, err := auth.Seal(b.BytesTo(ivLen), b.BytesRange(ivLen, payloadLen))
 	return err

@@ -13,6 +13,8 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -159,7 +161,11 @@ func (m *udpManager) close(uc *udpConn) {
 	if !uc.closed {
 		uc.closed = true
 		close(uc.queue)
-		delete(m.m, uc.src.NetAddr())
+		for range uc.queue {
+		} // a retired owner must not retain its pending packets
+		if m.m[uc.src.NetAddr()] == uc {
+			delete(m.m, uc.src.NetAddr())
+		}
 	}
 }
 
@@ -247,7 +253,12 @@ func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			return nil, io.EOF
 		}
 
-		b := buf.New()
+		var b *buf.Buffer
+		if len(q.p) > buf.Size {
+			b = buf.NewWithSize(int32(len(q.p)))
+		} else {
+			b = buf.New()
+		}
 		if _, err := b.Write(q.p); err != nil {
 			errors.LogErrorInner(context.Background(), err, "drop packet to ", q.dest, " with size ", len(q.p))
 			b.Release()
@@ -273,6 +284,10 @@ func (c *udpConn) Read(p []byte) (int, error) {
 }
 
 func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return c.writeMultiBuffer(mb, nil)
+}
+
+func (c *udpConn) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for i, b := range mb {
 		dst := c.dst
 		if b.UDP != nil {
@@ -283,6 +298,9 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 		err := c.writeFunc(b.Bytes(), dst, c.src)
+		if receipt != nil {
+			proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil, err != nil, err)
+		}
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
@@ -290,6 +308,20 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		b.Release()
 	}
 	return nil
+}
+
+func (c *udpConn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
+	return &inspectionUDPWriter{udpConn: c, receipt: receipt}
+}
+
+type inspectionUDPWriter struct {
+	*udpConn
+	receipt stats.Exchange
+}
+
+func (w *inspectionUDPWriter) WriterReceipt() stats.Exchange { return w.receipt }
+func (w *inspectionUDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.udpConn.writeMultiBuffer(mb, w.receipt)
 }
 
 func (c *udpConn) Write(p []byte) (int, error) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
+	goerrors "errors"
 	"reflect"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
@@ -103,6 +105,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 			Name: "vless-reverse",
 			User: handler.server.User, // TODO: email
 		})
+		rvsCtx = session.ContextWithTrafficOrigin(rvsCtx, session.TrafficOriginInternal)
 		if sc := a.Reverse.Sniffing; sc != nil && sc.Enabled {
 			request, err := proxymanConfig.BuildSniffingRequest(sc)
 			if err != nil {
@@ -155,6 +158,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	rec := h.server
 	var conn stat.Connection
+	target := ob.Target
+	account := rec.User.Account.(*vless.MemoryAccount)
+	ordinaryTarget := target.Network == net.Network_TCP || target.Network == net.Network_UDP
+	if target.Address.Family().IsDomain() {
+		domain := target.Address.Domain()
+		ordinaryTarget = ordinaryTarget && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
+	}
+	vision := account.Flow == vless.XRV || account.Flow == vless.XRV+"-udp443"
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget && (account.Flow == "" || vision))
+	if observation != nil {
+		observation.Exchange.Effective(target)
+	}
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {
@@ -176,7 +191,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		})
 		for {
-			connTime := <-h.preConns
+			var connTime *ConnExpire
+			select {
+			case connTime = <-h.preConns:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			if connTime == nil {
 				return errors.New("closed handler").AtWarning()
 			}
@@ -203,7 +223,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	defer conn.Close()
 
 	iConn := stat.TryUnwrapStatsConn(conn)
-	target := ob.Target
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
 
 	if h.encryption != nil {
@@ -237,8 +256,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		Port:    target.Port,
 	}
 
-	account := request.User.Account.(*vless.MemoryAccount)
-
 	requestAddons := &encoding.Addons{
 		Flow: account.Flow,
 	}
@@ -262,29 +279,29 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			fallthrough // let server break Mux connections that contain TCP requests
 		case protocol.RequestCommandTCP, protocol.RequestCommandRvs:
 			var t reflect.Type
-			var p uintptr
+			var p unsafe.Pointer
 			if commonConn, ok := conn.(*encryption.CommonConn); ok {
 				if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 					ob.CanSpliceCopy = 3 // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 				}
 				t = reflect.TypeOf(commonConn).Elem()
-				p = uintptr(unsafe.Pointer(commonConn))
+				p = unsafe.Pointer(commonConn)
 			} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 				t = reflect.TypeOf(tlsConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(tlsConn.Conn))
+				p = unsafe.Pointer(tlsConn.Conn)
 			} else if utlsConn, ok := iConn.(*tls.UConn); ok {
 				t = reflect.TypeOf(utlsConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(utlsConn.Conn))
+				p = unsafe.Pointer(utlsConn.Conn)
 			} else if realityConn, ok := iConn.(*reality.UConn); ok {
 				t = reflect.TypeOf(realityConn.Conn).Elem()
-				p = uintptr(unsafe.Pointer(realityConn.Conn))
+				p = unsafe.Pointer(realityConn.Conn)
 			} else {
 				return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 			}
 			i, _ := t.FieldByName("input")
 			r, _ := t.FieldByName("rawInput")
-			input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-			rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+			input = (*bytes.Reader)(unsafe.Add(p, i.Offset))
+			rawInput = (*bytes.Buffer)(unsafe.Add(p, r.Offset))
 		default:
 			panic("unknown VLESS request command")
 		}
@@ -381,6 +398,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		responseAddons, err := encoding.DecodeResponseHeader(conn, request)
 		if err != nil {
+			if observation != nil {
+				reason := stats.EndReasonReadError
+				var timeout interface{ Timeout() bool }
+				if goerrors.As(err, &timeout) && timeout.Timeout() {
+					reason = stats.EndReasonTimeout
+				}
+				observation.Exchange.SetEndReason(reason)
+			}
 			return errors.New("failed to decode response header").Base(err).AtInfo()
 		}
 
@@ -398,10 +423,29 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if requestAddons.Flow == vless.XRV {
-			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
+			var receipt stats.Exchange
+			if observation != nil {
+				receipt = observation.Exchange
+			}
+			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx, receipt)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer
 			err = buf.Copy(serverReader, clientWriter, buf.UpdateActivity(timer))
+			if observation != nil {
+				switch {
+				case err == nil:
+					observation.Exchange.SetEndReason(stats.EndReasonEOF)
+				case buf.IsReadError(err):
+					reason := stats.EndReasonReadError
+					var timeout interface{ Timeout() bool }
+					if goerrors.As(err, &timeout) && timeout.Timeout() {
+						reason = stats.EndReasonTimeout
+					}
+					observation.Exchange.SetEndReason(reason)
+				case buf.IsWriteError(err):
+					// The actual endpoint writer owns its accepted result and cause.
+				}
+			}
 		}
 
 		if err != nil {
@@ -459,7 +503,7 @@ func (r *Reverse) monitor() error {
 			Tag:        r.tag,
 			Dispatcher: r.dispatcher,
 		}
-		worker, err := mux.NewServerWorker(session.ContextWithIsReverseMux(r.ctx, true), w, link1)
+		worker, err := mux.NewServerWorker(reverseChildContext(r.ctx), w, link1)
 		if err != nil {
 			errors.LogWarningInner(r.ctx, err, "failed to create mux server worker")
 			return nil
@@ -476,6 +520,11 @@ func (r *Reverse) monitor() error {
 		}()
 	}
 	return nil
+}
+
+func reverseChildContext(ctx context.Context) context.Context {
+	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUnknown)
+	return session.ContextWithIsReverseMux(ctx, true)
 }
 
 func (r *Reverse) Start() error {

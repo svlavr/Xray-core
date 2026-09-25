@@ -15,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -90,16 +91,20 @@ type ServerWorker struct {
 	sessionManager *SessionManager
 	done           *done.Instance
 	timer          *time.Ticker
+	stats          stats.Manager
+	store          stats.AdmissionStore
+	runtime        stats.RuntimeID
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
 	worker := &ServerWorker{
 		dispatcher:     d,
-		link:           link,
+		link:           &transport.Link{Reader: link.Reader, Writer: link.Writer},
 		sessionManager: NewSessionManager(),
 		done:           done.New(),
 		timer:          time.NewTicker(60 * time.Second),
 	}
+	worker.initializeInspection(ctx)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.CanSpliceCopy = 3
 	}
@@ -110,13 +115,16 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
+	if _, ok := output.(*inspectionOutput); ok {
+		writer.receipt = s.inspection
+	}
 	if err := buf.Copy(s.input, writer); err != nil {
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
 	}
 
 	writer.Close()
-	s.Close(false)
+	s.finishServer()
 }
 
 func (w *ServerWorker) monitor() {
@@ -163,6 +171,12 @@ func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.Bu
 }
 
 func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata, reader *buf.BufferedReader) error {
+	w.sessionManager.RLock()
+	occupied := w.sessionManager.sessions[meta.SessionID] != nil
+	w.sessionManager.RUnlock()
+	if occupied {
+		return errors.New("duplicate mux session ID")
+	}
 	ctx = session.SubContextFromMuxInbound(ctx)
 	if meta.Inbound != nil && meta.Inbound.Source.IsValid() && meta.Inbound.Local.IsValid() {
 		if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -181,7 +195,9 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		}
 		if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
 			msg.From = inbound.Source
-			msg.Email = inbound.User.Email
+			if inbound.User != nil {
+				msg.Email = inbound.User.Email
+			}
 		}
 		ctx = log.ContextWithAccessMessage(ctx, msg)
 	}
@@ -193,93 +209,50 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	}
 
 	if meta.GlobalID != [8]byte{} { // MUST ignore empty Global ID
-		mb, err := NewPacketReader(reader, &meta.Target).ReadMultiBuffer()
-		if err != nil {
-			return err
-		}
-		XUDPManager.Lock()
-		x := XUDPManager.Map[meta.GlobalID]
-		if x == nil {
-			x = &XUDP{GlobalID: meta.GlobalID}
-			XUDPManager.Map[meta.GlobalID] = x
-			XUDPManager.Unlock()
-		} else {
-			if x.Status == Initializing { // nearly impossible
-				XUDPManager.Unlock()
-				errors.LogWarningInner(ctx, errors.New("conflict"), "XUDP hit ", meta.GlobalID)
-				// It's not a good idea to return an err here, so just let client wait.
-				// Client will receive an End frame after sending a Keep frame.
-				return nil
-			}
-			x.Status = Initializing
-			XUDPManager.Unlock()
-			x.Mux.Close(false) // detach from previous Mux
-			b := buf.New()
-			b.Write(mb[0].Bytes())
-			b.UDP = mb[0].UDP
-			if err = x.Mux.output.WriteMultiBuffer(mb); err != nil {
-				x.Interrupt()
-				mb = buf.MultiBuffer{b}
-			} else {
-				b.Release()
-				mb = nil
-			}
-			errors.LogInfoInner(ctx, err, "XUDP hit ", meta.GlobalID)
-		}
-		if mb != nil {
-			ctx = session.ContextWithTimeoutOnly(ctx, true)
-			// Actually, it won't return an error in Xray-core's implementations.
-			link, err := w.dispatcher.Dispatch(ctx, meta.Target)
-			if err != nil {
-				XUDPManager.Lock()
-				delete(XUDPManager.Map, x.GlobalID)
-				XUDPManager.Unlock()
-				err = errors.New("XUDP new ", meta.GlobalID).Base(errors.New("failed to dispatch request to ", meta.Target).Base(err))
-				return err // it will break the whole Mux connection
-			}
-			link.Writer.WriteMultiBuffer(mb) // it's meaningless to test a new pipe
-			x.Mux = &Session{
-				input:  link.Reader,
-				output: link.Writer,
-			}
-			errors.LogInfoInner(ctx, err, "XUDP new ", meta.GlobalID)
-		}
-		x.Mux = &Session{
-			input:        x.Mux.input,
-			output:       x.Mux.output,
-			parent:       w.sessionManager,
-			ID:           meta.SessionID,
-			transferType: protocol.TransferTypePacket,
-			XUDP:         x,
-		}
-		x.Status = Active
-		if !w.sessionManager.Add(x.Mux) {
-			x.Mux.Close(false)
-			return errors.New("failed to add new session")
-		}
-		go handle(ctx, x.Mux, w.link.Writer)
-		return nil
+		return w.handleXUDP(ctx, meta, reader)
 	}
 
+	s := &Session{parent: w.sessionManager, ID: meta.SessionID, transferType: protocol.TransferTypeStream, server: true, initializing: true}
+	defer s.finishAdmission()
+	if meta.Target.Network == net.Network_UDP {
+		s.transferType = protocol.TransferTypePacket
+	}
+	var cleanup func()
+	ctx, cleanup = w.observeChild(ctx, meta.Target, s)
+	s.cleanup = cleanup
 	link, err := w.dispatcher.Dispatch(ctx, meta.Target)
 	if err != nil {
+		if ctx.Err() != nil && s.inspection != nil {
+			s.cancelAdmission(ctx, w.link.Writer)
+			if meta.Option.Has(OptionData) {
+				return buf.Copy(NewStreamReader(reader), buf.Discard)
+			}
+			return nil
+		}
+		s.finishServer()
 		if meta.Option.Has(OptionData) {
 			buf.Copy(NewStreamReader(reader), buf.Discard)
 		}
 		return errors.New("failed to dispatch request.").Base(err)
 	}
-	s := &Session{
-		input:        link.Reader,
-		output:       link.Writer,
-		parent:       w.sessionManager,
-		ID:           meta.SessionID,
-		transferType: protocol.TransferTypeStream,
+	s.parent.Lock()
+	s.input, s.output = link.Reader, link.Writer
+	closed := s.closed
+	s.parent.Unlock()
+	if closed {
+		common.Interrupt(link.Reader)
+		common.Close(link.Writer)
 	}
-	if meta.Target.Network == net.Network_UDP {
-		s.transferType = protocol.TransferTypePacket
-	}
+
 	if !w.sessionManager.Add(s) {
-		s.Close(false)
+		if ctx.Err() != nil && s.inspection != nil {
+			s.cancelAdmission(ctx, w.link.Writer)
+			if meta.Option.Has(OptionData) {
+				return buf.Copy(NewStreamReader(reader), buf.Discard)
+			}
+			return nil
+		}
+		s.finishServer()
 		return errors.New("failed to add new session")
 	}
 	go handle(ctx, s, w.link.Writer)
@@ -287,14 +260,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return nil
 	}
 
-	rr := s.NewReader(reader, &meta.Target)
-	err = buf.Copy(rr, s.output)
-
-	if err != nil && buf.IsWriteError(err) {
-		s.Close(false)
-		return buf.Copy(rr, buf.Discard)
-	}
-	return err
+	return s.copyInput(reader, meta.Target)
 }
 
 func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
@@ -302,8 +268,11 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return nil
 	}
 
-	s, found := w.sessionManager.Get(meta.SessionID)
-	if !found {
+	s, admitted := w.sessionManager.lookup(meta.SessionID, false)
+	if s == nil {
+		if admitted {
+			return buf.Copy(NewStreamReader(reader), buf.Discard)
+		}
 		// Notify remote peer to close this session.
 		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
 		closingWriter.Close()
@@ -311,16 +280,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
-	rr := s.NewReader(reader, &meta.Target)
-	err := buf.Copy(rr, s.output)
-
-	if err != nil && buf.IsWriteError(err) {
-		errors.LogInfoInner(context.Background(), err, "failed to write to downstream writer. closing session ", s.ID)
-		s.Close(false)
-		return buf.Copy(rr, buf.Discard)
-	}
-
-	return err
+	return s.copyInput(reader, meta.Target)
 }
 
 func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {

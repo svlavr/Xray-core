@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
@@ -35,6 +36,7 @@ func init() {
 }
 
 type RelayInbound struct {
+	packetInput  sync.Mutex
 	networks     []net.Network
 	destinations []*RelayDestination
 	service      *shadowaead_2022.RelayService[int]
@@ -102,6 +104,7 @@ func (i *RelayInbound) Process(ctx context.Context, network net.Network, connect
 	if network == net.Network_TCP {
 		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
 	} else {
+		ctx = packetContext(ctx, connection)
 		reader := buf.NewReader(connection)
 		pc := &natPacketConn{connection}
 		for {
@@ -113,7 +116,9 @@ func (i *RelayInbound) Process(ctx context.Context, network net.Network, connect
 			for _, buffer := range mb {
 				packet := B.As(buffer.Bytes()).ToOwned()
 				buffer.Release()
+				i.packetInput.Lock()
 				err = i.service.NewPacket(ctx, pc, packet, metadata)
+				i.packetInput.Unlock()
 				if err != nil {
 					packet.Release()
 					buf.ReleaseMulti(mb)
@@ -152,6 +157,7 @@ func (i *RelayInbound) NewConnection(ctx context.Context, conn net.Conn, metadat
 }
 
 func (i *RelayInbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+	ctx = packetSessionContext(ctx)
 	inbound := session.InboundFromContext(ctx)
 	userInt, _ := A.UserFromContext[int](ctx)
 	user := i.destinations[userInt]

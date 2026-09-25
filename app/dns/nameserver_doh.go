@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	go_errors "errors"
 	"fmt"
 	"io"
+	stdnet "net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -22,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/common/utils"
 	dns_feature "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/net/http2"
 )
@@ -33,7 +37,13 @@ type DoHNameServer struct {
 	cacheController *CacheController
 	httpClient      *http.Client
 	dohURL          string
+	destination     net.Destination
+	routed          bool
 	clientIP        net.IP
+	mu              sync.Mutex
+	connections     map[net.Conn]struct{}
+	closed          bool
+	dialing         sync.WaitGroup
 }
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
@@ -47,20 +57,32 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 	s := &DoHNameServer{
 		cacheController: NewCacheController(mode+"//"+url.Host, disableCache, serveStale, serveExpiredTTL),
 		dohURL:          url.String(),
+		destination:     dohDestination(url.Hostname(), url.Port()),
+		routed:          dispatcher != nil,
 		clientIP:        clientIP,
+		connections:     make(map[net.Conn]struct{}),
 	}
 	s.httpClient = &http.Client{
 		Transport: &http2.Transport{
 			IdleConnTimeout: net.ConnIdleTimeout,
 			ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				if !s.beginDial() {
+					return nil, context.Canceled
+				}
+				defer s.dialing.Done()
 				dest, err := net.ParseDestination(network + ":" + addr)
 				if err != nil {
 					return nil, err
 				}
 				var conn net.Conn
+				var routeReceipt *dohRouteReceipt
 				if dispatcher != nil {
 					dnsCtx := toDnsContext(ctx, s.dohURL)
+					if dohObservationAvailable(ctx) {
+						routeReceipt = newDoHRouteReceipt()
+						dnsCtx = session.ContextWithRouteOnlyReceipt(dnsCtx, routeReceipt)
+					}
 					if h2c {
 						dnsCtx = session.ContextWithMitmAlpn11(dnsCtx, false) // for insurance
 						dnsCtx = session.ContextWithMitmServerName(dnsCtx, url.Hostname())
@@ -98,17 +120,46 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 						return nil, err
 					}
 				}
+				tracked, ok := s.trackConnection(conn)
+				if !ok {
+					return nil, context.Canceled
+				}
+				conn = tracked
+				if routeReceipt != nil {
+					step, waitErr := routeReceipt.WaitOffer(ctx)
+					if waitErr != nil {
+						_ = conn.Close()
+						return nil, waitErr
+					}
+					if step.Selection == stats.SelectionRejected {
+						_ = conn.Close()
+						return nil, &dohRouteError{step: step}
+					}
+				}
 				if !h2c {
 					conn = utls.UClient(conn, &utls.Config{ServerName: url.Hostname()}, utls.HelloChrome_Auto)
 					if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
-						return nil, err
+						return nil, classifyDoHTLSHandshakeError(ctx, conn, routeReceipt, err)
 					}
+				}
+				if routeReceipt != nil {
+					conn = &dohCarrierConn{Conn: conn, route: routeReceipt}
 				}
 				return conn, nil
 			},
 		},
 	}
 	return s
+}
+
+func (s *DoHNameServer) beginDial() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.dialing.Add(1)
+	return true
 }
 
 // Name implements Server.
@@ -172,7 +223,15 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		go func(r *dnsRequest) {
+		reserved, release, reserveErr := dns_feature.ReserveContextBinding(ctx)
+		if reserveErr != nil {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- reserveErr
+			}
+			continue
+		}
+		go func(r *dnsRequest, ctx context.Context, release func()) {
+			defer release()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
 			dnsCtx := ctx
@@ -202,15 +261,20 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
-			resp, err := s.dohHTTPSContext(dnsCtx, b.Bytes())
+			payload := append([]byte(nil), b.Bytes()...)
+			b.Release()
+			resp, observation, err := s.dohHTTPSContextObserved(dnsCtx, payload)
 			if err != nil {
+				if observation != nil {
+					observation.finish(false)
+				}
 				errors.LogErrorInner(ctx, err, "failed to retrieve response for ", fqdn)
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
 				}
 				return
 			}
-			rec, err := parseResponse(resp)
+			rec, err := parseObservedDoHResponse(resp, observation)
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to handle DOH response for ", fqdn)
 				if noResponseErrCh != nil {
@@ -219,15 +283,98 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				return
 			}
 			s.cacheController.updateRecord(r, rec)
-		}(req)
+		}(req, reserved, release)
 	}
 }
 
+type dohTrackedConn struct {
+	net.Conn
+	state resourceCloseState
+	done  func()
+}
+
+func (c *dohTrackedConn) Close() error {
+	return c.state.close(func() error {
+		err := c.Conn.Close()
+		if go_errors.Is(err, stdnet.ErrClosed) {
+			return nil
+		}
+		return err
+	}, c.done)
+}
+
+func (s *DoHNameServer) trackConnection(conn net.Conn) (net.Conn, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	accepted := !s.closed
+	var tracked *dohTrackedConn
+	tracked = &dohTrackedConn{Conn: conn, done: func() {
+		s.mu.Lock()
+		delete(s.connections, tracked)
+		s.mu.Unlock()
+	}}
+	s.connections[tracked] = struct{}{}
+	return tracked, accepted
+}
+
+func (s *DoHNameServer) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.dialing.Wait()
+	s.mu.Lock()
+	connections := make([]net.Conn, 0, len(s.connections))
+	for conn := range s.connections {
+		connections = append(connections, conn)
+	}
+	s.mu.Unlock()
+	if transport, ok := s.httpClient.Transport.(*http2.Transport); ok {
+		transport.CloseIdleConnections()
+	}
+	var errs []error
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	errs = append(errs, s.cacheController.Close())
+	return go_errors.Join(errs...)
+}
+
 func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, error) {
-	body := bytes.NewBuffer(b)
-	req, err := http.NewRequest("POST", s.dohURL, body)
+	response, observation, err := s.dohHTTPSContextObserved(ctx, b)
+	if observation != nil {
+		observation.finish(err == nil)
+	}
+	return response, err
+}
+
+func (s *DoHNameServer) dohHTTPSContextObserved(ctx context.Context, b []byte) ([]byte, *dohRequestObservation, error) {
+	var store stats.AdmissionStore
+	if s.routed {
+		store = dohObservationStore(ctx)
+	}
+	return s.dohHTTPSContextWithStore(ctx, b, store)
+}
+
+func (s *DoHNameServer) dohHTTPSContextWithStore(ctx context.Context, b []byte, store stats.AdmissionStore) ([]byte, *dohRequestObservation, error) {
+	var observation *dohRequestObservation
+	if store != nil {
+		ctx, observation = beginRoutedDoHObservation(ctx, store, s.destination, len(b))
+	}
+	if ctx.Err() != nil {
+		return nil, observation, ctx.Err()
+	}
+
+	var req *http.Request
+	var err error
+	if observation != nil {
+		req, err = newObservedDoHRequest(ctx, "POST", s.dohURL, b, observation)
+	} else {
+		req, err = http.NewRequestWithContext(ctx, "POST", s.dohURL, bytes.NewBuffer(b))
+	}
 	if err != nil {
-		return nil, err
+		return nil, observation, err
 	}
 
 	req.Header.Add("Accept", "application/dns-message")
@@ -237,18 +384,25 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 
 	hc := s.httpClient
 
-	resp, err := hc.Do(req.WithContext(ctx))
+	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, err
+		if step, rejected := dohRejectedRoute(err); rejected && observation != nil {
+			observation.reject(step)
+		}
+		return nil, observation, err
 	}
 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body) // flush resp.Body so that the conn is reusable
-		return nil, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
+		return nil, observation, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	response, err := io.ReadAll(resp.Body)
+	if observation != nil {
+		observation.recordResponseRead(len(response), err)
+	}
+	return response, observation, err
 }
 
 // QueryIP implements Server.

@@ -215,12 +215,17 @@ func EncodeUDPPacket(request *protocol.RequestHeader, payload []byte) (*buf.Buff
 	}
 
 	if err := addrParser.WriteAddressPort(buffer, request.Address, request.Port); err != nil {
+		buffer.Release()
 		return nil, errors.New("failed to write address").Base(err)
 	}
 
-	buffer.Write(payload)
+	if _, err := buffer.Write(payload); err != nil {
+		buffer.Release()
+		return nil, errors.New("failed to write UDP payload").Base(err)
+	}
 
 	if err := account.Cipher.EncodePacket(account.Key, buffer); err != nil {
+		buffer.Release()
 		return nil, errors.New("failed to encrypt UDP payload").Base(err)
 	}
 

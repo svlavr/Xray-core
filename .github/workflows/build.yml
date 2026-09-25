@@ -1,0 +1,135 @@
+name: CI / Platform Builds
+
+on:
+  push:
+    branches: [codex/clean-control-stats-ci]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  required-platform-builds:
+    name: Required Platform Builds / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux amd64, goos: linux, goarch: amd64 }
+          - { name: Windows amd64, goos: windows, goarch: amd64 }
+          - { name: Darwin amd64, goos: darwin, goarch: amd64 }
+          - { name: Darwin arm64, goos: darwin, goarch: arm64 }
+    env: { GOOS: '${{ matrix.goos }}', GOARCH: '${{ matrix.goarch }}', CGO_ENABLED: 0 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version-file: go.mod, check-latest: true }
+      - run: go mod download
+      - name: Compile main
+        shell: bash
+        run: |
+          COMMIT=$(git describe --always --dirty)
+          go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
+
+  android-build:
+    name: Android Build / ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { goarch: [arm64, amd64] }
+    env: { GOOS: android, GOARCH: '${{ matrix.goarch }}', CGO_ENABLED: 1 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version-file: go.mod, check-latest: true }
+      - name: Set up Android NDK r28b
+        shell: bash
+        run: |
+          wget -qO "${RUNNER_TEMP}/android-ndk.zip" https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          echo "f574d3165405bd59ffc5edaadac02689075a729f  ${RUNNER_TEMP}/android-ndk.zip" | sha1sum --check --strict
+          unzip -q "${RUNNER_TEMP}/android-ndk.zip" -d "${RUNNER_TEMP}"
+          if [ "${GOARCH}" = "amd64" ]; then compiler=x86_64-linux-android24-clang; else compiler=aarch64-linux-android24-clang; fi
+          echo "CC=${RUNNER_TEMP}/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin/${compiler}" >> "$GITHUB_ENV"
+      - run: go mod download
+      - name: Compile main
+        shell: bash
+        run: |
+          COMMIT=$(git describe --always --dirty)
+          go build -o "${RUNNER_TEMP}/xray-android-${GOARCH}" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid= -checklinkname=0" -v ./main
+
+  extended-build-matrix:
+    name: Extended Build Matrix / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows 386, goos: windows, goarch: 386 }
+          - { name: Windows arm64, goos: windows, goarch: arm64 }
+          - { name: Linux 386, goos: linux, goarch: 386 }
+          - { name: Linux arm5, goos: linux, goarch: arm, goarm: 5 }
+          - { name: Linux arm6, goos: linux, goarch: arm, goarm: 6 }
+          - { name: Linux arm7, goos: linux, goarch: arm, goarm: 7 }
+          - { name: Linux arm64, goos: linux, goarch: arm64 }
+          - { name: Linux riscv64, goos: linux, goarch: riscv64 }
+          - { name: Linux loong64, goos: linux, goarch: loong64 }
+          - { name: Linux mips, goos: linux, goarch: mips }
+          - { name: Linux mipsle, goos: linux, goarch: mipsle }
+          - { name: Linux mips64, goos: linux, goarch: mips64 }
+          - { name: Linux mips64le, goos: linux, goarch: mips64le }
+          - { name: Linux ppc64, goos: linux, goarch: ppc64 }
+          - { name: Linux ppc64le, goos: linux, goarch: ppc64le }
+          - { name: Linux s390x, goos: linux, goarch: s390x }
+          - { name: FreeBSD amd64, goos: freebsd, goarch: amd64 }
+          - { name: FreeBSD 386, goos: freebsd, goarch: 386 }
+          - { name: FreeBSD arm64, goos: freebsd, goarch: arm64 }
+          - { name: FreeBSD arm7, goos: freebsd, goarch: arm, goarm: 7 }
+          - { name: OpenBSD amd64, goos: openbsd, goarch: amd64 }
+          - { name: OpenBSD 386, goos: openbsd, goarch: 386 }
+          - { name: OpenBSD arm64, goos: openbsd, goarch: arm64 }
+          - { name: OpenBSD arm7, goos: openbsd, goarch: arm, goarm: 7 }
+    env: { GOOS: '${{ matrix.goos }}', GOARCH: '${{ matrix.goarch }}', GOARM: '${{ matrix.goarm }}', CGO_ENABLED: 0 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version-file: go.mod, check-latest: true }
+      - run: go mod download
+      - name: Compile main
+        shell: bash
+        run: |
+          COMMIT=$(git describe --always --dirty)
+          if [ "${GOOS}" = linux ] && { [ "${GOARCH}" = mips ] || [ "${GOARCH}" = mipsle ]; }; then
+            go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}${GOARM}" -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
+            GOMIPS=softfloat go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}-softfloat" -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
+          else
+            go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}${GOARM}" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
+          fi
+
+  windows-7-build:
+    name: Windows 7 Build / ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { goarch: [amd64, 386] }
+    env: { GOOS: windows, GOARCH: '${{ matrix.goarch }}', CGO_ENABLED: 0 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version-file: go.mod, check-latest: true }
+      - name: Set up patched XTLS/go-win7 builder
+        shell: bash
+        run: |
+          GOROOT=$(go env GOROOT)
+          rm -rf "${GOROOT:?}"/*
+          curl --fail --location --output "${RUNNER_TEMP}/go-win7.zip" https://github.com/XTLS/go-win7/releases/download/patched-1.27.1/go-for-win7-linux-amd64.zip
+          echo "4f0434fceea1b1c80c6d3511f0f777b0dc3b1260f172f1bf1ec202575bd36ec1  ${RUNNER_TEMP}/go-win7.zip" | sha256sum --check --strict
+          unzip -q "${RUNNER_TEMP}/go-win7.zip" -d "$GOROOT"
+      - run: go mod download
+      - name: Compile main
+        shell: bash
+        run: |
+          COMMIT=$(git describe --always --dirty)
+          go build -o "${RUNNER_TEMP}/xray-win7-${GOARCH}.exe" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main

@@ -8,7 +8,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/features/dns"
 )
 
@@ -35,7 +34,9 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 				if cache.serveStale && (cache.serveExpiredTTL == 0 || cache.serveExpiredTTL < ttl) {
 					errors.LogDebugInner(ctx, err, cache.name, " cache OPTIMISTE ", fqdn, " -> ", ips)
 					log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheOptimiste, Elapsed: 0, Error: err})
-					go pull(ctx, s, fqdn, option)
+					if reserved, release, reserveErr := dns.ReserveSpeculativeContextBinding(context.WithoutCancel(ctx)); reserveErr == nil {
+						go pull(reserved, release, s, fqdn, option)
+					}
 					return ips, 1, err
 				}
 			}
@@ -47,8 +48,9 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 	return fetch(ctx, s, fqdn, option)
 }
 
-func pull(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) {
-	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+func pull(ctx context.Context, release func(), s CachedNameserver, fqdn string, option dns.IPOption) {
+	defer release()
+	nctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
 	fetch(nctx, s, fqdn, option)
@@ -84,7 +86,7 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 	defer closeSubscribers(sub4, sub6)
 
 	noResponseErrCh := make(chan error, 2)
-	onEvent := func(sub *pubsub.Subscriber) (*IPRecord, error) {
+	onEvent := func(sub *cacheSubscriber) (*IPRecord, error) {
 		if sub == nil {
 			return nil, nil
 		}
@@ -93,9 +95,11 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 			return nil, ctx.Err()
 		case err := <-noResponseErrCh:
 			return nil, err
-		case msg := <-sub.Wait():
-			sub.Close()
-			return msg.(*IPRecord), nil // should panic
+		case <-sub.done:
+			return nil, &dns.CausalBindingError{Reason: "DNS cache closed"}
+		case msg := <-sub.buffer:
+			sub.close()
+			return msg, nil
 		}
 	}
 

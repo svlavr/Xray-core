@@ -71,7 +71,14 @@ func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) err
 		return errors.New("outbound metadata not found").AtError()
 	}
 
-	if isDomain(ob.Target, p.domain) {
+	if isPortalCarrier(ob.Target, p.domain) {
+		// This exact selected owner knows that the prepared TCP endpoint is a
+		// carrier. Keep its native receipt lifetime, but publish no logical row.
+		if _, ok := link.Reader.(*buf.InspectionReader); ok {
+			if observation := session.LogicalObservationFromContext(ctx); observation != nil {
+				observation.Exchange.ExcludeCarrier()
+			}
+		}
 		muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
 		if err != nil {
 			return errors.New("failed to create mux client worker").Base(err).AtWarning()
@@ -108,6 +115,21 @@ type Outbound struct {
 
 func (o *Outbound) Tag() string {
 	return o.tag
+}
+
+// IsInspectionCarrier reports the selected Portal role before dispatcher route
+// publication. The configured domain alone is insufficient without this exact
+// selected handler.
+func (o *Outbound) IsInspectionCarrier(ctx context.Context) bool {
+	outbounds := session.OutboundsFromContext(ctx)
+	if len(outbounds) == 0 || outbounds[len(outbounds)-1] == nil {
+		return false
+	}
+	return isPortalCarrier(outbounds[len(outbounds)-1].Target, o.portal.domain)
+}
+
+func isPortalCarrier(destination net.Destination, domain string) bool {
+	return destination.Network == net.Network_TCP && isDomain(destination, domain)
 }
 
 func (o *Outbound) Dispatch(ctx context.Context, link *transport.Link) {
@@ -237,6 +259,7 @@ func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
 	ctx := context.Background()
+	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginInternal)
 	outbounds := []*session.Outbound{{
 		Target: net.UDPDestination(net.DomainAddress(internalDomain), 0),
 	}}

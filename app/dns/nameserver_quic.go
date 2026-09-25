@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	go_errors "errors"
+	stdnet "net"
 	"net/url"
 	"sync"
 	"time"
@@ -33,6 +35,9 @@ type QUICNameServer struct {
 	destination     *net.Destination
 	connection      *quic.Conn
 	clientIP        net.IP
+	transport       *quic.Transport
+	packetConn      stdnet.PacketConn
+	closed          bool
 }
 
 // NewQUICNameServer creates DNS-over-QUIC client object for local resolving
@@ -100,7 +105,15 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 	}
 
 	for _, req := range reqs {
-		go func(r *dnsRequest) {
+		reserved, release, reserveErr := dns_feature.ReserveContextBinding(ctx)
+		if reserveErr != nil {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- reserveErr
+			}
+			continue
+		}
+		go func(r *dnsRequest, ctx context.Context, release func()) {
+			defer release()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
 			dnsCtx := ctx
@@ -127,8 +140,10 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
+			defer b.Release()
 
 			dnsReqBuf := buf.New()
+			defer dnsReqBuf.Release()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "binary write failed")
@@ -205,7 +220,7 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				return
 			}
 			s.cacheController.updateRecord(r, rec)
-		}(req)
+		}(req, reserved, release)
 	}
 }
 
@@ -223,32 +238,29 @@ func isActive(s *quic.Conn) bool {
 	}
 }
 
-func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
-	var conn *quic.Conn
-	s.RLock()
-	conn = s.connection
+func (s *QUICNameServer) getConnection(ctx context.Context) (*quic.Conn, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.closed {
+		return nil, context.Canceled
+	}
+	conn := s.connection
 	if conn != nil && isActive(conn) {
-		s.RUnlock()
 		return conn, nil
 	}
 	if conn != nil {
-		// we're recreating the connection, let's create a new one
 		_ = conn.CloseWithError(0, "")
 	}
-	s.RUnlock()
-
-	s.Lock()
-	defer s.Unlock()
 
 	var err error
-	conn, err = s.openConnection()
+	conn, err = s.openConnection(ctx)
 	if err != nil {
 		// This does not look too nice, but QUIC (or maybe quic-go)
 		// doesn't seem stable enough.
 		// Maybe retransmissions aren't fully implemented in quic-go?
 		// Anyways, the simple solution is to make a second try when
 		// it fails to open the QUIC connection.
-		conn, err = s.openConnection()
+		conn, err = s.openConnection(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -257,13 +269,34 @@ func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
 	return conn, nil
 }
 
-func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
+func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error) {
 	tlsConfig := tls.Config{}
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout: handshakeTimeout,
 	}
 	tlsConfig.ServerName = s.destination.Address.String()
-	conn, err := quic.DialAddr(context.Background(), s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	remote := &stdnet.UDPAddr{Port: int(s.destination.Port)}
+	if s.destination.Address.Family().IsIP() {
+		remote.IP = stdnet.IP(s.destination.Address.IP())
+	} else {
+		addresses, err := stdnet.DefaultResolver.LookupIP(ctx, "ip", s.destination.Address.Domain())
+		if err != nil {
+			return nil, err
+		}
+		if len(addresses) == 0 {
+			return nil, dns_feature.ErrEmptyResponse
+		}
+		remote.IP = selectQUICRemoteIP(addresses)
+	}
+	if s.transport == nil {
+		packetConn, err := stdnet.ListenUDP("udp", nil)
+		if err != nil {
+			return nil, err
+		}
+		s.packetConn = packetConn
+		s.transport = &quic.Transport{Conn: packetConn}
+	}
+	conn, err := s.transport.Dial(ctx, remote, tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
 	log.Record(&log.AccessMessage{
 		From:   "DNS",
 		To:     s.destination,
@@ -277,12 +310,67 @@ func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
 	return conn, nil
 }
 
+func selectQUICRemoteIP(addresses []stdnet.IP) stdnet.IP {
+	for _, address := range addresses {
+		if ipv4 := address.To4(); ipv4 != nil {
+			return ipv4
+		}
+	}
+	if len(addresses) != 0 {
+		return addresses[0]
+	}
+	return nil
+}
+
 func (s *QUICNameServer) openStream(ctx context.Context) (*quic.Stream, error) {
-	conn, err := s.getConnection()
+	conn, err := s.getConnection(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// open a new stream
 	return conn.OpenStreamSync(ctx)
+}
+
+func (s *QUICNameServer) Close() error {
+	s.Lock()
+	s.closed = true
+	conn, transport, packetConn := s.connection, s.transport, s.packetConn
+	s.Unlock()
+	var errs []error
+	if conn != nil {
+		if err := conn.CloseWithError(0, "DNS generation retired"); err != nil {
+			errs = append(errs, err)
+		} else {
+			s.Lock()
+			if s.connection == conn {
+				s.connection = nil
+			}
+			s.Unlock()
+		}
+	}
+	if transport != nil {
+		if err := transport.Close(); err != nil {
+			errs = append(errs, err)
+		} else {
+			s.Lock()
+			if s.transport == transport {
+				s.transport = nil
+			}
+			s.Unlock()
+		}
+	}
+	if packetConn != nil {
+		if err := packetConn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
+			errs = append(errs, err)
+		} else {
+			s.Lock()
+			if s.packetConn == packetConn {
+				s.packetConn = nil
+			}
+			s.Unlock()
+		}
+	}
+	errs = append(errs, s.cacheController.Close())
+	return go_errors.Join(errs...)
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/wireguard"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -87,7 +88,9 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 		policyManager: p,
 		remoteDNS:     remoteDNS,
 	}
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	carrierCtx := session.ContextWithFullHandler(core.ToBackgroundDetachedContext(ctx), session.FullHandlerFromContext(ctx))
+	carrierCtx = session.ContextWithTrafficOrigin(carrierCtx, session.TrafficOriginInternal)
+	c.ctx, c.cancel = context.WithCancel(carrierCtx)
 	return c, nil
 }
 
@@ -99,10 +102,22 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	}
 	ob.Name = "masque"
 	ob.CanSpliceCopy = 3
+	eligible := ob.Target.Network == net.Network_TCP || ob.Target.Network == net.Network_UDP
+	if ob.Target.Address.Family().IsDomain() {
+		domain := ob.Target.Address.Domain()
+		eligible = eligible && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
+	}
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, eligible)
+	if observation != nil {
+		observation.Exchange.Effective(ob.Target)
+	}
 
-	t, err := c.getTunnel(ctx, dialer)
+	t, err := c.getTunnel(ctx, ob.Gateway, dialer)
 	if err != nil {
 		return errors.New("failed to establish CONNECT-IP tunnel").Base(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	var newCtx context.Context
@@ -113,6 +128,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	sessionPolicy := c.policyManager.ForLevel(0)
 	ctx, cancel := context.WithCancel(ctx)
+	requestCtx := ctx
 	timer := signal.CancelAfterInactivity(ctx, func() {
 		cancel()
 		if newCancel != nil {
@@ -123,6 +139,10 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	if newCtx != nil {
 		ctx = newCtx
 	}
+	dialCtx := ctx
+	if observation != nil {
+		dialCtx = requestCtx
+	}
 
 	var reader buf.Reader
 	var writer buf.Writer
@@ -132,11 +152,15 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		var conn net.Conn
 		var err error
 		if sessionPolicy.Timeouts.Handshake != 0 {
-			timeoutCtx, timeoutCancel := context.WithTimeout(ctx, sessionPolicy.Timeouts.Handshake)
+			timeoutCtx, timeoutCancel := context.WithTimeout(dialCtx, sessionPolicy.Timeouts.Handshake)
 			conn, err = t.tnet.DialContext(timeoutCtx, "tcp", ob.Target.NetAddr())
 			timeoutCancel()
 		} else {
-			conn, err = t.tnet.Dial("tcp", ob.Target.NetAddr())
+			if observation != nil {
+				conn, err = t.tnet.DialContext(dialCtx, "tcp", ob.Target.NetAddr())
+			} else {
+				conn, err = t.tnet.Dial("tcp", ob.Target.NetAddr())
+			}
 		}
 		if err != nil {
 			return errors.New("failed to create TCP connection").Base(err)
@@ -145,7 +169,13 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		reader = buf.NewReader(conn)
 		writer = buf.NewWriter(conn)
 	case net.Network_UDP:
-		conn, err := t.tnet.Dial("udp", ob.Target.NetAddr())
+		var conn net.Conn
+		var err error
+		if observation != nil {
+			conn, err = t.tnet.DialContext(dialCtx, "udp", ob.Target.NetAddr())
+		} else {
+			conn, err = t.tnet.Dial("udp", ob.Target.NetAddr())
+		}
 		if err != nil {
 			return errors.New("failed to create UDP connection").Base(err)
 		}
@@ -180,7 +210,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	return nil
 }
 
-func (c *Client) getTunnel(ctx context.Context, dialer internet.Dialer) (*tunnel, error) {
+func (c *Client) getTunnel(ctx context.Context, gateway net.Address, dialer internet.Dialer) (*tunnel, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.ctx.Err() != nil {
@@ -200,7 +230,7 @@ func (c *Client) getTunnel(ctx context.Context, dialer internet.Dialer) (*tunnel
 		return nil, c.lastErr
 	}
 
-	t, err := c.establish(ctx, dialer)
+	t, err := c.establish(gateway, dialer)
 	if err != nil {
 		c.lastErr, c.lastErrAt = err, time.Now()
 		return nil, err
@@ -216,10 +246,11 @@ func (c *Client) getTunnel(ctx context.Context, dialer internet.Dialer) (*tunnel
 	return t, nil
 }
 
-func (c *Client) establish(ctx context.Context, dialer internet.Dialer) (*tunnel, error) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), establishTimeout)
+func (c *Client) establish(gateway net.Address, dialer internet.Dialer) (*tunnel, error) {
+	server := c.server.Destination
+	ctx := c.carrierContext(server, gateway)
+	ctx, cancel := context.WithTimeout(ctx, establishTimeout)
 	defer cancel()
-	defer context.AfterFunc(c.ctx, cancel)()
 	conn, err := dialer.Dial(ctx, c.server.Destination)
 	if err != nil {
 		return nil, err
@@ -236,6 +267,13 @@ func (c *Client) establish(ctx context.Context, dialer internet.Dialer) (*tunnel
 	}
 	errors.LogInfo(ctx, "MASQUE: tunnel established from ", mconn.LocalAddrs())
 	return t, nil
+}
+
+func (c *Client) carrierContext(dest net.Destination, gateway net.Address) context.Context {
+	return session.ContextWithOutbounds(c.ctx, []*session.Outbound{{
+		OriginalTarget: dest, Target: dest, RouteTarget: dest, Gateway: gateway,
+		Tag: session.FullHandlerFromContext(c.ctx).Tag(), Name: "masque", CanSpliceCopy: 3,
+	}})
 }
 
 func (c *Client) Close() error {

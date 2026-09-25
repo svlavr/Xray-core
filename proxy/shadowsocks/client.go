@@ -15,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -55,6 +56,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.CanSpliceCopy = 3
 	destination := ob.Target
 	network := destination.Network
+
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, network == net.Network_TCP || network == net.Network_UDP)
+	if observation != nil {
+		observation.Exchange.Effective(destination)
+	}
 
 	server := c.server
 	dest := server.Destination
@@ -114,8 +120,9 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		ctx = newCtx
 	}
 
+	var requestDone, responseDone func() error
 	if request.Command == protocol.RequestCommandTCP {
-		requestDone := func() error {
+		requestDone = func() error {
 			defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 			bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 			bodyWriter, err := WriteTCPRequest(request, bufferedWriter)
@@ -134,7 +141,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			return buf.Copy(link.Reader, bodyWriter, buf.UpdateActivity(timer))
 		}
 
-		responseDone := func() error {
+		responseDone = func() error {
 			defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 			responseReader, err := ReadTCPResponse(user, conn)
@@ -145,17 +152,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			return buf.Copy(responseReader, link.Writer, buf.UpdateActivity(timer))
 		}
 
-		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
-			return errors.New("connection ends").Base(err)
-		}
-
-		return nil
-	}
-
-	if request.Command == protocol.RequestCommandUDP {
-
-		requestDone := func() error {
+	} else {
+		requestDone = func() error {
 			defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
 			writer := &UDPWriter{
@@ -169,7 +167,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			return nil
 		}
 
-		responseDone := func() error {
+		responseDone = func() error {
 			defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 			reader := &UDPReader{
@@ -183,12 +181,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			return nil
 		}
 
-		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
-			return errors.New("connection ends").Base(err)
-		}
+	}
 
-		return nil
+	responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
+	if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
+		return errors.New("connection ends").Base(err)
 	}
 
 	return nil

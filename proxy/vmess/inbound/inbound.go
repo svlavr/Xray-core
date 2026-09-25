@@ -9,6 +9,7 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
@@ -21,6 +22,8 @@ import (
 	feature_inbound "github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/proxy/vmess/encoding"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -103,6 +106,7 @@ func (v *userByEmail) Remove(email string) bool {
 // Handler is an inbound connection handler that handles messages in VMess protocol.
 type Handler struct {
 	policyManager         policy.Manager
+	statsManager          stats.Manager
 	inboundHandlerManager feature_inbound.Manager
 	clients               *vmess.TimedUserValidator
 	usersByEmail          *userByEmail
@@ -114,6 +118,7 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 	v := core.MustFromContext(ctx)
 	handler := &Handler{
 		policyManager:         v.GetFeature(policy.ManagerType()).(policy.Manager),
+		statsManager:          v.GetFeature(stats.ManagerType()).(stats.Manager),
 		inboundHandlerManager: v.GetFeature(feature_inbound.ManagerType()).(feature_inbound.Manager),
 		clients:               vmess.NewTimedUserValidator(),
 		usersByEmail:          newUserByEmail(config.GetDefaultValue()),
@@ -185,13 +190,23 @@ func (h *Handler) RemoveUser(ctx context.Context, email string) error {
 	return nil
 }
 
-func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSession, request *protocol.RequestHeader, response *protocol.ResponseHeader, input buf.Reader, output *buf.BufferedWriter) error {
+func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSession, request *protocol.RequestHeader, response *protocol.ResponseHeader, input buf.Reader, output *buf.BufferedWriter, flow stats.Exchange) error {
+	var finish func()
+	defer func() {
+		// Preserve the response owner's one native final flush, including
+		// header-only failure paths; release the mapping only afterwards.
+		output.Flush()
+		if finish != nil {
+			finish()
+		}
+	}()
 	session.EncodeResponseHeader(response, output)
 
 	bodyWriter, err := session.EncodeResponseBody(request, output)
 	if err != nil {
 		return errors.New("failed to start decoding response").Base(err)
 	}
+	bodyWriter, finish = crypto.ObserveAuthenticationWriter(bodyWriter, flow)
 	{
 		// Optimize for small response packet
 		data, err := input.ReadMultiBuffer()
@@ -279,6 +294,18 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
+	var observation *session.LogicalObservation
+	if request.Command == protocol.RequestCommandTCP || request.Command == protocol.RequestCommandUDP {
+		kind := stats.FlowKindTCP
+		if request.Command == protocol.RequestCommandUDP {
+			kind = stats.FlowKindUDPAssociation
+		}
+		var cleanup func()
+		ctx, observation, cleanup = proxy.BeginReturnedObservation(ctx, h.statsManager, connection, request.Destination(), kind)
+		if cleanup != nil {
+			defer cleanup()
+		}
+	}
 	link, err := dispatcher.Dispatch(ctx, request.Destination())
 	if err != nil {
 		return errors.New("failed to dispatch request to ", request.Destination()).Base(err)
@@ -289,7 +316,18 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 		bodyReader, err := svrSession.DecodeRequestBody(request, reader)
 		if err != nil {
+			if observation != nil {
+				observation.Exchange.SetEndReason(stats.EndReasonReadError)
+			}
 			return errors.New("failed to start decoding").Base(err)
+		}
+		if observation != nil {
+			cursor := proxy.ObserveDecodedReader(bodyReader, observation.Exchange, func() {})
+			if request.Command == protocol.RequestCommandUDP {
+				cursor.PacketDestination = request.Destination()
+			}
+			defer cursor.Interrupt()
+			bodyReader = cursor
 		}
 		if err := buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to transfer request").Base(err)
@@ -301,12 +339,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		writer := buf.NewBufferedWriter(buf.NewWriter(connection))
-		defer writer.Flush()
 
 		response := &protocol.ResponseHeader{
 			Command: h.generateCommand(ctx, request),
 		}
-		return transferResponse(timer, svrSession, request, response, link.Reader, writer)
+		var flow stats.Exchange
+		if observation != nil {
+			flow = observation.Exchange
+		}
+		return transferResponse(timer, svrSession, request, response, link.Reader, writer, flow)
 	}
 
 	requestDonePost := task.OnSuccess(requestDone, task.Close(link.Writer))

@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vless"
 	"google.golang.org/protobuf/proto"
@@ -95,7 +96,12 @@ type MultiLengthPacketWriter struct {
 }
 
 func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.writeMultiBuffer(mb, nil)
+}
+
+func (w *MultiLengthPacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	defer buf.ReleaseMulti(mb)
+	var payload uint64
 	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
 	for _, b := range mb {
 		length := b.Len()
@@ -116,11 +122,43 @@ func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			continue
 		}
 		mb2Write = append(mb2Write, eb)
+		if receipt != nil {
+			payload += uint64(length)
+		}
 	}
 	if mb2Write.IsEmpty() {
 		return nil
 	}
-	return w.Writer.WriteMultiBuffer(mb2Write)
+	err := w.Writer.WriteMultiBuffer(mb2Write)
+	if receipt != nil {
+		if err != nil {
+			receipt.MarkDownlinkIncomplete()
+			receipt.SetEndReason(stats.EndReasonWriteError)
+		} else if payload != 0 {
+			receipt.AddDownlink(payload)
+		}
+	}
+	return err
+}
+
+type inspectionLengthPacketWriter struct {
+	*MultiLengthPacketWriter
+	receipt stats.Exchange
+}
+
+func (w *inspectionLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.MultiLengthPacketWriter.writeMultiBuffer(mb, w.receipt)
+}
+
+func (w *inspectionLengthPacketWriter) WriterReceipt() stats.Exchange { return w.receipt }
+
+// WithWriterReceipt binds the decoded packet operation. The native encoder and
+// lower writer keep their batching and buffering behavior.
+func (w *MultiLengthPacketWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
+	if flow == nil {
+		return w
+	}
+	return &inspectionLengthPacketWriter{MultiLengthPacketWriter: w, receipt: flow}
 }
 
 func NewLengthPacketWriter(writer io.Writer) *LengthPacketWriter {
@@ -183,6 +221,8 @@ func (r *LengthPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		length -= size
 		b := buf.New()
 		if _, err := b.ReadFullFrom(r.Reader, size); err != nil {
+			b.Release()
+			buf.ReleaseMulti(mb)
 			return nil, errors.New("failed to read packet payload").Base(err)
 		}
 		mb = append(mb, b)

@@ -415,6 +415,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			ctx, cancel := context.WithCancel(ctx)
 			timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 			ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
+			ctx, fallbackReader, observation, cleanup := proxy.ObserveFallback(ctx, h.stats, connection, fb.Type, fb.Dest, reader)
+			if cleanup != nil {
+				defer cleanup()
+			}
 
 			var conn net.Conn
 			if err := retry.ExponentialBackoff(5, 100).On(func() error {
@@ -425,9 +429,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				}
 				return nil
 			}); err != nil {
+				if observation != nil {
+					observation.SetEndReason(stats.EndReasonRejected)
+				}
 				return errors.New("failed to dial to " + fb.Dest).Base(err).AtWarning()
 			}
 			defer conn.Close()
+			if observation != nil {
+				observation.Effective(net.DestinationFromAddr(conn.RemoteAddr()))
+			}
 
 			serverReader := buf.NewReader(conn)
 			serverWriter := buf.NewWriter(conn)
@@ -485,26 +495,40 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 						pro.Write([]byte{byte(p1 >> 8), byte(p1), byte(p2 >> 8), byte(p2)})
 					}
 					if err := serverWriter.WriteMultiBuffer(buf.MultiBuffer{pro}); err != nil {
+						if observation != nil {
+							observation.SetEndReason(stats.EndReasonWriteError)
+						}
 						return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err).AtWarning()
 					}
 				}
-				if err := buf.Copy(reader, serverWriter, buf.UpdateActivity(timer)); err != nil {
+				if err := buf.Copy(fallbackReader, serverWriter, buf.UpdateActivity(timer)); err != nil {
+					if observation != nil && buf.IsWriteError(err) {
+						observation.SetEndReason(stats.EndReasonWriteError)
+					}
 					return errors.New("failed to fallback request payload").Base(err).AtInfo()
 				}
 				return nil
 			}
 
 			writer := buf.NewWriter(connection)
+			if observation != nil {
+				writer = buf.AttachWriterReceipt(writer, observation)
+			}
 
 			getResponse := func() error {
 				defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 				if err := buf.Copy(serverReader, writer, buf.UpdateActivity(timer)); err != nil {
+					if observation != nil && buf.IsReadError(err) {
+						observation.SetEndReason(stats.EndReasonReadError)
+					}
 					return errors.New("failed to deliver response payload").Base(err).AtInfo()
 				}
 				return nil
 			}
 
-			if err := task.Run(ctx, task.OnSuccess(postRequest, task.Close(serverWriter)), task.OnSuccess(getResponse, task.Close(writer))); err != nil {
+			requestDone := task.OnSuccess(postRequest, task.Close(serverWriter))
+			responseDone := task.OnSuccess(getResponse, task.Close(writer))
+			if err := task.Run(ctx, requestDone, responseDone); err != nil {
 				common.Interrupt(serverReader)
 				common.Interrupt(serverWriter)
 				return errors.New("fallback ends").Base(err).AtInfo()
@@ -538,6 +562,26 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
 
 	account := request.User.Account.(*vless.MemoryAccount)
+	ordinary := request.Command == protocol.RequestCommandTCP || request.Command == protocol.RequestCommandUDP
+	carrier := request.Address.Family().IsDomain() && request.Address.Domain() == "v1.mux.cool"
+	var observation *session.LogicalObservation
+	var observationCleanup func()
+	responsePrepared := false
+	if ordinary && !carrier {
+		kind := stats.FlowKindTCP
+		if request.Command == protocol.RequestCommandUDP {
+			kind = stats.FlowKindUDPAssociation
+		}
+		ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, h.stats, connection, request.Destination(), kind)
+		if observationCleanup != nil {
+			defer func() {
+				if !responsePrepared {
+					observation.Exchange.SetEndReason(stats.EndReasonRejected)
+				}
+				observationCleanup()
+			}()
+		}
+	}
 
 	if account.Reverse != nil && request.Command != protocol.RequestCommandRvs {
 		return errors.New("for safety reasons, user " + account.ID.String() + " is not allowed to use forward proxy")
@@ -561,29 +605,29 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				fallthrough // we will break Mux connections that contain TCP requests
 			case protocol.RequestCommandTCP:
 				var t reflect.Type
-				var p uintptr
+				var p unsafe.Pointer
 				if commonConn, ok := connection.(*encryption.CommonConn); ok {
 					if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 						inbound.CanSpliceCopy = 3 // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 					}
 					t = reflect.TypeOf(commonConn).Elem()
-					p = uintptr(unsafe.Pointer(commonConn))
+					p = unsafe.Pointer(commonConn)
 				} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 					if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
 						return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
 					}
 					t = reflect.TypeOf(tlsConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(tlsConn.Conn))
+					p = unsafe.Pointer(tlsConn.Conn)
 				} else if realityConn, ok := iConn.(*reality.Conn); ok {
 					t = reflect.TypeOf(realityConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(realityConn.Conn))
+					p = unsafe.Pointer(realityConn.Conn)
 				} else {
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
 				i, _ := t.FieldByName("input")
 				r, _ := t.FieldByName("rawInput")
-				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				input = (*bytes.Reader)(unsafe.Add(p, i.Offset))
+				rawInput = (*bytes.Buffer)(unsafe.Add(p, r.Offset))
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
@@ -621,8 +665,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, ctx, connection, nil)
 	bufferWriter.SetFlushNext()
+	responsePrepared = true
 
 	if request.Command == protocol.RequestCommandRvs {
+		ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginInternal)
 		r, err := h.GetReverse(account)
 		if err != nil {
 			return err
@@ -630,12 +676,20 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return r.NewMux(ctx, dispatcher.WrapLink(ctx, h.policyManager, h.stats, &transport.Link{Reader: clientReader, Writer: clientWriter}), h.observer)
 	}
 
-	if err := dispatch.DispatchLink(
-		ctx, request.Destination(), &transport.Link{
-			Reader: clientReader,
-			Writer: clientWriter,
-		},
-	); err != nil {
+	link := &transport.Link{Reader: clientReader, Writer: clientWriter}
+	if observation != nil && (requestAddons.Flow == "" || request.Command == protocol.RequestCommandTCP && requestAddons.Flow == vless.XRV) {
+		cursor := proxy.ObserveDecodedReader(link.Reader, observation.Exchange, func() {})
+		if request.Command == protocol.RequestCommandUDP {
+			cursor.PacketDestination = request.Destination()
+		}
+		link.Reader = cursor
+		link.Writer = buf.AttachWriterReceipt(link.Writer, observation.Exchange)
+		defer cursor.Interrupt()
+	}
+	if err := dispatch.DispatchLink(ctx, request.Destination(), link); err != nil {
+		if observation != nil {
+			observation.Exchange.SetEndReason(stats.EndReasonRejected)
+		}
 		return errors.New("failed to dispatch request").Base(err)
 	}
 	return nil
@@ -650,6 +704,10 @@ type Reverse struct {
 func (r *Reverse) Tag() string {
 	return r.tag
 }
+
+// InspectionClaimSettledOnReturn marks ClientManager.Dispatch's synchronous
+// child claim or definitive pre-launch failure boundary.
+func (*Reverse) InspectionClaimSettledOnReturn() {}
 
 func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer features.Feature) error {
 	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})

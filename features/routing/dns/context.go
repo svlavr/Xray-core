@@ -17,6 +17,17 @@ type ResolvableContext struct {
 	hasError  bool
 }
 
+type originatingContext interface {
+	OriginatingContext() context.Context
+}
+
+func (ctx *ResolvableContext) OriginatingContext() context.Context {
+	if origin, ok := ctx.Context.(originatingContext); ok {
+		return origin.OriginatingContext()
+	}
+	return nil
+}
+
 // GetTargetIPs overrides original routing.Context's implementation.
 func (ctx *ResolvableContext) GetTargetIPs() []net.IP {
 	if len(ctx.cacheIPs) > 0 {
@@ -28,7 +39,11 @@ func (ctx *ResolvableContext) GetTargetIPs() []net.IP {
 	}
 
 	if domain := ctx.GetTargetDomain(); len(domain) != 0 {
-		ips, _, err := ctx.dnsClient.LookupIP(domain, dns.IPOption{
+		lookupCtx := context.Background()
+		if origin, ok := ctx.Context.(originatingContext); ok && origin.OriginatingContext() != nil {
+			lookupCtx = origin.OriginatingContext()
+		}
+		ips, _, err := dns.LookupIPContext(lookupCtx, ctx.dnsClient, domain, dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,

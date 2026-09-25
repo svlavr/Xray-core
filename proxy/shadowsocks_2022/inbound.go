@@ -2,13 +2,13 @@ package shadowsocks_2022
 
 import (
 	"context"
-	"time"
+	"sync"
 
 	shadowsocks "github.com/sagernet/sing-shadowsocks"
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	C "github.com/sagernet/sing/common"
 	B "github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
+
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -19,9 +19,12 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal"
+
 	"github.com/xtls/xray-core/common/singbridge"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -32,10 +35,13 @@ func init() {
 }
 
 type Inbound struct {
-	networks []net.Network
-	service  shadowsocks.Service
-	email    string
-	level    int
+	packetInput  sync.Mutex
+	packetOutput sync.Mutex
+	networks     []net.Network
+	service      shadowsocks.Service
+	email        string
+	level        int
+	stats        stats.Manager
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
@@ -50,6 +56,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 		networks: networks,
 		email:    config.Email,
 		level:    int(config.Level),
+		stats:    core.MustFromContext(ctx).GetFeature(stats.ManagerType()).(stats.Manager),
 	}
 	if !C.Contains(shadowaead_2022.List, config.Method) {
 		return nil, errors.New("unsupported method ", config.Method)
@@ -79,8 +86,12 @@ func (i *Inbound) Process(ctx context.Context, network net.Network, connection s
 	ctx = session.ContextWithDispatcher(ctx, dispatcher)
 
 	if network == net.Network_TCP {
+		if proxy.ObservationStore(i.stats) != nil {
+			connection = &inspectionEndpoint{Conn: connection}
+		}
 		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
 	} else {
+		ctx = packetContext(ctx, connection)
 		reader := buf.NewReader(connection)
 		pc := &natPacketConn{connection}
 		for {
@@ -92,7 +103,9 @@ func (i *Inbound) Process(ctx context.Context, network net.Network, connection s
 			for _, buffer := range mb {
 				packet := B.As(buffer.Bytes()).ToOwned()
 				buffer.Release()
+				i.packetInput.Lock()
 				err = i.service.NewPacket(ctx, pc, packet, metadata)
+				i.packetInput.Unlock()
 				if err != nil {
 					packet.Release()
 					buf.ReleaseMulti(mb)
@@ -116,19 +129,15 @@ func (i *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata M.M
 		Email:  i.email,
 	})
 	errors.LogInfo(ctx, "tunnelling request to tcp:", metadata.Destination)
-	dispatcher := session.DispatcherFromContext(ctx)
 	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_TCP)
 	if err != nil {
 		return err
 	}
-	link, err := dispatcher.Dispatch(ctx, destination)
-	if err != nil {
-		return err
-	}
-	return singbridge.CopyConn(ctx, nil, link, conn)
+	return dispatchTCP(ctx, i.stats, nil, conn, destination)
 }
 
 func (i *Inbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+	ctx = packetSessionContext(ctx)
 	inbound := session.InboundFromContext(ctx)
 	inbound.User = &protocol.MemoryUser{
 		Email: i.email,
@@ -141,24 +150,11 @@ func (i *Inbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, me
 		Email:  i.email,
 	})
 	errors.LogInfo(ctx, "tunnelling request to udp:", metadata.Destination)
-	dispatcher := session.DispatcherFromContext(ctx)
 	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_UDP)
 	if err != nil {
 		return err
 	}
-	link, err := dispatcher.Dispatch(ctx, destination)
-	if err != nil {
-		return err
-	}
-	outConn := &singbridge.PacketConnWrapper{
-		Reader: link.Reader,
-		Writer: link.Writer,
-		Dest:   destination,
-		T: signal.CancelAfterInactivity(ctx, func() {
-			common.Interrupt(link.Reader)
-		}, 300*time.Second),
-	}
-	return bufio.CopyPacketConn(ctx, conn, outConn)
+	return dispatchPacket(ctx, i.stats, conn, destination, &i.packetOutput)
 }
 
 func (i *Inbound) NewError(ctx context.Context, err error) {
@@ -166,18 +162,4 @@ func (i *Inbound) NewError(ctx context.Context, err error) {
 		return
 	}
 	errors.LogWarning(ctx, err.Error())
-}
-
-type natPacketConn struct {
-	net.Conn
-}
-
-func (c *natPacketConn) ReadPacket(buffer *B.Buffer) (addr M.Socksaddr, err error) {
-	_, err = buffer.ReadFrom(c)
-	return
-}
-
-func (c *natPacketConn) WritePacket(buffer *B.Buffer, addr M.Socksaddr) error {
-	_, err := buffer.WriteTo(c)
-	return err
 }

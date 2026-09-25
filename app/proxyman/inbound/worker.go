@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,7 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 		Tag:     w.tag,
 		Conn:    conn,
 	})
+	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUser)
 
 	content := new(session.Content)
 	content.SniffingRequest = w.sniffingRequest
@@ -174,17 +176,15 @@ type udpConn struct {
 	reader           buf.Reader
 	writer           buf.Writer
 	output           func([]byte) (int, error)
+	outputTo         func([]byte, net.Destination) (int, error)
+	packetCtx        context.Context
 	remote           net.Addr
 	local            net.Addr
 	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
-	inactive         bool
+	ctx              context.Context
 	cancel           context.CancelFunc
-}
-
-func (c *udpConn) setInactive() {
-	c.inactive = true
 }
 
 func (c *udpConn) updateActivity() {
@@ -213,6 +213,24 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
 	n, err := c.output(buf)
+	return c.writeResult(n, err)
+}
+
+// WriteTo sends through the shared listener, including after this source's
+// outer connection expires. A protocol association supplies its current peer.
+func (c *udpConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
+	if c.packetCtx != nil && c.packetCtx.Err() != nil {
+		return 0, io.ErrClosedPipe
+	}
+	destination := net.DestinationFromAddr(addr)
+	if !destination.IsValid() || destination.Network != net.Network_UDP || destination.Address.Family().IsDomain() || c.outputTo == nil {
+		return 0, errors.New("invalid UDP response endpoint")
+	}
+	n, err := c.outputTo(payload, destination)
+	return c.writeResult(n, err)
+}
+
+func (c *udpConn) writeResult(n int, err error) (int, error) {
 	if c.downlink != nil {
 		c.downlink.Add(int64(n))
 	}
@@ -273,13 +291,19 @@ type udpWorker struct {
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
 
-	ctx  context.Context
-	cone bool
+	ctx          context.Context
+	cone         bool
+	packetCtx    context.Context
+	packetCancel context.CancelFunc
+	closed       bool
 }
 
 func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 	w.Lock()
 	defer w.Unlock()
+	if w.closed || w.packetCtx != nil && w.packetCtx.Err() != nil {
+		return nil, false
+	}
 
 	if conn, found := w.activeConn[id]; found && !conn.done.Done() {
 		conn.updateActivity()
@@ -287,9 +311,13 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 	}
 
 	pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))
+	ctx, cancel := context.WithCancel(w.ctx)
 	conn := &udpConn{
-		reader: pReader,
-		writer: pWriter,
+		ctx:       ctx,
+		packetCtx: w.packetCtx,
+		cancel:    cancel,
+		reader:    pReader,
+		writer:    pWriter,
 		output: func(b []byte) (int, error) {
 			return w.hub.WriteTo(b, id.src)
 		},
@@ -304,6 +332,9 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		done:     done.New(),
 		uplink:   w.uplinkCounter,
 		downlink: w.downlinkCounter,
+	}
+	if w.hub != nil {
+		conn.outputTo = w.hub.WriteTo
 	}
 	w.activeConn[id] = conn
 
@@ -322,6 +353,10 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		b.UDP = &originalDest
 	}
 	conn, existing := w.getConnection(id)
+	if conn == nil {
+		b.Release()
+		return
+	}
 
 	// payload will be discarded in pipe is full.
 	conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
@@ -330,8 +365,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		common.Must(w.checker.Start())
 
 		go func() {
-			ctx, cancel := context.WithCancel(w.ctx)
-			conn.cancel = cancel
+			ctx := conn.ctx
 			sid := session.NewID()
 			ctx = c.ContextWithID(ctx, sid)
 
@@ -355,6 +389,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				Gateway: net.UDPDestination(w.address, w.port),
 				Tag:     w.tag,
 			})
+			ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUser)
 			content := new(session.Content)
 			content.SniffingRequest = w.sniffingRequest
 			ctx = session.ContextWithContent(ctx, content)
@@ -362,18 +397,16 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				errors.LogInfoInner(ctx, err, "connection ends")
 			}
 			conn.Close()
-			// conn not removed by checker TODO may be lock worker here is better
-			if !conn.inactive {
-				conn.setInactive()
-				w.removeConn(id)
-			}
+			w.removeConn(id, conn)
 		}()
 	}
 }
 
-func (w *udpWorker) removeConn(id connID) {
+func (w *udpWorker) removeConn(id connID, expected *udpConn) {
 	w.Lock()
-	delete(w.activeConn, id)
+	if w.activeConn[id] == expected {
+		delete(w.activeConn, id)
+	}
 	w.Unlock()
 }
 
@@ -395,10 +428,7 @@ func (w *udpWorker) clean() error {
 
 	for addr, conn := range w.activeConn {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
-			if !conn.inactive {
-				conn.setInactive()
-				delete(w.activeConn, addr)
-			}
+			delete(w.activeConn, addr)
 			conn.Close()
 		}
 	}
@@ -426,13 +456,22 @@ func (w *udpWorker) Start() error {
 	}
 
 	w.hub = h
+	w.packetCtx, w.packetCancel = context.WithCancel(w.ctx)
 	go w.handlePackets()
 	return nil
 }
 
 func (w *udpWorker) Close() error {
+	if w.packetCancel != nil {
+		w.packetCancel()
+	}
 	w.Lock()
 	defer w.Unlock()
+	w.closed = true
+	for id, conn := range w.activeConn {
+		conn.Close()
+		delete(w.activeConn, id)
+	}
 
 	var errs []interface{}
 
@@ -500,6 +539,7 @@ func (w *dsWorker) callback(conn stat.Connection) {
 		Tag:     w.tag,
 		Conn:    conn,
 	})
+	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUser)
 
 	content := new(session.Content)
 	content.SniffingRequest = w.sniffingRequest

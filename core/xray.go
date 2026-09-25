@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	go_errors "errors"
 	"reflect"
 	"sync"
 
@@ -85,6 +86,7 @@ type Instance struct {
 	pendingResolutions         []resolution
 	pendingOptionalResolutions []resolution
 	running                    bool
+	started                    bool
 	resolveLock                sync.Mutex
 
 	ctx context.Context
@@ -262,6 +264,7 @@ func (s *Instance) Close() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
+	s.started = true
 	s.running = false
 
 	var errs []interface{}
@@ -368,11 +371,13 @@ func (s *Instance) AddFeature(feature features.Feature) error {
 	s.pendingOptionalResolutions = pendingOptional
 	s.resolveLock.Unlock()
 
-	var err error
+	var errs []error
 	for _, r := range availableResolution {
-		err = r.callbackResolution(s.features) // only return the last error for now
+		if err := r.callbackResolution(s.features); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return err
+	return go_errors.Join(errs...)
 }
 
 // GetFeature returns a feature of the given type, or nil if such feature is not registered.
@@ -388,6 +393,7 @@ func (s *Instance) Start() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
+	s.started = true
 	s.running = true
 	for _, f := range s.features {
 		if err := f.Start(); err != nil {

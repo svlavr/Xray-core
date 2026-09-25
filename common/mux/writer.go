@@ -1,13 +1,31 @@
 package mux
 
 import (
+	"sync"
+
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/stats"
 )
+
+type serializedWriter struct {
+	sync.Mutex
+	writer buf.Writer
+}
+
+func (w *serializedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	w.Lock()
+	defer w.Unlock()
+	return w.writer.WriteMultiBuffer(mb)
+}
+
+// Cancellation must remain able to unblock the current native write.
+func (w *serializedWriter) Close() error { return common.Close(w.writer) }
+func (w *serializedWriter) Interrupt()   { common.Interrupt(w.writer) }
 
 type Writer struct {
 	dest         net.Destination
@@ -18,6 +36,7 @@ type Writer struct {
 	transferType protocol.TransferType
 	globalID     [8]byte
 	inbound      *session.Inbound
+	receipt      stats.Exchange
 }
 
 func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, globalID [8]byte, inbound *session.Inbound) *Writer {
@@ -68,7 +87,7 @@ func (w *Writer) writeMetaOnly() error {
 	return w.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 }
 
-func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
+func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer, receipt stats.Exchange) error {
 	frame := buf.New()
 	if len(data) == 1 {
 		frame.UDP = data[0].UDP
@@ -83,6 +102,9 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	mb2 := make(buf.MultiBuffer, 0, len(data)+1)
 	mb2 = append(mb2, frame)
 	mb2 = append(mb2, data...)
+	if output, ok := writer.(*inspectionOutput); ok && receipt != nil {
+		return output.writeFrame(mb2, data.Len(), receipt)
+	}
 	return writer.WriteMultiBuffer(mb2)
 }
 
@@ -90,7 +112,7 @@ func (w *Writer) writeData(mb buf.MultiBuffer) error {
 	meta := w.getNextFrameMeta()
 	meta.Option.Set(OptionData)
 
-	return writeMetaWithFrame(w.writer, meta, mb)
+	return writeMetaWithFrame(w.writer, meta, mb, w.receipt)
 }
 
 // WriteMultiBuffer implements buf.Writer.

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -15,12 +14,14 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/utils"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/routing"
+	"google.golang.org/protobuf/proto"
 )
 
 // DNS is a DNS rely server.
 type DNS struct {
-	sync.Mutex
 	disableFallback        bool
 	disableFallbackIfMatch bool
 	enableParallelQuery    bool
@@ -31,6 +32,7 @@ type DNS struct {
 	domainMatcher          geodata.DomainMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
+	runtime                *dnsRuntime
 }
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher.
@@ -41,6 +43,51 @@ type DomainMatcherInfo struct {
 
 // New creates a new DNS server with given configuration.
 func New(ctx context.Context, config *Config) (*DNS, error) {
+	if config == nil {
+		return nil, errors.New("missing DNS config")
+	}
+	config = proto.Clone(config).(*Config)
+	needsFakeDNS := false
+	for _, ns := range config.NameServer {
+		if ns == nil || ns.Address == nil || ns.Address.Address == nil {
+			return nil, errors.New("missing nameserver address")
+		}
+		needsFakeDNS = needsFakeDNS || strings.EqualFold(ns.Address.Address.GetDomain(), "fakedns")
+	}
+	if len(config.NameServer) == 0 {
+		prepared, err := buildDNS(ctx, config, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		stable := &DNS{ctx: ctx}
+		stable.initRuntime(nil, nil, prepared)
+		return stable, nil
+	}
+	s := &DNS{ctx: ctx}
+	build := func(dispatcher routing.Dispatcher, fake dns.FakeDNSEngine) error {
+		prepared, err := buildDNS(ctx, config, dispatcher, fake)
+		if err == nil {
+			s.initRuntime(dispatcher, fake, prepared)
+		}
+		return err
+	}
+	var err error
+	if needsFakeDNS {
+		err = core.RequireFeatures(ctx, build)
+	} else {
+		err = core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
+			return build(dispatcher, nil)
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// buildDNS consumes candidate-owned configuration and already resolved features.
+// It never registers dependency callbacks or starts nameserver I/O or workers.
+func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher, fake dns.FakeDNSEngine) (*DNS, error) {
 	var clientIP net.IP
 	switch len(config.ClientIp) {
 	case 0, net.IPv4len, net.IPv6len:
@@ -149,10 +196,12 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			return nil, errors.New("no QueryStrategy available for ", ns.Address)
 		}
 
-		client, err := NewClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, updateRules)
+		client, err := newClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, dispatcher, fake)
 		if err != nil {
 			return nil, errors.New("failed to create client").Base(err)
 		}
+		_, isLocal := client.server.(*LocalNameServer)
+		updateRules(isLocal)
 		clients = append(clients, client)
 	}
 
@@ -195,25 +244,124 @@ func (s *DNS) Start() error {
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
-	return nil
+	if s.runtime == nil {
+		return closeResolverResources(s)
+	}
+	rt := s.runtime
+	rt.mu.Lock()
+	if rt.closed {
+		done := rt.closeDone
+		rt.mu.Unlock()
+		<-done
+		rt.mu.Lock()
+		err := rt.closeErr
+		rt.mu.Unlock()
+		return err
+	}
+	rt.closed = true
+	current, retiring, prepDone := rt.current, rt.retiring, rt.prepDone
+	if current != nil {
+		current.markSealed(true)
+	}
+	if retiring != nil {
+		retiring.markSealed(true)
+	}
+	rt.mu.Unlock()
+	if current != nil {
+		current.stopSpeculation()
+	}
+	if retiring != nil && retiring != current {
+		retiring.stopSpeculation()
+	}
+	if prepDone != nil {
+		<-prepDone
+	}
+
+	var errs []error
+	if current != nil {
+		errs = append(errs, current.closeResources())
+	}
+	if retiring != nil && retiring != current {
+		errs = append(errs, retiring.closeResources())
+	}
+	if current != nil {
+		current.waitLeases()
+		errs = append(errs, current.closeResources())
+	}
+	if retiring != nil && retiring != current {
+		retiring.waitLeases()
+		retireErr := retiring.closeResources()
+		errs = append(errs, retireErr)
+		if retireErr == nil {
+			rt.mu.Lock()
+			receipt := rt.retiringReceipt
+			rt.mu.Unlock()
+			result := s.finishRetirement(retiring)
+			if receipt != nil {
+				receipt.complete(result)
+			}
+		}
+	}
+	// Admission is sealed and an in-progress Apply has completed its handoff.
+	// No new retirement worker can be registered after this point.
+	rt.retirementWork.Wait()
+	err := go_errors.Join(errs...)
+	rt.mu.Lock()
+	rt.closeErr = err
+	close(rt.closeDone)
+	rt.mu.Unlock()
+	return err
 }
 
 // IsOwnLink implements proxy.dns.ownLinkVerifier
 func (s *DNS) IsOwnLink(ctx context.Context) bool {
-	inbound := session.InboundFromContext(ctx)
-	if inbound == nil {
-		return false
-	}
-	for _, client := range s.clients {
-		if client.tag == inbound.Tag {
-			return true
-		}
-	}
-	return false
+	return s.runtime != nil && dns.ContextBindingOwnedBy(ctx, s.runtime.contextOwner)
 }
 
 // LookupIP implements dns.Client.
 func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	return s.LookupIPContext(s.ctx, domain, option)
+}
+
+// LookupIPContext implements dns.ContextClient and starts a current-generation
+// root only when no causal binding is already present.
+func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	if dns.HasContextBinding(ctx) {
+		return dns.LookupIPContext(ctx, nil, domain, option)
+	}
+	if s.runtime == nil {
+		return s.lookupIP(ctx, domain, option)
+	}
+	g, lease, err := s.acquireCurrent()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer lease.release()
+	ownerCtx, releaseOwnerCtx := owningDNSContext(s.ctx, ctx)
+	defer releaseOwnerCtx()
+	queryCtx, cancel := g.queryContext(g.bind(ownerCtx, lease))
+	defer cancel()
+	return g.resolver.lookupIP(queryCtx, domain, option)
+}
+
+func owningDNSContext(ownerCtx, callCtx context.Context) (context.Context, func()) {
+	base := context.Background()
+	if core.FromContext(ownerCtx) != nil {
+		base = core.ToBackgroundDetachedContext(ownerCtx)
+	}
+	base = dns.CopyContextBinding(base, callCtx)
+	if inbound := session.InboundFromContext(callCtx); inbound != nil {
+		base = session.ContextWithInbound(base, inbound)
+	}
+	if content := session.ContentFromContext(callCtx); content != nil {
+		base = session.ContextWithContent(base, content)
+	}
+	ctx, cancel := context.WithCancel(base)
+	stop := context.AfterFunc(callCtx, cancel)
+	return ctx, func() { stop(); cancel() }
+}
+
+func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	// Normalize the FQDN form query
 	domain = strings.TrimSuffix(domain, ".")
 	if domain == "" {
@@ -258,9 +406,9 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 
 	// Name servers lookup
 	if s.enableParallelQuery {
-		return s.parallelQuery(domain, option)
+		return s.parallelQuery(ctx, domain, option)
 	} else {
-		return s.serialQuery(domain, option)
+		return s.serialQuery(ctx, domain, option)
 	}
 }
 
@@ -360,7 +508,7 @@ func mergeQueryErrors(domain string, errs []error) error {
 	return errors.New("returning nil for domain ", domain).Base(noRNF)
 }
 
-func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *DNS) serialQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	for _, client := range s.sortClients(domain) {
 		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
@@ -368,7 +516,7 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 			continue
 		}
 
-		ips, ttl, err := client.QueryIP(s.ctx, domain, option)
+		ips, ttl, err := client.QueryIP(ctx, domain, option)
 
 		if len(ips) > 0 {
 			return ips, ttl, nil
@@ -383,11 +531,11 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 	return nil, 0, mergeQueryErrors(domain, errs)
 }
 
-func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *DNS) parallelQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	clients := s.sortClients(domain)
 
-	resultsChan := asyncQueryAll(domain, option, clients, s.ctx)
+	resultsChan := asyncQueryAll(domain, option, clients, ctx)
 
 	groups, groupOf := makeGroups( /*s.ctx,*/ clients)
 	results := make([]*queryResult, len(clients))
@@ -459,16 +607,25 @@ func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx co
 			continue
 		}
 
-		go func(i int, c *Client) {
-			qctx := ctx
+		reserveCtx := ctx
+		if !client.server.IsDisableCache() {
+			reserveCtx = context.WithoutCancel(ctx)
+		}
+		qctx, release, err := dns.ReserveContextBinding(reserveCtx)
+		if err != nil {
+			ch <- queryResult{err: err, index: i}
+			continue
+		}
+		go func(i int, c *Client, qctx context.Context, release func()) {
+			defer release()
 			if !c.server.IsDisableCache() {
-				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeoutMs*2)
+				nctx, cancel := context.WithTimeout(qctx, c.timeoutMs*2)
 				qctx = nctx
 				defer cancel()
 			}
 			ips, ttl, err := c.QueryIP(qctx, domain, option)
 			ch <- queryResult{ips: ips, ttl: ttl, err: err, index: i}
-		}(i, client)
+		}(i, client, qctx, release)
 	}
 	return ch
 }

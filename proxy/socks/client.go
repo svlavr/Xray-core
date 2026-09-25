@@ -15,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -56,6 +57,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.CanSpliceCopy = 2
 	// Destination of the inner request.
 	destination := ob.Target
+
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, destination.Network == net.Network_TCP || destination.Network == net.Network_UDP)
+	if observation != nil {
+		observation.Exchange.Effective(destination)
+	}
 
 	// Outbound server.
 	server := c.server

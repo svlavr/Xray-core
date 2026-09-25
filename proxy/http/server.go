@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -22,6 +23,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -31,6 +33,7 @@ import (
 type Server struct {
 	config        *ServerConfig
 	policyManager policy.Manager
+	statsManager  stats.Manager
 }
 
 // NewServer creates a new HTTP inbound handler.
@@ -39,6 +42,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	s := &Server{
 		config:        config,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+		statsManager:  v.GetFeature(stats.ManagerType()).(stats.Manager),
 	}
 
 	return s, nil
@@ -81,6 +85,64 @@ type readerOnly struct {
 	io.Reader
 }
 
+type plainRequestOwner struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	link   *transport.Link
+	closed bool
+}
+
+func (o *plainRequestOwner) attach(link *transport.Link) {
+	o.mu.Lock()
+	o.link = link
+	closed := o.closed
+	o.mu.Unlock()
+	if closed {
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+	}
+}
+
+func (o *plainRequestOwner) Close() error {
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return nil
+	}
+	o.closed = true
+	link := o.link
+	cancel := o.cancel
+	o.mu.Unlock()
+	if link != nil {
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+	} else if cancel != nil {
+		// Before Dispatch returns its request-local pipes, cancellation is the
+		// only exact way to prevent that request from starting execution.
+		cancel()
+	}
+	return nil
+}
+
+type responseReceiptWriter struct {
+	io.Writer
+	receipt stats.Exchange
+}
+
+func (w *responseReceiptWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if n < 0 || n > len(p) {
+		w.receipt.MarkDownlinkIncomplete()
+		w.receipt.SetEndReason(stats.EndReasonWriteError)
+		return n, err
+	}
+	w.receipt.AddDownlink(uint64(n))
+	if err != nil || n != len(p) {
+		w.receipt.SetEndReason(stats.EndReasonWriteError)
+	}
+	return n, err
+}
+
 func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	return s.ProcessWithFirstbyte(ctx, network, conn, dispatcher)
 }
@@ -101,8 +163,9 @@ func (s *Server) ProcessWithFirstbyte(ctx context.Context, network net.Network, 
 	}
 	var reader *bufio.Reader
 	if len(firstbyte) > 0 {
-		readerWithoutFirstbyte := bufio.NewReaderSize(readerOnly{conn}, buf.Size)
-		multiReader := io.MultiReader(bytes.NewReader(firstbyte), readerWithoutFirstbyte)
+		// CONNECT transfers this reader's residual to the tunnel. A second
+		// buffered reader underneath would hide bytes from that transfer.
+		multiReader := io.MultiReader(bytes.NewReader(firstbyte), readerOnly{conn})
 		reader = bufio.NewReaderSize(multiReader, buf.Size)
 	} else {
 		reader = bufio.NewReaderSize(readerOnly{conn}, buf.Size)
@@ -192,11 +255,13 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *buf
 	if inbound.CanSpliceCopy == 2 {
 		inbound.CanSpliceCopy = 1
 	}
+	link := &transport.Link{Reader: reader, Writer: buf.NewWriter(conn)}
+	ctx, finish := proxy.ObserveTCP(ctx, s.statsManager, conn, dest, link)
+	if finish != nil {
+		defer finish()
+	}
 	if err := dispatcher.DispatchLink(
-		ctx, dest, &transport.Link{
-			Reader: reader,
-			Writer: buf.NewWriter(conn),
-		},
+		ctx, dest, link,
 	); err != nil {
 		return errors.New("failed to dispatch request").Base(err)
 	}
@@ -206,6 +271,18 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *buf
 var errWaitAnother = errors.New("keep alive")
 
 func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, writer io.Writer, dest net.Destination, dispatcher routing.Dispatcher) error {
+	requestCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	owner := &plainRequestOwner{cancel: cancel}
+	ctx, observation, cleanup := proxy.BeginExecutionObservation(requestCtx, s.statsManager, owner, dest)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	responseWriter := writer
+	if observation != nil {
+		responseWriter = &responseReceiptWriter{Writer: writer, receipt: observation.Exchange}
+	}
+
 	if !s.config.AllowTransparent && request.URL.Host == "" {
 		// RFC 2068 (HTTP/1.1) requires URL to be absolute URL in HTTP proxy.
 		response := &http.Response{
@@ -221,7 +298,17 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		}
 		response.Header.Set("Proxy-Connection", "close")
 		response.Header.Set("Connection", "close")
-		return response.Write(writer)
+		if observation != nil {
+			observation.Exchange.Unassign()
+			// ReadRequest may have prefetched later keep-alive bytes. The exact
+			// consumed request serialization is unavailable without a second parser.
+			observation.Exchange.MarkUplinkIncomplete()
+		}
+		err := response.Write(responseWriter)
+		if observation != nil && err == nil {
+			observation.Exchange.SetEndReason(stats.EndReasonRejected)
+		}
+		return err
 	}
 
 	if len(request.URL.Host) > 0 {
@@ -246,11 +333,18 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 	}
 
 	ctx = session.ContextWithContent(ctx, content)
+	// A keep-alive request may start while the previous outbound is still
+	// finishing. Do not reuse its mutable route and splice metadata.
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{}})
 
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
+		if observation != nil {
+			observation.Exchange.SetEndReason(stats.EndReasonRejected)
+		}
 		return err
 	}
+	owner.attach(link)
 
 	// Plain HTTP request is not a stream. The request always finishes before response. Hense request has to be closed later.
 	defer common.Close(link.Writer)
@@ -262,6 +356,9 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		requestWriter := buf.NewBufferedWriter(link.Writer)
 		common.Must(requestWriter.SetBuffered(false))
 		if err := request.Write(requestWriter); err != nil {
+			if observation != nil {
+				observation.Exchange.SetEndReason(stats.EndReasonWriteError)
+			}
 			return errors.New("failed to write whole request").Base(err).AtWarning()
 		}
 		return nil
@@ -269,7 +366,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 
 	responseDone := func() error {
 		responseReader := bufio.NewReaderSize(&buf.BufferedReader{Reader: link.Reader}, buf.Size)
-		response, err := readResponseAndHandle100Continue(responseReader, request, writer)
+		response, err := readResponseAndHandle100Continue(responseReader, request, responseWriter)
 		if err == nil {
 			http_proto.RemoveHopByHopHeaders(response.Header)
 			if response.ContentLength >= 0 {
@@ -284,6 +381,9 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			defer response.Body.Close()
 		} else {
 			errors.LogWarningInner(ctx, err, "failed to read response from ", request.Host)
+			if observation != nil {
+				observation.Exchange.SetEndReason(stats.EndReasonReadError)
+			}
 			response = &http.Response{
 				Status:        "Service Unavailable",
 				StatusCode:    503,
@@ -298,7 +398,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			response.Header.Set("Connection", "close")
 			response.Header.Set("Proxy-Connection", "close")
 		}
-		if err := response.Write(writer); err != nil {
+		if err := response.Write(responseWriter); err != nil {
 			return errors.New("failed to write response").Base(err).AtWarning()
 		}
 		return nil

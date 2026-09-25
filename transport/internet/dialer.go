@@ -85,17 +85,23 @@ var (
 )
 
 func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
-	if dnsClient == nil {
+	return LookupForIPContext(context.Background(), domain, strategy, localAddr)
+}
+
+// LookupForIPContext preserves an opaque causal DNS binding before consulting
+// the process-global client.
+func LookupForIPContext(ctx context.Context, domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
+	if dnsClient == nil && !dns.HasContextBinding(ctx) {
 		return nil, errors.New("DNS client not initialized").AtError()
 	}
 
-	ips, _, err := dnsClient.LookupIP(domain, dns.IPOption{
+	ips, _, err := dns.LookupIPContext(ctx, dnsClient, domain, dns.IPOption{
 		IPv4Enable: (localAddr == nil && strategy.PreferIP4()) || (localAddr != nil && localAddr.Family().IsIPv4() && (strategy.PreferIP4() || strategy.FallbackIP4())),
 		IPv6Enable: (localAddr == nil && strategy.PreferIP6()) || (localAddr != nil && localAddr.Family().IsIPv6() && (strategy.PreferIP6() || strategy.FallbackIP6())),
 	})
 	{ // Resolve fallback
 		if (len(ips) == 0 || err != nil) && strategy.HasFallback() && localAddr == nil {
-			ips, _, err = dnsClient.LookupIP(domain, dns.IPOption{
+			ips, _, err = dns.LookupIPContext(ctx, dnsClient, domain, dns.IPOption{
 				IPv4Enable: strategy.FallbackIP4(),
 				IPv6Enable: strategy.FallbackIP6(),
 			})
@@ -108,7 +114,7 @@ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) 
 	return ips, err
 }
 
-func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.Handler) net.Conn {
+func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.Handler) (net.Conn, error) {
 	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
 	outbounds := session.OutboundsFromContext(ctx)
 	ctx = session.ContextWithOutbounds(ctx, append(outbounds, &session.Outbound{
@@ -116,11 +122,19 @@ func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.H
 		Gateway: nil,
 		Tag:     obt,
 	})) // add another outbound in session ctx
+	dispatchCtx, release, err := dns.ReserveContextBinding(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
 	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
 
-	go h.Dispatch(context.WithoutCancel(ctx), &transport.Link{Reader: ur, Writer: dw})
+	go func() {
+		defer release()
+		detached := dns.CopyContextBinding(context.WithoutCancel(dispatchCtx), dispatchCtx)
+		h.Dispatch(detached, &transport.Link{Reader: ur, Writer: dw})
+	}()
 	var readerOpt cnc.ConnectionOption
 	if dst.Network == net.Network_TCP {
 		readerOpt = cnc.ConnectionOutputMulti(dr)
@@ -132,7 +146,7 @@ func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.H
 		readerOpt,
 		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
 	)
-	return nc
+	return nc, nil
 }
 
 func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
@@ -253,7 +267,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		if outboundName == "freedom" && dest.Network == net.Network_UDP && origTargetAddr != nil && src == nil {
 			finalStrategy = finalStrategy.GetDynamicStrategy(origTargetAddr.Family())
 		}
-		ips, err := LookupForIP(dest.Address.Domain(), finalStrategy, src)
+		ips, err := LookupForIPContext(ctx, dest.Address.Domain(), finalStrategy, src)
 		if err != nil {
 			errors.LogErrorInner(ctx, err, "failed to resolve ip")
 			if sockopt.DomainStrategy.ForceIP() {
@@ -275,7 +289,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		if h == nil {
 			return nil, errors.New("there is no outbound handler for dialerProxy").AtError()
 		}
-		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
+		return redirect(ctx, dest, sockopt.DialerProxy, h)
 	}
 
 	return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)

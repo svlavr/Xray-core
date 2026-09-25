@@ -25,7 +25,7 @@ func isInternalDomain(dest net.Destination) bool {
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		r := new(Reverse)
+		r := &Reverse{ctx: core.ToBackgroundDetachedContext(ctx)}
 		if err := core.RequireFeatures(ctx, func(d routing.Dispatcher, om outbound.Manager) error {
 			return r.Init(config.(*Config), d, om)
 		}); err != nil {
@@ -36,6 +36,7 @@ func init() {
 }
 
 type Reverse struct {
+	ctx     context.Context
 	bridges []*Bridge
 	portals []*Portal
 }
@@ -45,6 +46,9 @@ func (r *Reverse) Init(config *Config, d routing.Dispatcher, ohm outbound.Manage
 		b, err := NewBridge(bConfig, d)
 		if err != nil {
 			return err
+		}
+		if r.ctx != nil {
+			b.ctx = r.ctx
 		}
 		r.bridges = append(r.bridges, b)
 	}

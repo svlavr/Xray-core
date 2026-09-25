@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/http"
 	"github.com/xtls/xray-core/transport"
@@ -31,6 +32,7 @@ type Server struct {
 	policyManager policy.Manager
 	cone          bool
 	httpServer    *http.Server
+	statsManager  stats.Manager
 }
 
 // NewServer creates a new Server object.
@@ -38,6 +40,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
 	s := &Server{
 		config:        config,
+		statsManager:  v.GetFeature(stats.ManagerType()).(stats.Manager),
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
 	}
@@ -122,6 +125,22 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 	request, tempUDPConn, err := svrSession.Handshake(reader, conn)
 	defer common.CloseIfExists(tempUDPConn)
 	if err != nil {
+		var rejected *decodedSocks4Rejection
+		if goerrors.As(err, &rejected) {
+			if store := proxy.ObservationStore(s.statsManager); store != nil {
+				destination := rejected.destination
+				flow := store.PrepareTCP(session.TrafficOriginFromContext(ctx), inbound.Source, destination, nil)
+				if flow != nil {
+					flow.Unassign()
+					if rejected.responseErr != nil {
+						flow.SetEndReason(stats.EndReasonWriteError)
+					} else {
+						flow.SetEndReason(stats.EndReasonRejected)
+					}
+					flow.Finish()
+				}
+			}
+		}
 		if inbound.Source.IsValid() {
 			log.Record(&log.AccessMessage{
 				From:   inbound.Source,
@@ -154,11 +173,13 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 		if inbound.CanSpliceCopy == 2 {
 			inbound.CanSpliceCopy = 1
 		}
+		link := &transport.Link{Reader: reader, Writer: buf.NewWriter(conn)}
+		ctx, finish := proxy.ObserveTCP(ctx, s.statsManager, conn, dest, link)
+		if finish != nil {
+			defer finish()
+		}
 		if err := dispatcher.DispatchLink(
-			ctx, dest, &transport.Link{
-				Reader: reader,
-				Writer: buf.NewWriter(conn),
-			},
+			ctx, dest, link,
 		); err != nil {
 			return errors.New("failed to dispatch request").Base(err)
 		}
@@ -169,10 +190,29 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 		if tempUDPConn == nil {
 			return errors.New("UDP associate with listen port failed")
 		}
+		store := proxy.ObservationStore(s.statsManager)
+		var flow stats.Exchange
+		if store != nil {
+			// The control TCP peer is not the UDP peer. Admit the native
+			// association now with an explicitly unavailable source; the first
+			// accepted datagram still supplies packet destinations and callback
+			// metadata without rewriting the association identity.
+			if inbound != nil {
+				associationInbound := *inbound
+				associationInbound.Source = net.Destination{}
+				ctx = session.ContextWithInbound(ctx, &associationInbound)
+			}
+			var cancel context.CancelFunc
+			ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, tempUDPConn, net.Destination{}, stats.FlowKindUDPAssociation)
+			if flow != nil {
+				defer cancel()
+				defer flow.Finish()
+			}
+		}
 		tempUDPConn.SetTimeout(plcy.Timeouts.ConnectionIdle)
 		errCh := make(chan error, 1)
 		go func() {
-			errCh <- s.handleUDPPayload(ctx, tempUDPConn, dispatcher)
+			errCh <- s.handleUDPPayload(ctx, tempUDPConn, dispatcher, flow)
 		}()
 		// Associated TCP keeps the UDP alive
 		// Close UDP if TCP connection is closed
@@ -184,37 +224,50 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 	return nil
 }
 
-func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
-		payload := packet.Payload
-		errors.LogDebug(ctx, "writing back UDP response with ", payload.Len(), " bytes")
+func writeUDPResponse(ctx context.Context, conn stat.Connection, packet *udp_proto.Packet) {
+	payload := packet.Payload
+	n := uint64(payload.Len())
+	var receipt stats.Exchange
+	if observation := session.LogicalObservationFromContext(ctx); observation != nil {
+		receipt = observation.Exchange
+	}
+	errors.LogDebug(ctx, "writing back UDP response with ", payload.Len(), " bytes")
 
-		request := protocol.RequestHeaderFromContext(ctx)
-		if request == nil {
-			payload.Release()
-			return
-		}
-
-		if payload.UDP != nil {
-			request = &protocol.RequestHeader{
-				User:    request.User,
-				Address: payload.UDP.Address,
-				Port:    payload.UDP.Port,
-			}
-		}
-
-		udpMessage, err := EncodeUDPPacket(request, payload.Bytes())
+	request := protocol.RequestHeaderFromContext(ctx)
+	if request == nil {
 		payload.Release()
+		return
+	}
 
-		if err != nil {
-			errors.LogWarningInner(ctx, err, "failed to write UDP response")
-			return
+	if payload.UDP != nil {
+		request = &protocol.RequestHeader{
+			User:    request.User,
+			Address: payload.UDP.Address,
+			Port:    payload.UDP.Port,
 		}
+	}
 
-		conn.Write(udpMessage.Bytes())
-		udpMessage.Release()
+	udpMessage, err := EncodeUDPPacket(request, payload.Bytes())
+	payload.Release()
+
+	if err != nil {
+		errors.LogWarningInner(ctx, err, "failed to write UDP response")
+		return
+	}
+
+	written, writeErr := conn.Write(udpMessage.Bytes())
+	proxy.RecordPacketWrite(receipt, n, int(udpMessage.Len()), written, writeErr)
+	udpMessage.Release()
+}
+
+func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher, flow stats.Exchange) error {
+	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
+		writeUDPResponse(ctx, conn, packet)
 	})
-	defer udpServer.RemoveRay()
+	udpServer.Observation = flow
+	defer func() {
+		udpServer.RemoveRay()
+	}()
 
 	inbound := session.InboundFromContext(ctx)
 
@@ -224,20 +277,24 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 	var changeRemote sync.Once
 	for {
 		mpayload, err := reader.ReadMultiBuffer()
-		if err != nil {
-			return err
-		}
-		changeRemote.Do(func() {
-			if inbound != nil {
+		if len(mpayload) != 0 {
+			changeRemote.Do(func() {
+				source := net.DestinationFromAddr(conn.RemoteAddr())
+				if flow != nil {
+					flow.SetSource(source)
+				}
+				if inbound == nil {
+					return
+				}
 				newInbound := *inbound
 				// change source to real remote UDP address
-				newInbound.Source = net.DestinationFromAddr(conn.RemoteAddr())
+				newInbound.Source = source
 				newInbound.Local = net.DestinationFromAddr(conn.LocalAddr())
 				inbound = &newInbound
 				ctx = session.ContextWithInbound(ctx, inbound)
 				errors.LogInfo(ctx, "client UDP connection from ", inbound.Source)
-			}
-		})
+			})
+		}
 
 		for _, payload := range mpayload {
 			request, err := DecodeUDPPacket(payload)
@@ -273,6 +330,16 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 
 			currentPacketCtx = protocol.ContextWithRequestHeader(currentPacketCtx, request)
 			udpServer.Dispatch(currentPacketCtx, *dest, payload)
+		}
+		if err != nil {
+			if flow != nil {
+				reason := stats.EndReasonReadError
+				if goerrors.Is(err, io.EOF) {
+					reason = stats.EndReasonEOF
+				}
+				flow.SetEndReason(reason)
+			}
+			return err
 		}
 	}
 }

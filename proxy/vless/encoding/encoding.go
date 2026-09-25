@@ -2,6 +2,7 @@ package encoding
 
 import (
 	"context"
+	goerrors "errors"
 	"io"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -11,6 +12,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/uuid"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vless"
 )
@@ -173,7 +175,7 @@ func DecodeResponseHeader(reader io.Reader, request *protocol.RequestHeader) (*A
 }
 
 // XtlsRead can switch to splice copy
-func XtlsRead(reader buf.Reader, writer buf.Writer, timer *signal.ActivityTimer, conn net.Conn, trafficState *proxy.TrafficState, isUplink bool, ctx context.Context) error {
+func XtlsRead(reader buf.Reader, writer buf.Writer, timer *signal.ActivityTimer, conn net.Conn, trafficState *proxy.TrafficState, isUplink bool, ctx context.Context, receipt stats.Exchange) error {
 	err := func() error {
 		for {
 			if isUplink && trafficState.Inbound.UplinkReaderDirectCopy || !isUplink && trafficState.Outbound.DownlinkReaderDirectCopy {
@@ -183,7 +185,11 @@ func XtlsRead(reader buf.Reader, writer buf.Writer, timer *signal.ActivityTimer,
 					writerConn = inbound.Conn
 					inTimer = inbound.Timer
 				}
-				return proxy.CopyRawConnIfExist(ctx, conn, writerConn, writer, timer, inTimer)
+				err := proxy.CopyRawConnIfExist(ctx, conn, writerConn, writer, timer, inTimer)
+				if err == nil && receipt != nil {
+					receipt.SetEndReason(stats.EndReasonEOF)
+				}
+				return err
 			}
 			buffer, err := reader.ReadMultiBuffer()
 			if !buffer.IsEmpty() {
@@ -193,6 +199,7 @@ func XtlsRead(reader buf.Reader, writer buf.Writer, timer *signal.ActivityTimer,
 				}
 			}
 			if err != nil {
+				markXtlsReadResult(receipt, err)
 				return err
 			}
 		}
@@ -201,4 +208,20 @@ func XtlsRead(reader buf.Reader, writer buf.Writer, timer *signal.ActivityTimer,
 		return err
 	}
 	return nil
+}
+
+func markXtlsReadResult(receipt stats.Exchange, err error) {
+	if receipt == nil || err == nil {
+		return
+	}
+	reason := stats.EndReasonReadError
+	if errors.Cause(err) == io.EOF {
+		reason = stats.EndReasonEOF
+	} else {
+		var timeout interface{ Timeout() bool }
+		if goerrors.As(err, &timeout) && timeout.Timeout() {
+			reason = stats.EndReasonTimeout
+		}
+	}
+	receipt.SetEndReason(reason)
 }

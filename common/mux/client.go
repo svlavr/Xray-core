@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/xudp"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -31,6 +32,8 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 	for i := 0; i < 16; i++ {
 		worker, err := m.Picker.PickAvailable()
 		if err != nil {
+			// Failure before child launch owns no asynchronous work.
+			proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 			return err
 		}
 		if worker.Dispatch(ctx, link) {
@@ -38,6 +41,7 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 		}
 	}
 
+	proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 	return errors.New("unable to find an available mux client").AtWarning()
 }
 
@@ -188,6 +192,11 @@ var (
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
+	// Native pipes already enqueue whole batches atomically. Supplied carriers
+	// may transform data before writing, so their whole writer call is shared.
+	if _, nativePipe := stream.Writer.(*pipe.Writer); !nativePipe {
+		stream.Writer = &serializedWriter{writer: stream.Writer}
+	}
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
 		link:           stream,
@@ -259,16 +268,11 @@ func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
-	transferType := protocol.TransferTypeStream
-	if ob.Target.Network == net.Network_UDP {
-		transferType = protocol.TransferTypePacket
-	}
-	s.transferType = transferType
 	var inbound *session.Inbound
 	if session.IsReverseMuxFromContext(ctx) {
 		inbound = session.InboundFromContext(ctx)
 	}
-	writer := NewWriter(s.ID, ob.Target, output, transferType, xudp.GetGlobalID(ctx), inbound)
+	writer := NewWriter(s.ID, ob.Target, output, s.transferType, xudp.GetGlobalID(ctx), inbound)
 	defer s.Close(false)
 	defer writer.Close()
 
@@ -288,7 +292,8 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 
 func (m *ClientWorker) IsClosing() bool {
 	sm := m.sessionManager
-	if m.strategy.MaxConnection > 0 && sm.Count() >= int(m.strategy.MaxConnection) {
+	count := sm.Count()
+	if count == int(^uint16(0)) || m.strategy.MaxConnection > 0 && count >= int(m.strategy.MaxConnection) {
 		return true
 	}
 	return false
@@ -313,17 +318,25 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 		return false
 	}
 
-	sm := m.sessionManager
-	s := sm.Allocate(&m.strategy)
-	if s == nil {
+	s := &Session{input: link.Reader, output: link.Writer, transferType: protocol.TransferTypeStream}
+	if outbounds := session.OutboundsFromContext(ctx); outbounds[len(outbounds)-1].Target.Network == net.Network_UDP {
+		s.transferType = protocol.TransferTypePacket
+	}
+	if observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, true); observation != nil {
+		s.inspection = observation.Exchange
+		outbounds := session.OutboundsFromContext(ctx)
+		s.inspection.Effective(outbounds[len(outbounds)-1].Target)
+	}
+	if m.sessionManager.allocate(&m.strategy, s) == nil {
 		return false
 	}
-	s.input = link.Reader
-	s.output = link.Writer
 	go fetchInput(ctx, s, m.link.Writer)
 	if _, ok := link.Reader.(*pipe.Reader); !ok {
 		select {
 		case <-ctx.Done():
+			if s.inspection != nil {
+				s.Close(false)
+			}
 		case <-s.done.Wait():
 		}
 	}
@@ -349,8 +362,11 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return nil
 	}
 
-	s, found := m.sessionManager.Get(meta.SessionID)
-	if !found {
+	s, admitted := m.sessionManager.lookup(meta.SessionID, true)
+	if s == nil {
+		if admitted {
+			return buf.Copy(NewStreamReader(reader), buf.Discard)
+		}
 		// Notify remote peer to close this session.
 		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
 		closingWriter.Close()
@@ -371,6 +387,11 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
+		if s.inspection != nil {
+			if !meta.Option.Has(OptionError) {
+				s.inspection.SetEndReason(stats.EndReasonEOF)
+			}
+		}
 		s.Close(false)
 	}
 	if meta.Option.Has(OptionData) {

@@ -2,9 +2,11 @@ package dokodemo
 
 import (
 	"context"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -16,6 +18,8 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -24,7 +28,8 @@ import (
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		d := new(DokodemoDoor)
-		err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
+		err := core.RequireFeatures(ctx, func(pm policy.Manager, sm stats.Manager) error {
+			d.statsManager = sm
 			return d.Init(config.(*Config), pm, session.SockoptFromContext(ctx))
 		})
 		return d, err
@@ -33,6 +38,7 @@ func init() {
 
 type DokodemoDoor struct {
 	policyManager  policy.Manager
+	statsManager   stats.Manager
 	config         *Config
 	rewriteAddress net.Address
 	rewritePort    net.Port
@@ -158,6 +164,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 	}
 
 	var writer buf.Writer
+	var packetWriter *PacketWriter
 	if network == net.Network_TCP {
 		writer = buf.NewWriter(conn)
 	} else {
@@ -186,15 +193,25 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 				return err
 			}
 			writer = NewPacketWriter(pConn, &dest, mark, back)
-			defer writer.(*PacketWriter).Close() // close fake UDP conns
+			packetWriter = writer.(*PacketWriter)
 		}
 	}
 
+	link := &transport.Link{Reader: reader, Writer: writer}
+	var finish func()
+	if network == net.Network_TCP && dest.Network == net.Network_TCP {
+		ctx, finish = proxy.ObserveTCP(ctx, d.statsManager, conn, dest, link)
+	} else if network == net.Network_UDP && dest.Network == net.Network_UDP {
+		ctx, finish = proxy.ObserveUDP(ctx, d.statsManager, conn, dest, link)
+	}
+	if finish != nil {
+		defer finish()
+	}
+	if packetWriter != nil {
+		defer packetWriter.Close()
+	} // before observation can finish
 	if err := dispatcher.DispatchLink(
-		ctx, dest, &transport.Link{
-			Reader: reader,
-			Writer: writer,
-		},
+		ctx, dest, link,
 	); err != nil {
 		return errors.New("failed to dispatch request").Base(err)
 	}
@@ -213,13 +230,20 @@ func NewPacketWriter(conn net.PacketConn, d *net.Destination, mark int, back *ne
 }
 
 type PacketWriter struct {
-	conn  net.PacketConn
-	conns map[net.Destination]net.PacketConn
-	mark  int
-	back  *net.UDPAddr
+	mu        sync.Mutex
+	closed    bool
+	closeOnce sync.Once
+	conn      net.PacketConn
+	conns     map[net.Destination]net.PacketConn
+	mark      int
+	back      *net.UDPAddr
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.writeMultiBuffer(mb, nil)
+}
+
+func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for {
 		mb2, b := buf.SplitFirst(mb)
 		mb = mb2
@@ -228,31 +252,38 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 		var err error
 		if b.UDP != nil && b.UDP.Address.Family().IsIP() {
-			conn := w.conns[*b.UDP]
-			if conn == nil {
-				conn, err = FakeUDP(
-					&net.UDPAddr{
-						IP:   b.UDP.Address.IP(),
-						Port: int(b.UDP.Port),
-					},
-					w.mark,
-				)
-				if err != nil {
-					errors.LogInfo(context.Background(), err.Error())
-					b.Release()
-					continue
+			conn, openErr := w.packetConn(b.UDP)
+			if openErr != nil {
+				b.Release()
+				if openErr == io.ErrClosedPipe {
+					buf.ReleaseMulti(mb)
+					return openErr
 				}
-				w.conns[*b.UDP] = conn
+				errors.LogInfo(context.Background(), openErr.Error())
+				continue
 			}
-			_, err = conn.WriteTo(b.Bytes(), w.back)
+			n, writeErr := conn.WriteTo(b.Bytes(), w.back)
+			err = writeErr
+			if receipt != nil {
+				proxy.RecordUnframedPacketWrite(receipt, int(b.Len()), n, err)
+			}
 			if err != nil {
 				errors.LogInfo(context.Background(), err.Error())
-				w.conns[*b.UDP] = nil
-				conn.Close()
+				w.retire(*b.UDP, conn)
 			}
 			b.Release()
 		} else {
-			_, err = w.conn.WriteTo(b.Bytes(), w.back)
+			conn, openErr := w.packetConn(nil)
+			if openErr != nil {
+				b.Release()
+				buf.ReleaseMulti(mb)
+				return openErr
+			}
+			n, writeErr := conn.WriteTo(b.Bytes(), w.back)
+			err = writeErr
+			if receipt != nil {
+				proxy.RecordUnframedPacketWrite(receipt, int(b.Len()), n, err)
+			}
 			b.Release()
 			if err != nil {
 				buf.ReleaseMulti(mb)
@@ -264,10 +295,77 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (w *PacketWriter) Close() error {
-	for _, conn := range w.conns {
-		if conn != nil {
-			conn.Close()
+	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		w.closed = true
+		conns := w.conns
+		w.conns = nil
+		w.mu.Unlock()
+		for _, conn := range conns {
+			if conn != nil {
+				conn.Close()
+			}
 		}
-	}
+	})
 	return nil
+}
+
+func (w *PacketWriter) packetConn(destination *net.Destination) (net.PacketConn, error) {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil, io.ErrClosedPipe
+	}
+	conn := w.conn
+	if destination != nil {
+		conn = w.conns[*destination]
+	}
+	w.mu.Unlock()
+	if conn != nil || destination == nil {
+		return conn, nil
+	}
+	conn, err := FakeUDP(&net.UDPAddr{IP: destination.Address.IP(), Port: int(destination.Port)}, w.mark)
+	if err != nil {
+		return nil, err
+	}
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		conn.Close()
+		return nil, io.ErrClosedPipe
+	}
+	if current := w.conns[*destination]; current != nil {
+		w.mu.Unlock()
+		conn.Close()
+		return current, nil
+	}
+	w.conns[*destination] = conn
+	w.mu.Unlock()
+	return conn, nil
+}
+
+func (w *PacketWriter) retire(destination net.Destination, conn net.PacketConn) {
+	w.mu.Lock()
+	owned := w.conns[destination] == conn
+	if owned {
+		delete(w.conns, destination)
+	}
+	w.mu.Unlock()
+	if owned {
+		conn.Close()
+	}
+}
+
+func (w *PacketWriter) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
+	return &inspectionPacketWriter{PacketWriter: w, receipt: receipt}
+}
+
+type inspectionPacketWriter struct {
+	*PacketWriter
+	receipt stats.Exchange
+}
+
+func (w *inspectionPacketWriter) WriterReceipt() stats.Exchange { return w.receipt }
+func (w *inspectionPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.PacketWriter.writeMultiBuffer(mb, w.receipt)
 }

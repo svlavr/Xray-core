@@ -17,6 +17,8 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria"
@@ -59,6 +61,14 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.Name = "hysteria"
 	ob.CanSpliceCopy = 3
 	target := ob.Target
+	ordinaryTarget := target.Network == net.Network_TCP || target.Network == net.Network_UDP
+	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
+		ordinaryTarget = false
+	}
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget)
+	if observation != nil {
+		observation.Exchange.Effective(target)
+	}
 
 	conn, err := dialer.Dial(hysteria.ContextWithDatagram(ctx, target.Network == net.Network_UDP), c.server.Destination)
 	if err != nil {
@@ -181,51 +191,106 @@ type UDPWriter struct {
 }
 
 func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
-	msgN := msg.Serialize(w.buf[:])
-	if msgN < 0 {
-		return nil
-	}
-	_, err := w.writer.Write(w.buf[:msgN])
+	_, err := w.sendMessage(msg)
 	return err
 }
 
+func (w *UDPWriter) sendMessage(msg *UDPMessage) (int, error) {
+	size := msg.Size()
+	message := w.buf[:]
+	if size > len(message) {
+		message = make([]byte, size)
+	}
+	msgN := msg.Serialize(message)
+	if msgN != size {
+		return 0, errors.New("failed to serialize UDP message")
+	}
+	n, err := w.writer.Write(message[:msgN])
+	if err != nil {
+		return n, err
+	}
+	if n != msgN {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
+}
+
 func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.writeMultiBuffer(mb, nil)
+}
+
+func (w *UDPWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for i, b := range mb {
-		addr := w.addr
-		if b.UDP != nil {
-			addr = b.UDP.NetAddr()
-		}
-
-		msg := &UDPMessage{
-			SessionID: 0,
-			PacketID:  0,
-			FragID:    0,
-			FragCount: 1,
-			Addr:      addr,
-			Data:      b.Bytes(),
-		}
-
-		err := w.SendMessage(msg)
-		var errTooLarge *quic.DatagramTooLargeError
-		if go_errors.As(err, &errTooLarge) {
-			msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
-			fMsgs := FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
-			for _, fMsg := range fMsgs {
-				err := w.SendMessage(&fMsg)
-				if err != nil {
-					buf.ReleaseMulti(mb[i:])
-					return err
-				}
-			}
-		} else if err != nil {
+		if err := w.writePacket(b, receipt); err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
 		}
-
 		b.Release()
 	}
-
 	return nil
+}
+
+func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err error) {
+	complete, partial := false, false
+	if receipt != nil {
+		defer func() { proxy.RecordPacketOutcome(receipt, uint64(b.Len()), complete, partial, err) }()
+	}
+	addr := w.addr
+	if b.UDP != nil {
+		addr = b.UDP.NetAddr()
+	}
+
+	msg := &UDPMessage{
+		SessionID: 0,
+		PacketID:  0,
+		FragID:    0,
+		FragCount: 1,
+		Addr:      addr,
+		Data:      b.Bytes(),
+	}
+
+	n, err := w.sendMessage(msg)
+	complete, partial = n == msg.Size(), n > 0
+	var errTooLarge *quic.DatagramTooLargeError
+	if go_errors.As(err, &errTooLarge) {
+		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
+		fMsgs := FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
+		if len(fMsgs) == 0 {
+			return errors.New("failed to fragment UDP message")
+		}
+		all := true
+		for i, fMsg := range fMsgs {
+			n, sendErr := w.sendMessage(&fMsg)
+			all = all && n == fMsg.Size()
+			partial = partial || n > 0
+			if i == len(fMsgs)-1 {
+				complete = complete || all
+			}
+			err := sendErr
+			if err != nil {
+				return err
+			}
+		}
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+type inspectionUDPWriter struct {
+	*UDPWriter
+	receipt stats.Exchange
+}
+
+func (w *inspectionUDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.UDPWriter.writeMultiBuffer(mb, w.receipt)
+}
+
+func (w *UDPWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
+	if flow == nil {
+		return w
+	}
+	return &inspectionUDPWriter{UDPWriter: w, receipt: flow}
 }
 
 type UDPReader struct {

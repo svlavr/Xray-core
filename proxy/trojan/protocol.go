@@ -8,6 +8,8 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 )
 
 var (
@@ -102,6 +104,10 @@ type PacketWriter struct {
 
 // WriteMultiBuffer implements buf.Writer
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.writeMultiBuffer(mb, nil)
+}
+
+func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for {
 		mb2, b := buf.SplitFirst(mb)
 		mb = mb2
@@ -112,7 +118,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if b.UDP != nil {
 			target = b.UDP
 		}
-		if _, err := w.writePacket(b.Bytes(), *target); err != nil {
+		if _, err := w.writePacket(b.Bytes(), *target, receipt); err != nil {
 			b.Release()
 			buf.ReleaseMulti(mb)
 			return err
@@ -122,9 +128,13 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return nil
 }
 
-func (w *PacketWriter) writePacket(payload []byte, dest net.Destination) (int, error) {
+func (w *PacketWriter) writePacket(payload []byte, dest net.Destination, receipt stats.Exchange) (_ int, err error) {
 	buffer := buf.StackNew()
 	defer buffer.Release()
+	var encoded, written int
+	if receipt != nil {
+		defer func() { proxy.RecordPacketWrite(receipt, uint64(len(payload)), encoded, written, err) }()
+	}
 
 	length := len(payload)
 	lengthBuf := [2]byte{}
@@ -141,7 +151,8 @@ func (w *PacketWriter) writePacket(payload []byte, dest net.Destination) (int, e
 	if _, err := buffer.Write(payload); err != nil {
 		return 0, err
 	}
-	_, err := w.Write(buffer.Bytes())
+	encoded = int(buffer.Len())
+	written, err = w.Write(buffer.Bytes())
 	if err != nil {
 		return 0, err
 	}

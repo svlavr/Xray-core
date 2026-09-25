@@ -174,6 +174,11 @@ func (h *Handler) Tag() string {
 	return h.tag
 }
 
+// InspectionClaimSettledOnReturn marks the native handler boundary where every
+// path has synchronously claimed the selected logical endpoint or has returned
+// without launching an owner that can claim it later.
+func (*Handler) InspectionClaimSettledOnReturn() {}
+
 // Dispatch implements proxy.Outbound.Dispatch.
 func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 	outbounds := session.OutboundsFromContext(ctx)
@@ -184,7 +189,7 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
 			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
 		}
-		ips, err := internet.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
+		ips, err := internet.LookupForIPContext(ctx, ob.Target.Address.Domain(), strategy, nil)
 		if err != nil {
 			errors.LogInfoInner(ctx, err, "failed to resolve ip for target ", ob.Target.Address.Domain())
 			if h.senderSettings.TargetStrategy.ForceIP() {

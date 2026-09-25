@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -79,6 +80,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	if target.Network == net.Network_UDP {
 		return errors.New("UDP is not supported by HTTP outbound")
+	}
+
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
+	if observation != nil {
+		observation.Exchange.Effective(target)
 	}
 
 	server := c.server
@@ -262,20 +268,29 @@ func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, u
 		}()
 
 		resp, err := h2clientConn.RoundTrip(req)
+		cleanup := func(cause error) {
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			pr.CloseWithError(cause)
+			pw.CloseWithError(cause)
+			wg.Wait()
+		}
 		if err != nil {
-			rawConn.Close()
+			cleanup(err)
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			err := errors.New("Proxy responded with non 200 code: " + resp.Status)
+			cleanup(err)
 			return nil, err
 		}
 
 		wg.Wait()
 		if pErr != nil {
-			rawConn.Close()
+			cleanup(pErr)
 			return nil, pErr
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			rawConn.Close()
-			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status)
 		}
 		return newHTTP2Conn(rawConn, pw, resp.Body), nil
 	}

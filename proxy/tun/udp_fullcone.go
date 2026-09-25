@@ -9,6 +9,8 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 )
 
 type packet struct {
@@ -78,12 +80,13 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	}
 }
 
-func (u *udpConnectionHandler) connectionFinished(src net.Destination) {
+func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	u.Lock()
-	conn, found := u.udpConns[src]
-	if found {
-		delete(u.udpConns, src)
+	if u.udpConns[conn.src] == conn {
+		delete(u.udpConns, conn.src)
 		close(conn.egress)
+		for range conn.egress {
+		} // release unconsumed packet storage at retirement
 	}
 	u.Unlock()
 }
@@ -104,7 +107,12 @@ func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			return nil, io.EOF
 		}
 
-		b := buf.New()
+		var b *buf.Buffer
+		if len(e.data) > buf.Size {
+			b = buf.NewWithSize(int32(len(e.data)))
+		} else {
+			b = buf.New()
+		}
 		if _, err := b.Write(e.data); err != nil {
 			errors.LogErrorInner(context.Background(), err, "drop packet to ", e.dest, " with size ", len(e.data))
 			b.Release()
@@ -130,6 +138,10 @@ func (c *udpConn) Read(p []byte) (int, error) {
 }
 
 func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return c.writeMultiBuffer(mb, nil)
+}
+
+func (c *udpConn) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for i, b := range mb {
 		dst := c.dst
 		if b.UDP != nil {
@@ -140,6 +152,9 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 		err := c.handler.writePacket(b.Bytes(), dst, c.src)
+		if receipt != nil {
+			proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil, err != nil, err)
+		}
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
@@ -154,16 +169,30 @@ func (c *udpConn) Write(p []byte) (int, error) {
 	// sending packets back mean sending payload with source/destination reversed
 	err := c.handler.writePacket(p, c.dst, c.src)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 
 	return len(p), nil
 }
 
 func (c *udpConn) Close() error {
-	c.handler.connectionFinished(c.src)
+	c.handler.connectionFinished(c)
 
 	return nil
+}
+
+func (c *udpConn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
+	return &inspectionUDPWriter{udpConn: c, receipt: receipt}
+}
+
+type inspectionUDPWriter struct {
+	*udpConn
+	receipt stats.Exchange
+}
+
+func (w *inspectionUDPWriter) WriterReceipt() stats.Exchange { return w.receipt }
+func (w *inspectionUDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.udpConn.writeMultiBuffer(mb, w.receipt)
 }
 
 func (c *udpConn) LocalAddr() net.Addr {

@@ -18,6 +18,7 @@ import (
 
 // Bridge is a component in reverse proxy, that relays connections from Portal to local address.
 type Bridge struct {
+	ctx         context.Context
 	dispatcher  routing.Dispatcher
 	tag         string
 	domain      string
@@ -35,6 +36,7 @@ func NewBridge(config *BridgeConfig, dispatcher routing.Dispatcher) (*Bridge, er
 	}
 
 	b := &Bridge{
+		ctx:        context.Background(),
 		dispatcher: dispatcher,
 		tag:        config.Tag,
 		domain:     config.Domain,
@@ -79,7 +81,7 @@ func (b *Bridge) monitor() error {
 	}
 
 	if numWorker == 0 || numConnections/numWorker > 16 {
-		worker, err := NewBridgeWorker(b.domain, b.tag, b.dispatcher)
+		worker, err := newBridgeWorker(b.ctx, b.domain, b.tag, b.dispatcher)
 		if err != nil {
 			errors.LogWarningInner(context.Background(), err, "failed to create bridge worker")
 			return nil
@@ -107,10 +109,15 @@ type BridgeWorker struct {
 }
 
 func NewBridgeWorker(domain string, tag string, d routing.Dispatcher) (*BridgeWorker, error) {
-	ctx := context.Background()
+	return newBridgeWorker(context.Background(), domain, tag, d)
+}
+
+func newBridgeWorker(base context.Context, domain string, tag string, d routing.Dispatcher) (*BridgeWorker, error) {
+	ctx := base
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{
 		Tag: tag,
 	})
+	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginInternal)
 	link, err := d.Dispatch(ctx, net.Destination{
 		Network: net.Network_TCP,
 		Address: net.DomainAddress(domain),
@@ -125,7 +132,9 @@ func NewBridgeWorker(domain string, tag string, d routing.Dispatcher) (*BridgeWo
 		Tag:        tag,
 	}
 
-	worker, err := mux.NewServerWorker(context.Background(), w, link)
+	childCtx := session.ContextWithInbound(base, &session.Inbound{Tag: tag})
+	childCtx = session.ContextWithTrafficOrigin(childCtx, session.TrafficOriginUnknown)
+	worker, err := mux.NewServerWorker(childCtx, w, link)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +146,9 @@ func NewBridgeWorker(domain string, tag string, d routing.Dispatcher) (*BridgeWo
 	w.Timer = signal.CancelAfterInactivity(ctx, terminate, 60*time.Second)
 	return w, nil
 }
+
+// Reverse heartbeats are control work, not decoded logical data admissions.
+func (*BridgeWorker) InspectMuxChild(dest net.Destination) bool { return !isInternalDomain(dest) }
 
 func (w *BridgeWorker) Type() interface{} {
 	return routing.DispatcherType()

@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -35,6 +36,7 @@ type Handler struct {
 	sniffingRequest session.SniffingRequest
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
+	statsManager    stats.Manager
 }
 
 type tunUDPStatsWriter struct {
@@ -55,6 +57,12 @@ func (w *tunUDPStatsWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 	return nil
 }
+
+func (w *tunUDPStatsWriter) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
+	w.writer = buf.AttachWriterReceipt(w.writer, receipt)
+	return w
+}
+func (w *tunUDPStatsWriter) WriterReceipt() stats.Exchange { return buf.WriterReceipt(w.writer) }
 
 // ConnectionHandler interface with the only method that stack is going to push new connections to
 type ConnectionHandler interface {
@@ -80,6 +88,9 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	t.ctx = core.ToBackgroundDetachedContext(ctx)
 	t.policyManager = pm
 	t.dispatcher = dispatcher
+	if instance := core.FromContext(ctx); instance != nil {
+		t.statsManager, _ = instance.GetFeature(stats.ManagerType()).(stats.Manager)
+	}
 
 	if len(t.tag) > 0 && pm.ForSystem().Stats.InboundUplink {
 		statsManager := core.MustFromContext(ctx).GetFeature(stats.ManagerType()).(stats.Manager)
@@ -210,6 +221,7 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	}
 
 	ctx = session.ContextWithInbound(ctx, &inbound)
+	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUser)
 	ctx = session.ContextWithContent(ctx, &session.Content{
 		SniffingRequest: t.sniffingRequest,
 	})
@@ -223,10 +235,9 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	})
 	errors.LogInfo(ctx, "processing from ", source, " to ", destination)
 
-	reader := &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)}
+	reader := buf.NewReader(conn)
 	writer := buf.NewWriter(conn)
 	if isUDP {
-		reader.Counter = t.uplinkCounter
 		if t.downlinkCounter != nil {
 			writer = &tunUDPStatsWriter{writer: writer, counter: t.downlinkCounter}
 		}
@@ -235,6 +246,24 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	link := &transport.Link{
 		Reader: reader,
 		Writer: writer,
+	}
+	var finish func()
+	if isUDP {
+		ctx, finish = proxy.ObserveUDP(ctx, t.statsManager, conn, destination, link)
+	} else {
+		ctx, finish = proxy.ObserveTCP(ctx, t.statsManager, conn, destination, link)
+	}
+	if finish != nil {
+		defer finish()
+		if isUDP {
+			link.Reader.(*buf.InspectionReader).SetCounter(t.uplinkCounter)
+		}
+	} else {
+		reader := &buf.TimeoutWrapperReader{Reader: link.Reader}
+		if isUDP {
+			reader.Counter = t.uplinkCounter
+		}
+		link.Reader = reader
 	}
 	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
 		errors.LogError(ctx, errors.New("connection closed").Base(err))

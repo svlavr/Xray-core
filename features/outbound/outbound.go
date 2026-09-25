@@ -49,3 +49,9 @@ type Manager interface {
 func ManagerType() interface{} {
 	return (*Manager)(nil)
 }
+
+// HandlerResolver resolves the native handler and its insertion identity under
+// one lock. A zero serial means unavailable identity, never a routing failure.
+type HandlerResolver interface {
+	ResolveHandler(tag string, useDefault bool) (Handler, uint64)
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/common/bytespool"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/features/stats"
 )
 
 type BytesGenerator func() []byte
@@ -275,8 +276,12 @@ func (w *AuthenticationWriter) seal(b []byte) (*buf.Buffer, error) {
 	return eb, nil
 }
 
-func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
+func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	defer buf.ReleaseMulti(mb)
+	var payload uint64
+	if receipt != nil {
+		payload = uint64(mb.Len())
+	}
 
 	var maxPadding int32
 	if w.padding != nil {
@@ -298,6 +303,9 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 		eb, err := w.seal(rawBytes[:nBytes])
 		if err != nil {
 			buf.ReleaseMulti(mb2Write)
+			if receipt != nil {
+				receipt.SetEndReason(stats.EndReasonWriteError)
+			}
 			return err
 		}
 		mb2Write = append(mb2Write, eb)
@@ -306,13 +314,14 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 		}
 	}
 
-	return w.writer.WriteMultiBuffer(mb2Write)
+	return w.writeBatch(mb2Write, receipt, payload)
 }
 
-func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
+func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	defer buf.ReleaseMulti(mb)
 
 	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
+	var payload uint64
 
 	for _, b := range mb {
 		if b.IsEmpty() {
@@ -325,26 +334,48 @@ func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 		}
 
 		mb2Write = append(mb2Write, eb)
+		if receipt != nil {
+			payload += uint64(b.Len())
+		}
 	}
 
 	if mb2Write.IsEmpty() {
 		return nil
 	}
 
-	return w.writer.WriteMultiBuffer(mb2Write)
+	return w.writeBatch(mb2Write, receipt, payload)
 }
 
 // WriteMultiBuffer implements buf.Writer.
 func (w *AuthenticationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return w.writeMultiBuffer(mb, nil)
+}
+
+func (w *AuthenticationWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	if mb.IsEmpty() {
 		eb, err := w.seal([]byte{})
 		common.Must(err)
-		return w.writer.WriteMultiBuffer(buf.MultiBuffer{eb})
+		return w.writeBatch(buf.MultiBuffer{eb}, receipt, 0)
 	}
 
 	if w.transferType == protocol.TransferTypeStream {
-		return w.writeStream(mb)
+		return w.writeStream(mb, receipt)
 	}
 
-	return w.writePacket(mb)
+	return w.writePacket(mb, receipt)
+}
+
+func (w *AuthenticationWriter) writeBatch(mb buf.MultiBuffer, receipt stats.Exchange, payload uint64) error {
+	err := w.writer.WriteMultiBuffer(mb)
+	if receipt != nil {
+		if err == nil {
+			if payload != 0 {
+				receipt.AddDownlink(payload)
+			}
+		} else {
+			receipt.MarkDownlinkIncomplete()
+			receipt.SetEndReason(stats.EndReasonWriteError)
+		}
+	}
+	return err
 }

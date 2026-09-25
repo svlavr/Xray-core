@@ -14,6 +14,8 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -60,10 +62,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob := outbounds[len(outbounds)-1]
 	ob.Name = "blackhole"
 
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, ob.Target.Network == net.Network_TCP || ob.Target.Network == net.Network_UDP)
+	if observation != nil {
+		observation.Exchange.Effective(ob.Target)
+	}
+
+	var responseErr error
 	if len(h.response) > 0 {
 		mbc := buf.MultiBufferContainer{}
 		common.Must2(mbc.Write(h.response))
-		link.Writer.WriteMultiBuffer(mbc.MultiBuffer)
+		responseErr = link.Writer.WriteMultiBuffer(mbc.MultiBuffer)
 		// Sleep a little here to make sure the response is sent to client.
 		time.Sleep(time.Second)
 	}
@@ -75,8 +83,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		timer := signal.CancelAfterInactivity(ctx, func() {
 			cancel()
 		}, time.Duration(30+dice.Roll(61))*time.Second)
-		go buf.Copy(link.Reader, buf.Discard, buf.UpdateActivity(timer))
+		go func() {
+			buf.Copy(link.Reader, buf.Discard, buf.UpdateActivity(timer))
+		}()
 		<-ctx.Done()
+	}
+	if observation != nil {
+		reason := stats.EndReasonRejected
+		if responseErr != nil {
+			reason = stats.EndReasonWriteError
+		}
+		observation.Exchange.SetEndReason(reason)
 	}
 	return nil
 }

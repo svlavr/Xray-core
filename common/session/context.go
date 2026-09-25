@@ -2,12 +2,14 @@ package session
 
 import (
 	"context"
+	"sync/atomic"
 	_ "unsafe"
 
 	"github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
+	featurestats "github.com/xtls/xray-core/features/stats"
 )
 
 //go:linkname IndependentCancelCtx context.newCancelCtx
@@ -28,7 +30,40 @@ const (
 	mitmServerNameKey         ctx.SessionKey = 12 // used by TLS dialer
 
 	streamSettingsKey ctx.SessionKey = 13
+	trafficOriginKey  ctx.SessionKey = 14
 )
+
+// TrafficOrigin is an explicit technical admission fact. Unknown must never be
+// promoted to another origin from inbound metadata or call-path inference.
+type TrafficOrigin = featurestats.TrafficOrigin
+
+const (
+	TrafficOriginUnknown               = featurestats.TrafficOriginUnknown
+	TrafficOriginUser                  = featurestats.TrafficOriginUser
+	TrafficOriginInternal              = featurestats.TrafficOriginInternal
+	TrafficOriginControlledMeasurement = featurestats.TrafficOriginControlledMeasurement
+)
+
+// ContextWithTrafficOrigin records the explicit origin of routed traffic.
+func ContextWithTrafficOrigin(ctx context.Context, origin TrafficOrigin) context.Context {
+	return context.WithValue(ctx, trafficOriginKey, normalizeTrafficOrigin(origin))
+}
+
+// TrafficOriginFromContext returns the explicit origin, or Unknown when none
+// was recorded by an admission owner.
+func TrafficOriginFromContext(ctx context.Context) TrafficOrigin {
+	origin, _ := ctx.Value(trafficOriginKey).(TrafficOrigin)
+	return normalizeTrafficOrigin(origin)
+}
+
+func normalizeTrafficOrigin(origin TrafficOrigin) TrafficOrigin {
+	switch origin {
+	case TrafficOriginUser, TrafficOriginInternal, TrafficOriginControlledMeasurement:
+		return origin
+	default:
+		return TrafficOriginUnknown
+	}
+}
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
 	return context.WithValue(ctx, inboundSessionKey, inbound)
@@ -201,4 +236,46 @@ func ContextWithStreamSettings(ctx context.Context, streamSettings any) context.
 
 func StreamSettingsFromContext(ctx context.Context) any {
 	return ctx.Value(streamSettingsKey)
+}
+
+type (
+	logicalObservationKey struct{}
+	routeOnlyReceiptKey   struct{}
+)
+
+// RouteOnlyReceipt captures the selected physical route without creating or
+// inheriting a logical observation. Offer may be repeated by continuations;
+// Commit freezes the route at the actual consuming endpoint claim.
+type RouteOnlyReceipt interface {
+	Offer(featurestats.RouteStep)
+	Commit()
+}
+
+func ContextWithRouteOnlyReceipt(ctx context.Context, receipt RouteOnlyReceipt) context.Context {
+	return context.WithValue(ctx, routeOnlyReceiptKey{}, receipt)
+}
+
+func RouteOnlyReceiptFromContext(ctx context.Context) RouteOnlyReceipt {
+	receipt, _ := ctx.Value(routeOnlyReceiptKey{}).(RouteOnlyReceipt)
+	return receipt
+}
+
+// LogicalObservation is the endpoint owner's receipt binding.
+type LogicalObservation struct {
+	Exchange featurestats.Exchange
+	// ReturnedLink is a one-shot claim by the actual decoded callback owner.
+	// Consuming it prevents nested physical Dispatch calls from inheriting it.
+	ReturnedLink atomic.Bool
+	// InputAtExecution leaves caller-root uplink credit at the native consumer.
+	// Callback admissions that already credited decoded input keep this false.
+	InputAtExecution bool
+}
+
+func ContextWithLogicalObservation(ctx context.Context, observation *LogicalObservation) context.Context {
+	return context.WithValue(ctx, logicalObservationKey{}, observation)
+}
+
+func LogicalObservationFromContext(ctx context.Context) *LogicalObservation {
+	observation, _ := ctx.Value(logicalObservationKey{}).(*LogicalObservation)
+	return observation
 }

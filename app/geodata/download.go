@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform/filesystem"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/routing"
@@ -64,6 +65,7 @@ func newDownloader(ctx context.Context, dispatcher routing.Dispatcher, outbound 
 }
 
 func newClient(baseCtx context.Context, dispatcher routing.Dispatcher, outbound string, isHTTPS bool) *http.Client {
+	baseCtx = session.ContextWithTrafficOrigin(baseCtx, session.TrafficOriginInternal)
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
 		var conn net.Conn
 		err := task.Run(ctx, func() error {

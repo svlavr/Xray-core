@@ -17,6 +17,8 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/singbridge"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -74,6 +76,19 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	destination := ob.Target
 	network := destination.Network
 
+	if network == net.Network_UDP {
+		_, isSingPacketConn := inboundConn.(N.PacketConn)
+		_, isNetPacketConn := inboundConn.(net.PacketConn)
+		if isSingPacketConn || isNetPacketConn {
+			return errors.New("direct inbound PacketConn is unsupported; use the routed Link packet path")
+		}
+	}
+	usesObservedEndpoint := network == net.Network_TCP || network == net.Network_UDP
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, usesObservedEndpoint)
+	if observation != nil {
+		observation.Exchange.Effective(destination)
+	}
+
 	errors.LogInfo(ctx, "tunneling request to ", destination, " via ", o.server.NetAddr())
 
 	serverDestination := o.server
@@ -85,7 +100,9 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	defer connection.Close()
 
 	if session.TimeoutOnlyFromContext(ctx) {
-		ctx, _ = context.WithCancel(context.Background())
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(context.Background())
+		defer cancel()
 	}
 
 	if network == net.Network_TCP {
@@ -122,26 +139,27 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 				return errors.New("client handshake").Base(err)
 			}
 		}
-		return singbridge.CopyConn(ctx, inboundConn, link, serverConn)
+		err = singbridge.CopyConn(ctx, inboundConn, link, serverConn)
+		if err == nil && observation != nil {
+			observation.Exchange.SetEndReason(stats.EndReasonEOF)
+		}
+		return err
 	} else {
-		var packetConn N.PacketConn
-		if pc, isPacketConn := inboundConn.(N.PacketConn); isPacketConn {
-			packetConn = pc
-		} else if nc, isNetPacket := inboundConn.(net.PacketConn); isNetPacket {
-			packetConn = bufio.NewPacketConn(nc)
-		} else {
-			packetConn = &singbridge.PacketConnWrapper{
-				Reader: link.Reader,
-				Writer: link.Writer,
-				Conn:   inboundConn,
-				Dest:   destination,
-				T: signal.CancelAfterInactivity(ctx, func() {
-					common.Interrupt(link.Reader)
-				}, 300*time.Second),
-			}
+		packetConn := &singbridge.PacketConnWrapper{
+			Reader: link.Reader,
+			Writer: link.Writer,
+			Conn:   inboundConn,
+			Dest:   destination,
+			T: signal.CancelAfterInactivity(ctx, func() {
+				common.Interrupt(link.Reader)
+			}, 300*time.Second),
 		}
 
 		serverConn := o.method.DialPacketConn(connection)
-		return singbridge.ReturnError(bufio.CopyPacketConn(ctx, packetConn, serverConn))
+		err = singbridge.ReturnError(bufio.CopyPacketConn(ctx, packetConn, serverConn))
+		if err == nil && observation != nil {
+			observation.Exchange.SetEndReason(stats.EndReasonEOF)
+		}
+		return err
 	}
 }

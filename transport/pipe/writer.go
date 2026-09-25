@@ -1,6 +1,8 @@
 package pipe
 
 import (
+	"context"
+
 	"github.com/xtls/xray-core/common/buf"
 )
 
@@ -12,6 +14,12 @@ type Writer struct {
 // WriteMultiBuffer implements buf.Writer.
 func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.pipe.WriteMultiBuffer(mb)
+}
+
+// WriteMultiBufferContext cancels only this write. A canceled unqueued batch is
+// released; successful enqueue transfers custody even if cancellation follows.
+func (w *Writer) WriteMultiBufferContext(ctx context.Context, mb buf.MultiBuffer) error {
+	return w.pipe.writeMultiBuffer(mb, ctx)
 }
 
 // Close implements io.Closer. After the pipe is closed, writing to the pipe will return io.ErrClosedPipe, while reading will return io.EOF.

@@ -6,13 +6,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	C "github.com/sagernet/sing/common"
 	A "github.com/sagernet/sing/common/auth"
 	B "github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
+
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -23,10 +22,13 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal"
+
 	"github.com/xtls/xray-core/common/singbridge"
 	"github.com/xtls/xray-core/common/uuid"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -38,9 +40,12 @@ func init() {
 
 type MultiUserInbound struct {
 	sync.Mutex
-	networks []net.Network
-	users    []*protocol.MemoryUser
-	service  *shadowaead_2022.MultiService[int]
+	packetInput  sync.Mutex
+	packetOutput sync.Mutex
+	networks     []net.Network
+	users        []*protocol.MemoryUser
+	service      *shadowaead_2022.MultiService[int]
+	stats        stats.Manager
 }
 
 func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiUserInbound, error) {
@@ -67,6 +72,7 @@ func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiU
 	inbound := &MultiUserInbound{
 		networks: networks,
 		users:    memUsers,
+		stats:    core.MustFromContext(ctx).GetFeature(stats.ManagerType()).(stats.Manager),
 	}
 	if config.Key == "" {
 		return nil, errors.New("missing key")
@@ -202,8 +208,12 @@ func (i *MultiUserInbound) Process(ctx context.Context, network net.Network, con
 	ctx = session.ContextWithDispatcher(ctx, dispatcher)
 
 	if network == net.Network_TCP {
+		if proxy.ObservationStore(i.stats) != nil {
+			connection = &inspectionEndpoint{Conn: connection}
+		}
 		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
 	} else {
+		ctx = packetContext(ctx, connection)
 		reader := buf.NewReader(connection)
 		pc := &natPacketConn{connection}
 		for {
@@ -215,7 +225,9 @@ func (i *MultiUserInbound) Process(ctx context.Context, network net.Network, con
 			for _, buffer := range mb {
 				packet := B.As(buffer.Bytes()).ToOwned()
 				buffer.Release()
+				i.packetInput.Lock()
 				err = i.service.NewPacket(ctx, pc, packet, metadata)
+				i.packetInput.Unlock()
 				if err != nil {
 					packet.Release()
 					buf.ReleaseMulti(mb)
@@ -238,19 +250,15 @@ func (i *MultiUserInbound) NewConnection(ctx context.Context, conn net.Conn, met
 		Email:  user.Email,
 	})
 	errors.LogInfo(ctx, "tunnelling request to tcp:", metadata.Destination)
-	dispatcher := session.DispatcherFromContext(ctx)
 	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_TCP)
 	if err != nil {
 		return err
 	}
-	link, err := dispatcher.Dispatch(ctx, destination)
-	if err != nil {
-		return err
-	}
-	return singbridge.CopyConn(ctx, conn, link, conn)
+	return dispatchTCP(ctx, i.stats, conn, conn, destination)
 }
 
 func (i *MultiUserInbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error {
+	ctx = packetSessionContext(ctx)
 	inbound := session.InboundFromContext(ctx)
 	userInt, _ := A.UserFromContext[int](ctx)
 	user := i.users[userInt]
@@ -262,24 +270,11 @@ func (i *MultiUserInbound) NewPacketConnection(ctx context.Context, conn N.Packe
 		Email:  user.Email,
 	})
 	errors.LogInfo(ctx, "tunnelling request to udp:", metadata.Destination)
-	dispatcher := session.DispatcherFromContext(ctx)
 	destination, err := singbridge.ToDestination(metadata.Destination, net.Network_UDP)
 	if err != nil {
 		return err
 	}
-	link, err := dispatcher.Dispatch(ctx, destination)
-	if err != nil {
-		return err
-	}
-	outConn := &singbridge.PacketConnWrapper{
-		Reader: link.Reader,
-		Writer: link.Writer,
-		Dest:   destination,
-		T: signal.CancelAfterInactivity(ctx, func() {
-			common.Interrupt(link.Reader)
-		}, 300*time.Second),
-	}
-	return bufio.CopyPacketConn(ctx, conn, outConn)
+	return dispatchPacket(ctx, i.stats, conn, destination, &i.packetOutput)
 }
 
 func (i *MultiUserInbound) NewError(ctx context.Context, err error) {

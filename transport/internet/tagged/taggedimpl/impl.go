@@ -2,20 +2,133 @@ package taggedimpl
 
 import (
 	"context"
+	"io"
+	"sync"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/tagged"
 )
 
+type taggedObservation struct {
+	mu       sync.Mutex
+	conn     net.Conn
+	exchange stats.Exchange
+	closed   bool
+}
+
+func beginTaggedObservation(ctx context.Context, instance *core.Instance, destination net.Destination) (context.Context, *taggedObservation) {
+	if current := session.LogicalObservationFromContext(ctx); current != nil && current.Exchange != nil {
+		continuation := &session.LogicalObservation{Exchange: current.Exchange}
+		continuation.ReturnedLink.Store(true)
+		return session.ContextWithLogicalObservation(ctx, continuation), nil
+	}
+	feature := instance.GetFeature(stats.ManagerType())
+	provider, ok := feature.(stats.ObservationProvider)
+	if !ok {
+		return ctx, nil
+	}
+	store := provider.Observation()
+	if store == nil {
+		return ctx, nil
+	}
+	owner := new(taggedObservation)
+	var source net.Destination
+	if inbound := session.InboundFromContext(ctx); inbound != nil {
+		source = inbound.Source
+	}
+	if destination.Network == net.Network_TCP {
+		owner.exchange = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
+	} else {
+		owner.exchange = store.Begin(stats.FlowKindUDPAssociation, session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
+	}
+	if owner.exchange == nil {
+		return ctx, nil
+	}
+	observation := &session.LogicalObservation{Exchange: owner.exchange, InputAtExecution: true}
+	observation.ReturnedLink.Store(true)
+	return session.ContextWithLogicalObservation(ctx, observation), owner
+}
+
+func (o *taggedObservation) attach(conn net.Conn) {
+	o.mu.Lock()
+	o.conn = conn
+	closed := o.closed
+	o.mu.Unlock()
+	if closed {
+		conn.Close()
+	}
+}
+
+func (o *taggedObservation) Close() error {
+	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return nil
+	}
+	o.closed = true
+	conn := o.conn
+	o.mu.Unlock()
+	var err error
+	if conn != nil {
+		err = conn.Close()
+	}
+	o.exchange.Finish()
+	return err
+}
+
+func (o *taggedObservation) recordRead(n int, err error) {
+	if n > 0 {
+		o.exchange.AddDownlink(uint64(n))
+	}
+	if err == nil {
+		return
+	}
+	reason := stats.EndReasonReadError
+	if err == io.EOF {
+		reason = stats.EndReasonEOF
+	}
+	if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+		reason = stats.EndReasonTimeout
+	}
+	o.exchange.SetEndReason(reason)
+}
+
+type inspectedTaggedConn struct {
+	net.Conn
+	observation *taggedObservation
+}
+
+func (c *inspectedTaggedConn) Read(payload []byte) (int, error) {
+	n, err := c.Conn.Read(payload)
+	c.observation.recordRead(n, err)
+	return n, err
+}
+
+func (c *inspectedTaggedConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := c.Conn.(buf.Reader).ReadMultiBuffer()
+	c.observation.recordRead(int(mb.Len()), err)
+	return mb, err
+}
+
+func (c *inspectedTaggedConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return c.Conn.(buf.Writer).WriteMultiBuffer(mb)
+}
+
+func (c *inspectedTaggedConn) Close() error { return c.observation.Close() }
+
 func DialTaggedOutbound(ctx context.Context, dispatcher routing.Dispatcher, dest net.Destination, tag string) (net.Conn, error) {
-	if core.FromContext(ctx) == nil {
+	instance := core.FromContext(ctx)
+	if instance == nil {
 		return nil, errors.New("Instance context variable is not in context, dial denied. ")
 	}
+	ctx, observation := beginTaggedObservation(ctx, instance, dest)
 	content := new(session.Content)
 	content.SkipDNSResolve = true
 
@@ -24,6 +137,9 @@ func DialTaggedOutbound(ctx context.Context, dispatcher routing.Dispatcher, dest
 
 	r, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
+		if observation != nil {
+			observation.Close()
+		}
 		return nil, err
 	}
 	var readerOpt cnc.ConnectionOption
@@ -32,7 +148,12 @@ func DialTaggedOutbound(ctx context.Context, dispatcher routing.Dispatcher, dest
 	} else {
 		readerOpt = cnc.ConnectionOutputMultiUDP(r.Reader)
 	}
-	return cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt), nil
+	conn := cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt)
+	if observation == nil {
+		return conn, nil
+	}
+	observation.attach(conn)
+	return &inspectedTaggedConn{Conn: conn, observation: observation}, nil
 }
 
 func init() {

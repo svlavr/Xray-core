@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
@@ -48,14 +49,25 @@ func StartInstance(configFormat string, configBytes []byte) (*Instance, error) {
 // xray:api:stable
 func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, error) {
 	ctx = toContext(ctx, v)
+	kind := stats.FlowKindTCP
+	if dest.Network == net.Network_UDP {
+		kind = stats.FlowKindUDPAssociation
+	}
+	ctx, observation := beginAPIObservation(ctx, v, dest, kind, true)
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {
+		if observation != nil {
+			observation.Close()
+		}
 		return nil, errors.New("routing.Dispatcher is not registered in Xray core")
 	}
 
 	r, err := dispatcher.(routing.Dispatcher).Dispatch(ctx, dest)
 	if err != nil {
+		if observation != nil {
+			observation.Close()
+		}
 		return nil, err
 	}
 	var readerOpt cnc.ConnectionOption
@@ -64,7 +76,12 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 	} else {
 		readerOpt = cnc.ConnectionOutputMultiUDP(r.Reader)
 	}
-	return cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt), nil
+	conn := cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt)
+	if observation == nil {
+		return conn, nil
+	}
+	observation.attach(conn)
+	return &inspectedAPIConn{Conn: conn, observation: observation}, nil
 }
 
 // DialUDP provides a way to exchange UDP packets through Xray instance to remote servers.
@@ -75,10 +92,25 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 // xray:api:beta
 func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
 	ctx = toContext(ctx, v)
+	ctx, observation := beginAPIObservation(ctx, v, net.Destination{}, stats.FlowKindUDPAssociation, false)
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {
+		if observation != nil {
+			observation.Close()
+		}
 		return nil, errors.New("routing.Dispatcher is not registered in Xray core")
 	}
-	return udp.DialDispatcher(ctx, dispatcher.(routing.Dispatcher))
+	conn, err := udp.DialDispatcher(ctx, dispatcher.(routing.Dispatcher))
+	if err != nil {
+		if observation != nil {
+			observation.Close()
+		}
+		return nil, err
+	}
+	if observation == nil {
+		return conn, nil
+	}
+	observation.attach(conn)
+	return &inspectedAPIPacketConn{PacketConn: conn, observation: observation}, nil
 }

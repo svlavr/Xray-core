@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	go_errors "errors"
+	stdnet "net"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,7 +28,12 @@ type TCPNameServer struct {
 	destination     *net.Destination
 	reqID           uint32
 	dial            func(context.Context) (net.Conn, error)
+	routed          bool
 	clientIP        net.IP
+	mu              sync.Mutex
+	connections     map[net.Conn]struct{}
+	closed          bool
+	dialing         sync.WaitGroup
 }
 
 // NewTCPNameServer creates DNS over TCP server object for remote resolving.
@@ -40,8 +48,9 @@ func NewTCPNameServer(
 		return nil, err
 	}
 
+	s.routed = true
 	s.dial = func(ctx context.Context) (net.Conn, error) {
-		link, err := dispatcher.Dispatch(toDnsContext(ctx, s.destination.String()), *s.destination)
+		link, err := dispatcher.Dispatch(ctx, *s.destination)
 		if err != nil {
 			return nil, err
 		}
@@ -85,6 +94,7 @@ func baseTCPNameServer(url *url.URL, prefix string, disableCache bool, serveStal
 		cacheController: NewCacheController(prefix+"//"+dest.NetAddr(), disableCache, serveStale, serveExpiredTTL),
 		destination:     &dest,
 		clientIP:        clientIP,
+		connections:     make(map[net.Conn]struct{}),
 	}
 
 	return s, nil
@@ -135,7 +145,15 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		go func(r *dnsRequest) {
+		reserved, release, reserveErr := dns_feature.ReserveContextBinding(ctx)
+		if reserveErr != nil {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- reserveErr
+			}
+			continue
+		}
+		go func(r *dnsRequest, ctx context.Context, release func()) {
+			defer release()
 			dnsCtx := ctx
 
 			if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -159,19 +177,57 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
+			defer b.Release()
 
+			var owner *dnsTCPQueryOwner
+			if s.routed {
+				dnsCtx = toDnsContext(dnsCtx, s.destination.String())
+				dnsCtx, owner = beginRoutedDNSTCPObservation(dnsCtx, *s.destination, uint64(b.Len()))
+				if owner != nil {
+					defer owner.finish()
+				}
+			}
+
+			if !s.beginDial() {
+				if noResponseErrCh != nil {
+					noResponseErrCh <- context.Canceled
+				}
+				return
+			}
 			conn, err := s.dial(dnsCtx)
 			if err != nil {
+				s.dialing.Done()
 				errors.LogErrorInner(ctx, err, "failed to dial namesever")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
 				}
 				return
 			}
-			defer conn.Close()
+			tracked, ok := s.trackConnection(conn)
+			s.dialing.Done()
+			if !ok {
+				if noResponseErrCh != nil {
+					noResponseErrCh <- context.Canceled
+				}
+				return
+			}
+			conn = tracked
+			if owner != nil {
+				if err = owner.attach(conn); err != nil {
+					errors.LogErrorInner(ctx, err, "failed to attach routed DNS connection")
+					if noResponseErrCh != nil {
+						noResponseErrCh <- err
+					}
+					return
+				}
+			} else {
+				defer conn.Close()
+			}
 			dnsReqBuf := buf.New()
+			defer dnsReqBuf.Release()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
+				owner.markWriteError()
 				errors.LogErrorInner(ctx, err, "binary write failed")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
@@ -180,6 +236,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			}
 			_, err = dnsReqBuf.Write(b.Bytes())
 			if err != nil {
+				owner.markWriteError()
 				errors.LogErrorInner(ctx, err, "buffer write failed")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
@@ -190,6 +247,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 
 			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
+				owner.markWriteError()
 				errors.LogErrorInner(ctx, err, "failed to send query")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
@@ -202,6 +260,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			defer respBuf.Release()
 			n, err := respBuf.ReadFullFrom(conn, 2)
 			if err != nil && n == 0 {
+				owner.markResponseError()
 				errors.LogErrorInner(ctx, err, "failed to read response length")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
@@ -211,6 +270,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			var length uint16
 			err = binary.Read(bytes.NewReader(respBuf.Bytes()), binary.BigEndian, &length)
 			if err != nil {
+				owner.markResponseError()
 				errors.LogErrorInner(ctx, err, "failed to parse response length")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
@@ -219,6 +279,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			}
 			respBuf.Clear()
 			n, err = respBuf.ReadFullFrom(conn, int32(length))
+			owner.recordResponseRead(n, int64(length), err)
 			if err != nil && n == 0 {
 				errors.LogErrorInner(ctx, err, "failed to read response length")
 				if noResponseErrCh != nil {
@@ -229,6 +290,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 
 			rec, err := parseResponse(respBuf.Bytes())
 			if err != nil {
+				owner.markResponseDecodeError()
 				errors.LogErrorInner(ctx, err, "failed to parse DNS over TCP response")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
@@ -237,8 +299,69 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			}
 
 			s.cacheController.updateRecord(r, rec)
-		}(req)
+		}(req, reserved, release)
 	}
+}
+
+func (s *TCPNameServer) beginDial() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.dialing.Add(1)
+	return true
+}
+
+type tcpTrackedConn struct {
+	net.Conn
+	state resourceCloseState
+	done  func()
+}
+
+func (c *tcpTrackedConn) Close() error {
+	return c.state.close(func() error {
+		err := c.Conn.Close()
+		if go_errors.Is(err, stdnet.ErrClosed) {
+			return nil
+		}
+		return err
+	}, c.done)
+}
+
+func (s *TCPNameServer) trackConnection(conn net.Conn) (net.Conn, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	accepted := !s.closed
+	var tracked *tcpTrackedConn
+	tracked = &tcpTrackedConn{Conn: conn, done: func() {
+		s.mu.Lock()
+		delete(s.connections, tracked)
+		s.mu.Unlock()
+	}}
+	s.connections[tracked] = struct{}{}
+	return tracked, accepted
+}
+
+func (s *TCPNameServer) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	s.dialing.Wait()
+	s.mu.Lock()
+	connections := make([]net.Conn, 0, len(s.connections))
+	for conn := range s.connections {
+		connections = append(connections, conn)
+	}
+	s.mu.Unlock()
+	var errs []error
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	errs = append(errs, s.cacheController.Close())
+	return go_errors.Join(errs...)
 }
 
 // QueryIP implements Server.

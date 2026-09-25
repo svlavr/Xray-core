@@ -14,6 +14,8 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -25,6 +27,7 @@ type Server struct {
 	config        *ServerConfig
 	validator     *account.Validator
 	policyManager policy.Manager
+	stats         stats.Manager
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -52,6 +55,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		config:        config,
 		validator:     validator,
 		policyManager: p,
+		stats:         v.GetFeature(stats.ManagerType()).(stats.Manager),
 	}, nil
 }
 
@@ -122,10 +126,18 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			addr:   addr.NetAddr(),
 		}
 
-		return dispatcher.DispatchLink(ctx, *addr, &transport.Link{
+		link := &transport.Link{
 			Reader: reader,
 			Writer: writer,
-		})
+		}
+		if !addr.Address.Family().IsDomain() || addr.Address.Domain() != "v1.mux.cool" {
+			var cleanup func()
+			ctx, cleanup = proxy.ObserveUDP(ctx, s.stats, conn, *addr, link)
+			if cleanup != nil {
+				defer cleanup()
+			}
+		}
+		return dispatcher.DispatchLink(ctx, *addr, link)
 	} else {
 		sessionPolicy := s.policyManager.ForLevel(inbound.User.Level)
 
@@ -154,6 +166,20 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			Email:  inbound.User.Email,
 		})
 		errors.LogInfo(ctx, "tunnelling request to ", dest)
+		var observation *session.LogicalObservation
+		var observationCleanup func()
+		responsePrepared := false
+		if !dest.Address.Family().IsDomain() || dest.Address.Domain() != "v1.mux.cool" {
+			ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, s.stats, conn, dest, stats.FlowKindTCP)
+			if observationCleanup != nil {
+				defer func() {
+					if !responsePrepared {
+						observation.Exchange.SetEndReason(stats.EndReasonRejected)
+					}
+					observationCleanup()
+				}()
+			}
+		}
 
 		bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 		err = WriteTCPResponse(bufferedWriter, true, "")
@@ -163,11 +189,25 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		if err := bufferedWriter.SetBuffered(false); err != nil {
 			return err
 		}
+		responsePrepared = true
 
-		return dispatcher.DispatchLink(ctx, dest, &transport.Link{
+		link := &transport.Link{
 			Reader: buf.NewReader(conn),
 			Writer: bufferedWriter,
-		})
+		}
+		if observation != nil {
+			cursor := proxy.ObserveDecodedReader(link.Reader, observation.Exchange, func() {})
+			link.Reader = cursor
+			link.Writer = buf.AttachWriterReceipt(link.Writer, observation.Exchange)
+			defer cursor.Interrupt()
+		}
+		if err := dispatcher.DispatchLink(ctx, dest, link); err != nil {
+			if observation != nil {
+				observation.Exchange.SetEndReason(stats.EndReasonRejected)
+			}
+			return err
+		}
+		return nil
 	}
 }
 

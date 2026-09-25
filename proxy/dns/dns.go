@@ -20,6 +20,8 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -151,6 +153,45 @@ func (h *Handler) applyRules(qType dnsmessage.Type, domain string) (RuleAction, 
 	return RuleAction_Return, dnsmessage.RCodeSuccess
 }
 
+type observedMessageReader struct {
+	dns_proto.MessageReader
+	receipt stats.Exchange
+}
+
+func (r *observedMessageReader) ReadMessage() (*buf.Buffer, error) {
+	b, err := r.MessageReader.ReadMessage()
+	if b != nil {
+		r.receipt.AddUplink(uint64(b.Len()))
+	}
+	if err != nil {
+		reason := stats.EndReasonReadError
+		if err == io.EOF {
+			reason = stats.EndReasonEOF
+		} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+			reason = stats.EndReasonTimeout
+		}
+		r.receipt.SetEndReason(reason)
+	}
+	return b, err
+}
+
+type observedMessageWriter struct {
+	dns_proto.MessageWriter
+	receipt stats.Exchange
+}
+
+func (w *observedMessageWriter) WriteMessage(b *buf.Buffer) error {
+	size := uint64(b.Len())
+	err := w.MessageWriter.WriteMessage(b)
+	if err == nil {
+		w.receipt.AddDownlink(size)
+	} else {
+		w.receipt.MarkDownlinkIncomplete()
+		w.receipt.SetEndReason(stats.EndReasonWriteError)
+	}
+	return err
+}
+
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.Dialer) error {
 	outbounds := session.OutboundsFromContext(ctx)
@@ -181,6 +222,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		},
 		connReady: make(chan struct{}, 1),
 	}
+	receipt := proxy.ClaimDecodedEndpoint(ctx, link.Reader)
 
 	var reader dns_proto.MessageReader
 	var writer dns_proto.MessageWriter
@@ -196,6 +238,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		writer = &dns_proto.UDPWriter{
 			Writer: link.Writer,
 		}
+	}
+	if receipt != nil {
+		reader = &observedMessageReader{MessageReader: reader, receipt: receipt}
+		writer = &observedMessageWriter{MessageWriter: writer, receipt: receipt}
 	}
 
 	var connReader dns_proto.MessageReader
@@ -214,8 +260,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		}
 	}
 
-	if session.TimeoutOnlyFromContext(ctx) {
-		ctx = context.Background()
+	if session.TimeoutOnlyFromContext(ctx) && receipt == nil {
+		ctx = dns.CopyContextBinding(context.Background(), ctx)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -271,7 +317,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 						return err
 					}
 				} else {
-					go h.handleIPQuery(id, qType, domain, writer, timer)
+					queryCtx, release, reserveErr := dns.ReserveContextBinding(ctx)
+					if reserveErr != nil {
+						errors.LogInfoInner(ctx, reserveErr, "failed to reserve causal DNS query")
+						continue
+					}
+					go func() {
+						defer release()
+						h.handleIPQuery(queryCtx, id, qType, domain, writer, timer)
+					}()
 				}
 			case RuleAction_Direct:
 				if err := connWriter.WriteMessage(b); err != nil {
@@ -310,20 +364,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 	return nil
 }
 
-func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter, timer *signal.ActivityTimer) {
+func (h *Handler) handleIPQuery(ctx context.Context, id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter, timer *signal.ActivityTimer) {
 	var ips []net.IP
 	var ttl uint32
 	var err error
 
 	switch qType {
 	case dnsmessage.TypeA:
-		ips, ttl, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl, err = dns.LookupIPContext(ctx, h.client, domain, dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: false,
 			FakeEnable: true,
 		})
 	case dnsmessage.TypeAAAA:
-		ips, ttl, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl, err = dns.LookupIPContext(ctx, h.client, domain, dns.IPOption{
 			IPv4Enable: false,
 			IPv6Enable: true,
 			FakeEnable: true,
@@ -493,6 +547,10 @@ func (c *outboundConn) Read(b []byte) (int, error) {
 
 func (c *outboundConn) Close() error {
 	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return nil
+	}
 	c.closed = true
 	close(c.connReady)
 	if c.conn != nil {

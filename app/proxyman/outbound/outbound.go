@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -13,12 +14,18 @@ import (
 	"github.com/xtls/xray-core/features/outbound"
 )
 
+type handlerEntry struct {
+	handler outbound.Handler
+	serial  uint64
+}
+
 // Manager is to manage all outbound handlers.
 type Manager struct {
 	access           sync.RWMutex
-	defaultHandler   outbound.Handler
-	taggedHandler    map[string]outbound.Handler
-	untaggedHandlers []outbound.Handler
+	defaultHandler   *handlerEntry
+	taggedHandler    map[string]*handlerEntry
+	untaggedHandlers []*handlerEntry
+	nextSerial       uint64
 	running          bool
 	tagsCache        *sync.Map
 }
@@ -26,7 +33,7 @@ type Manager struct {
 // New creates a new Manager.
 func New(ctx context.Context, config *proxyman.OutboundConfig) (*Manager, error) {
 	m := &Manager{
-		taggedHandler: make(map[string]outbound.Handler),
+		taggedHandler: make(map[string]*handlerEntry),
 		tagsCache:     &sync.Map{},
 	}
 	return m, nil
@@ -45,13 +52,13 @@ func (m *Manager) Start() error {
 	m.running = true
 
 	for _, h := range m.taggedHandler {
-		if err := h.Start(); err != nil {
+		if err := h.handler.Start(); err != nil {
 			return err
 		}
 	}
 
 	for _, h := range m.untaggedHandlers {
-		if err := h.Start(); err != nil {
+		if err := h.handler.Start(); err != nil {
 			return err
 		}
 	}
@@ -68,11 +75,11 @@ func (m *Manager) Close() error {
 
 	var errs []error
 	for _, h := range m.taggedHandler {
-		errs = append(errs, h.Close())
+		errs = append(errs, h.handler.Close())
 	}
 
 	for _, h := range m.untaggedHandlers {
-		errs = append(errs, h.Close())
+		errs = append(errs, h.handler.Close())
 	}
 
 	return errors.Combine(errs...)
@@ -86,7 +93,7 @@ func (m *Manager) GetDefaultHandler() outbound.Handler {
 	if m.defaultHandler == nil {
 		return nil
 	}
-	return m.defaultHandler
+	return m.defaultHandler.handler
 }
 
 // GetHandler implements outbound.Manager.
@@ -94,7 +101,7 @@ func (m *Manager) GetHandler(tag string) outbound.Handler {
 	m.access.RLock()
 	defer m.access.RUnlock()
 	if handler, found := m.taggedHandler[tag]; found {
-		return handler
+		return handler.handler
 	}
 	return nil
 }
@@ -105,9 +112,9 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 	defer m.access.Unlock()
 
 	m.tagsCache = &sync.Map{}
-
+	entry := &handlerEntry{handler: handler}
 	if m.defaultHandler == nil {
-		m.defaultHandler = handler
+		m.defaultHandler = entry
 	}
 
 	tag := handler.Tag()
@@ -115,9 +122,14 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 		if _, found := m.taggedHandler[tag]; found {
 			return errors.New("existing tag found: " + tag)
 		}
-		m.taggedHandler[tag] = handler
+		m.taggedHandler[tag] = entry
 	} else {
-		m.untaggedHandlers = append(m.untaggedHandlers, handler)
+		m.untaggedHandlers = append(m.untaggedHandlers, entry)
+	}
+
+	if m.nextSerial < math.MaxUint64 {
+		m.nextSerial++
+		entry.serial = m.nextSerial
 	}
 
 	if m.running {
@@ -138,7 +150,7 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 	m.tagsCache = &sync.Map{}
 
 	delete(m.taggedHandler, tag)
-	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
+	if m.defaultHandler != nil && m.defaultHandler.handler.Tag() == tag {
 		m.defaultHandler = nil
 	}
 
@@ -150,11 +162,13 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 	m.access.RLock()
 	defer m.access.RUnlock()
 
-	response := make([]outbound.Handler, len(m.untaggedHandlers))
-	copy(response, m.untaggedHandlers)
+	response := make([]outbound.Handler, 0, len(m.untaggedHandlers)+len(m.taggedHandler))
+	for _, e := range m.untaggedHandlers {
+		response = append(response, e.handler)
+	}
 
 	for _, v := range m.taggedHandler {
-		response = append(response, v)
+		response = append(response, v.handler)
 	}
 
 	return response
@@ -163,12 +177,11 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 // Select implements outbound.HandlerSelector.
 func (m *Manager) Select(selectors []string) []string {
 	key := strings.Join(selectors, ",")
+	m.access.RLock()
+	defer m.access.RUnlock()
 	if cache, ok := m.tagsCache.Load(key); ok {
 		return cache.([]string)
 	}
-
-	m.access.RLock()
-	defer m.access.RUnlock()
 
 	tags := make([]string, 0, len(selectors))
 
@@ -185,6 +198,21 @@ func (m *Manager) Select(selectors []string) []string {
 	m.tagsCache.Store(key, tags)
 
 	return tags
+}
+
+// ResolveHandler returns the selected entry and its non-reused insertion serial
+// under the same native manager lock. The empty tag selects the default entry.
+func (m *Manager) ResolveHandler(tag string, useDefault bool) (outbound.Handler, uint64) {
+	m.access.RLock()
+	defer m.access.RUnlock()
+	entry := m.taggedHandler[tag]
+	if useDefault {
+		entry = m.defaultHandler
+	}
+	if entry == nil {
+		return nil, 0
+	}
+	return entry.handler, entry.serial
 }
 
 func init() {

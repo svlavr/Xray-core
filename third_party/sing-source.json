@@ -1,0 +1,11 @@
+{
+  "module": "github.com/sagernet/sing",
+  "upstream": "https://github.com/SagerNet/sing.git",
+  "upstream_commit": "8c0bf1c05e576e854cb071ca1116958df7bf6692",
+  "upstream_version": "v0.5.1",
+  "reviewed_commit": "d572e2debaa3694504ef8e3c506b16db10e2f05d",
+  "reviewed_tree": "04623baa2908ab0639da9efae4f4930c59869c1b",
+  "files": 278,
+  "bytes": 583163,
+  "sha256": "a361a8cc1d29fd22180d3d53e61d7185823992567c58662ae644f15b976da49e"
+}

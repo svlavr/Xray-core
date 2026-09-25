@@ -36,6 +36,18 @@ const (
 	statusCmdNotSupport = 0x07
 )
 
+// decodedSocks4Rejection carries only a fully parsed request target back to
+// the native admission owner. A handshake or authentication failure before
+// target decoding must not create a logical exchange.
+type decodedSocks4Rejection struct {
+	destination net.Destination
+	responseErr error
+	cause       error
+}
+
+func (e *decodedSocks4Rejection) Error() string { return e.cause.Error() }
+func (e *decodedSocks4Rejection) Unwrap() error { return e.cause }
+
 var addrParser = protocol.NewAddressParser(
 	protocol.AddressFamilyByte(0x01, net.AddressFamilyIPv4),
 	protocol.AddressFamilyByte(0x04, net.AddressFamilyIPv6),
@@ -93,8 +105,12 @@ func (s *ServerSession) handshake4(cmd byte, reader io.Reader, writer io.Writer)
 		}
 		return request, nil
 	default:
-		writeSocks4Response(writer, socks4RequestRejected, net.AnyIP, net.Port(0))
-		return nil, errors.New("unsupported command: ", cmd)
+		responseErr := writeSocks4Response(writer, socks4RequestRejected, net.AnyIP, net.Port(0))
+		return nil, &decodedSocks4Rejection{
+			destination: net.TCPDestination(address, port),
+			responseErr: responseErr,
+			cause:       errors.New("unsupported command: ", cmd),
+		}
 	}
 }
 
