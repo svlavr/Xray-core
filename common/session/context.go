@@ -240,25 +240,7 @@ func StreamSettingsFromContext(ctx context.Context) any {
 
 type (
 	logicalObservationKey struct{}
-	routeOnlyReceiptKey   struct{}
 )
-
-// RouteOnlyReceipt captures the selected physical route without creating or
-// inheriting a logical observation. Offer may be repeated by continuations;
-// Commit freezes the route at the actual consuming endpoint claim.
-type RouteOnlyReceipt interface {
-	Offer(featurestats.RouteStep)
-	Commit()
-}
-
-func ContextWithRouteOnlyReceipt(ctx context.Context, receipt RouteOnlyReceipt) context.Context {
-	return context.WithValue(ctx, routeOnlyReceiptKey{}, receipt)
-}
-
-func RouteOnlyReceiptFromContext(ctx context.Context) RouteOnlyReceipt {
-	receipt, _ := ctx.Value(routeOnlyReceiptKey{}).(RouteOnlyReceipt)
-	return receipt
-}
 
 // LogicalObservation is the endpoint owner's receipt binding.
 type LogicalObservation struct {

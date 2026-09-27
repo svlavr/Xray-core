@@ -88,10 +88,9 @@ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) 
 	return LookupForIPContext(context.Background(), domain, strategy, localAddr)
 }
 
-// LookupForIPContext preserves an opaque causal DNS binding before consulting
-// the process-global client.
+// LookupForIPContext preserves caller cancellation for DNS resolution.
 func LookupForIPContext(ctx context.Context, domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
-	if dnsClient == nil && !dns.HasContextBinding(ctx) {
+	if dnsClient == nil {
 		return nil, errors.New("DNS client not initialized").AtError()
 	}
 
@@ -115,6 +114,9 @@ func LookupForIPContext(ctx context.Context, domain string, strategy DomainStrat
 }
 
 func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.Handler) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
 	outbounds := session.OutboundsFromContext(ctx)
 	ctx = session.ContextWithOutbounds(ctx, append(outbounds, &session.Outbound{
@@ -122,17 +124,11 @@ func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.H
 		Gateway: nil,
 		Tag:     obt,
 	})) // add another outbound in session ctx
-	dispatchCtx, release, err := dns.ReserveContextBinding(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
 	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
 
 	go func() {
-		defer release()
-		detached := dns.CopyContextBinding(context.WithoutCancel(dispatchCtx), dispatchCtx)
+		detached := dns.CopyContextOwner(context.WithoutCancel(ctx), ctx)
 		h.Dispatch(detached, &transport.Link{Reader: ur, Writer: dw})
 	}()
 	var readerOpt cnc.ConnectionOption

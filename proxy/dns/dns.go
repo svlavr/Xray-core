@@ -250,7 +250,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 	}
 
 	if session.TimeoutOnlyFromContext(ctx) && receipt == nil {
-		ctx = dns.CopyContextBinding(context.Background(), ctx)
+		ctx = dns.CopyContextOwner(context.Background(), ctx)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -306,14 +306,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 						return err
 					}
 				} else {
-					queryCtx, release, reserveErr := dns.ReserveContextBinding(ctx)
-					if reserveErr != nil {
-						errors.LogInfoInner(ctx, reserveErr, "failed to reserve causal DNS query")
-						continue
-					}
 					go func() {
-						defer release()
-						h.handleIPQuery(queryCtx, id, qType, domain, writer, timer)
+						h.handleIPQuery(ctx, id, qType, domain, writer, timer)
 					}()
 				}
 			case RuleAction_Direct:

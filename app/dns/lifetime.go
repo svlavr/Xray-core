@@ -5,163 +5,51 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
 )
 
-type RetirementDisposition string
-
-const (
-	Retired        RetirementDisposition = "RETIRED"
-	WaitIncomplete RetirementDisposition = "WAIT_INCOMPLETE"
-	RetireFailed   RetirementDisposition = "RETIRE_FAILED"
-)
-
-type RetirementResult struct {
-	Generation  uint64
-	Terminal    bool
-	Disposition RetirementDisposition
-	Failure     FailureClass
-}
-
-type RetirementReceipt struct {
-	generation uint64
-	mu         sync.Mutex
-	done       chan struct{}
-	doneClosed bool
-	result     RetirementResult
-	retrying   bool
-	retry      func() RetirementResult
-}
-
-func newRetirementReceipt(generation uint64) *RetirementReceipt {
-	return &RetirementReceipt{
-		generation: generation,
-		done:       make(chan struct{}),
-		result:     RetirementResult{Generation: generation, Disposition: WaitIncomplete},
-	}
-}
-
-func (r *RetirementReceipt) complete(result RetirementResult) {
-	r.mu.Lock()
-	if r.result.Terminal {
-		r.mu.Unlock()
-		return
-	}
-	r.result = result
-	if result.Terminal {
-		r.retry = nil
-	}
-	if !r.doneClosed {
-		close(r.done)
-		r.doneClosed = true
-	}
-	r.mu.Unlock()
-}
-
-func (r *RetirementReceipt) Wait(ctx context.Context) RetirementResult {
-	r.mu.Lock()
-	done := r.done
-	result := r.result
-	r.mu.Unlock()
-	if result.Terminal || result.Disposition == RetireFailed {
-		return result
-	}
-	select {
-	case <-done:
-		r.mu.Lock()
-		result = r.result
-		r.mu.Unlock()
-		return result
-	case <-ctx.Done():
-		return RetirementResult{Generation: r.generation, Disposition: WaitIncomplete, Failure: FailureCanceled}
-	}
-}
-
-func (r *RetirementReceipt) Retry(ctx context.Context) RetirementResult {
-	r.mu.Lock()
-	if r.result.Terminal {
-		result := r.result
-		r.mu.Unlock()
-		return result
-	}
-	if r.result.Disposition != RetireFailed || r.retry == nil || r.retrying {
-		r.mu.Unlock()
-		return RetirementResult{Generation: r.generation, Disposition: WaitIncomplete}
-	}
-	r.retrying = true
-	retry := r.retry
-	r.mu.Unlock()
-
-	done := make(chan RetirementResult, 1)
-	go func() {
-		result := retry()
-		r.mu.Lock()
-		r.retrying = false
-		if !r.result.Terminal {
-			r.result = result
-			if result.Terminal {
-				r.retry = nil
-			}
-		}
-		result = r.result
-		r.mu.Unlock()
-		done <- result
-	}()
-	select {
-	case result := <-done:
-		return result
-	case <-ctx.Done():
-		return RetirementResult{Generation: r.generation, Disposition: WaitIncomplete, Failure: FailureCanceled}
-	}
-}
-
+// dnsRuntime owns the published resolver and, at most, one unfinished close.
+// The feature mutex serializes publication and admission. Each resolver joins
+// its admitted queries before its resource references can be forgotten.
 type dnsRuntime struct {
-	mu              sync.Mutex
-	current         *dnsGeneration
-	retiring        *dnsGeneration
-	retiringReceipt *RetirementReceipt
-	preparing       bool
-	prepDone        chan struct{}
-	closed          bool
-	closeDone       chan struct{}
-	closeErr        error
-	nextID          uint64
-	dispatcher      routing.Dispatcher
-	fake            featuredns.FakeDNSEngine
-	contextOwner    *featuredns.ContextOwner
-	retirementWork  sync.WaitGroup
+	mu           sync.Mutex
+	closeMu      sync.Mutex
+	current      *resolverOwner
+	closing      *resolverOwner
+	preparing    bool
+	prepDone     chan struct{}
+	closed       bool
+	dispatcher   routing.Dispatcher
+	fake         featuredns.FakeDNSEngine
+	contextOwner *featuredns.ContextOwner
 }
 
-type dnsGeneration struct {
-	id       uint64
-	owner    *DNS
-	resolver *DNS
-	ctx      context.Context
-	cancel   context.CancelFunc
-
-	mu     sync.Mutex
-	cond   *sync.Cond
-	sealed bool
-	leases int
-	closed bool
-
-	cleanupMu   sync.Mutex
-	cleanupDone bool
-	resources   []*generationResourceState
+type resolverOwner struct {
+	resolver  *DNS
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	cond      *sync.Cond
+	queries   int
+	closed    bool
+	closing   bool
+	done      chan struct{}
+	err       error
+	resources []*resourceState
 }
 
-type generationResourceState struct {
+type resourceState struct {
 	name     string
-	resource generationResource
+	resource interface{ Close() error }
 	done     bool
 }
 
+// resourceCloseState is local to a concrete native connection owner. Failed
+// closes retain that connection so the owner can reach it on the next Close.
 type resourceCloseState struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
@@ -204,13 +92,8 @@ func (s *resourceCloseState) close(run func() error, onSuccess func()) error {
 	return err
 }
 
-type dnsLease struct {
-	generation *dnsGeneration
-	active     atomic.Bool
-}
-
-// ownedPeriodic is a DNS-local periodic owner with an explicit in-flight join.
-// It replaces task.Periodic only where truthful generation retirement needs it.
+// ownedPeriodic preserves the cache and UDP cleanup worker join already needed
+// by their native owners; it carries no resolver identity or query capability.
 type ownedPeriodic struct {
 	mu       sync.Mutex
 	interval time.Duration
@@ -269,8 +152,7 @@ func (p *ownedPeriodic) scheduleLocked() {
 
 func (p *ownedPeriodic) Close() error {
 	p.mu.Lock()
-	p.closed = true
-	p.running = false
+	p.closed, p.running = true, false
 	if p.timer != nil {
 		p.timer.Stop()
 		p.timer = nil
@@ -280,211 +162,160 @@ func (p *ownedPeriodic) Close() error {
 	return nil
 }
 
-func newDNSGeneration(owner, resolver *DNS, id uint64) *dnsGeneration {
+func newResolverOwner(resolver *DNS) *resolverOwner {
 	ctx, cancel := context.WithCancel(context.Background())
-	g := &dnsGeneration{id: id, owner: owner, resolver: resolver, ctx: ctx, cancel: cancel, resources: resolverResources(resolver)}
-	g.cond = sync.NewCond(&g.mu)
-	return g
+	o := &resolverOwner{resolver: resolver, ctx: ctx, cancel: cancel, resources: resolverResources(resolver)}
+	o.cond = sync.NewCond(&o.mu)
+	return o
 }
 
-func (g *dnsGeneration) acquireRoot() (*dnsLease, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.sealed {
-		return nil, &featuredns.CausalBindingError{Reason: "generation sealed"}
+func (o *resolverOwner) admit() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return false
 	}
-	g.leases++
-	lease := &dnsLease{generation: g}
-	lease.active.Store(true)
-	return lease, nil
+	o.queries++
+	return true
 }
 
-func (g *dnsGeneration) acquireChild(parent *dnsLease, speculative bool) (*dnsLease, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if parent == nil || parent.generation != g || !parent.active.Load() || g.closed || speculative && g.sealed {
-		return nil, &featuredns.CausalBindingError{Reason: "parent lease expired"}
+func (o *resolverOwner) release() {
+	o.mu.Lock()
+	o.queries--
+	if o.queries == 0 {
+		o.cond.Broadcast()
 	}
-	g.leases++
-	lease := &dnsLease{generation: g}
-	lease.active.Store(true)
-	return lease, nil
+	o.mu.Unlock()
 }
 
-func (l *dnsLease) release() {
-	if l == nil || !l.active.Swap(false) {
-		return
-	}
-	g := l.generation
-	g.mu.Lock()
-	g.leases--
-	if g.leases == 0 {
-		g.cond.Broadcast()
-	}
-	g.mu.Unlock()
+func (o *resolverOwner) stop() {
+	o.mu.Lock()
+	o.closed = true
+	o.cancel()
+	o.mu.Unlock()
 }
 
-func (g *dnsGeneration) bind(ctx context.Context, lease *dnsLease) context.Context {
-	var binding *featuredns.ContextBinding
-	binding = featuredns.NewContextBindingWithSpeculation(g.owner.runtime.contextOwner,
-		func(callCtx context.Context, domain string, option featuredns.IPOption) ([]net.IP, uint32, error) {
-			return g.lookupChild(callCtx, lease, domain, option)
-		},
-		func(childCtx context.Context) (context.Context, func(), error) {
-			child, err := g.acquireChild(lease, false)
-			if err != nil {
-				return nil, nil, err
-			}
-			queryCtx, cancel := g.queryContext(childCtx)
-			return g.bind(queryCtx, child), func() { cancel(); child.release() }, nil
-		},
-		func(childCtx context.Context) (context.Context, func(), error) {
-			child, err := g.acquireChild(lease, true)
-			if err != nil {
-				return nil, nil, err
-			}
-			queryCtx, cancel := g.queryContext(childCtx)
-			return g.bind(queryCtx, child), func() { cancel(); child.release() }, nil
-		},
-		func() bool { return g.bindingValid(lease) },
-		g.ctx,
-	)
-	return featuredns.ContextWithBinding(ctx, binding)
-}
-
-func (g *dnsGeneration) bindingValid(lease *dnsLease) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return lease != nil && lease.generation == g && lease.active.Load() && !g.closed
-}
-
-func (g *dnsGeneration) lookupChild(ctx context.Context, parent *dnsLease, domain string, option featuredns.IPOption) ([]net.IP, uint32, error) {
-	lease, err := g.acquireChild(parent, false)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer lease.release()
-	ownerCtx, releaseOwnerCtx := owningDNSContext(g.owner.ctx, ctx)
-	defer releaseOwnerCtx()
-	queryCtx, cancel := g.queryContext(g.bind(ownerCtx, lease))
-	defer cancel()
-	return g.resolver.lookupIP(queryCtx, domain, option)
-}
-
-func (g *dnsGeneration) queryContext(ctx context.Context) (context.Context, func()) {
-	queryCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(g.ctx, cancel)
-	return queryCtx, func() { stop(); cancel() }
-}
-
-func (g *dnsGeneration) markSealed(cancel bool) {
-	g.mu.Lock()
-	g.sealed = true
-	if cancel {
-		g.closed = true
-		g.cancel()
-	}
-	g.mu.Unlock()
-}
-
-func (g *dnsGeneration) stopSpeculation() {
-	for _, client := range g.resolver.clients {
-		if cached, ok := client.server.(CachedNameserver); ok {
-			cached.getCacheController().Seal()
-		}
-	}
-}
-
-func (g *dnsGeneration) waitLeases() {
-	g.mu.Lock()
-	for g.leases != 0 {
-		g.cond.Wait()
-	}
-	g.mu.Unlock()
-}
-
-func (g *dnsGeneration) closeResources() error {
-	g.mu.Lock()
-	g.closed = true
-	g.mu.Unlock()
-
-	g.cleanupMu.Lock()
-	defer g.cleanupMu.Unlock()
-	if g.cleanupDone {
-		return nil
-	}
+func (o *resolverOwner) closeResources() error {
 	var errs []error
-	allDone := true
-	for _, state := range g.resources {
+	for _, state := range o.resources {
 		if state.done {
 			continue
 		}
 		if err := state.resource.Close(); err != nil {
-			allDone = false
 			errs = append(errs, fmt.Errorf("close %s: %w", state.name, err))
 		} else {
 			state.done = true
 		}
 	}
-	g.cleanupDone = allDone
 	return errors.Join(errs...)
 }
 
-func (s *DNS) initRuntime(dispatcher routing.Dispatcher, fake featuredns.FakeDNSEngine, resolver *DNS) {
-	rt := &dnsRuntime{dispatcher: dispatcher, fake: fake, nextID: 2, closeDone: make(chan struct{}), contextOwner: featuredns.NewContextOwner()}
-	rt.current = newDNSGeneration(s, resolver, 1)
-	s.runtime = rt
+// closeOwned first interrupts concrete resources, then joins admitted queries.
+// A failed resource is retained in the same owner for a later feature Close.
+func (o *resolverOwner) closeOwned() error {
+	o.mu.Lock()
+	if o.closing {
+		done := o.done
+		o.mu.Unlock()
+		<-done
+		return o.err
+	}
+	o.closing = true
+	o.done = make(chan struct{})
+	o.mu.Unlock()
+	o.stop()
+	err := o.closeResources()
+	o.mu.Lock()
+	for o.queries != 0 {
+		o.cond.Wait()
+	}
+	o.mu.Unlock()
+	o.resolver.queryWorkers.Wait()
+	o.mu.Lock()
+	o.err = err
+	o.closing = false
+	close(o.done)
+	o.mu.Unlock()
+	return err
 }
 
-func (s *DNS) acquireCurrent() (*dnsGeneration, *dnsLease, error) {
+func (s *DNS) initRuntime(dispatcher routing.Dispatcher, fake featuredns.FakeDNSEngine, resolver *DNS) {
+	s.runtime = &dnsRuntime{current: newResolverOwner(resolver), dispatcher: dispatcher, fake: fake, contextOwner: featuredns.NewContextOwner()}
+}
+
+func (s *DNS) acquireCurrent() (*resolverOwner, error) {
 	rt := s.runtime
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if rt.closed {
-		return nil, nil, &featuredns.CausalBindingError{Reason: "DNS feature closed"}
+	if rt.closed || rt.current == nil {
+		return nil, context.Canceled
 	}
-	g := rt.current
-	lease, err := g.acquireRoot()
-	return g, lease, err
+	owner := rt.current
+	if !owner.admit() {
+		return nil, context.Canceled
+	}
+	return owner, nil
+}
+
+func (s *DNS) finishPreparation() {
+	rt := s.runtime
+	rt.mu.Lock()
+	rt.preparing = false
+	close(rt.prepDone)
+	rt.prepDone = nil
+	rt.mu.Unlock()
+}
+
+func (s *DNS) closeUnpublished(candidate *DNS) error {
+	o := newResolverOwner(candidate)
+	rt := s.runtime
+	rt.mu.Lock()
+	if rt.closing != nil {
+		rt.mu.Unlock()
+		return fmt.Errorf("DNS cleanup owner occupied")
+	}
+	rt.closing = o
+	rt.mu.Unlock()
+	err := o.closeOwned()
+	if err == nil {
+		rt.mu.Lock()
+		if rt.closing == o {
+			rt.closing = nil
+		}
+		rt.mu.Unlock()
+	}
+	return err
 }
 
 func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	rt := s.runtime
 	rt.mu.Lock()
-	if rt.closed {
+	switch {
+	case rt.closed:
 		rt.mu.Unlock()
-		return ApplyResult{Disposition: ApplyClosed, Failure: FailureCanceled}
-	}
-	if rt.preparing {
+		return ApplyResult{Err: context.Canceled}
+	case rt.preparing:
 		rt.mu.Unlock()
-		return ApplyResult{Disposition: ApplyBusy}
-	}
-	if rt.retiring != nil {
+		return ApplyResult{Err: fmt.Errorf("DNS update already in progress")}
+	case rt.closing != nil:
 		rt.mu.Unlock()
-		return ApplyResult{Disposition: ApplyRetiringLimit}
+		return ApplyResult{Err: fmt.Errorf("previous DNS resolver cleanup incomplete")}
 	}
 	rt.preparing = true
 	rt.prepDone = make(chan struct{})
 	dispatcher, fake := rt.dispatcher, rt.fake
 	rt.mu.Unlock()
+	defer s.finishPreparation()
 
-	finishPreparation := func() {
-		rt.mu.Lock()
-		if rt.preparing {
-			rt.preparing = false
-			close(rt.prepDone)
-			rt.prepDone = nil
-		}
-		rt.mu.Unlock()
-	}
 	clone, err := cloneAndValidateConfig(config)
 	if err != nil {
-		finishPreparation()
-		return ApplyResult{Disposition: ApplyPrepareFailed, Failure: FailureInvalid}
+		return ApplyResult{Err: err}
+	}
+	if len(clone.NameServer) == 0 {
+		return ApplyResult{Err: fmt.Errorf("explicit DNS update requires a nameserver")}
 	}
 	if err := ctx.Err(); err != nil {
-		finishPreparation()
-		return ApplyResult{Disposition: ApplyCanceled, Failure: FailureCanceled}
+		return ApplyResult{Err: err}
 	}
 	if instance := core.FromContext(s.ctx); instance != nil {
 		if dispatcher == nil {
@@ -494,7 +325,6 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 			fake, _ = instance.GetFeature((*featuredns.FakeDNSEngine)(nil)).(featuredns.FakeDNSEngine)
 		}
 	}
-
 	var candidate *DNS
 	func() {
 		defer func() {
@@ -505,82 +335,51 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 		candidate, err = buildDNS(context.Background(), clone, dispatcher, fake)
 	}()
 	if err != nil {
-		finishPreparation()
-		return ApplyResult{Disposition: ApplyPrepareFailed, Failure: preparationFailureClass(err)}
+		return ApplyResult{Err: err}
 	}
+	candidate.strictSelection = true
 	if err := ctx.Err(); err != nil {
-		_ = closeResolverResources(candidate)
-		finishPreparation()
-		return ApplyResult{Disposition: ApplyCanceled, Failure: FailureCanceled}
+		return ApplyResult{Err: errors.Join(err, s.closeUnpublished(candidate))}
 	}
-
 	rt.mu.Lock()
-	if rt.closed {
+	if rt.closed || ctx.Err() != nil {
 		rt.mu.Unlock()
-		_ = closeResolverResources(candidate)
-		finishPreparation()
-		return ApplyResult{Disposition: ApplyClosed, Failure: FailureCanceled}
+		return ApplyResult{Err: errors.Join(context.Canceled, ctx.Err(), s.closeUnpublished(candidate))}
 	}
 	old := rt.current
-	newGeneration := newDNSGeneration(s, candidate, rt.nextID)
-	rt.nextID++
-	rt.current = newGeneration
-	rt.retiring = old
+	rt.current = newResolverOwner(candidate)
+	rt.closing = old
 	rt.dispatcher, rt.fake = dispatcher, fake
-	old.markSealed(false)
-	receipt := newRetirementReceipt(old.id)
-	receipt.retry = func() RetirementResult { return s.retryRetirement(old) }
-	rt.retiringReceipt = receipt
-	rt.retirementWork.Add(1)
+	old.stop()
 	rt.mu.Unlock()
-	old.stopSpeculation()
-
-	go s.retireGeneration(old, receipt)
-	finishPreparation()
-	return ApplyResult{
-		Disposition: ApplyApplied, Generation: newGeneration.id, PreviousGeneration: old.id, Retirement: receipt,
+	// Publication is complete. Cancellation, resource close, and query join are
+	// bounded by ctx for the caller; unfinished work remains in rt.closing.
+	done := make(chan error, 1)
+	go func() {
+		err := old.closeOwned()
+		if err == nil {
+			rt.mu.Lock()
+			if rt.closing == old {
+				rt.closing = nil
+			}
+			rt.mu.Unlock()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return ApplyResult{Applied: true, Err: err}
+	case <-ctx.Done():
+		return ApplyResult{Applied: true, Err: ctx.Err()}
 	}
 }
 
-func (s *DNS) retireGeneration(g *dnsGeneration, receipt *RetirementReceipt) {
-	defer s.runtime.retirementWork.Done()
-	g.waitLeases()
-	result := s.finishRetirement(g)
-	receipt.complete(result)
-}
-
-func (s *DNS) finishRetirement(g *dnsGeneration) RetirementResult {
-	g.cancel()
-	err := g.closeResources()
-	result := RetirementResult{Generation: g.id, Terminal: err == nil, Disposition: Retired}
-	if err != nil {
-		result.Disposition = RetireFailed
-		result.Failure = FailureCleanup
-		return result
-	}
-	s.runtime.mu.Lock()
-	if s.runtime.retiring == g {
-		s.runtime.retiring = nil
-		s.runtime.retiringReceipt = nil
-	}
-	s.runtime.mu.Unlock()
-	return result
-}
-
-func (s *DNS) retryRetirement(g *dnsGeneration) RetirementResult {
-	// Resource closers are idempotent. A retained failed generation remains in
-	// the bounded slot until every closer reports success.
-	return s.finishRetirement(g)
-}
-
-type generationResource interface{ Close() error }
-
-func resolverResources(resolver *DNS) []*generationResourceState {
+func resolverResources(resolver *DNS) []*resourceState {
 	if resolver == nil {
 		return nil
 	}
 	seen := make(map[Server]struct{})
-	var resources []*generationResourceState
+	var resources []*resourceState
 	for _, client := range resolver.clients {
 		if client == nil || client.server == nil {
 			continue
@@ -589,19 +388,11 @@ func resolverResources(resolver *DNS) []*generationResourceState {
 			continue
 		}
 		seen[client.server] = struct{}{}
-		if resource, ok := client.server.(generationResource); ok {
-			resources = append(resources, &generationResourceState{name: client.Name(), resource: resource})
+		if resource, ok := client.server.(interface{ Close() error }); ok {
+			resources = append(resources, &resourceState{name: client.Name(), resource: resource})
 		}
 	}
 	return resources
 }
 
-func closeResolverResources(resolver *DNS) error {
-	var errs []error
-	for _, state := range resolverResources(resolver) {
-		if err := state.resource.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close %s: %w", state.name, err))
-		}
-	}
-	return errors.Join(errs...)
-}
+func closeResolverResources(resolver *DNS) error { return newResolverOwner(resolver).closeOwned() }

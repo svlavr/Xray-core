@@ -38,8 +38,10 @@ type CacheController struct {
 	highWatermark int
 	requestGroup  singleflight.Group
 	migrations    sync.WaitGroup
+	pulls         sync.WaitGroup
+	pullCtx       context.Context
+	cancelPulls   context.CancelFunc
 	closed        atomic.Bool
-	sealed        atomic.Bool
 }
 
 type cacheSubscriber struct {
@@ -71,6 +73,7 @@ func (s *cacheSubscriber) close() {
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
+	pullCtx, cancelPulls := context.WithCancel(context.Background())
 	c := &CacheController{
 		name:            name,
 		disableCache:    disableCache,
@@ -78,6 +81,8 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		serveExpiredTTL: -int32(serveExpiredTTL),
 		ips:             make(map[string]*record),
 		subs:            make(map[string][]*cacheSubscriber),
+		pullCtx:         pullCtx,
+		cancelPulls:     cancelPulls,
 	}
 
 	c.cacheCleanup = newOwnedPeriodic(300*time.Second, c.CacheCleanup)
@@ -97,13 +102,17 @@ func (c *CacheController) CacheCleanup() error {
 	return nil
 }
 
-// Seal stops speculative cache scheduling while admitted requests may still
-// publish their required response to existing subscribers.
-func (c *CacheController) Seal() {
-	if c.sealed.Swap(true) {
+func (c *CacheController) startPull(ctx context.Context, s CachedNameserver, fqdn string, option dns_feature.IPOption) {
+	c.Lock()
+	if c.closed.Load() {
+		c.Unlock()
 		return
 	}
-	_ = c.cacheCleanup.Close()
+	c.pulls.Add(1)
+	c.Unlock()
+	// Keep query metadata while the cache owner controls refresh cancellation.
+	pullCtx := &dnsRequestContext{Context: context.WithoutCancel(ctx), caller: c.pullCtx}
+	go func() { defer c.pulls.Done(); pull(pullCtx, s, fqdn, option) }()
 }
 
 func (c *CacheController) collectExpiredKeys() ([]string, error) {
@@ -346,7 +355,7 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 
 	errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt, ", lock: ", lockWait)
 
-	if !c.sealed.Load() && (!c.serveStale || c.serveExpiredTTL != 0) {
+	if !c.serveStale || c.serveExpiredTTL != 0 {
 		common.Must(c.cacheCleanup.Start())
 	}
 }
@@ -408,6 +417,7 @@ func closeSubscribers(sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
 
 func (c *CacheController) Close() error {
 	c.closed.Store(true)
+	c.cancelPulls()
 	_ = c.cacheCleanup.Close()
 	c.Lock()
 	var subscribers []*cacheSubscriber
@@ -421,5 +431,6 @@ func (c *CacheController) Close() error {
 		sub.close()
 	}
 	c.migrations.Wait()
+	c.pulls.Wait()
 	return nil
 }

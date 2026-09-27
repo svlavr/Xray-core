@@ -97,7 +97,7 @@ jobs:
       - name: Repeat control, statistics and DNS ownership regressions
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
-          -run '^(TestInspection|TestFlowInspection|TestControlStats|TestCleanControlStats|TestDNSPreparation|TestApplyConfig|TestApplyPublication|TestRetirementTerminal|TestBoundLookup|TestDNSClose|TestObservedUDP|TestRoutedDNS|TestRoutedDoH|TestGenerationSeal|TestOwnedPeriodic|TestCacheClose|TestTCPResolver|TestH2CPooled|TestUDPTruncated)'
+          -run '^(TestInspection|TestFlowInspection|TestControlStats|TestCleanControlStats|TestStageB|TestDNSPreparation|TestOwnedPeriodic|TestCacheClose|TestTrackedTCPAndDoH|TestTCPAndDoH|TestQUICResource|TestQUICCanceled|TestQUICResolution|TestDoHResource|TestToDNSContext)'
           ./app/stats ./app/dns ./core
       - name: Test shared transport and endpoint mechanisms
         if: ${{ !cancelled() }}
@@ -112,7 +112,7 @@ jobs:
           GODEBUG: http2legacy=1
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
-          -run '^(TestRoutedDoH|TestH2CPooledResolverReplacement)'
+          -run '^TestStageBDoHPooledSiblingCancellation$'
           ./app/dns
       - name: Smoke test enabled and disabled API benchmark
         if: ${{ !cancelled() }}

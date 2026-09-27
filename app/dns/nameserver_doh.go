@@ -25,7 +25,6 @@ import (
 	"github.com/xtls/xray-core/common/utils"
 	dns_feature "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/net/http2"
 )
@@ -37,13 +36,14 @@ type DoHNameServer struct {
 	cacheController *CacheController
 	httpClient      *http.Client
 	dohURL          string
-	destination     net.Destination
-	routed          bool
 	clientIP        net.IP
 	mu              sync.Mutex
 	connections     map[net.Conn]struct{}
 	closed          bool
 	dialing         sync.WaitGroup
+	workCtx         context.Context
+	cancelWork      context.CancelFunc
+	workers         sync.WaitGroup
 }
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
@@ -54,13 +54,13 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 		mode = "DOHL"
 	}
 	errors.LogInfo(context.Background(), "DNS: created ", mode, " client for ", url.String(), ", with h2c ", h2c)
+	workCtx, cancelWork := context.WithCancel(context.Background())
 	s := &DoHNameServer{
 		cacheController: NewCacheController(mode+"//"+url.Host, disableCache, serveStale, serveExpiredTTL),
 		dohURL:          url.String(),
-		destination:     dohDestination(url.Hostname(), url.Port()),
-		routed:          dispatcher != nil,
 		clientIP:        clientIP,
 		connections:     make(map[net.Conn]struct{}),
+		workCtx:         workCtx, cancelWork: cancelWork,
 	}
 	s.httpClient = &http.Client{
 		Transport: &http2.Transport{
@@ -76,32 +76,32 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 					return nil, err
 				}
 				var conn net.Conn
-				var routeReceipt *dohRouteReceipt
 				if dispatcher != nil {
 					dnsCtx := toDnsContext(ctx, s.dohURL)
-					if dohObservationAvailable(ctx) {
-						routeReceipt = newDoHRouteReceipt()
-						dnsCtx = session.ContextWithRouteOnlyReceipt(dnsCtx, routeReceipt)
-					}
 					if h2c {
 						dnsCtx = session.ContextWithMitmAlpn11(dnsCtx, false) // for insurance
 						dnsCtx = session.ContextWithMitmServerName(dnsCtx, url.Hostname())
 					}
 					link, err := dispatcher.Dispatch(dnsCtx, dest)
-					select {
-					case <-ctx.Done():
+					cc := common.ChainedClosable{}
+					if link != nil {
+						if cw, ok := link.Writer.(common.Closable); ok {
+							cc = append(cc, cw)
+						}
+						if cr, ok := link.Reader.(common.Closable); ok {
+							cc = append(cc, cr)
+						}
+					}
+					if ctx.Err() != nil {
+						_ = cc.Close()
 						return nil, ctx.Err()
-					default:
 					}
 					if err != nil {
+						_ = cc.Close()
 						return nil, err
 					}
-					cc := common.ChainedClosable{}
-					if cw, ok := link.Writer.(common.Closable); ok {
-						cc = append(cc, cw)
-					}
-					if cr, ok := link.Reader.(common.Closable); ok {
-						cc = append(cc, cr)
+					if link == nil {
+						return nil, fmt.Errorf("DNS dispatcher returned no link")
 					}
 					conn = cnc.NewConnection(
 						cnc.ConnectionInputMulti(link.Writer),
@@ -122,28 +122,16 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 				}
 				tracked, ok := s.trackConnection(conn)
 				if !ok {
+					_ = tracked.Close()
 					return nil, context.Canceled
 				}
 				conn = tracked
-				if routeReceipt != nil {
-					step, waitErr := routeReceipt.WaitOffer(ctx)
-					if waitErr != nil {
-						_ = conn.Close()
-						return nil, waitErr
-					}
-					if step.Selection == stats.SelectionRejected {
-						_ = conn.Close()
-						return nil, &dohRouteError{step: step}
-					}
-				}
 				if !h2c {
 					conn = utls.UClient(conn, &utls.Config{ServerName: url.Hostname()}, utls.HelloChrome_Auto)
 					if err := conn.(*utls.UConn).HandshakeContext(ctx); err != nil {
-						return nil, classifyDoHTLSHandshakeError(ctx, conn, routeReceipt, err)
+						_ = conn.Close()
+						return nil, err
 					}
-				}
-				if routeReceipt != nil {
-					conn = &dohCarrierConn{Conn: conn, route: routeReceipt}
 				}
 				return conn, nil
 			},
@@ -159,6 +147,16 @@ func (s *DoHNameServer) beginDial() bool {
 		return false
 	}
 	s.dialing.Add(1)
+	return true
+}
+
+func (s *DoHNameServer) beginWork() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.workers.Add(1)
 	return true
 }
 
@@ -223,18 +221,20 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		reserved, release, reserveErr := dns_feature.ReserveContextBinding(ctx)
-		if reserveErr != nil {
+		if !s.beginWork() {
 			if noResponseErrCh != nil {
-				noResponseErrCh <- reserveErr
+				noResponseErrCh <- context.Canceled
 			}
 			continue
 		}
-		go func(r *dnsRequest, ctx context.Context, release func()) {
-			defer release()
+		go func(r *dnsRequest, ctx context.Context) {
+			defer s.workers.Done()
+			workCtx, cancelWork := context.WithCancel(ctx)
+			stop := context.AfterFunc(s.workCtx, cancelWork)
+			defer func() { stop(); cancelWork() }()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
-			dnsCtx := ctx
+			dnsCtx := workCtx
 
 			// reserve internal dns server requested Inbound
 			if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -263,18 +263,15 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			}
 			payload := append([]byte(nil), b.Bytes()...)
 			b.Release()
-			resp, observation, err := s.dohHTTPSContextObserved(dnsCtx, payload)
+			resp, err := s.dohHTTPSContext(dnsCtx, payload)
 			if err != nil {
-				if observation != nil {
-					observation.finish(false)
-				}
 				errors.LogErrorInner(ctx, err, "failed to retrieve response for ", fqdn)
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
 				}
 				return
 			}
-			rec, err := parseObservedDoHResponse(resp, observation)
+			rec, err := parseResponse(resp)
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to handle DOH response for ", fqdn)
 				if noResponseErrCh != nil {
@@ -283,7 +280,7 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				return
 			}
 			s.cacheController.updateRecord(r, rec)
-		}(req, reserved, release)
+		}(req, ctx)
 	}
 }
 
@@ -321,6 +318,9 @@ func (s *DoHNameServer) Close() error {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
+	if s.cancelWork != nil {
+		s.cancelWork()
+	}
 	s.dialing.Wait()
 	s.mu.Lock()
 	connections := make([]net.Conn, 0, len(s.connections))
@@ -338,43 +338,17 @@ func (s *DoHNameServer) Close() error {
 		}
 	}
 	errs = append(errs, s.cacheController.Close())
+	s.workers.Wait()
 	return go_errors.Join(errs...)
 }
 
 func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, error) {
-	response, observation, err := s.dohHTTPSContextObserved(ctx, b)
-	if observation != nil {
-		observation.finish(err == nil)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return response, err
-}
-
-func (s *DoHNameServer) dohHTTPSContextObserved(ctx context.Context, b []byte) ([]byte, *dohRequestObservation, error) {
-	var store stats.AdmissionStore
-	if s.routed {
-		store = dohObservationStore(ctx)
-	}
-	return s.dohHTTPSContextWithStore(ctx, b, store)
-}
-
-func (s *DoHNameServer) dohHTTPSContextWithStore(ctx context.Context, b []byte, store stats.AdmissionStore) ([]byte, *dohRequestObservation, error) {
-	var observation *dohRequestObservation
-	if store != nil {
-		ctx, observation = beginRoutedDoHObservation(ctx, store, s.destination, len(b))
-	}
-	if ctx.Err() != nil {
-		return nil, observation, ctx.Err()
-	}
-
-	var req *http.Request
-	var err error
-	if observation != nil {
-		req, err = newObservedDoHRequest(ctx, "POST", s.dohURL, b, observation)
-	} else {
-		req, err = http.NewRequestWithContext(ctx, "POST", s.dohURL, bytes.NewBuffer(b))
-	}
+	req, err := http.NewRequestWithContext(ctx, "POST", s.dohURL, bytes.NewBuffer(b))
 	if err != nil {
-		return nil, observation, err
+		return nil, err
 	}
 
 	req.Header.Add("Accept", "application/dns-message")
@@ -386,23 +360,16 @@ func (s *DoHNameServer) dohHTTPSContextWithStore(ctx context.Context, b []byte, 
 
 	resp, err := hc.Do(req)
 	if err != nil {
-		if step, rejected := dohRejectedRoute(err); rejected && observation != nil {
-			observation.reject(step)
-		}
-		return nil, observation, err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body) // flush resp.Body so that the conn is reusable
-		return nil, observation, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
+		return nil, fmt.Errorf("DOH server returned code %d", resp.StatusCode)
 	}
 
-	response, err := io.ReadAll(resp.Body)
-	if observation != nil {
-		observation.recordResponseRead(len(response), err)
-	}
-	return response, observation, err
+	return io.ReadAll(resp.Body)
 }
 
 // QueryIP implements Server.

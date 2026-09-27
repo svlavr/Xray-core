@@ -173,8 +173,8 @@ func TestDNSPreparationAllNativeKinds(t *testing.T) {
 					t.Fatal("borrowed FakeDNS dependency changed")
 				}
 			case *ClassicNameServer:
-				if len(server.requests) != 0 || server.dispatcher != dispatcher {
-					t.Fatal("UDP preparation launched work or lost dispatcher")
+				if len(server.requests) != 0 || server.udpServer == nil {
+					t.Fatal("UDP preparation launched work or lacks its native dispatcher")
 				}
 			case *QUICNameServer:
 				if server.connection != nil {

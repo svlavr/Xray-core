@@ -38,6 +38,9 @@ type QUICNameServer struct {
 	transport       *quic.Transport
 	packetConn      stdnet.PacketConn
 	closed          bool
+	workCtx         context.Context
+	cancelWork      context.CancelFunc
+	workers         sync.WaitGroup
 }
 
 // NewQUICNameServer creates DNS-over-QUIC client object for local resolving
@@ -52,10 +55,12 @@ func NewQUICNameServer(url *url.URL, disableCache bool, serveStale bool, serveEx
 	}
 	dest := net.UDPDestination(net.ParseAddress(url.Hostname()), port)
 
+	workCtx, cancelWork := context.WithCancel(context.Background())
 	s := &QUICNameServer{
 		cacheController: NewCacheController(url.String(), disableCache, serveStale, serveExpiredTTL),
 		destination:     &dest,
 		clientIP:        clientIP,
+		workCtx:         workCtx, cancelWork: cancelWork,
 	}
 
 	errors.LogInfo(context.Background(), "DNS: created Local DNS-over-QUIC client for ", url.String())
@@ -105,18 +110,20 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 	}
 
 	for _, req := range reqs {
-		reserved, release, reserveErr := dns_feature.ReserveContextBinding(ctx)
-		if reserveErr != nil {
+		if !s.beginWork() {
 			if noResponseErrCh != nil {
-				noResponseErrCh <- reserveErr
+				noResponseErrCh <- context.Canceled
 			}
 			continue
 		}
-		go func(r *dnsRequest, ctx context.Context, release func()) {
-			defer release()
+		go func(r *dnsRequest, ctx context.Context) {
+			defer s.workers.Done()
+			workCtx, cancelWork := context.WithCancel(ctx)
+			stop := context.AfterFunc(s.workCtx, cancelWork)
+			defer func() { stop(); cancelWork() }()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
-			dnsCtx := ctx
+			dnsCtx := workCtx
 
 			// reserve internal dns server requested Inbound
 			if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -170,6 +177,20 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
+			_ = conn.SetDeadline(deadline)
+			ioCanceled := make(chan struct{})
+			stopIO := context.AfterFunc(dnsCtx, func() {
+				conn.CancelRead(0)
+				conn.CancelWrite(0)
+				close(ioCanceled)
+			})
+			defer func() {
+				if !stopIO() {
+					<-ioCanceled
+				}
+				conn.CancelRead(0)
+				conn.CancelWrite(0)
+			}()
 
 			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
@@ -220,13 +241,23 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				return
 			}
 			s.cacheController.updateRecord(r, rec)
-		}(req, reserved, release)
+		}(req, ctx)
 	}
 }
 
 // QueryIP implements Server.
 func (s *QUICNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+func (s *QUICNameServer) beginWork() bool {
+	s.Lock()
+	defer s.Unlock()
+	if s.closed {
+		return false
+	}
+	s.workers.Add(1)
+	return true
 }
 
 func isActive(s *quic.Conn) bool {
@@ -337,9 +368,12 @@ func (s *QUICNameServer) Close() error {
 	s.closed = true
 	conn, transport, packetConn := s.connection, s.transport, s.packetConn
 	s.Unlock()
+	if s.cancelWork != nil {
+		s.cancelWork()
+	}
 	var errs []error
 	if conn != nil {
-		if err := conn.CloseWithError(0, "DNS generation retired"); err != nil {
+		if err := conn.CloseWithError(0, "DNS resolver closed"); err != nil {
 			errs = append(errs, err)
 		} else {
 			s.Lock()
@@ -372,5 +406,6 @@ func (s *QUICNameServer) Close() error {
 		}
 	}
 	errs = append(errs, s.cacheController.Close())
+	s.workers.Wait()
 	return go_errors.Join(errs...)
 }

@@ -302,9 +302,6 @@ func ClaimObservedEndpoint(ctx context.Context, reader buf.Reader, eligible bool
 	if !eligible {
 		return nil
 	}
-	if receipt := session.RouteOnlyReceiptFromContext(ctx); receipt != nil {
-		receipt.Commit()
-	}
 	if override, ok := reader.(*buf.EndpointOverrideReader); ok {
 		reader = override.Reader
 	}

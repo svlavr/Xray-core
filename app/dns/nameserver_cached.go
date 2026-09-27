@@ -34,9 +34,7 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 				if cache.serveStale && (cache.serveExpiredTTL == 0 || cache.serveExpiredTTL < ttl) {
 					errors.LogDebugInner(ctx, err, cache.name, " cache OPTIMISTE ", fqdn, " -> ", ips)
 					log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheOptimiste, Elapsed: 0, Error: err})
-					if reserved, release, reserveErr := dns.ReserveSpeculativeContextBinding(context.WithoutCancel(ctx)); reserveErr == nil {
-						go pull(reserved, release, s, fqdn, option)
-					}
+					cache.startPull(ctx, s, fqdn, option)
 					return ips, 1, err
 				}
 			}
@@ -48,8 +46,7 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 	return fetch(ctx, s, fqdn, option)
 }
 
-func pull(ctx context.Context, release func(), s CachedNameserver, fqdn string, option dns.IPOption) {
-	defer release()
+func pull(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) {
 	nctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
@@ -96,7 +93,7 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 		case err := <-noResponseErrCh:
 			return nil, err
 		case <-sub.done:
-			return nil, &dns.CausalBindingError{Reason: "DNS cache closed"}
+			return nil, context.Canceled
 		case msg := <-sub.buffer:
 			sub.close()
 			return msg, nil

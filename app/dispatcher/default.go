@@ -482,7 +482,6 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	var handler outbound.Handler
 	var serial uint64
 	observation := session.LogicalObservationFromContext(ctx)
-	routeReceipt := session.RouteOnlyReceiptFromContext(ctx)
 	// Only the admitted endpoint binds P1 facts. Returned-link continuations and
 	// physical detours need their own P2 owner integration.
 	if _, ok := link.Reader.(*buf.InspectionReader); !ok {
@@ -490,7 +489,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 	step := stats.RouteStep{Selection: stats.SelectionDefault, SelectedTarget: ob.Target}
 	resolve := func(tag string, useDefault bool) outbound.Handler {
-		if observation != nil || routeReceipt != nil {
+		if observation != nil {
 			step.Outbound.Tag = tag
 			if manager, ok := d.ohm.(outbound.HandlerResolver); ok {
 				h, id := manager.ResolveHandler(tag, useDefault)
@@ -509,10 +508,6 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			observation.Exchange.Route(step)
 			observation.Exchange.BindRoute()
 
-		}
-		if routeReceipt != nil {
-			routeReceipt.Offer(step)
-			routeReceipt.Commit()
 		}
 	}
 
@@ -579,11 +574,6 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		step.Outbound.Serial = serial
 		step.Outbound.Tag = handler.Tag()
 		observation.Exchange.Route(step)
-	}
-	if routeReceipt != nil {
-		step.Outbound.Serial = serial
-		step.Outbound.Tag = handler.Tag()
-		routeReceipt.Offer(step)
 	}
 	ob.Tag = handler.Tag()
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {

@@ -2,63 +2,28 @@ package dns
 
 import (
 	"context"
-	go_errors "errors"
 	"fmt"
-	"strings"
 
 	"github.com/xtls/xray-core/common/geodata"
 	featuredns "github.com/xtls/xray-core/features/dns"
 	"google.golang.org/protobuf/proto"
 )
 
-type ApplyDisposition string
-
-const (
-	ApplyApplied           ApplyDisposition = "APPLIED"
-	ApplyPrepareFailed     ApplyDisposition = "NOT_APPLIED_PREPARE_FAILED"
-	ApplyBusy              ApplyDisposition = "NOT_APPLIED_BUSY"
-	ApplyRetiringLimit     ApplyDisposition = "NOT_APPLIED_RETIRING_LIMIT"
-	ApplyCanceled          ApplyDisposition = "NOT_APPLIED_CANCELED"
-	ApplyClosed            ApplyDisposition = "NOT_APPLIED_CLOSED"
-	ApplyUnsupportedClient ApplyDisposition = "NOT_APPLIED_UNSUPPORTED_CLIENT"
-)
-
-type FailureClass string
-
-const (
-	FailureNone        FailureClass = "NONE"
-	FailureInvalid     FailureClass = "INVALID_CONFIG"
-	FailureDependency  FailureClass = "DEPENDENCY"
-	FailureCanceled    FailureClass = "CANCELED"
-	FailureCleanup     FailureClass = "CLEANUP"
-	FailureUnsupported FailureClass = "UNSUPPORTED"
-)
-
 type ApplyResult struct {
-	Disposition        ApplyDisposition
-	Generation         uint64
-	PreviousGeneration uint64
-	Failure            FailureClass
-	Retirement         *RetirementReceipt
+	Applied bool
+	Err     error
 }
 
 type readyDependencyError struct{ name string }
 
 func (e *readyDependencyError) Error() string { return "missing ready DNS dependency: " + e.name }
 
-func preparationFailureClass(err error) FailureClass {
-	var dependency *readyDependencyError
-	if go_errors.As(err, &dependency) || strings.Contains(strings.ToLower(err.Error()), "failed to load") {
-		return FailureDependency
-	}
-	return FailureInvalid
-}
-
-// ApplyConfig prepares and atomically publishes a fresh immutable generation.
+// ApplyConfig prepares and publishes a fresh resolver in the existing DNS feature.
+// Applied remains true when old-resource cleanup fails after publication.
 func ApplyConfig(ctx context.Context, client featuredns.Client, config *Config) ApplyResult {
 	server, ok := client.(*DNS)
 	if !ok || server == nil || server.runtime == nil {
-		return ApplyResult{Disposition: ApplyUnsupportedClient, Failure: FailureUnsupported}
+		return ApplyResult{Err: fmt.Errorf("DNS client does not support ApplyConfig")}
 	}
 	return server.applyConfig(ctx, config)
 }

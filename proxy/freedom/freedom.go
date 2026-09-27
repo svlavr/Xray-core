@@ -382,7 +382,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		detached := featuredns.CopyContextBinding(context.Background(), ctx)
+		detached := featuredns.CopyContextOwner(context.Background(), ctx)
 		newCtx, newCancel = context.WithCancel(detached)
 	}
 

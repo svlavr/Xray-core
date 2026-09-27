@@ -10,29 +10,30 @@ import (
 	routingsession "github.com/xtls/xray-core/features/routing/session"
 )
 
-type bindingTestClient struct{ ip net.IP }
-
-func (*bindingTestClient) Type() interface{} { return featuredns.ClientType() }
-func (*bindingTestClient) Start() error      { return nil }
-func (*bindingTestClient) Close() error      { return nil }
-func (c *bindingTestClient) LookupIP(string, featuredns.IPOption) ([]net.IP, uint32, error) {
-	return []net.IP{c.ip}, 1, nil
+type contextTestClient struct {
+	seen context.Context
 }
 
-func TestResolvableContextUsesOriginatingDNSBinding(t *testing.T) {
+func (*contextTestClient) Type() interface{} { return featuredns.ClientType() }
+func (*contextTestClient) Start() error      { return nil }
+func (*contextTestClient) Close() error      { return nil }
+func (*contextTestClient) LookupIP(string, featuredns.IPOption) ([]net.IP, uint32, error) {
+	return nil, 0, featuredns.ErrEmptyResponse
+}
+
+func (c *contextTestClient) LookupIPContext(ctx context.Context, _ string, _ featuredns.IPOption) ([]net.IP, uint32, error) {
+	c.seen = ctx
+	return []net.IP{{192, 0, 2, 1}}, 1, nil
+}
+
+func TestResolvableContextPreservesOriginatingDNSContext(t *testing.T) {
 	owner := featuredns.NewContextOwner()
-	binding := featuredns.NewContextBinding(owner,
-		func(context.Context, string, featuredns.IPOption) ([]net.IP, uint32, error) {
-			return []net.IP{{192, 0, 2, 1}}, 1, nil
-		}, nil, func() bool { return true })
-	ctx := featuredns.ContextWithBinding(context.Background(), binding)
-	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{
-		Target: net.TCPDestination(net.DomainAddress("bound.test"), 443),
-	}})
-	routingContext := routingsession.AsRoutingContext(ctx)
-	resolved := ContextWithDNSClient(routingContext, &bindingTestClient{ip: net.IP{192, 0, 2, 2}})
+	ctx := featuredns.ContextWithOwner(context.Background(), owner)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: net.TCPDestination(net.DomainAddress("owner.test"), 443)}})
+	client := new(contextTestClient)
+	resolved := ContextWithDNSClient(routingsession.AsRoutingContext(ctx), client)
 	ips := resolved.GetTargetIPs()
-	if len(ips) != 1 || !ips[0].Equal(net.IP{192, 0, 2, 1}) {
-		t.Fatalf("routing context dropped originating binding: %v", ips)
+	if len(ips) != 1 || !ips[0].Equal(net.IP{192, 0, 2, 1}) || !featuredns.ContextOwnedBy(client.seen, owner) {
+		t.Fatalf("originating DNS context lost: ips=%v owner=%v", ips, featuredns.ContextOwnedBy(client.seen, owner))
 	}
 }
