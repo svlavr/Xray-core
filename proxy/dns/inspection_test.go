@@ -223,8 +223,13 @@ func TestInspectionDNSDecodedUDPBranches(t *testing.T) {
 					t.Fatal(err)
 				}
 				if len(live.Rows) == 1 {
-					if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{live.Rows[0].Ref}); err != nil {
-						t.Fatal(err)
+					flow := live.Rows[0]
+					// Peer delivery does not join the writer's accounting callback.
+					// Close only after the facts this test checks have been recorded.
+					if flow.Uplink.Known == uint64(len(wire)) && flow.Downlink.Known == uint64(n) {
+						if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref}); err != nil {
+							t.Fatal(err)
+						}
 					}
 				}
 				page, err := view.ReadTerminals()

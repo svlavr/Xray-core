@@ -98,7 +98,7 @@ jobs:
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
           -run '^(TestInspection|TestFlowInspection|TestControlStats|TestCleanControlStats|TestStageB|TestDNSPreparation|TestOwnedPeriodic|TestCacheClose|TestTrackedTCPAndDoH|TestTCPAndDoH|TestQUICResource|TestQUICCanceled|TestQUICResolution|TestDoHResource|TestToDNSContext)'
-          ./app/stats ./app/dns ./core
+          ./app/stats ./app/dns ./core ./proxy/dns
       - name: Test shared transport and endpoint mechanisms
         if: ${{ !cancelled() }}
         run: >-
