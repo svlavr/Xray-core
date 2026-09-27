@@ -305,6 +305,15 @@ func TestControlUDPPortAllocation(t *testing.T) {
 	count := controlCount(t, "XRAY_CONTROL_PORTS", 256, 512)
 	var system, standard []net.PacketConn
 	defer func() {
+		// Keep exact tuples even after an early assertion, before releasing the
+		// sockets. Other test binaries may hold wildcard sockets on these ports.
+		for name, sockets := range map[string][]net.PacketConn{"system": system, "standard": standard} {
+			tuples := make([]string, 0, len(sockets))
+			for _, conn := range sockets {
+				tuples = append(tuples, conn.LocalAddr().Network()+":"+conn.LocalAddr().String())
+			}
+			t.Logf("CONTROL_PORT_BINDINGS mode=%s kind=%s tuples=%v", mode, name, tuples)
+		}
 		for _, conn := range standard {
 			_ = conn.Close()
 		}

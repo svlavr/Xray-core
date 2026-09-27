@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/router"
@@ -65,23 +66,32 @@ func inspectionTCPOutboundThrough(t *testing.T, enabled bool, outbound *core.Out
 
 func inspectionOutboundTotals(t *testing.T, view fs.FlowInspection, tag string, want uint64) {
 	t.Helper()
-	totals, err := view.ReadTotals()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var up, down uint64
-	for _, row := range totals.Rows {
-		if row.Uplink.Known == 0 && row.Downlink.Known == 0 {
-			continue
+	// A peer can read the last response before the endpoint Write returns and
+	// publishes its byte credit. Keep the existing inspectionWait deadline.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		totals, err := view.ReadTotals()
+		if err != nil {
+			t.Fatal(err)
 		}
-		if row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
-			t.Fatalf("outbound attribution: %+v", row)
+		var up, down uint64
+		for _, row := range totals.Rows {
+			if row.Uplink.Known == 0 && row.Downlink.Known == 0 {
+				continue
+			}
+			if row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
+				t.Fatalf("outbound attribution: %+v", row)
+			}
+			up += row.Uplink.Known
+			down += row.Downlink.Known
 		}
-		up += row.Uplink.Known
-		down += row.Downlink.Known
-	}
-	if up != want || down != want {
-		t.Fatalf("framing included or payload lost: %d/%d want %d", up, down, want)
+		if up == want && down == want {
+			return
+		}
+		if up > want || down > want || !time.Now().Before(deadline) {
+			t.Fatalf("framing included or payload lost: %d/%d want %d", up, down, want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
