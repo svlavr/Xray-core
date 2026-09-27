@@ -66,19 +66,23 @@ func inspectionSOCKSPacket(t *testing.T, client *net.UDPConn, relay *net.UDPAddr
 	}
 	response := buf.New()
 	defer response.Release()
-	if _, err := response.ReadFrom(client); err != nil {
-		t.Fatal(err)
+	packet := response.Extend(buf.Size)
+	n, sender, err := client.ReadFromUDP(packet)
+	if err != nil {
+		t.Fatalf("SOCKS UDP receive: n=%d sender=%v client=%v relay=%v destination=%v err=%v", n, sender, client.LocalAddr(), relay, dest, err)
 	}
+	response.Resize(0, int32(n))
+	wire := append([]byte(nil), response.Bytes()[:min(n, 16)]...)
 	request, err := socks.DecodeUDPPacket(response)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("SOCKS UDP decode: n=%d sender=%v client=%v relay=%v destination=%v wire-prefix=%x err=%v", n, sender, client.LocalAddr(), relay, dest, wire, err)
 	}
 	want := append([]byte(nil), payload...)
 	for i := range want {
 		want[i] ^= mask
 	}
 	if request.Destination() != dest || !bytes.Equal(response.Bytes(), want) {
-		t.Fatalf("response destination/payload: %+v %q", request, response.Bytes())
+		t.Fatalf("response destination/payload: request=%+v payload=%q n=%d sender=%v client=%v relay=%v destination=%v wire-prefix=%x", request, response.Bytes(), n, sender, client.LocalAddr(), relay, dest, wire)
 	}
 }
 
