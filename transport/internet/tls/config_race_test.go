@@ -147,6 +147,9 @@ func TestCertificateSetPathReloadPublishesImmutableReplacement(t *testing.T) {
 	oldEntry.CertificatePath, oldEntry.KeyPath = certPath, keyPath
 	set := (&Config{Certificate: []*Certificate{oldEntry}}).buildCertificateSet(true)
 	initial := set.load(0)
+	// The watcher's first reload can finish before this snapshot is captured.
+	initialName := initial.Leaf.Subject.CommonName
+	initialDER := bytes.Clone(initial.Certificate[0])
 	selector := getNewGetCertificateFunc(set, false)
 
 	var failed atomic.Bool
@@ -174,9 +177,11 @@ func TestCertificateSetPathReloadPublishesImmutableReplacement(t *testing.T) {
 		})
 	}
 	deadline := time.Now().Add(time.Second)
+	var replacement *tls.Certificate
 	for {
 		selected, err := selector(&tls.ClientHelloInfo{})
 		if err == nil && selected.Leaf.Subject.CommonName == "new.example" {
+			replacement = selected
 			break
 		}
 		if time.Now().After(deadline) {
@@ -191,11 +196,14 @@ func TestCertificateSetPathReloadPublishesImmutableReplacement(t *testing.T) {
 	if failed.Load() {
 		t.Fatal("reader observed an incomplete certificate during reload")
 	}
-	if initial.Leaf.Subject.CommonName != "old.example" {
+	if initial.Leaf.Subject.CommonName != initialName || !bytes.Equal(initial.Certificate[0], initialDER) {
 		t.Fatal("reload mutated the previously published certificate")
 	}
+	if initialName == "old.example" && replacement == initial {
+		t.Fatal("reload reused the previously published certificate")
+	}
 	oldEntry.Certificate[0] ^= 0xff
-	if initial.Leaf.Subject.CommonName != "old.example" {
+	if initial.Leaf.Subject.CommonName != initialName || !bytes.Equal(initial.Certificate[0], initialDER) {
 		t.Fatal("reload state aliases source protobuf")
 	}
 }
