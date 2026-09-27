@@ -52,7 +52,7 @@ func inspectionFlow(t *testing.T, close func() error) (fs.Exchange, fs.FlowInspe
 
 func inspectionLive(t *testing.T, view fs.FlowInspection) fs.FlowRecord {
 	t.Helper()
-	live, err := view.ReadLive(context.Background())
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 {
 		t.Fatalf("live: %+v %v", live, err)
 	}
@@ -138,7 +138,7 @@ func TestInspectionSS2022NativeCodecResults(t *testing.T) {
 				t.Fatal(err)
 			}
 			row := inspectionLive(t, view)
-			if row.Uplink.Known != 7 || row.Downlink.Known != uint64(test.known) || row.Downlink.Incomplete != (test.failAt != 0) {
+			if row.Uplink.Known != 7 || row.Downlink.Known != uint64(test.known) {
 				t.Fatalf("decoded receipts: %+v", row)
 			}
 		})
@@ -153,7 +153,7 @@ func TestInspectionSS2022ScalarPositiveError(t *testing.T) {
 			t.Fatalf("result: %d %v", n, err)
 		}
 		fact := inspectionLive(t, view).Downlink
-		if fact.Known != uint64(accepted) || fact.Incomplete != (accepted < 4) {
+		if fact.Known != uint64(accepted) {
 			t.Fatalf("positive error: %+v", fact)
 		}
 	}
@@ -231,8 +231,8 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 		t.Fatalf("stop: %+v %v", result, err)
 	}
 	flow.Finish()
-	page, _ := view.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 || page.Rows[0].Reason != fs.EndReasonLocalStop {
+	page, _ := view.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("owner-end write snapshot: %+v", page)
 	}
 	once.Do(func() { close(release) })
@@ -244,11 +244,11 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("write did not finish")
 	}
-	page, _ = view.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 || page.Rows[0].Reason != fs.EndReasonLocalStop {
+	page, _ = view.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("late receipt: %+v", page)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
 		known += total.Downlink.Known

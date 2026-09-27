@@ -231,9 +231,9 @@ func (w *UDPWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange)
 }
 
 func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err error) {
-	complete, partial := false, false
+	complete := false
 	if receipt != nil {
-		defer func() { proxy.RecordPacketOutcome(receipt, uint64(b.Len()), complete, partial, err) }()
+		defer func() { proxy.RecordPacketOutcome(receipt, uint64(b.Len()), complete) }()
 	}
 	addr := w.addr
 	if b.UDP != nil {
@@ -250,7 +250,7 @@ func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err erro
 	}
 
 	n, err := w.sendMessage(msg)
-	complete, partial = n == msg.Size(), n > 0
+	complete = n == msg.Size()
 	var errTooLarge *quic.DatagramTooLargeError
 	if go_errors.As(err, &errTooLarge) {
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
@@ -262,7 +262,6 @@ func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err erro
 		for i, fMsg := range fMsgs {
 			n, sendErr := w.sendMessage(&fMsg)
 			all = all && n == fMsg.Size()
-			partial = partial || n > 0
 			if i == len(fMsgs)-1 {
 				complete = complete || all
 			}

@@ -86,9 +86,9 @@ func TestFlowInspectionBlackholeTCP(t *testing.T) {
 					var ref fs.FlowRef
 					if kind == "custom" {
 						inspectionWait(t, func() bool {
-							live, _ := view.ReadLive(context.Background())
+							live, _ := view.ReadLive()
 							for _, row := range live.Rows {
-								if row.AccountingRoute.Outbound.Tag == "block" && row.Downlink.Known == uint64(len(response)) {
+								if row.SelectedRoute.Outbound.Tag == "block" && row.Downlink.Known == uint64(len(response)) {
 									ref = row.Ref
 									return true
 								}
@@ -102,9 +102,9 @@ func TestFlowInspectionBlackholeTCP(t *testing.T) {
 					}
 					var terminal fs.TerminalRecord
 					inspectionWait(t, func() bool {
-						page, _ := view.ReadTerminals(context.Background())
+						page, _ := view.ReadTerminals()
 						for _, row := range page.Rows {
-							if row.Flow.AccountingRoute.Outbound.Tag == "block" {
+							if row.Flow.SelectedRoute.Outbound.Tag == "block" {
 								terminal = row
 								return true
 							}
@@ -112,25 +112,23 @@ func TestFlowInspectionBlackholeTCP(t *testing.T) {
 						return false
 					})
 					flow := terminal.Flow
-					wantReason := fs.EndReasonRejected
 					if kind == "custom" {
-						wantReason = fs.EndReasonLocalStop
 						if flow.Ref != ref {
 							t.Fatal("stopped reference changed")
 						}
 					}
-					if terminal.Reason != wantReason || flow.Origin != fs.TrafficOriginUser || len(flow.Routes) == 0 || flow.AccountingRoute.Outbound.Serial == 0 || flow.AccountingRoute.Effective != destination || flow.Routes[0].Outbound != flow.AccountingRoute.Outbound {
+					if flow.Origin != fs.TrafficOriginUser || flow.SelectedRoute.Outbound.Serial == 0 || flow.EffectiveDestination != destination {
 						t.Fatalf("ending/route/origin: %+v", terminal)
 					}
-					if flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(response)) || flow.Uplink.Incomplete || flow.Downlink.Incomplete {
+					if flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(response)) {
 						t.Fatalf("terminal custody: %+v", flow)
 					}
-					totals, _ := view.ReadTotals(context.Background())
+					totals, _ := view.ReadTotals()
 					var found bool
 					for _, row := range totals.Rows {
-						if row.Outbound == flow.AccountingRoute.Outbound {
+						if row.Outbound == flow.SelectedRoute.Outbound {
 							found = true
-							if row.Uplink.Known != flow.Uplink.Known || row.Downlink.Known != flow.Downlink.Known || row.Uplink.Incomplete || row.Downlink.Incomplete {
+							if row.Uplink.Known != flow.Uplink.Known || row.Downlink.Known != flow.Downlink.Known {
 								t.Fatalf("total/terminal mismatch: %+v", row)
 							}
 						}
@@ -192,16 +190,16 @@ func TestFlowInspectionBlackholeUDP(t *testing.T) {
 				t.Helper()
 				var found fs.FlowRecord
 				inspectionWait(t, func() bool {
-					live, _ := view.ReadLive(context.Background())
+					live, _ := view.ReadLive()
 					for _, row := range live.Rows {
-						if row.Source.Port == cnet.Port(conn.LocalAddr().(*net.UDPAddr).Port) && row.Uplink.Known == count && row.Downlink.Known == uint64(len(response)) && !row.Uplink.Incomplete && !row.Downlink.Incomplete {
+						if row.Source.Port == cnet.Port(conn.LocalAddr().(*net.UDPAddr).Port) && row.Uplink.Known == count && row.Downlink.Known == uint64(len(response)) {
 							found = row
 							return true
 						}
 					}
 					return false
 				})
-				if found.Kind != fs.FlowKindUDPAssociation || found.Origin != fs.TrafficOriginUser || found.AccountingRoute.Outbound.Tag != "block" || found.AccountingRoute.Outbound.Serial == 0 || found.AccountingRoute.Effective != destination || found.Uplink.Incomplete || found.Downlink.Incomplete {
+				if found.Kind != fs.FlowKindUDPAssociation || found.Origin != fs.TrafficOriginUser || found.SelectedRoute.Outbound.Tag != "block" || found.SelectedRoute.Outbound.Serial == 0 || found.EffectiveDestination != destination {
 					t.Fatalf("Blackhole UDP facts: %+v", found)
 				}
 				return found
@@ -213,12 +211,12 @@ func TestFlowInspectionBlackholeUDP(t *testing.T) {
 				t.Fatalf("exact Blackhole UDP stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				if len(page.Rows) != 1 {
 					return false
 				}
 				terminal := page.Rows[0]
-				if terminal.Flow.Ref != selected.Ref || terminal.Reason != fs.EndReasonLocalStop || terminal.Flow.Uplink.Known != uint64(len(payload)) || terminal.Flow.Downlink.Known != uint64(len(response)) {
+				if terminal.Flow.Ref != selected.Ref || terminal.Flow.Uplink.Known != uint64(len(payload)) || terminal.Flow.Downlink.Known != uint64(len(response)) {
 					t.Fatalf("Blackhole UDP terminal: %+v", terminal)
 				}
 				return true
@@ -227,20 +225,20 @@ func TestFlowInspectionBlackholeUDP(t *testing.T) {
 			if row := readRow(sibling, uint64(2*len(payload))); row.Ref != other.Ref {
 				t.Fatal("closing one Blackhole association replaced its sibling")
 			}
-			totals, err := view.ReadTotals(context.Background())
+			totals, err := view.ReadTotals()
 			if err != nil {
 				t.Fatalf("Blackhole UDP totals: %+v %v", totals, err)
 			}
 			var matched bool
 			for _, total := range totals.Rows {
-				if total.Outbound != selected.AccountingRoute.Outbound {
+				if total.Outbound != selected.SelectedRoute.Outbound {
 					if total.Uplink.Known != 0 || total.Downlink.Known != 0 {
 						t.Fatalf("unexpected UDP attribution: %+v", total)
 					}
 					continue
 				}
 				matched = true
-				if total.Origin != fs.TrafficOriginUser || total.Uplink.Known != uint64(3*len(payload)) || total.Downlink.Known != uint64(2*len(response)) || total.Uplink.Incomplete || total.Downlink.Incomplete {
+				if total.Origin != fs.TrafficOriginUser || total.Uplink.Known != uint64(3*len(payload)) || total.Downlink.Known != uint64(2*len(response)) {
 					t.Fatalf("Blackhole UDP total attribution: %+v", total)
 				}
 			}

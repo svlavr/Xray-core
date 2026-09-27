@@ -113,15 +113,15 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 		t.Fatal("native write did not start")
 	}
 	flow.Finish()
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 2 || page.Rows[0].Flow.Downlink.Incomplete {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 2 {
 		t.Errorf("owner-end write snapshot: %+v %v", page, err)
 	}
 	close(release)
 	if err := <-done; !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals(context.Background())
+	page, err = view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
@@ -129,16 +129,21 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 		t.Fatalf("counter: %d", counter.Value())
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact.Known != 2 || fact.Incomplete {
+	if calls != 2 || fact.Known != 2 {
 		t.Fatalf("native partial result: calls=%d fact=%+v", calls, fact)
 	}
-	totals, _ := view.ReadTotals(context.Background())
-	var incomplete bool
+	totals, _ := view.ReadTotals()
+	var found bool
 	for _, row := range totals.Rows {
-		incomplete = incomplete || row.Downlink.Incomplete
+		if row.Outbound.Serial == 1 && row.Origin == fs.TrafficOriginUser {
+			found = true
+			if row.Downlink.Known != 2 {
+				t.Fatalf("native partial total: %+v", row)
+			}
+		}
 	}
-	if !incomplete {
-		t.Fatalf("late error missing from totals: %+v", totals)
+	if !found {
+		t.Fatalf("native partial total missing: %+v", totals)
 	}
 }
 
@@ -199,12 +204,12 @@ func TestInspectionTUNHandlerEnabledAndDisabled(t *testing.T) {
 				t.Fatal(reply)
 			}
 			if enabled {
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				if err != nil || len(page.Rows) != 1 {
 					t.Fatalf("terminal: %+v %v", page, err)
 				}
 				f := page.Rows[0].Flow
-				if f.Origin != fs.TrafficOriginUser || f.Uplink.Known != 6 || f.Downlink.Known != 8 || f.AccountingRoute.Outbound.Tag != "direct" {
+				if f.Origin != fs.TrafficOriginUser || f.Uplink.Known != 6 || f.Downlink.Known != 8 || f.SelectedRoute.Outbound.Tag != "direct" {
 					t.Fatalf("endpoint: %+v", f)
 				}
 			}
@@ -297,7 +302,7 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 		close(release)
 		t.Fatalf("stop: %+v %v", outcomes, err)
 	}
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != uint64(len("head")) {
 		t.Errorf("owner-end batch snapshot: %+v %v", page, err)
 	}
@@ -305,15 +310,15 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals(context.Background())
+	page, err = view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 3 || counter.Value() != int64(len("headtail")) || fact.Known != uint64(len("head")) || fact.Incomplete {
+	if calls != 3 || counter.Value() != int64(len("headtail")) || fact.Known != uint64(len("head")) {
 		t.Fatalf("late native batch: native=%d counter=%d fact=%+v", calls, counter.Value(), fact)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
 		known += row.Downlink.Known

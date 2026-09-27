@@ -99,18 +99,15 @@ func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt)
 				receipt.add(pumped)
 			}
 			if writeErr != nil {
-				receipt.markWriteError(writeErr)
 				return written, true, writeErr
 			}
 			if pumped == 0 {
 				err := io.ErrShortWrite
-				receipt.markWriteError(err)
 				return written, true, err
 			}
 		}
 
 		if readErr != nil {
-			receipt.markReadError(readErr)
 			return written, true, readErr
 		}
 		if moved == 0 {

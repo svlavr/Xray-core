@@ -27,27 +27,27 @@ func inspectionOnlyMuxFlow(t *testing.T, view fs.FlowInspection, conn net.Conn, 
 	t.Helper()
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil || len(live.Rows) != 1 {
 			return false
 		}
 		r := live.Rows[0]
-		if r.InitialDestination != destination || r.AccountingRoute.Outbound.Tag != tag || r.AccountingRoute.Outbound.Serial == 0 || r.AccountingRoute.Effective != destination || r.Origin != fs.TrafficOriginUser {
+		if r.InitialDestination != destination || r.SelectedRoute.Outbound.Tag != tag || r.SelectedRoute.Outbound.Serial == 0 || r.EffectiveDestination != destination || r.Origin != fs.TrafficOriginUser {
 			t.Fatalf("MUX logical owner: %+v", r)
 		}
 		ref = r.Ref
 		return r.Uplink.Known == uint64(len(payload)) && r.Downlink.Known == uint64(len(payload))
 	})
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 0 {
 		t.Fatalf("carrier produced terminal: %+v %v", page, err)
 	}
 	conn.Close()
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref
 	})
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var up, down uint64
 	for _, r := range totals.Rows {
 		up += r.Uplink.Known
@@ -103,14 +103,14 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 				total += uint64(len(payload))
 				var row fs.FlowRecord
 				inspectionWait(t, func() bool {
-					live, _ := remote.ReadLive(context.Background())
+					live, _ := remote.ReadLive()
 					if len(live.Rows) != 1 {
 						return false
 					}
 					row = live.Rows[0]
 					return row.Uplink.Known == total && row.Downlink.Known == total
 				})
-				if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Tag != "direct" || row.AccountingRoute.Effective != destination || row.Uplink.Incomplete || row.Downlink.Incomplete {
+				if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "direct" || row.EffectiveDestination != destination {
 					t.Fatalf("server facts: %+v", row)
 				}
 				if i > 0 && row.Ref != retainedRef {
@@ -119,7 +119,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 				retainedRef = row.Ref
 				var clientRef fs.FlowRef
 				inspectionWait(t, func() bool {
-					live, _ := local.ReadLive(context.Background())
+					live, _ := local.ReadLive()
 					for _, r := range live.Rows {
 						if r.Source.Port == cnet.Port(client.LocalAddr().(*net.UDPAddr).Port) && r.Uplink.Known == uint64(len(payload)) && r.Downlink.Known == uint64(len(payload)) {
 							clientRef = r.Ref
@@ -132,7 +132,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 				if err != nil || out[0].Code != fs.CloseCodeAccepted {
 					t.Fatalf("client stop: %+v %v", out, err)
 				}
-				inspectionWait(t, func() bool { live, _ := local.ReadLive(context.Background()); return len(live.Rows) == 0 })
+				inspectionWait(t, func() bool { live, _ := local.ReadLive(); return len(live.Rows) == 0 })
 				control.Close()
 			}
 			if test.retained {
@@ -142,7 +142,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 				}
 			}
 			inspectionWait(t, func() bool {
-				page, _ := remote.ReadTerminals(context.Background())
+				page, _ := remote.ReadTerminals()
 				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == retainedRef
 			})
 			inspectionOutboundTotals(t, remote, "direct", total)

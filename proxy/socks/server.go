@@ -132,11 +132,6 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 				flow := store.PrepareTCP(session.TrafficOriginFromContext(ctx), inbound.Source, destination, nil)
 				if flow != nil {
 					flow.Unassign()
-					if rejected.responseErr != nil {
-						flow.SetEndReason(stats.EndReasonWriteError)
-					} else {
-						flow.SetEndReason(stats.EndReasonRejected)
-					}
 					flow.Finish()
 				}
 			}
@@ -255,8 +250,8 @@ func writeUDPResponse(ctx context.Context, conn stat.Connection, packet *udp_pro
 		return
 	}
 
-	written, writeErr := conn.Write(udpMessage.Bytes())
-	proxy.RecordPacketWrite(receipt, n, int(udpMessage.Len()), written, writeErr)
+	written, _ := conn.Write(udpMessage.Bytes())
+	proxy.RecordPacketWrite(receipt, n, int(udpMessage.Len()), written)
 	udpMessage.Release()
 }
 
@@ -332,13 +327,6 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			udpServer.Dispatch(currentPacketCtx, *dest, payload)
 		}
 		if err != nil {
-			if flow != nil {
-				reason := stats.EndReasonReadError
-				if goerrors.Is(err, io.EOF) {
-					reason = stats.EndReasonEOF
-				}
-				flow.SetEndReason(reason)
-			}
 			return err
 		}
 	}

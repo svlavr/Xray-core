@@ -27,7 +27,6 @@ func (c *rawSpliceTestCounter) Add(v int64) int64 { return c.value.Add(v) }
 
 type rawSpliceTestExchange struct {
 	downlink atomic.Uint64
-	reason   atomic.Uint32
 	added    chan uint64
 }
 
@@ -43,12 +42,9 @@ func (e *rawSpliceTestExchange) Unassign()                                   {}
 func (e *rawSpliceTestExchange) Effective(xnet.Destination)                  {}
 func (e *rawSpliceTestExchange) SetSource(xnet.Destination)                  {}
 func (e *rawSpliceTestExchange) AddUplink(uint64)                            {}
-func (e *rawSpliceTestExchange) MarkUplinkIncomplete()                       {}
-func (e *rawSpliceTestExchange) MarkDownlinkIncomplete()                     {}
 func (e *rawSpliceTestExchange) Enter() bool                                 { return true }
 func (e *rawSpliceTestExchange) Leave()                                      {}
 func (e *rawSpliceTestExchange) Finish()                                     {}
-func (e *rawSpliceTestExchange) SetEndReason(reason stats.EndReason)         { e.reason.Store(uint32(reason)) }
 
 func (e *rawSpliceTestExchange) AddDownlink(n uint64) {
 	e.downlink.Add(n)
@@ -241,9 +237,6 @@ func TestRawSpliceDeadlinePreservesPositivePrefix(t *testing.T) {
 	var timeout interface{ Timeout() bool }
 	if !errors.As(err, &timeout) || !timeout.Timeout() {
 		t.Fatalf("deadline error is not observable as timeout: %T %v", err, err)
-	}
-	if got := stats.EndReason(exchange.reason.Load()); got != stats.EndReasonTimeout {
-		t.Fatalf("end reason = %v, want timeout", got)
 	}
 	assertRawSpliceReceipts(t, written, exchange, readCounter, writeCounter, userCounter)
 	if err := sourceReader.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {

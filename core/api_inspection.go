@@ -103,21 +103,10 @@ func (o *apiObservation) Close() error {
 	return err
 }
 
-func (o *apiObservation) recordRead(n int, err error) {
+func (o *apiObservation) recordRead(n int) {
 	if n > 0 {
 		o.exchange.AddDownlink(uint64(n))
 	}
-	if err == nil {
-		return
-	}
-	reason := stats.EndReasonReadError
-	if err == io.EOF {
-		reason = stats.EndReasonEOF
-	}
-	if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
-		reason = stats.EndReasonTimeout
-	}
-	o.exchange.SetEndReason(reason)
 }
 
 type inspectedAPIConn struct {
@@ -127,13 +116,13 @@ type inspectedAPIConn struct {
 
 func (c *inspectedAPIConn) Read(payload []byte) (int, error) {
 	n, err := c.Conn.Read(payload)
-	c.observation.recordRead(n, err)
+	c.observation.recordRead(n)
 	return n, err
 }
 
 func (c *inspectedAPIConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb, err := c.Conn.(buf.Reader).ReadMultiBuffer()
-	c.observation.recordRead(int(mb.Len()), err)
+	c.observation.recordRead(int(mb.Len()))
 	return mb, err
 }
 

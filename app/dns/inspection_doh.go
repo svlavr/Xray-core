@@ -104,9 +104,6 @@ type dohAttempt struct {
 func (a *dohAttempt) bindRoute(step stats.RouteStep) {
 	a.leg.Route(step)
 	a.leg.BindRoute()
-	if step.Selection == stats.SelectionRejected {
-		a.leg.SetEndReason(stats.EndReasonRejected)
-	}
 	a.routeSet = true
 }
 
@@ -121,12 +118,6 @@ func (a *dohAttempt) finish(responseComplete bool) {
 	if a == nil || !a.finished.CompareAndSwap(false, true) {
 		return
 	}
-	if a.bodyRead.Load() != a.bodySize {
-		a.leg.MarkUplinkIncomplete()
-	}
-	if !responseComplete {
-		a.leg.MarkDownlinkIncomplete()
-	}
 	if !a.routeSet {
 		if step, ok := a.route.Snapshot(); ok {
 			a.bindRoute(step)
@@ -134,8 +125,6 @@ func (a *dohAttempt) finish(responseComplete bool) {
 	}
 	if !a.routeSet {
 		a.leg.Unassign()
-		a.leg.MarkUplinkIncomplete()
-		a.leg.MarkDownlinkIncomplete()
 	}
 	a.leg.Finish()
 }
@@ -204,19 +193,11 @@ func (o *dohRequestObservation) recordResponseRead(n int, err error) {
 	if n > 0 {
 		attempt.leg.AddDownlink(uint64(n))
 	}
-	if err != nil {
-		attempt.leg.MarkDownlinkIncomplete()
-		attempt.leg.SetEndReason(stats.EndReasonReadError)
-	}
 }
 
 func (o *dohRequestObservation) markDecodeError() {
 	if o == nil {
 		return
-	}
-	if attempt := o.current.Load(); attempt != nil {
-		attempt.leg.MarkDownlinkIncomplete()
-		attempt.leg.SetEndReason(stats.EndReasonReadError)
 	}
 }
 
@@ -233,9 +214,7 @@ func (o *dohRequestObservation) reject(step stats.RouteStep) {
 	}
 	leg.Route(step)
 	leg.BindRoute()
-	leg.MarkUplinkIncomplete()
-	leg.MarkDownlinkIncomplete()
-	leg.SetEndReason(stats.EndReasonRejected)
+
 	leg.Finish()
 }
 

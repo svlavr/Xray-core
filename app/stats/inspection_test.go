@@ -78,69 +78,66 @@ func TestInspectionLifecycleTotalsClonesAndOwnerEnd(t *testing.T) {
 	}
 	exchange.AddUplink(5)
 	exchange.Route(featurestats.RouteStep{
-		Leg:       1,
 		Selection: featurestats.SelectionRule,
 		Outbound: featurestats.OutboundRef{
 			Runtime: store.runtime,
 			Serial:  7,
 			Tag:     strings.Repeat("t", 300),
 		},
-		RuleTag:     "rule",
-		RouteTarget: xnet.TCPDestination(xnet.DomainAddress("destination.example"), 443),
+		RuleTag:        "rule",
+		SelectedTarget: xnet.TCPDestination(xnet.DomainAddress("destination.example"), 443),
 	})
 	exchange.BindRoute()
 	exchange.Effective(xnet.TCPDestination(xnet.DomainAddress("effective.example"), 443))
 	exchange.AddUplink(2)
 	exchange.AddDownlink(3)
 
-	live, err := store.ReadLive(context.Background())
+	live, err := store.ReadLive()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(live.Rows) != 1 || live.Rows[0].Uplink.Known != 7 || live.Rows[0].Downlink.Known != 3 {
 		t.Fatalf("unexpected live rows: %+v", live.Rows)
 	}
-	if !live.Rows[0].MetadataTruncated || len(live.Rows[0].Source.Address.Domain()) > maxMetadataString || len(live.Rows[0].Routes[0].Outbound.Tag) > maxMetadataString {
+	if len(live.Rows[0].Source.Address.Domain()) > maxMetadataString || len(live.Rows[0].SelectedRoute.Outbound.Tag) > maxMetadataString {
 		t.Fatalf("metadata bounds were not applied: %+v", live.Rows[0])
 	}
-	live.Rows[0].Routes[0].RuleTag = "caller mutation"
-	live.Rows[0].Routes = nil
-	again, err := store.ReadLive(context.Background())
+	live.Rows[0].SelectedRoute.RuleTag = "caller mutation"
+	again, err := store.ReadLive()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(again.Rows[0].Routes) != 1 || again.Rows[0].Routes[0].RuleTag != "rule" {
+	if again.Rows[0].SelectedRoute.RuleTag != "rule" {
 		t.Fatal("live snapshot retained caller-owned slice state")
 	}
 
-	exchange.SetEndReason(featurestats.EndReasonEOF)
 	exchange.Finish()
-	page, err := store.ReadTerminals(context.Background())
+	page, err := store.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Rows) != 1 || page.Rows[0].Reason != featurestats.EndReasonEOF || page.Rows[0].Flow.Downlink.Known != 3 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 3 {
 		t.Fatalf("owner-end snapshot: %+v", page)
 	}
 	exchange.AddDownlink(2)
-	exchange.SetEndReason(featurestats.EndReasonWriteError)
-	page, err = store.ReadTerminals(context.Background())
+
+	page, err = store.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Rows) != 1 || page.Rows[0].Reason != featurestats.EndReasonEOF || page.Rows[0].Flow.Downlink.Known != 3 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 3 {
 		t.Fatalf("late result mutated history: %+v", page)
 	}
-	page.Rows[0].Flow.Routes[0].RuleTag = "caller mutation"
-	pageAgain, err := store.ReadTerminals(context.Background())
+	page.Rows[0].Flow.SelectedRoute.RuleTag = "caller mutation"
+	pageAgain, err := store.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pageAgain.Rows[0].Flow.Routes[0].RuleTag != "rule" {
+	if pageAgain.Rows[0].Flow.SelectedRoute.RuleTag != "rule" {
 		t.Fatal("terminal page retained caller-owned slice state")
 	}
 
-	totals, err := store.ReadTotals(context.Background())
+	totals, err := store.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,16 +163,13 @@ func TestInspectionCapacityRejectedAttributionAndBoundedHistory(t *testing.T) {
 	overflow.AddUplink(3)
 	overflow.Finish()
 
-	totals, err := store.ReadTotals(context.Background())
+	totals, err := store.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	unassigned := findTotal(t, totals.Rows, 0, featurestats.TrafficOriginUser)
-	if unassigned.Uplink.Known != 3 || unassigned.Uplink.Incomplete {
+	if unassigned.Uplink.Known != 3 {
 		t.Fatalf("rejected selection did not retain known unassigned bytes: %+v", unassigned)
-	}
-	if totals.Loss.UntrackedAdmissions != 1 {
-		t.Fatalf("untracked admission loss = %d", totals.Loss.UntrackedAdmissions)
 	}
 	first.Finish()
 
@@ -183,14 +177,14 @@ func TestInspectionCapacityRejectedAttributionAndBoundedHistory(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		exchange := store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUnknown, xnet.Destination{}, xnet.Destination{}, nil)
 		retained = append(retained, exchange.Ref())
-		exchange.SetEndReason(featurestats.EndReasonEOF)
+
 		exchange.Finish()
 	}
-	page, err := store.ReadTerminals(context.Background())
+	page, err := store.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Rows) != 2 || page.Rows[0].Flow.Ref != retained[0] || page.Rows[1].Flow.Ref != retained[1] || page.Loss.TerminalOverwrite != 1 {
+	if len(page.Rows) != 2 || page.Rows[0].Flow.Ref != retained[0] || page.Rows[1].Flow.Ref != retained[1] {
 		t.Fatalf("bounded oldest-first history = %+v", page)
 	}
 }
@@ -200,12 +194,12 @@ func TestInspectionCloseOutcomesAndCallbackOutsideLocks(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var exchange featurestats.Exchange
 	exchange = store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error {
-		if _, err := store.ReadLive(context.Background()); err != nil {
+		if _, err := store.ReadLive(); err != nil {
 			return err
 		}
 		close(entered)
 		<-release
-		exchange.SetEndReason(featurestats.EndReasonLocalStop)
+
 		return nil
 	})
 	type closeResult struct {
@@ -219,7 +213,7 @@ func TestInspectionCloseOutcomesAndCallbackOutsideLocks(t *testing.T) {
 	}()
 	<-entered
 	outcomes, err := store.CloseFlows(context.Background(), []featurestats.FlowRef{exchange.Ref()})
-	if err != nil || outcomes[0].Code != featurestats.CloseCodeAlreadyRequested {
+	if err != nil || outcomes[0].Code != featurestats.CloseCodeNoAction {
 		t.Fatalf("repeated close = %+v, %v", outcomes, err)
 	}
 	close(release)
@@ -228,7 +222,7 @@ func TestInspectionCloseOutcomesAndCallbackOutsideLocks(t *testing.T) {
 		t.Fatalf("first close = %+v, %v", first.outcomes, first.err)
 	}
 	outcomes, err = store.CloseFlows(context.Background(), []featurestats.FlowRef{exchange.Ref()})
-	if err != nil || outcomes[0].Code != featurestats.CloseCodeAlreadyEnded {
+	if err != nil || outcomes[0].Code != featurestats.CloseCodeNoAction {
 		t.Fatalf("ended close = %+v, %v", outcomes, err)
 	}
 
@@ -278,27 +272,27 @@ func TestInspectionConcurrentSnapshotAndLateTotals(t *testing.T) {
 		}()
 	}
 	exchange.Finish()
-	if page, err := store.ReadTerminals(context.Background()); err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+	if page, err := store.ReadTerminals(); err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("owner-end snapshot = %+v, %v", page, err)
 	}
 	close(release)
 	for done.Load() != workers {
-		if live, err := store.ReadLive(context.Background()); err != nil || len(live.Rows) != 0 {
+		if live, err := store.ReadLive(); err != nil || len(live.Rows) != 0 {
 			t.Fatal(err)
 		}
-		if _, err := store.ReadTotals(context.Background()); err != nil {
+		if _, err := store.ReadTotals(); err != nil {
 			t.Fatal(err)
 		}
 	}
 	wg.Wait()
-	page, err := store.ReadTerminals(context.Background())
+	page, err := store.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("concurrent terminal = %+v", page)
 	}
-	totals, _ := store.ReadTotals(context.Background())
+	totals, _ := store.ReadTotals()
 	if got := findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Uplink.Known; got != workers*additions {
 		t.Fatalf("late totals = %d", got)
 	}
@@ -318,23 +312,23 @@ func findTotal(t *testing.T, rows []featurestats.TotalRecord, serial uint64, ori
 func TestInspectionStopPublishesAndPreservesLateTotals(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	exchange := store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { return nil })
-	exchange.SetEndReason(featurestats.EndReasonEOF)
+
 	out, err := store.CloseFlows(context.Background(), []featurestats.FlowRef{exchange.Ref()})
 	if err != nil || out[0].Code != featurestats.CloseCodeAccepted {
 		t.Fatalf("close: %+v %v", out, err)
 	}
-	exchange.SetEndReason(featurestats.EndReasonReadError)
+
 	exchange.Finish()
-	page, _ := store.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Reason != featurestats.EndReasonLocalStop || page.Rows[0].Flow.Uplink.Known != 0 {
+	page, _ := store.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("close snapshot: %+v", page)
 	}
 	exchange.AddUplink(3)
-	page, _ = store.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Reason != featurestats.EndReasonLocalStop || page.Rows[0].Flow.Uplink.Known != 0 {
+	page, _ = store.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("owner completion: %+v", page)
 	}
-	totals, _ := store.ReadTotals(context.Background())
+	totals, _ := store.ReadTotals()
 	if got := findTotal(t, totals.Rows, 0, featurestats.TrafficOriginUser).Uplink.Known; got != 3 {
 		t.Fatalf("late close totals: %d", got)
 	}
@@ -343,11 +337,12 @@ func TestInspectionStopPublishesAndPreservesLateTotals(t *testing.T) {
 func TestInspectionCloseFailureAndCanceledSuffix(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
-	first := store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { cancel(); return errors.New("native failure") })
+	nativeFailure := errors.New("native failure")
+	first := store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { cancel(); return nativeFailure })
 	var secondCalled bool
 	second := store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { secondCalled = true; return nil })
 	out, err := store.CloseFlows(ctx, []featurestats.FlowRef{first.Ref(), second.Ref()})
-	if err != nil || len(out) != 2 || out[0].Code != featurestats.CloseCodeFailed || out[1].Code != featurestats.CloseCodeNotStartedCanceled || secondCalled {
+	if err != nil || len(out) != 2 || out[0].Code != featurestats.CloseCodeFailed || !errors.Is(out[0].Err, nativeFailure) || out[1].Code != featurestats.CloseCodeNotStartedCanceled || out[1].Err != nil || secondCalled {
 		t.Fatalf("partial close: %+v %v", out, err)
 	}
 	first.Finish()
@@ -355,15 +350,15 @@ func TestInspectionCloseFailureAndCanceledSuffix(t *testing.T) {
 }
 
 func TestInspectionRouteCaptureRequiresOwnerBinding(t *testing.T) {
-	store := testInspectionStore(t, featurestats.ObservationOptions{MaxRouteSteps: 1})
+	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	flow := store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	flow.AddUplink(9)
 	flow.Route(featurestats.RouteStep{Selection: featurestats.SelectionRule, Outbound: featurestats.OutboundRef{Serial: 1, Tag: "forward"}})
-	live, _ := store.ReadLive(context.Background())
-	if live.Rows[0].AccountingRoute.Outbound.Serial != 0 {
-		t.Fatal("selection was an accounting claim")
+	live, _ := store.ReadLive()
+	if live.Rows[0].SelectedRoute.Outbound.Serial != 1 {
+		t.Fatal("selection was not visible before owner binding")
 	}
-	totals, _ := store.ReadTotals(context.Background())
+	totals, _ := store.ReadTotals()
 	if len(totals.Rows) != 4 {
 		t.Fatal("selection created a bucket")
 	}
@@ -371,12 +366,12 @@ func TestInspectionRouteCaptureRequiresOwnerBinding(t *testing.T) {
 	flow.BindRoute()
 	flow.AddUplink(1)
 	flow.Finish()
-	page, _ := store.ReadTerminals(context.Background())
+	page, _ := store.ReadTerminals()
 	row := page.Rows[0].Flow
-	if len(row.Routes) != 1 || row.Routes[0].Outbound.Serial != 1 || row.AccountingRoute.Outbound.Serial != 2 || row.Routes[0].Leg == row.AccountingRoute.Leg || !row.MetadataTruncated || row.Uplink.Known != 10 {
-		t.Fatalf("bounded route projection: %+v", row)
+	if row.SelectedRoute.Outbound.Serial != 2 || row.Uplink.Known != 10 {
+		t.Fatalf("selected route and bytes: %+v", row)
 	}
-	totals, _ = store.ReadTotals(context.Background())
+	totals, _ = store.ReadTotals()
 	if len(totals.Rows) != 5 || findTotal(t, totals.Rows, 2, featurestats.TrafficOriginUser).Uplink.Known != 10 {
 		t.Fatalf("consuming totals: %+v", totals)
 	}
@@ -386,12 +381,12 @@ func TestInspectionIndependentSample(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	cell := store.unassigned[int(featurestats.TrafficOriginUser)]
 	cell.uplink.addKnown(1)
-	snapshot, err := store.ReadTotals(context.Background())
+	snapshot, err := store.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	fact := findTotal(t, snapshot.Rows, 0, featurestats.TrafficOriginUser).Uplink
-	if fact.Known != 1 || fact.Incomplete || snapshot.Sample.Runtime != store.runtime || snapshot.Sample.At < 0 {
+	if fact.Known != 1 || snapshot.Sample.Runtime != store.runtime || snapshot.Sample.At < 0 {
 		t.Fatalf("independent sample: %+v", snapshot)
 	}
 }
@@ -417,21 +412,21 @@ func TestInspectionKnownDownlink(t *testing.T) {
 	flow.Route(featurestats.RouteStep{Selection: featurestats.SelectionDefault, Outbound: featurestats.OutboundRef{Serial: 1}})
 	flow.BindRoute()
 	flow.AddDownlink(4)
-	flow.SetEndReason(featurestats.EndReasonWriteError)
+
 	flow.Finish()
-	page, err := store.ReadTerminals(context.Background())
+	page, err := store.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
 	final := page.Rows[0].Flow.Downlink
-	if final.Known != 7 || final.Incomplete {
+	if final.Known != 7 {
 		t.Fatalf("known facts: %+v", final)
 	}
-	totals, err := store.ReadTotals(context.Background())
+	totals, err := store.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Downlink; got.Known != 7 || got.Incomplete {
+	if got := findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Downlink; got.Known != 7 {
 		t.Fatalf("known totals: %+v", got)
 	}
 }
@@ -452,13 +447,13 @@ func TestInspectionPrebindAcceptedSaturation(t *testing.T) {
 			flow.BindRoute()
 			flow.Unassign()
 			flow.Finish()
-			totals, err := store.ReadTotals(context.Background())
+			totals, err := store.ReadTotals()
 			if err != nil {
 				t.Fatal(err)
 			}
 			row := findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser)
 			for _, fact := range []featurestats.ByteFact{row.Uplink, row.Downlink} {
-				if fact.Known != math.MaxUint64 || fact.Incomplete != overflow {
+				if fact.Known != math.MaxUint64 {
 					t.Fatalf("accepted saturation changed on binding: %+v", fact)
 				}
 			}

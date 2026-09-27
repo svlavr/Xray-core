@@ -16,12 +16,6 @@ type deferredEndpointReceipt struct {
 	mode     endpointReceiptMode
 	uplink   uint64
 	downlink uint64
-	upLost   bool
-	downLost bool
-	upOver   bool
-	downOver bool
-	reasons  [7]stats.EndReason
-	reasonN  int
 }
 
 type endpointReceiptMode uint8
@@ -32,10 +26,9 @@ const (
 	endpointDecoded
 )
 
-func (r *deferredEndpointReceipt) addPending(value *uint64, overflow *bool, n uint64) {
+func (r *deferredEndpointReceipt) addPending(value *uint64, n uint64) {
 	if math.MaxUint64-*value < n {
 		*value = math.MaxUint64
-		*overflow = true
 		return
 	}
 	*value += n
@@ -45,7 +38,7 @@ func (r *deferredEndpointReceipt) AddUplink(n uint64) {
 	r.mu.Lock()
 	switch r.mode {
 	case endpointPending:
-		r.addPending(&r.uplink, &r.upOver, n)
+		r.addPending(&r.uplink, n)
 	case endpointRaw:
 		r.Exchange.AddUplink(n)
 	}
@@ -56,51 +49,9 @@ func (r *deferredEndpointReceipt) AddDownlink(n uint64) {
 	r.mu.Lock()
 	switch r.mode {
 	case endpointPending:
-		r.addPending(&r.downlink, &r.downOver, n)
+		r.addPending(&r.downlink, n)
 	case endpointRaw:
 		r.Exchange.AddDownlink(n)
-	}
-	r.mu.Unlock()
-}
-
-func (r *deferredEndpointReceipt) MarkUplinkIncomplete() {
-	r.mu.Lock()
-	switch r.mode {
-	case endpointPending:
-		r.upLost = true
-	case endpointRaw:
-		r.Exchange.MarkUplinkIncomplete()
-	}
-	r.mu.Unlock()
-}
-
-func (r *deferredEndpointReceipt) MarkDownlinkIncomplete() {
-	r.mu.Lock()
-	switch r.mode {
-	case endpointPending:
-		r.downLost = true
-	case endpointRaw:
-		r.Exchange.MarkDownlinkIncomplete()
-	}
-	r.mu.Unlock()
-}
-
-func (r *deferredEndpointReceipt) SetEndReason(reason stats.EndReason) {
-	r.mu.Lock()
-	switch r.mode {
-	case endpointPending:
-		for i := 0; i < r.reasonN; i++ {
-			if r.reasons[i] == reason {
-				r.mu.Unlock()
-				return
-			}
-		}
-		if r.reasonN < len(r.reasons) {
-			r.reasons[r.reasonN] = reason
-			r.reasonN++
-		}
-	case endpointRaw:
-		r.Exchange.SetEndReason(reason)
 	}
 	r.mu.Unlock()
 }
@@ -113,21 +64,6 @@ func (r *deferredEndpointReceipt) selectRaw() {
 	r.mode = endpointRaw
 	r.Exchange.AddUplink(r.uplink)
 	r.Exchange.AddDownlink(r.downlink)
-	if r.upOver {
-		r.Exchange.AddUplink(1)
-	}
-	if r.downOver {
-		r.Exchange.AddDownlink(1)
-	}
-	if r.upLost {
-		r.Exchange.MarkUplinkIncomplete()
-	}
-	if r.downLost {
-		r.Exchange.MarkDownlinkIncomplete()
-	}
-	for i := 0; i < r.reasonN; i++ {
-		r.Exchange.SetEndReason(r.reasons[i])
-	}
 }
 
 func (r *deferredEndpointReceipt) BindRoute() {

@@ -1,7 +1,6 @@
 package stats
 
 import (
-	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -25,17 +24,16 @@ func TestInspectionPreparedCarrierNeverRegisters(t *testing.T) {
 	flow.Unassign()
 	flow.AddUplink(99)
 	flow.AddDownlink(99)
-	flow.MarkUplinkIncomplete()
-	flow.MarkDownlinkIncomplete()
+
 	flow.Finish()
-	live, _ := s.ReadLive(context.Background())
-	page, _ := s.ReadTerminals(context.Background())
-	totals, _ := s.ReadTotals(context.Background())
-	if len(live.Rows) != 0 || len(page.Rows) != 0 || live.Loss != (fs.LossFacts{}) || s.nextID != 0 {
-		t.Fatalf("carrier published state/loss: %+v %+v", live, page)
+	live, _ := s.ReadLive()
+	page, _ := s.ReadTerminals()
+	totals, _ := s.ReadTotals()
+	if len(live.Rows) != 0 || len(page.Rows) != 0 || s.nextID != 0 {
+		t.Fatalf("carrier published state: %+v %+v", live, page)
 	}
 	for _, row := range totals.Rows {
-		if row.Uplink.Known != 0 || row.Downlink.Known != 0 || row.Uplink.Incomplete || row.Downlink.Incomplete {
+		if row.Uplink.Known != 0 || row.Downlink.Known != 0 {
 			t.Fatalf("carrier totals: %+v", row)
 		}
 	}
@@ -53,13 +51,11 @@ func TestInspectionPreparedLogicalBindingAndFailure(t *testing.T) {
 		opened := flow.snapshot().Opened
 		flow.AddUplink(11)
 		flow.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: 1, Tag: "forward"}})
-		live, _ := s.ReadLive(context.Background())
+		live, _ := s.ReadLive()
 		if len(live.Rows) != 0 {
 			t.Fatal("forwarding selection published endpoint")
 		}
-		if failed {
-			flow.SetEndReason(fs.EndReasonReadError)
-		} else {
+		if !failed {
 			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 2, Tag: "consume"}})
 			var wg sync.WaitGroup
 			for range 8 {
@@ -76,16 +72,13 @@ func TestInspectionPreparedLogicalBindingAndFailure(t *testing.T) {
 			flow.AddUplink(3)
 		}
 		flow.Finish()
-		page, _ := s.ReadTerminals(context.Background())
+		page, _ := s.ReadTerminals()
 		want := uint64(14)
 		if failed {
 			want = 11
 		}
 		if len(page.Rows) != 1 || page.Rows[0].Flow.Opened != opened || page.Rows[0].Flow.Uplink.Known != want {
 			t.Fatalf("early facts lost: %+v", page)
-		}
-		if failed && page.Rows[0].Reason != fs.EndReasonReadError {
-			t.Fatal("early failure lost")
 		}
 	}
 }
@@ -97,12 +90,12 @@ func TestInspectionPreparedCapacityIsCheckedAtBinding(t *testing.T) {
 	a.AddUplink(5)
 	a.BindRoute()
 	a.BindRoute()
-	if a.Ref().ID != 0 || b.Ref().ID != 1 || s.loss.untrackedAdmissions.load() != 1 {
-		t.Fatal("incorrect registration capacity/loss")
+	if a.Ref().ID != 0 || b.Ref().ID != 1 {
+		t.Fatal("incorrect registration capacity")
 	}
 	a.Finish()
 	b.Finish()
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	if findTotal(t, totals.Rows, 0, fs.TrafficOriginUser).Uplink.Known != 5 {
 		t.Fatal("overflow lost actual payload")
 	}

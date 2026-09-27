@@ -103,10 +103,10 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		if len(page.Rows) == 1 {
-			if page.Rows[0].Reason != fs.EndReasonLocalStop {
-				t.Fatal("lost stop reason")
+			if page.Rows[0].Flow.State != fs.FlowStateEnded {
+				t.Fatal("lost ended state")
 			}
 			return
 		}
@@ -117,7 +117,7 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 
 func muxServerFact(t *testing.T, view fs.FlowInspection) fs.FlowRecord {
 	t.Helper()
-	live, err := view.ReadLive(context.Background())
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 {
 		t.Fatalf("live: %+v %v", live, err)
 	}
@@ -137,7 +137,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 			t.Fatal("missing partial error")
 		}
 		row := muxServerFact(t, view)
-		if row.Downlink.Known != 8192 || !row.Downlink.Incomplete {
+		if row.Downlink.Known != 8192 {
 			t.Fatalf("frame prefix: %+v", row.Downlink)
 		}
 		flow.Finish()
@@ -153,7 +153,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 			t.Fatal(err)
 		}
 		row := muxServerFact(t, view)
-		if row.Downlink.Known != 0 || row.Downlink.Incomplete {
+		if row.Downlink.Known != 0 {
 			t.Fatalf("overflow: %+v", row.Downlink)
 		}
 		flow.Finish()
@@ -172,7 +172,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 		}
 		writer.Close()
 		row := muxServerFact(t, view)
-		if row.Downlink.Known != 4 || row.Downlink.Incomplete {
+		if row.Downlink.Known != 4 {
 			t.Fatalf("header/control counted: %+v", row.Downlink)
 		}
 		flow.Finish()
@@ -183,7 +183,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 		writer.receipt = flow
 		writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("unknown"))})
 		row := muxServerFact(t, view)
-		if row.Downlink.Known != 7 || row.Downlink.Incomplete {
+		if row.Downlink.Known != 7 {
 			t.Fatalf("successful decoded operation lost: %+v", row.Downlink)
 		}
 		flow.Finish()
@@ -236,7 +236,7 @@ func TestMuxDeferredBufferDoesNotInventDrop(t *testing.T) {
 		t.Fatal("native flush lost frame")
 	}
 	row := muxServerFact(t, view)
-	if row.Downlink.Known != 5 || row.Downlink.Incomplete {
+	if row.Downlink.Known != 5 {
 		t.Fatalf("deferred operation result: %+v", row.Downlink)
 	}
 	flow.Finish()
@@ -307,7 +307,7 @@ func waitMuxTerminal(t *testing.T, view fs.FlowInspection) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		if len(page.Rows) == 1 {
 			return
 		}
@@ -368,9 +368,9 @@ func TestMuxStopDuringRetainedDispatchKeepsCarrier(t *testing.T) {
 	}
 	release()
 	waitMuxTerminal(t, view)
-	page, _ := view.ReadTerminals(context.Background())
-	if page.Rows[0].Reason != fs.EndReasonLocalStop {
-		t.Fatal("local stop reason lost")
+	page, _ := view.ReadTerminals()
+	if page.Rows[0].Flow.State != fs.FlowStateEnded {
+		t.Fatal("local stop did not end child")
 	}
 }
 
@@ -416,7 +416,7 @@ func TestMuxHeaderCloseKeepsReceiptOwner(t *testing.T) {
 	muxWait(t, closed)
 	muxWait(t, written)
 	muxCheckTerminal(t, view, 1)
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
 		known += row.Downlink.Known

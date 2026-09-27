@@ -17,7 +17,6 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/singbridge"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -140,9 +139,6 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			}
 		}
 		err = singbridge.CopyConn(ctx, inboundConn, link, serverConn)
-		if err == nil && observation != nil {
-			observation.Exchange.SetEndReason(stats.EndReasonEOF)
-		}
 		return err
 	} else {
 		packetConn := &singbridge.PacketConnWrapper{
@@ -157,9 +153,6 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 
 		serverConn := o.method.DialPacketConn(connection)
 		err = singbridge.ReturnError(bufio.CopyPacketConn(ctx, packetConn, serverConn))
-		if err == nil && observation != nil {
-			observation.Exchange.SetEndReason(stats.EndReasonEOF)
-		}
 		return err
 	}
 }

@@ -118,17 +118,17 @@ func TestFlowInspectionAppReverseChildren(t *testing.T) {
 	buf.ReleaseMulti(mb)
 	var row fs.FlowRecord
 	inspectionWait(t, func() bool {
-		live, _ := view.ReadLive(context.Background())
+		live, _ := view.ReadLive()
 		if len(live.Rows) != 1 {
 			return false
 		}
 		row = live.Rows[0]
 		return row.Uplink.Known == uint64(len(payload)) && row.Downlink.Known == uint64(len(payload))
 	})
-	if row.Origin != fs.TrafficOriginUnknown || row.InitialDestination != destination || row.AccountingRoute.Outbound.Tag != "direct" {
+	if row.Origin != fs.TrafficOriginUnknown || row.InitialDestination != destination || row.SelectedRoute.Outbound.Tag != "direct" {
 		t.Fatalf("reverse child: %+v", row)
 	}
-	page, _ := view.ReadTerminals(context.Background())
+	page, _ := view.ReadTerminals()
 	if len(page.Rows) != 0 {
 		t.Fatal("reverse control generated logical records")
 	}
@@ -137,10 +137,10 @@ func TestFlowInspectionAppReverseChildren(t *testing.T) {
 		t.Fatalf("reverse exact stop: %+v %v", out, err)
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref
 	})
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	for _, bucket := range totals.Rows {
 		if bucket.Uplink.Known != 0 && (bucket.Origin != fs.TrafficOriginUnknown || bucket.Uplink.Known != uint64(len(payload))) {
 			t.Fatalf("reverse control/USER contamination: %+v", bucket)

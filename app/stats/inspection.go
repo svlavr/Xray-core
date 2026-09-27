@@ -11,12 +11,10 @@ import (
 )
 
 var defaultObservationOptions = featurestats.ObservationOptions{
-	MaxLive:         256,
-	MaxTerminals:    1024,
-	MaxBuckets:      1024,
-	MaxClose:        64,
-	MaxRouteSteps:   4,
-	MaxDestinations: 8,
+	MaxLive:      256,
+	MaxTerminals: 1024,
+	MaxBuckets:   1024,
+	MaxClose:     64,
 }
 
 func normalizeObservationOptions(options featurestats.ObservationOptions) (featurestats.ObservationOptions, error) {
@@ -25,16 +23,12 @@ func normalizeObservationOptions(options featurestats.ObservationOptions) (featu
 		&options.MaxTerminals,
 		&options.MaxBuckets,
 		&options.MaxClose,
-		&options.MaxRouteSteps,
-		&options.MaxDestinations,
 	}
 	maxima := []uint32{
 		defaultObservationOptions.MaxLive,
 		defaultObservationOptions.MaxTerminals,
 		defaultObservationOptions.MaxBuckets,
 		defaultObservationOptions.MaxClose,
-		defaultObservationOptions.MaxRouteSteps,
-		defaultObservationOptions.MaxDestinations,
 	}
 	for i, value := range values {
 		if *value == 0 {
@@ -95,29 +89,26 @@ func (m *Manager) Observation() featurestats.AdmissionStore {
 }
 
 type saturatingUint64 struct {
-	value     atomic.Uint64
-	saturated atomic.Bool
+	value atomic.Uint64
 }
 
-func (v *saturatingUint64) add(delta uint64) bool {
+func (v *saturatingUint64) add(delta uint64) {
 	if delta == 0 {
-		return false
+		return
 	}
 	for {
 		old := v.value.Load()
 		if old == math.MaxUint64 {
-			v.saturated.Store(true)
-			return true
+			return
 		}
 		if delta > math.MaxUint64-old {
 			if v.value.CompareAndSwap(old, math.MaxUint64) {
-				v.saturated.Store(true)
-				return true
+				return
 			}
 			continue
 		}
 		if v.value.CompareAndSwap(old, old+delta) {
-			return false
+			return
 		}
 	}
 }

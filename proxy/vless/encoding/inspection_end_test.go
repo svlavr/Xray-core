@@ -34,14 +34,17 @@ type inspectionEndWriter struct{ err error }
 
 func (w inspectionEndWriter) Write(p []byte) (int, error) { return 0, w.err }
 
-func inspectionTerminalReason(t *testing.T, flow fs.Exchange, view fs.FlowInspection) fs.EndReason {
+func inspectionTerminal(t *testing.T, flow fs.Exchange, view fs.FlowInspection) fs.TerminalRecord {
 	t.Helper()
 	flow.Finish()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal page: %+v %v", page, err)
 	}
-	return page.Rows[0].Reason
+	if page.Rows[0].Flow.State != fs.FlowStateEnded {
+		t.Fatalf("flow did not end: %+v", page.Rows[0])
+	}
+	return page.Rows[0]
 }
 
 func inspectionActivityTimer(t *testing.T) *signal.ActivityTimer {
@@ -51,24 +54,23 @@ func inspectionActivityTimer(t *testing.T) *signal.ActivityTimer {
 	return timer
 }
 
-func TestInspectionXtlsReadEndReasons(t *testing.T) {
+func TestInspectionXtlsReadNativeResults(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		err  error
-		want fs.EndReason
 	}{
-		{name: "EOF", err: io.EOF, want: fs.EndReasonEOF},
-		{name: "read-error", err: io.ErrUnexpectedEOF, want: fs.EndReasonReadError},
-		{name: "timeout", err: inspectionTimeoutError{}, want: fs.EndReasonTimeout},
+		{name: "EOF", err: io.EOF},
+		{name: "read-error", err: io.ErrUnexpectedEOF},
+		{name: "timeout", err: inspectionTimeoutError{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			flow, view := inspectionPacketFlow(t)
-			err := XtlsRead(&inspectionEndReader{err: test.err}, buf.NewWriter(io.Discard), inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background(), flow)
+			err := XtlsRead(&inspectionEndReader{err: test.err}, buf.NewWriter(io.Discard), inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background())
 			if (test.err == io.EOF) != (err == nil) {
 				t.Fatalf("XtlsRead error = %v", err)
 			}
-			if got := inspectionTerminalReason(t, flow, view); got != test.want {
-				t.Fatalf("end reason = %v, want %v", got, test.want)
+			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink.Known != 0 {
+				t.Fatalf("read result invented bytes: %+v", got)
 			}
 		})
 	}
@@ -78,12 +80,12 @@ func TestInspectionXtlsReadWriterCauseAndLocalStop(t *testing.T) {
 	t.Run("writer", func(t *testing.T) {
 		flow, view := inspectionPacketFlow(t)
 		writer := buf.AttachWriterReceipt(buf.NewWriter(inspectionEndWriter{err: io.ErrClosedPipe}), flow)
-		err := XtlsRead(&inspectionEndReader{buffer: buf.MultiBuffer{buf.FromBytes([]byte("response"))}}, writer, inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background(), flow)
+		err := XtlsRead(&inspectionEndReader{buffer: buf.MultiBuffer{buf.FromBytes([]byte("response"))}}, writer, inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background())
 		if err == nil {
 			t.Fatal("writer failure was lost")
 		}
-		if got := inspectionTerminalReason(t, flow, view); got != fs.EndReasonWriteError {
-			t.Fatalf("end reason = %v, want write error", got)
+		if got := inspectionTerminal(t, flow, view); got.Flow.Downlink.Known != 0 {
+			t.Fatalf("failed opaque write invented bytes: %+v", got)
 		}
 	})
 
@@ -93,28 +95,26 @@ func TestInspectionXtlsReadWriterCauseAndLocalStop(t *testing.T) {
 		if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
 			t.Fatalf("stop: %+v %v", outcomes, err)
 		}
-		if err := XtlsRead(&inspectionEndReader{err: io.ErrUnexpectedEOF}, buf.NewWriter(io.Discard), inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background(), flow); err == nil {
+		if err := XtlsRead(&inspectionEndReader{err: io.ErrUnexpectedEOF}, buf.NewWriter(io.Discard), inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background()); err == nil {
 			t.Fatal("source failure was lost")
 		}
-		if got := inspectionTerminalReason(t, flow, view); got != fs.EndReasonLocalStop {
-			t.Fatalf("end reason = %v, want local stop", got)
-		}
+		inspectionTerminal(t, flow, view)
 	})
 }
 
-func TestInspectionXtlsReadRawFallbackEndReasons(t *testing.T) {
+func TestInspectionXtlsReadRawFallbackResults(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		writerErr error
 		attached  bool
 		localStop bool
-		want      fs.EndReason
+		wantBytes uint64
 	}{
-		{name: "attached-EOF", attached: true, want: fs.EndReasonEOF},
-		{name: "exact-exchange-EOF", want: fs.EndReasonEOF},
-		{name: "attached-writer", writerErr: io.ErrClosedPipe, attached: true, want: fs.EndReasonWriteError},
-		{name: "unattached-writer-unknown", writerErr: io.ErrClosedPipe, want: fs.EndReasonUnknown},
-		{name: "exact-exchange-local-stop", localStop: true, want: fs.EndReasonLocalStop},
+		{name: "attached-EOF", attached: true, wantBytes: uint64(len("raw response"))},
+		{name: "exact-exchange-EOF"},
+		{name: "attached-writer", writerErr: io.ErrClosedPipe, attached: true},
+		{name: "unattached-writer", writerErr: io.ErrClosedPipe},
+		{name: "exact-exchange-local-stop", localStop: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			flow, view := inspectionPacketFlow(t)
@@ -140,12 +140,12 @@ func TestInspectionXtlsReadRawFallbackEndReasons(t *testing.T) {
 			}
 			state := proxy.NewTrafficState(nil)
 			state.Outbound.DownlinkReaderDirectCopy = true
-			err := XtlsRead(buf.NewReader(bytes.NewReader(nil)), writer, inspectionActivityTimer(t), source, state, false, context.Background(), flow)
+			err := XtlsRead(buf.NewReader(bytes.NewReader(nil)), writer, inspectionActivityTimer(t), source, state, false, context.Background())
 			if (test.writerErr == nil) != (err == nil) {
 				t.Fatalf("raw fallback error = %v", err)
 			}
-			if got := inspectionTerminalReason(t, flow, view); got != test.want {
-				t.Fatalf("end reason = %v, want %v", got, test.want)
+			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink.Known != test.wantBytes {
+				t.Fatalf("raw fallback counted bytes: %+v want %d", got, test.wantBytes)
 			}
 		})
 	}

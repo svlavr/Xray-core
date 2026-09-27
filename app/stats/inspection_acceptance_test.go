@@ -54,14 +54,14 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 			t.Error("ended exchange retained native stop target")
 		}
 		exchange.AddDownlink(5)
-		totals, err := store.ReadTotals(context.Background())
+		totals, err := store.ReadTotals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if row := findTotal(t, totals.Rows, 1, fs.TrafficOriginUser); row.Downlink.Known != 8 {
 			t.Fatalf("late total: %+v", row)
 		}
-		terminal, err := store.ReadTerminals(context.Background())
+		terminal, err := store.ReadTerminals()
 		if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Downlink.Known != 3 {
 			t.Fatalf("terminal changed: %+v %v", terminal, err)
 		}
@@ -115,7 +115,7 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 		e.Finish()
 	}
 	add(1)
-	slow, err := store.ReadTerminals(context.Background())
+	slow, err := store.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,19 +126,19 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
-				page, err := store.ReadTerminals(context.Background())
+				page, err := store.ReadTerminals()
 				if err != nil {
 					t.Error(err)
 					return
 				}
 				for j := range page.Rows {
-					if page.Rows[j].Flow.Routes[0].RuleTag != "original" {
+					if page.Rows[j].Flow.SelectedRoute.RuleTag != "original" {
 						t.Error("another reader mutated store")
 					}
-					page.Rows[j].Flow.Routes[0].RuleTag = "reader mutation"
+					page.Rows[j].Flow.SelectedRoute.RuleTag = "reader mutation"
 				}
-				_, _ = store.ReadLive(context.Background())
-				_, _ = store.ReadTotals(context.Background())
+				_, _ = store.ReadLive()
+				_, _ = store.ReadTotals()
 			}
 		}()
 	}
@@ -146,23 +146,22 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 		add(i)
 	}
 	wg.Wait()
-	if len(slow.Rows) != 1 || slow.Rows[0].Flow.Ref != savedRef || slow.Rows[0].Flow.Uplink.Known != 1 || slow.Rows[0].Flow.Routes[0].RuleTag != "original" {
+	if len(slow.Rows) != 1 || slow.Rows[0].Flow.Ref != savedRef || slow.Rows[0].Flow.Uplink.Known != 1 || slow.Rows[0].Flow.SelectedRoute.RuleTag != "original" {
 		t.Fatal("retained reader snapshot changed")
 	}
-	fresh, err := store.ReadTerminals(context.Background())
-	if err != nil || len(fresh.Rows) != 2 || fresh.Loss.TerminalOverwrite != 99 {
+	fresh, err := store.ReadTerminals()
+	if err != nil || len(fresh.Rows) != 2 {
 		t.Fatalf("fresh bounded view: %+v %v", fresh, err)
 	}
 	outcomes, err := store.CloseFlows(context.Background(), []fs.FlowRef{savedRef, fresh.Rows[0].Flow.Ref})
-	if err != nil || outcomes[0].Code != fs.CloseCodeNotFound || outcomes[1].Code != fs.CloseCodeAlreadyEnded {
+	if err != nil || outcomes[0].Code != fs.CloseCodeNoAction || outcomes[1].Code != fs.CloseCodeNoAction {
 		t.Fatalf("retention close outcomes: %+v %v", outcomes, err)
 	}
 }
 
-func TestInspectionAcceptanceExhaustionAndSaturatedLoss(t *testing.T) {
+func TestInspectionAcceptanceExhaustionPreservesTotals(t *testing.T) {
 	store := testInspectionStore(t, fs.ObservationOptions{})
 	store.nextID = math.MaxUint64
-	store.loss.untrackedAdmissions.value.Store(math.MaxUint64 - 1)
 	for i := 0; i < 2; i++ {
 		e := store.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 		if e == nil || e.Ref() != (fs.FlowRef{}) {
@@ -173,12 +172,12 @@ func TestInspectionAcceptanceExhaustionAndSaturatedLoss(t *testing.T) {
 		e.AddUplink(7)
 		e.Finish()
 	}
-	totals, err := store.ReadTotals(context.Background())
+	totals, err := store.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if totals.Loss.UntrackedAdmissions != math.MaxUint64 || !totals.Loss.Saturated || store.nextID != math.MaxUint64 {
-		t.Fatalf("exhaustion facts: %+v", totals.Loss)
+	if store.nextID != math.MaxUint64 {
+		t.Fatalf("exhaustion wrapped ID: %d", store.nextID)
 	}
 	if row := findTotal(t, totals.Rows, 1, fs.TrafficOriginUser); row.Uplink.Known != 14 {
 		t.Fatalf("exhaustion lost native byte facts: %+v", row)
@@ -194,7 +193,7 @@ func TestInspectionAcceptanceStopRequestedIsVisible(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); _, _ = store.CloseFlows(context.Background(), []fs.FlowRef{e.Ref()}) }()
 	<-entered
-	live, err := store.ReadLive(context.Background())
+	live, err := store.ReadLive()
 	if err != nil || len(live.Rows) != 1 || live.Rows[0].State != fs.FlowStateStopRequested {
 		t.Errorf("stop in progress: %+v %v", live, err)
 	}
@@ -207,11 +206,12 @@ func acceptanceFillMetadata(store *inspectionStore, serial uint64, index int) *i
 		return xnet.UDPDestination(xnet.DomainAddress(fmt.Sprintf("%08d-%s-", index, label)+strings.Repeat("d", maxMetadataString)), 53)
 	}
 	e := store.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, domain("source"), domain("initial"), nil).(*inspectionExchange)
-	for i := uint32(0); i < store.limits.MaxRouteSteps; i++ {
-		e.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: serial, Tag: strings.Repeat("t", maxMetadataString)}, RuleTag: strings.Repeat("r", maxMetadataString), Original: domain("original"), RouteTarget: domain("route"), SelectedTarget: domain("selected"), Effective: domain("effective")})
+	for i := 0; i < 4; i++ {
+		e.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: serial, Tag: strings.Repeat("t", maxMetadataString)}, RuleTag: strings.Repeat("r", maxMetadataString), SelectedTarget: domain("selected")})
+		e.Effective(domain("effective"))
 	}
 	e.BindRoute()
-	for i := uint32(0); i < store.limits.MaxDestinations; i++ {
+	for i := 0; i < 8; i++ {
 		e.PacketDestination(domain(fmt.Sprintf("packet-%d", i)))
 	}
 	return e
@@ -228,8 +228,8 @@ func TestInspectionAcceptanceDefaultCapRetainedHeap(t *testing.T) {
 	}
 	for i := 0; i < int(store.limits.MaxTerminals); i++ {
 		e := acceptanceFillMetadata(store, uint64(i+1), i)
-		if e.metadataBudget != 0 {
-			t.Fatalf("fixture did not consume metadata budget: %d", e.metadataBudget)
+		if len(e.record.SelectedRoute.Outbound.Tag) != maxMetadataString || !e.record.LatestDestination.IsValid() {
+			t.Fatalf("latest bounded metadata missing: %+v", e.record)
 		}
 		e.Finish()
 	}
@@ -241,6 +241,6 @@ func TestInspectionAcceptanceDefaultCapRetainedHeap(t *testing.T) {
 	}
 	runtime.GC()
 	runtime.ReadMemStats(&after)
-	t.Logf("default-cap store retained HeapAlloc delta=%d bytes; live=%d terminals=%d attributed-buckets=%d; 4096-byte metadata budget consumed per record; caller copies/native connections/DNS caches excluded", int64(after.HeapAlloc)-int64(before.HeapAlloc), len(store.live), len(store.terminals), len(store.buckets))
+	t.Logf("default-cap store retained HeapAlloc delta=%d bytes; live=%d terminals=%d attributed-buckets=%d; caller copies/native connections/DNS caches excluded", int64(after.HeapAlloc)-int64(before.HeapAlloc), len(store.live), len(store.terminals), len(store.buckets))
 	runtime.KeepAlive(store)
 }

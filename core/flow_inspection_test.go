@@ -140,7 +140,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			second := inspectionSOCKS(t, address, destination, payload)
 			var rows []fs.FlowRecord
 			inspectionWait(t, func() bool {
-				live, err := view.ReadLive(context.Background())
+				live, err := view.ReadLive()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -157,7 +157,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			})
 			var selected fs.FlowRecord
 			for _, r := range rows {
-				if r.Origin != fs.TrafficOriginUser || r.AccountingRoute.Outbound.Serial == 0 || r.AccountingRoute.Outbound.Tag != "direct" {
+				if r.Origin != fs.TrafficOriginUser || r.SelectedRoute.Outbound.Serial == 0 || r.SelectedRoute.Outbound.Tag != "direct" {
 					t.Fatalf("bad admission/route: %+v", r)
 				}
 				if r.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -165,9 +165,6 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				}
 				if runtime.GOOS == "windows" && r.Downlink.Known != uint64(len(payload)) {
 					t.Fatalf("missing incremental output: %+v", r.Downlink)
-				}
-				if sniff && r.AccountingRoute.RouteTarget.Address.Domain() != "p1.invalid" {
-					t.Fatalf("missing route-only target: %+v", r.AccountingRoute)
 				}
 			}
 			if selected.Ref.ID == 0 {
@@ -179,7 +176,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			}
 			var terminal fs.TerminalRecord
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -191,11 +188,11 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				}
 				return false
 			})
-			if terminal.Flow.Uplink.Known != uint64(len(payload)) || terminal.Flow.Downlink.Known != uint64(len(payload)) || terminal.Flow.State != fs.FlowStateEnded || terminal.Reason != fs.EndReasonLocalStop {
+			if terminal.Flow.Uplink.Known != uint64(len(payload)) || terminal.Flow.Downlink.Known != uint64(len(payload)) || terminal.Flow.State != fs.FlowStateEnded {
 				t.Fatalf("final receipt: %+v", terminal)
 			}
 			out, err = view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || out[0].Code != fs.CloseCodeAlreadyEnded {
+			if err != nil || out[0].Code != fs.CloseCodeNoAction {
 				t.Fatalf("repeat close %+v %v", out, err)
 			}
 			extra := []byte("sibling stays open")
@@ -204,8 +201,8 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			}
 			inspectionResponse(t, second, extra)
 			second.Close()
-			inspectionWait(t, func() bool { live, _ := view.ReadLive(context.Background()); return len(live.Rows) == 0 })
-			totals, err := view.ReadTotals(context.Background())
+			inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 0 })
+			totals, err := view.ReadTotals()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -233,7 +230,7 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 		c := inspectionSOCKS(t, address, destination, []byte("short"))
 		c.Close()
 		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals(context.Background())
+			page, _ := view.ReadTerminals()
 			if len(page.Rows) != i+1 {
 				return false
 			}
@@ -241,7 +238,7 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 			if row.Flow.Uplink.Known != 5 || row.Flow.Downlink.Known != 5 {
 				t.Fatalf("short final: %+v", row)
 			}
-			serials = append(serials, row.Flow.AccountingRoute.Outbound.Serial)
+			serials = append(serials, row.Flow.SelectedRoute.Outbound.Serial)
 			return true
 		})
 		if i == 0 {
@@ -258,7 +255,7 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 	if serials[0] == 0 || serials[0] == serials[1] {
 		t.Fatalf("incarnation reuse: %v", serials)
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,17 +288,17 @@ func TestFlowInspectionRejectedSniffAndDisabled(t *testing.T) {
 	c.Write(request)
 	var final fs.TerminalRecord
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		if len(page.Rows) != 1 {
 			return false
 		}
 		final = page.Rows[0]
 		return true
 	})
-	if final.Reason != fs.EndReasonRejected || final.Flow.Uplink.Known != uint64(len(request)) || final.Flow.AccountingRoute.Outbound.Serial != 0 {
+	if final.Flow.Uplink.Known != uint64(len(request)) || final.Flow.SelectedRoute.Outbound.Serial != 0 {
 		t.Fatalf("rejected receipt: %+v", final)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, r := range totals.Rows {
 		if r.Origin == fs.TrafficOriginUser {
@@ -347,17 +344,14 @@ func TestFlowInspectionEnableBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Info().Limits.MaxLive != 1 {
-		t.Fatal("effective options")
-	}
 	if _, err = core.EnableFlowInspection(instance, fs.ObservationOptions{}); !errors.Is(err, fs.ErrInspectionAlreadyEnabled) {
 		t.Fatalf("second enable: %v", err)
 	}
 	if err = instance.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !view.Info().Closed {
-		t.Fatal("store not closed")
+	if _, err := view.ReadLive(); !errors.Is(err, fs.ErrInspectionClosed) {
+		t.Fatalf("closed read: %v", err)
 	}
 }
 
@@ -418,7 +412,7 @@ func TestFlowInspectionForcedSelection(t *testing.T) {
 			}
 			var final fs.TerminalRecord
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				if len(page.Rows) != 1 {
 					return false
 				}
@@ -429,10 +423,10 @@ func TestFlowInspectionForcedSelection(t *testing.T) {
 				t.Fatalf("sniff credit: %+v", final)
 			}
 			if tag == "direct" {
-				if final.Flow.AccountingRoute.Selection != fs.SelectionForced || final.Flow.AccountingRoute.Outbound.Serial == 0 {
+				if final.Flow.SelectedRoute.Selection != fs.SelectionForced || final.Flow.SelectedRoute.Outbound.Serial == 0 {
 					t.Fatalf("forced selection: %+v", final)
 				}
-			} else if final.Reason != fs.EndReasonRejected || final.Flow.AccountingRoute.Outbound.Serial != 0 || final.Flow.AccountingRoute.Outbound.Tag != "missing" {
+			} else if final.Flow.SelectedRoute.Outbound.Serial != 0 || final.Flow.SelectedRoute.Outbound.Tag != "missing" {
 				t.Fatalf("missing forced selection: %+v", final)
 			}
 		})
@@ -473,17 +467,17 @@ func TestFlowInspectionForwardingAttribution(t *testing.T) {
 	conn.Close()
 	var final fs.TerminalRecord
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		if len(page.Rows) != 1 {
 			return false
 		}
 		final = page.Rows[0]
 		return true
 	})
-	if len(final.Flow.Routes) != 2 || final.Flow.Routes[0].Outbound.Tag != "forward" || final.Flow.AccountingRoute.Outbound.Tag != "direct" || final.Flow.Routes[0].Leg == final.Flow.AccountingRoute.Leg || final.Flow.Uplink.Known != uint64(len(payload)) || final.Flow.Downlink.Known != uint64(len(payload)) {
+	if final.Flow.SelectedRoute.Outbound.Tag != "direct" || final.Flow.Uplink.Known != uint64(len(payload)) || final.Flow.Downlink.Known != uint64(len(payload)) {
 		t.Fatalf("forwarded flow: %+v", final)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var up, down uint64
 	for _, row := range totals.Rows {
 		if row.Outbound.Tag == "forward" {
@@ -528,17 +522,17 @@ func TestFlowInspectionUnclaimedOwnerUsesUnassigned(t *testing.T) {
 	conn.Close()
 	var ended fs.FlowRecord
 	inspectionWait(t, func() bool {
-		snapshot, _ := view.ReadTerminals(context.Background())
+		snapshot, _ := view.ReadTerminals()
 		if len(snapshot.Rows) != 1 {
 			return false
 		}
 		ended = snapshot.Rows[0].Flow
-		return ended.Uplink.Incomplete && ended.Downlink.Incomplete
+		return ended.Uplink.Known == uint64(len(payload))
 	})
-	if len(ended.Routes) != 1 || ended.Routes[0].Outbound.Tag != "unclaimed" || ended.AccountingRoute.Outbound.Serial != 0 || ended.Uplink.Known != uint64(len(payload)) {
+	if ended.SelectedRoute.Outbound.Tag != "unclaimed" || ended.SelectedRoute.Outbound.Serial == 0 || ended.Uplink.Known != uint64(len(payload)) {
 		t.Fatalf("unclaimed owner snapshot: %+v", ended)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
 		if row.Outbound.Serial != 0 {
@@ -546,9 +540,6 @@ func TestFlowInspectionUnclaimedOwnerUsesUnassigned(t *testing.T) {
 		}
 		if row.Origin == fs.TrafficOriginUser {
 			known += row.Uplink.Known
-			if !row.Uplink.Incomplete || !row.Downlink.Incomplete {
-				t.Fatalf("unclaimed uncertainty: %+v", row)
-			}
 		}
 	}
 	if known != uint64(len(payload)) {

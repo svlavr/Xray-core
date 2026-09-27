@@ -2,7 +2,6 @@ package taggedimpl
 
 import (
 	"context"
-	"io"
 	"sync"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -100,21 +99,10 @@ func (o *taggedObservation) Close() error {
 	return err
 }
 
-func (o *taggedObservation) recordRead(n int, err error) {
+func (o *taggedObservation) recordRead(n int) {
 	if n > 0 {
 		o.exchange.AddDownlink(uint64(n))
 	}
-	if err == nil {
-		return
-	}
-	reason := stats.EndReasonReadError
-	if err == io.EOF {
-		reason = stats.EndReasonEOF
-	}
-	if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
-		reason = stats.EndReasonTimeout
-	}
-	o.exchange.SetEndReason(reason)
 }
 
 type inspectedTaggedConn struct {
@@ -124,13 +112,13 @@ type inspectedTaggedConn struct {
 
 func (c *inspectedTaggedConn) Read(payload []byte) (int, error) {
 	n, err := c.Conn.Read(payload)
-	c.observation.recordRead(n, err)
+	c.observation.recordRead(n)
 	return n, err
 }
 
 func (c *inspectedTaggedConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb, err := c.Conn.(buf.Reader).ReadMultiBuffer()
-	c.observation.recordRead(int(mb.Len()), err)
+	c.observation.recordRead(int(mb.Len()))
 	return mb, err
 }
 

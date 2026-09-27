@@ -75,12 +75,12 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 			}
 			var first fs.FlowRef
 			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive(context.Background())
+				live, _ := view.ReadLive()
 				if len(live.Rows) != 2 {
 					return false
 				}
 				for _, r := range live.Rows {
-					if r.InitialDestination != dest || r.Origin != fs.TrafficOriginUser || r.AccountingRoute.Outbound.Tag != "portal" || r.Uplink.Known != uint64(len(payload)) || r.Downlink.Known != uint64(len(payload)) {
+					if r.InitialDestination != dest || r.Origin != fs.TrafficOriginUser || r.SelectedRoute.Outbound.Tag != "portal" || r.Uplink.Known != uint64(len(payload)) || r.Downlink.Known != uint64(len(payload)) {
 						return false
 					}
 					first = r.Ref
@@ -92,7 +92,7 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 				t.Fatalf("stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 1
 			})
 			// A new sibling still traverses the same surviving reverse carrier.
@@ -101,10 +101,10 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 			b.Close()
 			c.Close()
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 3
 			})
-			totals, _ := view.ReadTotals(context.Background())
+			totals, _ := view.ReadTotals()
 			var up, down uint64
 			for _, r := range totals.Rows {
 				up += r.Uplink.Known
@@ -183,12 +183,12 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	}
 	var firstRef fs.FlowRef
 	inspectionWait(t, func() bool {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		if readErr != nil || len(live.Rows) != 1 {
 			return false
 		}
 		row := live.Rows[0]
-		if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.InitialDestination != logicalDestination || row.AccountingRoute.Outbound.Tag != "portal" || row.Uplink.Known != uint64(len(firstPayload)) || row.Downlink.Known != uint64(len(firstPayload)) {
+		if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.InitialDestination != logicalDestination || row.SelectedRoute.Outbound.Tag != "portal" || row.Uplink.Known != uint64(len(firstPayload)) || row.Downlink.Known != uint64(len(firstPayload)) {
 			return false
 		}
 		firstRef = row.Ref
@@ -199,8 +199,8 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 		t.Fatalf("stop first UDP child: %+v %v", out, err)
 	}
 	inspectionWait(t, func() bool {
-		page, readErr := view.ReadTerminals(context.Background())
-		return readErr == nil && len(page.Rows) == 1 && page.Rows[0].Reason == fs.EndReasonLocalStop
+		page, readErr := view.ReadTerminals()
+		return readErr == nil && len(page.Rows) == 1
 	})
 	if bridge.Connections() == 0 {
 		t.Fatal("stopping UDP child closed the reverse carrier")
@@ -209,10 +209,10 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	secondPayload := []byte("reverse udp sibling")
 	inspectionUDPExchange(t, second, address, secondPayload, mask)
 	inspectionWait(t, func() bool {
-		live, readErr := view.ReadLive(context.Background())
-		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Ref != firstRef && live.Rows[0].AccountingRoute.Outbound.Tag == "portal" && live.Rows[0].Uplink.Known == uint64(len(secondPayload)) && live.Rows[0].Downlink.Known == uint64(len(secondPayload))
+		live, readErr := view.ReadLive()
+		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Ref != firstRef && live.Rows[0].SelectedRoute.Outbound.Tag == "portal" && live.Rows[0].Uplink.Known == uint64(len(secondPayload)) && live.Rows[0].Downlink.Known == uint64(len(secondPayload))
 	})
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,16 +272,16 @@ func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
 	}
 	inspectionResponse(t, conn, payload)
 	inspectionWait(t, func() bool {
-		live, _ := view.ReadLive(context.Background())
+		live, _ := view.ReadLive()
 		if len(live.Rows) != 1 {
 			return false
 		}
 		r := live.Rows[0]
-		return r.InitialDestination == target && r.AccountingRoute.Outbound.Tag == "same-domain" && r.AccountingRoute.Effective == dest && r.Uplink.Known == uint64(len(payload)) && r.Downlink.Known == uint64(len(payload))
+		return r.InitialDestination == target && r.SelectedRoute.Outbound.Tag == "same-domain" && r.EffectiveDestination == dest && r.Uplink.Known == uint64(len(payload)) && r.Downlink.Known == uint64(len(payload))
 	})
 	conn.Close()
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1
 	})
 }

@@ -153,7 +153,7 @@ func (c *udpConn) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) e
 		}
 		err := c.handler.writePacket(b.Bytes(), dst, c.src)
 		if receipt != nil {
-			proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil, err != nil, err)
+			proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil)
 		}
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])

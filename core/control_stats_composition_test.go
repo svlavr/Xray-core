@@ -51,7 +51,7 @@ func controlExchange(t *testing.T, conn net.Conn, network net.Network) {
 
 func controlOpen(t *testing.T, instance *core.Instance, view fs.FlowInspection, dest net.Destination) (net.Conn, fs.FlowRecord) {
 	t.Helper()
-	before, err := view.ReadLive(context.Background())
+	before, err := view.ReadLive()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,12 +68,12 @@ func controlOpen(t *testing.T, instance *core.Instance, view fs.FlowInspection, 
 	controlExchange(t, conn, dest.Network)
 	var found fs.FlowRecord
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
-			if !known[row.Ref] && row.AccountingRoute.Outbound.Serial != 0 && row.Downlink.Known > 0 {
+			if !known[row.Ref] && row.SelectedRoute.Outbound.Serial != 0 && row.Downlink.Known > 0 {
 				found = row
 				return true
 			}
@@ -92,11 +92,11 @@ func controlRule(target string, network net.Network) *router.Config {
 
 func controlRoute(t *testing.T, row fs.FlowRecord, tag string, selection fs.SelectionKind) {
 	t.Helper()
-	if row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Tag != tag || row.AccountingRoute.Outbound.Serial == 0 || row.AccountingRoute.Selection != selection {
+	if row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != tag || row.SelectedRoute.Outbound.Serial == 0 || row.SelectedRoute.Selection != selection {
 		t.Fatalf("unexpected route: %+v", row)
 	}
-	if selection == fs.SelectionRule && row.AccountingRoute.RuleTag != "p3-rule" {
-		t.Fatalf("missing rule readback: %+v", row.AccountingRoute)
+	if selection == fs.SelectionRule && row.SelectedRoute.RuleTag != "p3-rule" {
+		t.Fatalf("missing rule readback: %+v", row.SelectedRoute)
 	}
 }
 
@@ -140,17 +140,17 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 
 				// The caller captures exact refs BEFORE changing the route. Membership
 				// is bounded and deliberately excludes unrelated and future admissions.
-				live, err := view.ReadLive(context.Background())
+				live, err := view.ReadLive()
 				if err != nil {
 					t.Fatal(err)
 				}
 				var captured []fs.FlowRef
 				for _, row := range live.Rows {
-					if row.AccountingRoute.Outbound == firstRow.AccountingRoute.Outbound {
+					if row.SelectedRoute.Outbound == firstRow.SelectedRoute.Outbound {
 						captured = append(captured, row.Ref)
 					}
 				}
-				if len(captured) != 2 || len(captured) > int(view.Info().Limits.MaxClose) {
+				if len(captured) != 2 {
 					t.Fatalf("invalid captured set: %+v", captured)
 				}
 				// Failed native publication is observable. The caller does not invoke
@@ -192,7 +192,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				controlRoute(t, laterRow, "p3-b", fs.SelectionRule)
 				controlExchange(t, first, network)
 				controlExchange(t, second, network)
-				live, err = view.ReadLive(context.Background())
+				live, err = view.ReadLive()
 				if err != nil || len(live.Rows) != 5 {
 					t.Fatalf("ordinary update changed established membership: %+v %v", live, err)
 				}
@@ -220,12 +220,12 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 						t.Fatal("captured stop timed out instead of closing the endpoint")
 					}
 				}
-				terminals, err := view.ReadTerminals(context.Background())
+				terminals, err := view.ReadTerminals()
 				if err != nil || len(terminals.Rows) != 2 {
 					t.Fatalf("captured ending snapshots: %+v %v", terminals, err)
 				}
 				for _, terminal := range terminals.Rows {
-					if terminal.Reason != fs.EndReasonLocalStop || (terminal.Flow.Ref != firstRow.Ref && terminal.Flow.Ref != secondRow.Ref) {
+					if terminal.Flow.Ref != firstRow.Ref && terminal.Flow.Ref != secondRow.Ref {
 						t.Fatalf("wrong endpoint ended: %+v", terminal)
 					}
 					controlRoute(t, terminal.Flow, "p3-a", fs.SelectionRule)
@@ -233,7 +233,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				stale := laterRow.Ref
 				stale.Runtime[0] ^= 0xff
 				outcomes, err = view.CloseFlows(context.Background(), append(captured, stale))
-				if err != nil || len(outcomes) != 3 || outcomes[0].Code != fs.CloseCodeAlreadyEnded || outcomes[1].Code != fs.CloseCodeAlreadyEnded || outcomes[2].Code != fs.CloseCodeStaleRuntime {
+				if err != nil || len(outcomes) != 3 || outcomes[0].Code != fs.CloseCodeNoAction || outcomes[1].Code != fs.CloseCodeNoAction || outcomes[2].Code != fs.CloseCodeStaleRuntime {
 					t.Fatalf("repeat/stale results: %+v %v", outcomes, err)
 				}
 				controlExchange(t, unrelated, network)
@@ -309,10 +309,10 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 	}
 	newConn, newRow := controlOpen(t, instance, view, original)
 	controlRoute(t, newRow, "p3-dynamic", fs.SelectionRule)
-	if newRow.AccountingRoute.Outbound.Serial == oldRow.AccountingRoute.Outbound.Serial {
+	if newRow.SelectedRoute.Outbound.Serial == oldRow.SelectedRoute.Outbound.Serial {
 		t.Fatal("tag reuse reused the old incarnation")
 	}
-	if newRow.InitialDestination != original || newRow.AccountingRoute.Original != original || newRow.AccountingRoute.RouteTarget != (net.Destination{}) || newRow.AccountingRoute.SelectedTarget != original || newRow.AccountingRoute.Effective != redirected || redirectedBytes.Load() == 0 {
+	if newRow.InitialDestination != original || newRow.SelectedRoute.SelectedTarget != original || newRow.EffectiveDestination != redirected || redirectedBytes.Load() == 0 {
 		t.Fatalf("redirect facts: %+v", newRow)
 	}
 	if err := core.AddOutboundHandler(instance, &core.OutboundHandlerConfig{Tag: "p3-block", ProxySettings: serial.ToTypedMessage(&blackhole.Config{})}); err != nil {
@@ -335,13 +335,13 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 		t.Fatal("BLOCK timed out instead of ending")
 	}
 	blocked.Close()
-	terminals, err := view.ReadTerminals(context.Background())
+	terminals, err := view.ReadTerminals()
 	if err != nil || len(terminals.Rows) != 1 {
 		t.Fatalf("BLOCK terminal: %+v %v", terminals, err)
 	}
 	controlRoute(t, terminals.Rows[0].Flow, "p3-block", fs.SelectionRule)
-	if terminals.Rows[0].Reason != fs.EndReasonRejected {
-		t.Fatalf("BLOCK reason: %+v", terminals.Rows[0])
+	if terminals.Rows[0].Flow.State != fs.FlowStateEnded {
+		t.Fatalf("BLOCK completion: %+v", terminals.Rows[0])
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{oldRow.Ref})
 	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
@@ -401,7 +401,7 @@ func TestControlStatsP3InboundLifecycle(t *testing.T) {
 	address := net.JoinHostPort("127.0.0.1", port.String())
 	conn := inspectionSOCKS(t, address, dest, []byte("dynamic inbound"))
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil || len(live.Rows) != 1 {
 			return false
 		}

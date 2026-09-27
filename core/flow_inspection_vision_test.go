@@ -40,7 +40,7 @@ func inspectionVisionReceiverMode(t *testing.T, enabled, sniff, encrypted bool) 
 	if enabled {
 		t.Cleanup(func() {
 			if t.Failed() {
-				live, _ := view.ReadLive(context.Background())
+				live, _ := view.ReadLive()
 				t.Logf("receiver diagnostic: %+v", live.Rows)
 			}
 		})
@@ -169,7 +169,7 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			check := func(view fs.FlowInspection, tag string, count int) fs.FlowRecord {
 				var row fs.FlowRecord
 				inspectionWait(t, func() bool {
-					live, err := view.ReadLive(context.Background())
+					live, err := view.ReadLive()
 					if err != nil || len(live.Rows) != count {
 						return false
 					}
@@ -181,11 +181,11 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 					}
 					return false
 				})
-				if row.AccountingRoute.Outbound.Tag != tag || row.AccountingRoute.Outbound.Serial == 0 || row.Uplink.Incomplete || row.Downlink.Incomplete || row.Origin != fs.TrafficOriginUser {
+				if row.SelectedRoute.Outbound.Tag != tag || row.SelectedRoute.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
 					t.Fatalf("Vision live facts: %+v", row)
 				}
 				if count == 1 {
-					totals, err := view.ReadTotals(context.Background())
+					totals, err := view.ReadTotals()
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -205,7 +205,7 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			burst(first, "second low-rate burst while both endpoints remain open")
 			secondRow := check(receiving, "direct", 1)
 			check(sending, "vision", 1)
-			if firstRow.Ref != secondRow.Ref || firstRow.Downlink.Incomplete || secondRow.Downlink.Incomplete || secondRow.Downlink.Known <= firstRow.Downlink.Known {
+			if firstRow.Ref != secondRow.Ref || secondRow.Downlink.Known <= firstRow.Downlink.Known {
 				t.Fatal("raw transition lost active progress or continuity")
 			}
 			// The second write publishes native inbound splice readiness only
@@ -213,7 +213,7 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			burst(first, "third burst through both native splice handoffs")
 			thirdRow := check(receiving, "direct", 1)
 			check(sending, "vision", 1)
-			if thirdRow.Ref != firstRow.Ref || thirdRow.Downlink.Incomplete || thirdRow.Downlink.Known <= secondRow.Downlink.Known {
+			if thirdRow.Ref != firstRow.Ref || thirdRow.Downlink.Known <= secondRow.Downlink.Known {
 				t.Fatal("inbound raw pump lost progress")
 			}
 			sibling, siblingWire := connect()
@@ -230,27 +230,22 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			siblingWire.Close()
 			for _, view := range []fs.FlowInspection{receiving, sending} {
 				inspectionWait(t, func() bool {
-					page, err := view.ReadTerminals(context.Background())
+					page, err := view.ReadTerminals()
 					if err != nil || len(page.Rows) != 2 {
 						return false
 					}
 					var up, down uint64
-					sawEOF := false
 					for _, row := range page.Rows {
-						if view == receiving && row.Flow.Ref == firstRow.Ref && row.Reason != fs.EndReasonLocalStop {
-							t.Fatalf("Vision local stop cause: %+v", row)
+						if row.Flow.State != fs.FlowStateEnded {
+							t.Fatalf("Vision flow did not end: %+v", row)
 						}
-						sawEOF = sawEOF || row.Reason == fs.EndReasonEOF
 						up += row.Flow.Uplink.Known
 						down += row.Flow.Downlink.Known
-					}
-					if view == sending && !sawEOF {
-						t.Fatalf("Vision natural raw completion missing EOF: %+v", page.Rows)
 					}
 					if up != wire.written.Load()+siblingWire.written.Load() || down != wire.read.Load()+siblingWire.read.Load() {
 						t.Fatalf("Vision terminal double count: %d/%d want %d/%d", up, down, wire.written.Load()+siblingWire.written.Load(), wire.read.Load()+siblingWire.read.Load())
 					}
-					totals, _ := view.ReadTotals(context.Background())
+					totals, _ := view.ReadTotals()
 					var totalUp, totalDown uint64
 					for _, row := range totals.Rows {
 						totalUp += row.Uplink.Known

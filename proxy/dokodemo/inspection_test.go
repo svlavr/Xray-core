@@ -1,7 +1,6 @@
 package dokodemo
 
 import (
-	"context"
 	"errors"
 	"io"
 	"sync"
@@ -65,20 +64,19 @@ func (s *inspectionResultSocket) Close() error {
 
 func TestInspectionPacketWriterRawResults(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		offered, n  int
-		err         error
-		known       uint64
-		unavailable bool
+		name       string
+		offered, n int
+		err        error
+		known      uint64
 	}{
-		{"full", 4, 4, nil, 4, false},
-		{"prefix error", 4, 2, io.ErrClosedPipe, 2, false},
-		{"short nil", 4, 2, nil, 2, false},
-		{"full error", 4, 4, io.ErrClosedPipe, 4, false},
-		{"empty", 0, 0, nil, 0, false},
-		{"empty error", 0, 0, io.ErrClosedPipe, 0, false},
-		{"negative", 4, -1, nil, 0, true},
-		{"oversize", 4, 5, nil, 0, true},
+		{"full", 4, 4, nil, 4},
+		{"prefix error", 4, 2, io.ErrClosedPipe, 2},
+		{"short nil", 4, 2, nil, 2},
+		{"full error", 4, 4, io.ErrClosedPipe, 4},
+		{"empty", 0, 0, nil, 0},
+		{"empty error", 0, 0, io.ErrClosedPipe, 0},
+		{"negative", 4, -1, nil, 0},
+		{"oversize", 4, 5, nil, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, perDestination := range []bool{false, true} {
@@ -104,12 +102,12 @@ func TestInspectionPacketWriterRawResults(t *testing.T) {
 					t.Fatalf("native return changed: %v", err)
 				}
 				flow.Finish()
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				if err != nil || len(page.Rows) != 1 {
 					t.Fatalf("terminal: %+v %v", page, err)
 				}
 				fact := page.Rows[0].Flow.Downlink
-				if fact.Known != tc.known || fact.Incomplete != tc.unavailable {
+				if fact.Known != tc.known {
 					t.Fatalf("destination=%t fact=%+v", perDestination, fact)
 				}
 			}
@@ -141,7 +139,7 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 		t.Fatal("write did not start")
 	}
 	flow.Finish()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("owner-end write snapshot: %+v %v", page, err)
 	}
@@ -156,15 +154,15 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 	if err := <-done; !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals(context.Background())
+	page, err = view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if fact.Known != 0 || fact.Incomplete {
+	if fact.Known != 0 {
 		t.Fatalf("late write mutated history: %+v", fact)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
 		known += total.Downlink.Known

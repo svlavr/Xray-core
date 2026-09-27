@@ -164,10 +164,6 @@ func (o *inspectionOutput) writeFrame(mb buf.MultiBuffer, payload int32, flow st
 			}
 		}
 	} else {
-		if accepted {
-			flow.MarkDownlinkIncomplete()
-		}
-		flow.SetEndReason(stats.EndReasonWriteError)
 	}
 	return err
 }
@@ -190,9 +186,6 @@ func (r *childInput) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 	r.flow.AddUplink(uint64(mb.Len()))
-	if err != nil && err != io.EOF {
-		r.flow.SetEndReason(stats.EndReasonReadError)
-	}
 	return mb, err
 }
 

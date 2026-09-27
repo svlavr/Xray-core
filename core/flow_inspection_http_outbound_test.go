@@ -48,7 +48,7 @@ func inspectionHTTPOutbound(t *testing.T, remote string, enabled bool) (*core.In
 func inspectionHTTPOutboundTotals(t *testing.T, view fs.FlowInspection, want uint64) {
 	t.Helper()
 	inspectionWait(t, func() bool {
-		totals, err := view.ReadTotals(context.Background())
+		totals, err := view.ReadTotals()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -60,7 +60,7 @@ func inspectionHTTPOutboundTotals(t *testing.T, view fs.FlowInspection, want uin
 				}
 				continue
 			}
-			if row.Outbound.Tag != "http-proxy" || row.Origin != fs.TrafficOriginUser || row.Uplink.Incomplete || row.Downlink.Incomplete {
+			if row.Outbound.Tag != "http-proxy" || row.Origin != fs.TrafficOriginUser {
 				t.Fatalf("HTTP outbound totals: %+v", row)
 			}
 			up += row.Uplink.Known
@@ -91,15 +91,15 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 			}
 			var selected fs.FlowRef
 			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive(context.Background())
+				live, _ := view.ReadLive()
 				if len(live.Rows) != 2 {
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) || row.Uplink.Incomplete || row.Downlink.Incomplete {
+					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
 						return false
 					}
-					if row.AccountingRoute.Outbound.Tag != "http-proxy" || row.AccountingRoute.Outbound.Serial == 0 || row.AccountingRoute.Effective != destination || row.Origin != fs.TrafficOriginUser || row.Uplink.Incomplete || row.Downlink.Incomplete {
+					if row.SelectedRoute.Outbound.Tag != "http-proxy" || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("live proxy receipt: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -113,8 +113,8 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 				t.Fatalf("close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected && page.Rows[0].Reason == fs.EndReasonLocalStop
+				page, _ := view.ReadTerminals()
+				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected
 			})
 			if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
 				t.Fatalf("stopped endpoint returned %d, %v", n, err)
@@ -126,7 +126,7 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 			inspectionResponse(t, second, extra)
 			second.Close()
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 2
 			})
 			want := uint64(2*len(payload) + len(extra))
@@ -187,8 +187,8 @@ func TestFlowInspectionHTTPOutboundHandshakeEnding(t *testing.T) {
 			if err != nil || !bytes.HasPrefix(request[:n], []byte("CONNECT 127.0.0.1:80 HTTP/1.1\r\n")) {
 				t.Fatalf("native CONNECT request: %q %v", request[:n], err)
 			}
-			live, err := view.ReadLive(context.Background())
-			if err != nil || len(live.Rows) != 1 || live.Rows[0].AccountingRoute.Outbound.Tag != "http-proxy" {
+			live, err := view.ReadLive()
+			if err != nil || len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Outbound.Tag != "http-proxy" {
 				t.Fatalf("handshake owner: %+v %v", live, err)
 			}
 			ref := live.Rows[0].Ref
@@ -197,11 +197,11 @@ func TestFlowInspectionHTTPOutboundHandshakeEnding(t *testing.T) {
 				if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
 					t.Fatalf("handshake stop: %+v %v", outcomes, err)
 				}
-				page, _ := view.ReadTerminals(context.Background())
-				if len(page.Rows) != 1 || page.Rows[0].Reason != fs.EndReasonLocalStop {
+				page, _ := view.ReadTerminals()
+				if len(page.Rows) != 1 {
 					t.Fatalf("owner-close snapshot: %+v", page)
 				}
-				live, err := view.ReadLive(context.Background())
+				live, err := view.ReadLive()
 				if err != nil || len(live.Rows) != 0 {
 					t.Fatalf("owner-close remained live: %+v %v", live, err)
 				}
@@ -210,16 +210,16 @@ func TestFlowInspectionHTTPOutboundHandshakeEnding(t *testing.T) {
 				t.Fatal(err)
 			}
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				if len(page.Rows) != 1 {
 					return false
 				}
 				row := page.Rows[0]
-				if row.Flow.Ref != ref || row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.AccountingRoute.Outbound.Tag != "http-proxy" || row.Flow.Uplink.Incomplete || row.Flow.Downlink.Incomplete {
+				if row.Flow.Ref != ref || row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.SelectedRoute.Outbound.Tag != "http-proxy" {
 					t.Fatalf("failed handshake receipt: %+v", row)
 				}
-				if stop && row.Reason != fs.EndReasonLocalStop {
-					t.Fatalf("lost local stop: %+v", row)
+				if row.Flow.State != fs.FlowStateEnded {
+					t.Fatalf("missing owner end: %+v", row)
 				}
 				return true
 			})

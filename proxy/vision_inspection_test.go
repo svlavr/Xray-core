@@ -107,9 +107,8 @@ func TestVisionWriterPayloadPrefixes(t *testing.T) {
 				t.Fatal("partial lower result lost its error")
 			}
 			flow.Finish()
-			page, err := view.ReadTerminals(context.Background())
-			wantFailure := test.limit < 55 || test.fail
-			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != test.known || page.Rows[0].Flow.Downlink.Incomplete != wantFailure {
+			page, err := view.ReadTerminals()
+			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != test.known {
 				t.Fatalf("Vision prefix facts: %+v %v", page, err)
 			}
 		})
@@ -142,7 +141,7 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 	go func() { writeDone <- writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("request"))}) }()
 	<-lower.entered
 	flow.Finish()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("owner-end Vision snapshot: %+v %v", page, err)
 	}
@@ -161,11 +160,11 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals(context.Background())
+	page, err = view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("pending Vision result lost: %+v %v", page, err)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
 		known += total.Downlink.Known

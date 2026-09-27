@@ -43,9 +43,9 @@ func preconnectInspection(t *testing.T, target cnet.Destination, flow string, co
 	observation := session.LogicalObservationFromContext(ctx)
 	if observation != nil {
 		observation.Exchange.Route(fs.RouteStep{
-			Leg: 1, Selection: fs.SelectionDefault,
-			Outbound: fs.OutboundRef{Runtime: view.Info().Runtime, Serial: 1, Tag: "vless"},
-			Original: target, SelectedTarget: target,
+			Selection:      fs.SelectionDefault,
+			Outbound:       fs.OutboundRef{Runtime: view.Info().Runtime, Serial: 1, Tag: "vless"},
+			SelectedTarget: target,
 		})
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -90,11 +90,11 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 	var ref fs.FlowRef
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(live.Rows) == 1 && live.Rows[0].AccountingRoute.Outbound.Tag == "vless" && live.Rows[0].AccountingRoute.Effective == target {
+		if len(live.Rows) == 1 && live.Rows[0].SelectedRoute.Outbound.Tag == "vless" && live.Rows[0].EffectiveDestination == target {
 			ref = live.Rows[0].Ref
 			break
 		}
@@ -118,12 +118,12 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 	finish()
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(page.Rows) == 1 {
-			if page.Rows[0].Reason != fs.EndReasonLocalStop || page.Rows[0].Flow.Ref != ref {
+			if page.Rows[0].Flow.Ref != ref {
 				t.Fatalf("preconnect terminal: %+v", page.Rows[0])
 			}
 			return
@@ -159,8 +159,8 @@ func TestInspectionVLESSPreconnectCommandClaims(t *testing.T) {
 				t.Fatal("special branch did not reach Testpre receive")
 			}
 			observation := session.LogicalObservationFromContext(ctx)
-			live, err := view.ReadLive(context.Background())
-			claimed := observation != nil && len(live.Rows) == 1 && live.Rows[0].AccountingRoute.Outbound.Serial != 0
+			live, err := view.ReadLive()
+			claimed := observation != nil && len(live.Rows) == 1 && live.Rows[0].SelectedRoute.Outbound.Serial != 0
 			if err != nil || claimed != test.claimed {
 				t.Fatal("command claim disagrees with logical endpoint eligibility")
 			}

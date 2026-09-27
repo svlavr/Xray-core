@@ -2,7 +2,6 @@ package crypto_test
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"slices"
@@ -56,7 +55,7 @@ func authenticationFlow(t *testing.T) (fs.Exchange, fs.FlowInspection) {
 
 func authenticationFact(t *testing.T, view fs.FlowInspection) fs.ByteFact {
 	t.Helper()
-	live, err := view.ReadLive(context.Background())
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 {
 		t.Fatalf("codec live facts: %+v %v", live, err)
 	}
@@ -102,12 +101,10 @@ func TestInspectionAuthenticationPartialFrames(t *testing.T) {
 				finish()
 				fact := authenticationFact(t, view)
 				known := uint64(0)
-				incomplete := true
 				if limit >= total-1 {
 					known = uint64(len(payload))
-					incomplete = false
 				}
-				if fact.Known != known || fact.Incomplete != incomplete {
+				if fact.Known != known {
 					t.Fatalf("limit %d, codec result %+v", limit, fact)
 				}
 				if output.Len() != limit {
@@ -141,7 +138,7 @@ func TestInspectionAuthenticationBufferingAndNativeBatch(t *testing.T) {
 			t.Fatal(err)
 		}
 		finish()
-		if fact := authenticationFact(t, view); fact.Known != uint64(5+len(more)) || fact.Incomplete {
+		if fact := authenticationFact(t, view); fact.Known != uint64(5+len(more)) {
 			t.Fatalf("codec payload/framing: %+v", fact)
 		}
 		control := &authenticationOutput{limit: -1}
@@ -181,7 +178,7 @@ func TestInspectionAuthenticationFailedEmptyControlPreservesPayloadFacts(t *test
 				t.Fatalf("native empty-control error: %v", err)
 			}
 			finish()
-			totals, err := view.ReadTotals(context.Background())
+			totals, err := view.ReadTotals()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -234,7 +231,7 @@ func TestInspectionAuthenticationSealFailureKeepsOlderBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 4 || fact.Incomplete {
+	if fact := authenticationFact(t, view); fact.Known != 4 {
 		t.Fatalf("rollback erased older frame: %+v", fact)
 	}
 }
@@ -255,7 +252,7 @@ func TestInspectionAuthenticationPacketDropsAndAbandon(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 2 || fact.Incomplete {
+	if fact := authenticationFact(t, view); fact.Known != 2 {
 		t.Fatalf("packet seal drop: %+v", fact)
 	}
 	other, otherView := authenticationFlow(t)
@@ -270,7 +267,7 @@ func TestInspectionAuthenticationPacketDropsAndAbandon(t *testing.T) {
 	if abandoned.Len() != 0 {
 		t.Fatal("cleanup emitted a native-abandoned response")
 	}
-	if fact := authenticationFact(t, otherView); fact.Known != 9 || fact.Incomplete {
+	if fact := authenticationFact(t, otherView); fact.Known != 9 {
 		t.Fatalf("abandoned mapping: %+v", fact)
 	}
 }
@@ -290,7 +287,7 @@ func TestInspectionAuthenticationFailedFlushContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 6 || fact.Incomplete {
+	if fact := authenticationFact(t, view); fact.Known != 6 {
 		t.Fatalf("stale failed-frame mapping: %+v", fact)
 	}
 }
@@ -313,7 +310,7 @@ func TestInspectionAuthenticationUnavailableAndZeroProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 8 || fact.Incomplete {
+	if fact := authenticationFact(t, view); fact.Known != 8 {
 		t.Fatalf("decoded operation result: %+v", fact)
 	}
 	other, otherView := authenticationFlow(t)
@@ -327,7 +324,7 @@ func TestInspectionAuthenticationUnavailableAndZeroProgress(t *testing.T) {
 		t.Fatalf("zero progress result: %v", err)
 	}
 	release()
-	if fact := authenticationFact(t, otherView); fact.Known != 7 || fact.Incomplete {
+	if fact := authenticationFact(t, otherView); fact.Known != 7 {
 		t.Fatalf("zero acceptance mapping: %+v", fact)
 	}
 }

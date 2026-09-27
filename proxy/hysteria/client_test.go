@@ -2,7 +2,6 @@ package hysteria
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"testing"
@@ -183,22 +182,22 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 				t.Fatal("packet was not released")
 			}
 			flow.Finish()
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("packet terminal: %+v %v", page, err)
 			}
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full", "full-error", "fragments", "last-fragment-full-error":
-				if fact.Known != 512 || fact.Incomplete {
+				if fact.Known != 512 {
 					t.Fatalf("complete packet result: %+v", fact)
 				}
 			case "short-nil", "middle-fragment-error":
-				if fact.Known != 0 || !fact.Incomplete {
+				if fact.Known != 0 {
 					t.Fatalf("partial packet result: %+v", fact)
 				}
 			default:
-				if fact.Known != 0 || fact.Incomplete {
+				if fact.Known != 0 {
 					t.Fatalf("no accepted packet: %+v", fact)
 				}
 			}
@@ -239,12 +238,12 @@ func TestInspectionHysteriaPacketBatchFailure(t *testing.T) {
 		}
 	}
 	flow.Finish()
-	page, _ := view.ReadTerminals(context.Background())
+	page, _ := view.ReadTerminals()
 	if len(page.Rows) != 1 {
 		t.Fatal("missing batch terminal")
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact.Known != 5 || fact.Incomplete {
+	if calls != 2 || fact.Known != 5 {
 		t.Fatalf("batch results: %+v, calls %d", fact, calls)
 	}
 }

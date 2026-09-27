@@ -163,15 +163,6 @@ func (r *observedMessageReader) ReadMessage() (*buf.Buffer, error) {
 	if b != nil {
 		r.receipt.AddUplink(uint64(b.Len()))
 	}
-	if err != nil {
-		reason := stats.EndReasonReadError
-		if err == io.EOF {
-			reason = stats.EndReasonEOF
-		} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
-			reason = stats.EndReasonTimeout
-		}
-		r.receipt.SetEndReason(reason)
-	}
 	return b, err
 }
 
@@ -186,8 +177,6 @@ func (w *observedMessageWriter) WriteMessage(b *buf.Buffer) error {
 	if err == nil {
 		w.receipt.AddDownlink(size)
 	} else {
-		w.receipt.MarkDownlinkIncomplete()
-		w.receipt.SetEndReason(stats.EndReasonWriteError)
 	}
 	return err
 }

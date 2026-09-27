@@ -84,13 +84,13 @@ func TestInspectionDNSDecodedTCPReturn(t *testing.T) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.AccountingRoute.Outbound.Tag != "dns-local" || flow.AccountingRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(requestBytes)) || flow.Downlink.Known != uint64(len(responseBytes)) || flow.Uplink.Incomplete || flow.Downlink.Incomplete {
+			if flow.SelectedRoute.Outbound.Tag != "dns-local" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(requestBytes)) || flow.Downlink.Known != uint64(len(responseBytes)) {
 				t.Fatalf("decoded DNS facts: %+v; sizes %d/%d", flow, len(requestBytes), len(responseBytes))
 			}
 			return
@@ -218,7 +218,7 @@ func TestInspectionDNSDecodedUDPBranches(t *testing.T) {
 			}
 			deadline := time.Now().Add(3 * time.Second)
 			for time.Now().Before(deadline) {
-				live, err := view.ReadLive(context.Background())
+				live, err := view.ReadLive()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -227,13 +227,13 @@ func TestInspectionDNSDecodedUDPBranches(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				if err != nil {
 					t.Fatal(err)
 				}
 				if len(page.Rows) == 1 {
 					flow := page.Rows[0].Flow
-					if flow.AccountingRoute.Outbound.Tag != "dns-out" || flow.Uplink.Known != uint64(len(wire)) || flow.Downlink.Known != uint64(n) || flow.Uplink.Incomplete || flow.Downlink.Incomplete {
+					if flow.SelectedRoute.Outbound.Tag != "dns-out" || flow.Uplink.Known != uint64(len(wire)) || flow.Downlink.Known != uint64(n) {
 						t.Fatalf("decoded UDP facts: %+v; sizes %d/%d", flow, len(wire), n)
 					}
 					return

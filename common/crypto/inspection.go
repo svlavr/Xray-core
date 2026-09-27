@@ -25,7 +25,6 @@ func ObserveAuthenticationWriter(writer buf.Writer, flow stats.Exchange) (buf.Wr
 	}
 	w, ok := writer.(*AuthenticationWriter)
 	if !ok {
-		flow.MarkDownlinkIncomplete()
 		return writer, nil
 	}
 	return &inspectionAuthenticationWriter{AuthenticationWriter: w, receipt: flow}, func() {

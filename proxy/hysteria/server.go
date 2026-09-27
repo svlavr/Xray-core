@@ -168,14 +168,10 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		errors.LogInfo(ctx, "tunnelling request to ", dest)
 		var observation *session.LogicalObservation
 		var observationCleanup func()
-		responsePrepared := false
 		if !dest.Address.Family().IsDomain() || dest.Address.Domain() != "v1.mux.cool" {
 			ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, s.stats, conn, dest, stats.FlowKindTCP)
 			if observationCleanup != nil {
 				defer func() {
-					if !responsePrepared {
-						observation.Exchange.SetEndReason(stats.EndReasonRejected)
-					}
 					observationCleanup()
 				}()
 			}
@@ -189,7 +185,6 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		if err := bufferedWriter.SetBuffered(false); err != nil {
 			return err
 		}
-		responsePrepared = true
 
 		link := &transport.Link{
 			Reader: buf.NewReader(conn),
@@ -202,9 +197,6 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			defer cursor.Interrupt()
 		}
 		if err := dispatcher.DispatchLink(ctx, dest, link); err != nil {
-			if observation != nil {
-				observation.Exchange.SetEndReason(stats.EndReasonRejected)
-			}
 			return err
 		}
 		return nil

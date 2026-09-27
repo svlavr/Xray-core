@@ -55,7 +55,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 
 		var firstRow fs.FlowRecord
 		inspectionWait(t, func() bool {
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len(payload)) || live.Rows[0].Downlink.Known != uint64(len(payload)) {
 				return false
 			}
@@ -66,7 +66,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 
 		sibling := inspectionSOCKS(t, address, destination, payload)
 		inspectionWait(t, func() bool {
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			return err == nil && len(live.Rows) == 2
 		})
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
@@ -96,8 +96,8 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 			// Require actual local stop/join rather than inventing an ending.
 			var siblingRef fs.FlowRef
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
-				live, _ := view.ReadLive(context.Background())
+				page, _ := view.ReadTerminals()
+				live, _ := view.ReadLive()
 				if len(page.Rows) != 1 || page.Rows[0].Flow.Ref != firstRow.Ref || len(live.Rows) != 1 {
 					return false
 				}
@@ -110,13 +110,13 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 			}
 		}
 		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals(context.Background())
+			page, _ := view.ReadTerminals()
 			if len(page.Rows) != 2 {
 				return false
 			}
 			for _, row := range page.Rows {
 				if row.Flow.Ref == firstRow.Ref {
-					return row.Reason == fs.EndReasonLocalStop && row.Flow.Uplink.Known == uint64(len(payload)) && row.Flow.Downlink.Known == uint64(len(payload))
+					return row.Flow.Uplink.Known == uint64(len(payload)) && row.Flow.Downlink.Known == uint64(len(payload))
 				}
 			}
 			return false
@@ -135,12 +135,12 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 	client := inspectionSOCKS(t, address, destination, nil)
 	var row fs.FlowRecord
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil || len(live.Rows) != 1 {
 			return false
 		}
 		row = live.Rows[0]
-		return row.AccountingRoute.Outbound.Tag == "direct" && row.AccountingRoute.Outbound.Serial != 0
+		return row.SelectedRoute.Outbound.Tag == "direct" && row.SelectedRoute.Outbound.Serial != 0
 	})
 	if row.Uplink.Known != 0 || row.Downlink.Known != 0 {
 		t.Fatalf("VLESS response framing credited before payload: %+v", row)
@@ -153,8 +153,8 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 		t.Fatalf("stopped VLESS endpoint returned %d, %v", n, err)
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref && page.Rows[0].Reason == fs.EndReasonLocalStop && page.Rows[0].Flow.Downlink.Known == 0
+		page, _ := view.ReadTerminals()
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref && page.Rows[0].Flow.Downlink.Known == 0
 	})
 	inspectionOutboundTotals(t, view, "direct", 0)
 }
@@ -173,11 +173,11 @@ func TestFlowInspectionP2BSpecialCarriersNotAdmitted(t *testing.T) {
 			_, _, address := inspectionTCPOutboundThrough(t, false, outbound)
 			destination := startOutboundStatsTCPServer(t)
 			inspectionSOCKS(t, address, destination, []byte("excluded shared carrier"))
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			if err != nil || len(live.Rows) != 1 || live.Rows[0].InitialDestination != destination {
 				t.Fatalf("shared carrier admitted as a logical exchange: %+v %v", live, err)
 			}
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 0 {
 				t.Fatalf("shared carrier produced a terminal exchange: %+v %v", page, err)
 			}
@@ -203,7 +203,7 @@ func inspectionEnableOutboundMux(t *testing.T, outbound *core.OutboundHandlerCon
 
 func assertDecodedTCPReceiverFacts(t *testing.T, row fs.FlowRecord, destination cnet.Destination, payload uint64) {
 	t.Helper()
-	if row.Kind != fs.FlowKindTCP || row.InitialDestination != destination || row.AccountingRoute.Outbound.Tag != "direct" || row.AccountingRoute.Outbound.Serial == 0 || row.AccountingRoute.Effective != destination || row.Origin != fs.TrafficOriginUser || row.Uplink.Incomplete || row.Downlink.Incomplete || row.Uplink.Known != payload || row.Downlink.Known != payload {
+	if row.Kind != fs.FlowKindTCP || row.InitialDestination != destination || row.SelectedRoute.Outbound.Tag != "direct" || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser || row.Uplink.Known != payload || row.Downlink.Known != payload {
 		t.Fatalf("supplied TCP facts: %+v", row)
 	}
 }

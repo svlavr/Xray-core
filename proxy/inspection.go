@@ -63,8 +63,6 @@ func ObserveFallback(ctx context.Context, manager stats.Manager, conn io.Closer,
 	}
 	flow.Route(stats.RouteStep{
 		Selection:      stats.SelectionUnknown,
-		Original:       destination,
-		RouteTarget:    destination,
 		SelectedTarget: destination,
 	})
 	flow.BindRoute()
@@ -276,50 +274,24 @@ func closeObservedEndpoint(conn io.Closer) error {
 // RecordPacketWrite maps a native framed-packet write to logical payload. A
 // partial frame has no proven complete packet; its ciphertext/header prefix
 // must not be counted as payload. The callback's native ray holds the receipt.
-func RecordPacketWrite(receipt stats.Exchange, payload uint64, encoded, written int, err error) {
-	if receipt == nil {
-		return
-	}
-	complete := encoded > 0 && written == encoded
-	partial := encoded > 0 && written != 0 && !complete
-	if err == nil && written != encoded {
-		err = io.ErrShortWrite
-	}
-	RecordPacketOutcome(receipt, payload, complete, partial, err)
+func RecordPacketWrite(receipt stats.Exchange, payload uint64, encoded, written int) {
+	RecordPacketOutcome(receipt, payload, encoded > 0 && written == encoded)
 }
 
 // RecordUnframedPacketWrite retains the actual payload prefix from a raw
 // WriteTo. Unlike encoded frames, each returned byte is a logical payload byte.
-// A short-nil is an error fact without changing the native caller's result.
-func RecordUnframedPacketWrite(receipt stats.Exchange, offered, written int, err error) {
-	if receipt == nil {
-		return
-	}
-	if written < 0 || written > offered {
-		receipt.MarkDownlinkIncomplete()
-		receipt.SetEndReason(stats.EndReasonWriteError)
+func RecordUnframedPacketWrite(receipt stats.Exchange, offered, written int) {
+	if receipt == nil || written < 0 || written > offered {
 		return
 	}
 	receipt.AddDownlink(uint64(written))
-	if err != nil || written != offered {
-		receipt.SetEndReason(stats.EndReasonWriteError)
-	}
 }
 
 // RecordPacketOutcome also accepts a native fragment group's combined result:
 // one complete logical packet wins over any partial retry of that same packet.
-func RecordPacketOutcome(receipt stats.Exchange, payload uint64, complete, partial bool, err error) {
-	if receipt == nil {
-		return
-	}
-	switch {
-	case complete:
+func RecordPacketOutcome(receipt stats.Exchange, payload uint64, complete bool) {
+	if receipt != nil && complete {
 		receipt.AddDownlink(payload)
-	case partial && payload != 0:
-		receipt.MarkDownlinkIncomplete()
-	}
-	if err != nil {
-		receipt.SetEndReason(stats.EndReasonWriteError)
 	}
 }
 

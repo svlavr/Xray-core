@@ -14,7 +14,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -67,11 +66,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		observation.Exchange.Effective(ob.Target)
 	}
 
-	var responseErr error
 	if len(h.response) > 0 {
 		mbc := buf.MultiBufferContainer{}
 		common.Must2(mbc.Write(h.response))
-		responseErr = link.Writer.WriteMultiBuffer(mbc.MultiBuffer)
+		_ = link.Writer.WriteMultiBuffer(mbc.MultiBuffer)
 		// Sleep a little here to make sure the response is sent to client.
 		time.Sleep(time.Second)
 	}
@@ -87,13 +85,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			buf.Copy(link.Reader, buf.Discard, buf.UpdateActivity(timer))
 		}()
 		<-ctx.Done()
-	}
-	if observation != nil {
-		reason := stats.EndReasonRejected
-		if responseErr != nil {
-			reason = stats.EndReasonWriteError
-		}
-		observation.Exchange.SetEndReason(reason)
 	}
 	return nil
 }

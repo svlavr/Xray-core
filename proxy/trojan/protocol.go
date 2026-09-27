@@ -133,7 +133,7 @@ func (w *PacketWriter) writePacket(payload []byte, dest net.Destination, receipt
 	defer buffer.Release()
 	var encoded, written int
 	if receipt != nil {
-		defer func() { proxy.RecordPacketWrite(receipt, uint64(len(payload)), encoded, written, err) }()
+		defer func() { proxy.RecordPacketWrite(receipt, uint64(len(payload)), encoded, written) }()
 	}
 
 	length := len(payload)

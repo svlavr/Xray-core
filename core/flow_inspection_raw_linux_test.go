@@ -25,7 +25,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 			check := func(want uint64) {
 				t.Helper()
 				inspectionWait(t, func() bool {
-					live, err := view.ReadLive(context.Background())
+					live, err := view.ReadLive()
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -36,17 +36,14 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 					if flow.Uplink.Known != want || flow.Downlink.Known != want {
 						return false
 					}
-					if flow.Downlink.Incomplete {
-						t.Fatalf("raw fact: %+v", flow.Downlink)
-					}
 					ref = flow.Ref
-					totals, err := view.ReadTotals(context.Background())
+					totals, err := view.ReadTotals()
 					if err != nil {
 						t.Fatal(err)
 					}
 					for _, row := range totals.Rows {
-						if row.Outbound.Serial == flow.AccountingRoute.Outbound.Serial && row.Origin == fs.TrafficOriginUser {
-							if row.Downlink.Known != want || row.Downlink.Incomplete {
+						if row.Outbound.Serial == flow.SelectedRoute.Outbound.Serial && row.Origin == fs.TrafficOriginUser {
+							if row.Downlink.Known != want {
 								return false
 							}
 							return true
@@ -67,7 +64,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 				t.Fatalf("close: %+v %v", outcome, err)
 			}
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -75,7 +72,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 					return false
 				}
 				final := page.Rows[0]
-				if final.Flow.Downlink.Known != uint64(len(first)+len(second)) || final.Flow.Downlink.Incomplete || final.Reason != fs.EndReasonLocalStop {
+				if final.Flow.Downlink.Known != uint64(len(first)+len(second)) {
 					t.Fatalf("raw final: %+v", final)
 				}
 				return true

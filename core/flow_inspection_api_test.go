@@ -25,7 +25,7 @@ func inspectionAPITerminal(t *testing.T, view fs.FlowInspection) fs.TerminalReco
 	t.Helper()
 	var terminal fs.TerminalRecord
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -81,7 +81,7 @@ func TestFlowInspectionAPIDialTCPOrigins(t *testing.T) {
 				t.Fatal(err)
 			}
 			flow := inspectionAPITerminal(t, view).Flow
-			if flow.Kind != fs.FlowKindTCP || flow.Origin != origin || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) || flow.AccountingRoute.Outbound.Tag != "direct" || flow.AccountingRoute.Outbound.Serial == 0 {
+			if flow.Kind != fs.FlowKindTCP || flow.Origin != origin || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) || flow.SelectedRoute.Outbound.Tag != "direct" || flow.SelectedRoute.Outbound.Serial == 0 {
 				t.Fatalf("API TCP facts: %+v", flow)
 			}
 		})
@@ -110,7 +110,7 @@ func TestFlowInspectionAPIDialUDPStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Kind != fs.FlowKindUDPAssociation || flow.Origin != fs.TrafficOriginInternal || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) || len(flow.Destinations) != 1 || flow.Destinations[0] != destination {
+	if flow.Kind != fs.FlowKindUDPAssociation || flow.Origin != fs.TrafficOriginInternal || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) || flow.LatestDestination != destination {
 		t.Fatalf("API UDP stream facts: %+v", flow)
 	}
 }
@@ -138,7 +138,7 @@ func TestFlowInspectionAPIDialUDPPacketConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Kind != fs.FlowKindUDPAssociation || flow.Origin != fs.TrafficOriginInternal || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(n) || len(flow.Destinations) != 1 || flow.Destinations[0] != destination || flow.AccountingRoute.Outbound.Tag != "direct" || flow.AccountingRoute.Outbound.Serial == 0 {
+	if flow.Kind != fs.FlowKindUDPAssociation || flow.Origin != fs.TrafficOriginInternal || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(n) || flow.LatestDestination != destination || flow.SelectedRoute.Outbound.Tag != "direct" || flow.SelectedRoute.Outbound.Serial == 0 {
 		t.Fatalf("API PacketConn facts: %+v", flow)
 	}
 }
@@ -166,7 +166,7 @@ func TestFlowInspectionAPITaggedForcedHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Origin != fs.TrafficOriginControlledMeasurement || flow.AccountingRoute.Selection != fs.SelectionForced || flow.AccountingRoute.Outbound.Tag != "direct" || flow.AccountingRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) {
+	if flow.Origin != fs.TrafficOriginControlledMeasurement || flow.SelectedRoute.Selection != fs.SelectionForced || flow.SelectedRoute.Outbound.Tag != "direct" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) {
 		t.Fatalf("tagged API facts: %+v", flow)
 	}
 }
@@ -194,7 +194,7 @@ func TestFlowInspectionAPILoopbackContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := inspectionAPITerminal(t, view)
-	if page.Flow.Origin != fs.TrafficOriginUnknown || len(page.Flow.Routes) != 2 || page.Flow.Routes[0].Outbound.Tag != "forward" || page.Flow.AccountingRoute.Outbound.Tag != "direct" || page.Flow.Uplink.Known != uint64(len(payload)) || page.Flow.Downlink.Known != uint64(len(payload)) {
+	if page.Flow.Origin != fs.TrafficOriginUnknown || page.Flow.SelectedRoute.Outbound.Tag != "direct" || page.Flow.Uplink.Known != uint64(len(payload)) || page.Flow.Downlink.Known != uint64(len(payload)) {
 		t.Fatalf("loopback API continuation: %+v", page)
 	}
 }
@@ -211,11 +211,11 @@ func TestFlowInspectionAPILocalStop(t *testing.T) {
 	}
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(live.Rows) != 1 || live.Rows[0].AccountingRoute.Outbound.Serial == 0 {
+		if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Outbound.Serial == 0 {
 			return false
 		}
 		ref = live.Rows[0].Ref
@@ -226,7 +226,7 @@ func TestFlowInspectionAPILocalStop(t *testing.T) {
 		t.Fatalf("close API root: %+v %v", outcomes, err)
 	}
 	terminal := inspectionAPITerminal(t, view)
-	if terminal.Flow.Ref != ref || terminal.Reason != fs.EndReasonLocalStop {
+	if terminal.Flow.Ref != ref {
 		t.Fatalf("local-stop terminal: %+v", terminal)
 	}
 	if err := conn.Close(); err != nil {
@@ -260,7 +260,7 @@ func TestFlowInspectionAPIExistingRootContinuation(t *testing.T) {
 	}
 	root.Finish()
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Ref != root.Ref() || flow.Origin != fs.TrafficOriginUser || len(flow.Routes) != 1 || flow.AccountingRoute.Outbound.Tag != "direct" || flow.Uplink.Known != 0 || flow.Downlink.Known != 0 {
+	if flow.Ref != root.Ref() || flow.Origin != fs.TrafficOriginUser || flow.SelectedRoute.Outbound.Tag != "direct" || flow.Uplink.Known != 0 || flow.Downlink.Known != 0 {
 		t.Fatalf("existing-root continuation: %+v", flow)
 	}
 }
@@ -316,10 +316,10 @@ func TestFlowInspectionAPIDialerProxyPhysicalContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Origin != fs.TrafficOriginUser || len(flow.Routes) != 1 || flow.Routes[0].Outbound.Tag != "direct" || flow.AccountingRoute.Outbound.Tag != "direct" || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) {
+	if flow.Origin != fs.TrafficOriginUser || flow.SelectedRoute.Outbound.Tag != "direct" || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) {
 		t.Fatalf("dialerProxy physical continuation: %+v", flow)
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}

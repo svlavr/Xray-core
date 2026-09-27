@@ -44,14 +44,14 @@ func TestRecordPacketWritePartialZeroPayload(t *testing.T) {
 			flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
 			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}})
 			flow.BindRoute()
-			proxy.RecordPacketWrite(flow, test.payload, 10, 3, io.ErrClosedPipe)
+			proxy.RecordPacketWrite(flow, test.payload, 10, 3)
 			flow.Finish()
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("packet terminal: %+v %v", page, err)
 			}
-			want := fs.ByteFact{Incomplete: test.payload != 0}
-			if page.Rows[0].Flow.Downlink != want || page.Rows[0].Reason != fs.EndReasonWriteError {
+			want := fs.ByteFact{}
+			if page.Rows[0].Flow.Downlink != want {
 				t.Fatalf("partial packet facts: %+v", page.Rows[0])
 			}
 		})
@@ -98,8 +98,8 @@ func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 				if err != nil || len(outcomes) != 1 || outcomes[0].Code != test.want {
 					t.Fatalf("exact stop: %+v %v, want %v", outcomes, err, test.want)
 				}
-				page, err := view.ReadTerminals(context.Background())
-				if err != nil || len(page.Rows) != 1 || page.Rows[0].Reason != fs.EndReasonLocalStop {
+				page, err := view.ReadTerminals()
+				if err != nil || len(page.Rows) != 1 {
 					t.Fatalf("terminal: %+v %v", page, err)
 				}
 			})
@@ -159,7 +159,7 @@ func TestBeginReturnedObservationExcludesReservedCarrier(t *testing.T) {
 			t.Fatal("supplied UDP carrier was admitted")
 		}
 	}
-	live, err := view.ReadLive(ctx)
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 0 {
 		t.Fatalf("carrier facts: %+v %v", live, err)
 	}
@@ -188,7 +188,8 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 			}
 			t.Cleanup(func() { manager.Close() })
 			flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUnknown, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "selected"}})
+			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1, Tag: "selected"}})
+			flow.AddUplink(7)
 			observation := &session.LogicalObservation{Exchange: flow}
 			ctx := context.Background()
 			if test.withContext {
@@ -206,13 +207,30 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 			if (claimed == observation) != test.wantClaim {
 				t.Fatalf("claim=%t, want %t", claimed == observation, test.wantClaim)
 			}
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			if err != nil || len(live.Rows) != 1 {
 				t.Fatalf("live rows: %+v %v", live, err)
 			}
-			bound := live.Rows[0].AccountingRoute.Outbound.Tag == "selected"
+			if live.Rows[0].SelectedRoute.Outbound.Tag != "selected" {
+				t.Fatalf("selection not visible: %+v", live.Rows[0])
+			}
+			totals, err := view.ReadTotals()
+			if err != nil {
+				t.Fatal(err)
+			}
+			bound := false
+			for _, total := range totals.Rows {
+				if total.Outbound.Serial == 1 {
+					bound = true
+					if total.Uplink.Known != 7 {
+						t.Fatalf("bound credit: %+v", total)
+					}
+				} else if total.Uplink.Known != 0 {
+					t.Fatalf("unexpected credit: %+v", total)
+				}
+			}
 			if bound != test.wantClaim {
-				t.Fatalf("route bound=%t, want %t: %+v", bound, test.wantClaim, live.Rows[0].AccountingRoute)
+				t.Fatalf("bucket bound=%t, want %t", bound, test.wantClaim)
 			}
 		})
 	}
@@ -258,7 +276,7 @@ func TestNativeCopyTasksEarlyReturnKeepsHistoryImmutable(t *testing.T) {
 			t.Fatalf("native error changed: %v", err)
 		}
 		flow.Finish()
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 			t.Fatalf("owner-end snapshot: %+v %v", page, err)
 		}
@@ -268,11 +286,11 @@ func TestNativeCopyTasksEarlyReturnKeepsHistoryImmutable(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("copy task did not release")
 		}
-		page, err = view.ReadTerminals(context.Background())
+		page, err = view.ReadTerminals()
 		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 			t.Fatalf("late receipt mutated history: %+v %v", page, err)
 		}
-		totals, _ := view.ReadTotals(context.Background())
+		totals, _ := view.ReadTotals()
 		var known uint64
 		for _, row := range totals.Rows {
 			known += row.Uplink.Known
@@ -315,7 +333,7 @@ func TestObserveTCPRetainedInputAndOwnerEnd(t *testing.T) {
 		t.Fatal("inspection failed to install the enabled receipt writer")
 	}
 	finish()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Origin != fs.TrafficOriginInternal || page.Rows[0].Flow.Uplink.Known != 12 {
 		t.Fatalf("owner-end snapshot: %+v %v", page, err)
 	}
@@ -344,8 +362,8 @@ func TestObserveTCPCustomWriterRemainsUnavailable(t *testing.T) {
 	if link.Writer != writer || buf.WriterReceipt(link.Writer) != nil {
 		t.Fatal("custom writer was replaced or given an unsupported receipt")
 	}
-	live, err := view.ReadLive(context.Background())
-	if err != nil || len(live.Rows) != 1 || !live.Rows[0].Downlink.Incomplete {
+	live, err := view.ReadLive()
+	if err != nil || len(live.Rows) != 1 {
 		t.Fatalf("unsupported endpoint result: %+v %v", live, err)
 	}
 }
@@ -393,7 +411,7 @@ func TestObserveReturnedTCPDispatcherCleanupAndOwnerEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if page, err := view.ReadTerminals(context.Background()); err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+	if page, err := view.ReadTerminals(); err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("owner-end snapshot: %+v %v", page, err)
 	}
 	close(releasePump)
@@ -402,11 +420,11 @@ func TestObserveReturnedTCPDispatcherCleanupAndOwnerEnd(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("late inbound pump did not release")
 	}
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.AccountingRoute.Outbound.Tag != "selected" || page.Rows[0].Flow.Uplink.Known != 0 {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Tag != "selected" || page.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("late pump mutated history: %+v %v", page, err)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
 		known += row.Uplink.Known
@@ -432,8 +450,8 @@ func TestObserveReturnedTCPCleanupEndsUnclaimed(t *testing.T) {
 		t.Fatal("returned dispatcher claim failed")
 	}
 	finish()
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
 		t.Fatalf("unclaimed owner-end snapshot: %+v %v", page, err)
 	}
 	observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionRule, RuleTag: "late", Outbound: fs.OutboundRef{Tag: "selected", Serial: 9}})
@@ -443,8 +461,8 @@ func TestObserveReturnedTCPCleanupEndsUnclaimed(t *testing.T) {
 		t.Fatal("late downstream role claim was not returned")
 	}
 	finish()
-	page, err = view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, err = view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
 		t.Fatalf("late attribution mutated owner-end history: %+v %v", page, err)
 	}
 }
@@ -466,23 +484,18 @@ func TestObserveReturnedTCPUnconsumedOwnerEndsIncomplete(t *testing.T) {
 	}
 	finish()
 	observation.Exchange.Finish()
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
 		t.Fatalf("unconsumed owner snapshot: %+v %v", page, err)
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatalf("unconsumed returned owner lost uncertainty: %+v %v", totals, err)
 	}
-	var incomplete bool
 	for _, row := range totals.Rows {
 		if row.Outbound.Serial != 0 {
 			t.Fatalf("unconsumed returned owner acquired an outbound: %+v", row)
 		}
-		incomplete = incomplete || row.Uplink.Incomplete || row.Downlink.Incomplete
-	}
-	if !incomplete {
-		t.Fatalf("unconsumed returned owner lost uncertainty: %+v", totals)
 	}
 }
 
@@ -508,8 +521,8 @@ func TestObserveReturnedTCPRoleClaimAfterBoundStop(t *testing.T) {
 		t.Fatal("owner ending blocked the native role claim")
 	}
 	finish()
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Reason != fs.EndReasonLocalStop {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("failed dispatch ordering: %+v %v", page, err)
 	}
 }

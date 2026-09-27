@@ -52,20 +52,6 @@ func (r *InspectionReader) SetCounter(c stats.Counter) {
 	r.mu.Unlock()
 }
 
-func (r *InspectionReader) readReason(err error) {
-	if err == nil {
-		return
-	}
-	reason := stats.EndReasonReadError
-	if err == io.EOF {
-		reason = stats.EndReasonEOF
-	}
-	if e, ok := err.(interface{ Timeout() bool }); ok && e.Timeout() {
-		reason = stats.EndReasonTimeout
-	}
-	r.flow.SetEndReason(reason)
-}
-
 func (r *InspectionReader) credit(mb MultiBuffer) {
 	if !r.InputAlreadyObserved && r.PacketDestination.IsValid() {
 		for _, b := range mb {
@@ -112,7 +98,6 @@ func (r *InspectionReader) next(timeout time.Duration, timed bool) (MultiBuffer,
 			err = io.ErrClosedPipe
 		} else {
 			r.credit(mb)
-			r.readReason(err)
 		}
 		r.mu.Unlock()
 		return mb, err
@@ -154,7 +139,6 @@ func (r *InspectionReader) next(timeout time.Duration, timed bool) (MultiBuffer,
 	p.mb = nil
 	r.pending = nil
 	r.credit(mb)
-	r.readReason(err)
 	return mb, err
 }
 

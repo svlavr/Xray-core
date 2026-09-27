@@ -123,7 +123,7 @@ func TestRoutedDoHHTTP2ReuseAndExactStreamStop(t *testing.T) {
 		t.Fatalf("warm request: response=%q err=%v", response, requestErr)
 	}
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
 
@@ -140,7 +140,7 @@ func TestRoutedDoHHTTP2ReuseAndExactStreamStop(t *testing.T) {
 	}
 	var firstRef featurestats.FlowRef
 	waitDNSTCPRows(t, func() (int, error) {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		if readErr == nil && len(live.Rows) == 1 {
 			firstRef = live.Rows[0].Ref
 		}
@@ -195,25 +195,25 @@ func TestRoutedDoHHTTP2ReuseAndExactStreamStop(t *testing.T) {
 	}
 
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 5)
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var stoppedFound, routedSibling, failureFound, decodeFailureFound bool
 	for _, row := range page.Rows {
 		if row.Flow.Ref == firstRef {
-			stoppedFound = row.Reason == featurestats.EndReasonLocalStop
+			stoppedFound = row.Flow.State == featurestats.FlowStateEnded
 		}
-		if row.Flow.Uplink.Known == uint64(len("second")) && row.Flow.Downlink.Known == uint64(len("second-response")) && row.Flow.AccountingRoute.Outbound.Tag == "direct" && row.Flow.AccountingRoute.Outbound.Serial != 0 {
+		if row.Flow.Uplink.Known == uint64(len("second")) && row.Flow.Downlink.Known == uint64(len("second-response")) && row.Flow.SelectedRoute.Outbound.Tag == "direct" && row.Flow.SelectedRoute.Outbound.Serial != 0 {
 			routedSibling = true
 		}
-		if row.Flow.Uplink.Known == uint64(len("failure")) && row.Flow.Downlink.Known == 0 && row.Flow.Downlink.Incomplete && row.Flow.AccountingRoute.Outbound.Tag == "direct" {
+		if row.Flow.Uplink.Known == uint64(len("failure")) && row.Flow.Downlink.Known == 0 && row.Flow.SelectedRoute.Outbound.Tag == "direct" {
 			failureFound = true
 		}
-		if row.Flow.Uplink.Known == uint64(len("malformed")) && row.Flow.Downlink.Known == 3 && row.Flow.Downlink.Incomplete && row.Reason == featurestats.EndReasonReadError {
+		if row.Flow.Uplink.Known == uint64(len("malformed")) && row.Flow.Downlink.Known == 3 {
 			decodeFailureFound = true
 		}
 	}
@@ -265,11 +265,11 @@ func TestDoHRetryBodyReadsFollowEachCarrierLeg(t *testing.T) {
 	observation.recordResponseRead(7, nil)
 	observation.finish(true)
 
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 10 || page.Rows[0].Flow.Downlink.Known != 7 {
 		t.Fatalf("retry root: page=%+v err=%v", page, err)
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,9 +277,9 @@ func TestDoHRetryBodyReadsFollowEachCarrierLeg(t *testing.T) {
 	for _, total := range totals.Rows {
 		switch total.Outbound.Serial {
 		case 71:
-			first = total.Uplink.Known == 5 && total.Downlink.Known == 0 && total.Downlink.Incomplete
+			first = total.Uplink.Known == 5 && total.Downlink.Known == 0
 		case 72:
-			retry = total.Uplink.Known == 5 && total.Downlink.Known == 7 && !total.Uplink.Incomplete && !total.Downlink.Incomplete
+			retry = total.Uplink.Known == 5 && total.Downlink.Known == 7
 		}
 	}
 	if !first || !retry {
@@ -479,22 +479,22 @@ func TestRoutedDoHNativeGoAwayRetryAttribution(t *testing.T) {
 	}
 
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	flow := page.Rows[0].Flow
-	if flow.Ref == (featurestats.FlowRef{}) || flow.Origin != featurestats.TrafficOriginInternal || flow.Uplink.Known != uint64(2*len(payload)) || flow.Downlink.Known != uint64(len("retry-response")) || flow.Uplink.Incomplete || !flow.Downlink.Incomplete {
+	if flow.Ref == (featurestats.FlowRef{}) || flow.Origin != featurestats.TrafficOriginInternal || flow.Uplink.Known != uint64(2*len(payload)) || flow.Downlink.Known != uint64(len("retry-response")) {
 		t.Fatalf("native GOAWAY root facts: %+v", page.Rows[0])
 	}
-	if len(flow.Routes) != 2 || flow.Routes[0].Outbound.Serial != 101 || flow.Routes[1].Outbound.Serial != 102 || flow.AccountingRoute.Outbound.Serial != 102 {
-		t.Fatalf("native GOAWAY attempt routes: %+v", flow)
+	if flow.SelectedRoute.Outbound.Serial != 102 {
+		t.Fatalf("native GOAWAY selected route: %+v", flow)
 	}
 
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,9 +502,9 @@ func TestRoutedDoHNativeGoAwayRetryAttribution(t *testing.T) {
 	for _, total := range totals.Rows {
 		switch total.Outbound.Serial {
 		case 101:
-			first = total.Origin == featurestats.TrafficOriginInternal && total.Uplink.Known == uint64(len(payload)) && total.Downlink.Known == 0 && !total.Uplink.Incomplete && total.Downlink.Incomplete
+			first = total.Origin == featurestats.TrafficOriginInternal && total.Uplink.Known == uint64(len(payload)) && total.Downlink.Known == 0
 		case 102:
-			retry = total.Origin == featurestats.TrafficOriginInternal && total.Uplink.Known == uint64(len(payload)) && total.Downlink.Known == uint64(len("retry-response")) && !total.Uplink.Incomplete && !total.Downlink.Incomplete
+			retry = total.Origin == featurestats.TrafficOriginInternal && total.Uplink.Known == uint64(len(payload)) && total.Downlink.Known == uint64(len("retry-response"))
 		}
 	}
 	if !first || !retry {
@@ -515,9 +515,14 @@ func TestRoutedDoHNativeGoAwayRetryAttribution(t *testing.T) {
 func TestRoutedDoHCapacityFallsBackWithoutHiddenAggregate(t *testing.T) {
 	instance, view, _ := newDNSTCPInspectionCore(t)
 	store := instance.GetFeature(featurestats.ManagerType()).(featurestats.ObservationProvider).Observation()
-	roots := make([]featurestats.Exchange, 0, store.Info().Limits.MaxLive)
-	for range store.Info().Limits.MaxLive {
-		roots = append(roots, store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.TCPDestination(xnet.LocalHostIP, 80), nil))
+	var roots []featurestats.Exchange
+	for {
+		root := store.Begin(featurestats.FlowKindTCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.TCPDestination(xnet.LocalHostIP, 80), nil)
+		if root.Ref().ID == 0 {
+			root.Finish()
+			break
+		}
+		roots = append(roots, root)
 	}
 	t.Cleanup(func() {
 		for _, root := range roots {
@@ -540,14 +545,14 @@ func TestRoutedDoHCapacityFallsBackWithoutHiddenAggregate(t *testing.T) {
 	if err != nil || string(response) != "response" {
 		t.Fatalf("capacity fallback response=%q err=%v", response, err)
 	}
-	live, _ := view.ReadLive(context.Background())
-	terminals, _ := view.ReadTerminals(context.Background())
-	totals, _ := view.ReadTotals(context.Background())
-	if len(live.Rows) != int(store.Info().Limits.MaxLive) || len(terminals.Rows) != 0 || live.Loss.UntrackedAdmissions != 1 {
-		t.Fatalf("capacity fallback visibility: live=%d terminals=%d loss=%+v", len(live.Rows), len(terminals.Rows), live.Loss)
+	live, _ := view.ReadLive()
+	terminals, _ := view.ReadTerminals()
+	totals, _ := view.ReadTotals()
+	if len(live.Rows) != len(roots) || len(terminals.Rows) != 0 {
+		t.Fatalf("capacity fallback visibility: live=%d terminals=%d", len(live.Rows), len(terminals.Rows))
 	}
 	for _, total := range totals.Rows {
-		if total.Uplink.Known != 0 || total.Downlink.Known != 0 || total.Uplink.Incomplete || total.Downlink.Incomplete {
+		if total.Uplink.Known != 0 || total.Downlink.Known != 0 {
 			t.Fatalf("capacity fallback created hidden aggregate: %+v", total)
 		}
 	}
@@ -565,15 +570,15 @@ func TestRoutedDoHMissingForcedHandlerIsRejected(t *testing.T) {
 		t.Fatalf("missing forced handler response=%q err=%v", response, requestErr)
 	}
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	row := page.Rows[0]
-	if row.Reason != featurestats.EndReasonRejected || row.Flow.AccountingRoute.Selection != featurestats.SelectionRejected || row.Flow.AccountingRoute.Outbound.Tag != "missing" || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 || !row.Flow.Uplink.Incomplete || !row.Flow.Downlink.Incomplete {
+	if row.Flow.SelectedRoute.Selection != featurestats.SelectionRejected || row.Flow.SelectedRoute.Outbound.Tag != "missing" || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
 		t.Fatalf("missing forced handler facts: %+v", row)
 	}
 }
@@ -639,7 +644,7 @@ func TestRoutedDoHStopWhileWaitingForSharedDialFinishesRoot(t *testing.T) {
 	}
 	var firstRef featurestats.FlowRef
 	waitDNSTCPRows(t, func() (int, error) {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		if readErr == nil && len(live.Rows) == 1 {
 			firstRef = live.Rows[0].Ref
 		}
@@ -648,7 +653,7 @@ func TestRoutedDoHStopWhileWaitingForSharedDialFinishesRoot(t *testing.T) {
 	secondResult := request("second")
 	var secondRef featurestats.FlowRef
 	waitDNSTCPRows(t, func() (int, error) {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		if readErr == nil && len(live.Rows) == 2 {
 			for _, row := range live.Rows {
 				if row.Ref != firstRef {
@@ -668,8 +673,8 @@ func TestRoutedDoHStopWhileWaitingForSharedDialFinishesRoot(t *testing.T) {
 	if err != nil || len(outcomes) != 1 || outcomes[0].Code != featurestats.CloseCodeAccepted {
 		t.Fatalf("close pooled waiter: outcomes=%+v err=%v", outcomes, err)
 	}
-	terminals, err := view.ReadTerminals(context.Background())
-	if err != nil || len(terminals.Rows) != 1 || terminals.Rows[0].Flow.Ref != secondRef || terminals.Rows[0].Reason != featurestats.EndReasonLocalStop {
+	terminals, err := view.ReadTerminals()
+	if err != nil || len(terminals.Rows) != 1 || terminals.Rows[0].Flow.Ref != secondRef {
 		t.Fatalf("pooled waiter did not finish immediately: rows=%+v err=%v", terminals.Rows, err)
 	}
 	close(dispatcher.release)
@@ -689,9 +694,9 @@ func TestRoutedDoHStopWhileWaitingForSharedDialFinishesRoot(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("stopped pooled waiter did not return after shared dial")
 	}
-	terminals, _ = view.ReadTerminals(context.Background())
+	terminals, _ = view.ReadTerminals()
 	for _, row := range terminals.Rows {
-		if row.Flow.Ref == secondRef && (len(row.Flow.Routes) != 0 || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0) {
+		if row.Flow.Ref == secondRef && (row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0) {
 			t.Fatalf("late GotConn mutated stopped waiter: %+v", row)
 		}
 	}
@@ -717,7 +722,7 @@ func (*stopDuringBeginStore) Info() featurestats.InspectionInfo { return feature
 
 func (s *stopDuringBeginStore) Begin(_ featurestats.FlowKind, _ featurestats.TrafficOrigin, _, _ xnet.Destination, stop func() error) featurestats.Exchange {
 	s.exchange.live.Store(true)
-	s.exchange.SetEndReason(featurestats.EndReasonLocalStop)
+
 	_ = stop()
 	return s.exchange
 }
@@ -739,8 +744,8 @@ func TestRoutedDoHStopDuringBeginReturnsCanceledNativeContext(t *testing.T) {
 		})},
 	}
 	_, observation, err := server.dohHTTPSContextWithStore(context.Background(), []byte("query"), &stopDuringBeginStore{exchange: flow})
-	if err == nil || observation != nil || flow.finished.Load() != 1 || flow.live.Load() || featurestats.EndReason(flow.reason.Load()) != featurestats.EndReasonLocalStop || roundTrips.Load() != 0 {
-		t.Fatalf("stopped Begin result: calls=%d err=%v finishes=%d live=%v reason=%v", roundTrips.Load(), err, flow.finished.Load(), flow.live.Load(), featurestats.EndReason(flow.reason.Load()))
+	if err == nil || observation != nil || flow.finished.Load() != 1 || flow.live.Load() || roundTrips.Load() != 0 {
+		t.Fatalf("stopped Begin result: calls=%d err=%v finishes=%d live=%v", roundTrips.Load(), err, flow.finished.Load(), flow.live.Load())
 	}
 }
 
@@ -777,11 +782,11 @@ func TestDoHRetryThenRejectedDialKeepsPerAttemptAttribution(t *testing.T) {
 	observation.reject(featurestats.RouteStep{Selection: featurestats.SelectionRejected, Outbound: featurestats.OutboundRef{Serial: 82, Tag: "rejected"}})
 	observation.finish(false)
 
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 5 || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 82 || page.Rows[0].Reason != featurestats.EndReasonRejected {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 5 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 82 {
 		t.Fatalf("retry-rejection root: page=%+v err=%v", page, err)
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,9 +794,9 @@ func TestDoHRetryThenRejectedDialKeepsPerAttemptAttribution(t *testing.T) {
 	for _, total := range totals.Rows {
 		switch total.Outbound.Serial {
 		case 81:
-			first = total.Uplink.Known == 5 && total.Downlink.Known == 0 && total.Downlink.Incomplete
+			first = total.Uplink.Known == 5 && total.Downlink.Known == 0
 		case 82:
-			rejected = total.Uplink.Known == 0 && total.Downlink.Known == 0 && total.Uplink.Incomplete && total.Downlink.Incomplete
+			rejected = total.Uplink.Known == 0 && total.Downlink.Known == 0
 		}
 	}
 	if !first || !rejected {
@@ -844,15 +849,15 @@ func TestRoutedDoHTLSLoopbackRejectionSurvivesHandshakeError(t *testing.T) {
 		t.Fatalf("TLS loopback rejection response=%q err=%v", response, requestErr)
 	}
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	row := page.Rows[0]
-	if row.Reason != featurestats.EndReasonRejected || row.Flow.AccountingRoute.Selection != featurestats.SelectionRejected || row.Flow.AccountingRoute.Outbound.Tag != "missing" || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 || !row.Flow.Uplink.Incomplete || !row.Flow.Downlink.Incomplete {
+	if row.Flow.SelectedRoute.Selection != featurestats.SelectionRejected || row.Flow.SelectedRoute.Outbound.Tag != "missing" || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
 		t.Fatalf("TLS loopback rejection facts: %+v", row)
 	}
 }

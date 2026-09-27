@@ -36,30 +36,24 @@ type FlowRef struct {
 }
 
 type OutboundRef struct {
-	Runtime      RuntimeID
-	Serial       uint64
-	Tag          string
-	TagTruncated bool
+	Runtime RuntimeID
+	Serial  uint64
+	Tag     string
 }
 
 type ObservationOptions struct {
-	MaxLive         uint32
-	MaxTerminals    uint32
-	MaxBuckets      uint32
-	MaxClose        uint32
-	MaxRouteSteps   uint32
-	MaxDestinations uint32
+	MaxLive      uint32
+	MaxTerminals uint32
+	MaxBuckets   uint32
+	MaxClose     uint32
 }
 
 type InspectionInfo struct {
 	Runtime RuntimeID
-	Limits  ObservationOptions
-	Closed  bool
 }
 
 type ByteFact struct {
-	Known      uint64
-	Incomplete bool
+	Known uint64
 }
 
 type Sample struct {
@@ -78,15 +72,10 @@ const (
 )
 
 type RouteStep struct {
-	Leg            uint64
 	Selection      SelectionKind
 	Outbound       OutboundRef
 	RuleTag        string
-	Original       net.Destination
-	RouteTarget    net.Destination
 	SelectedTarget net.Destination
-	Effective      net.Destination
-	Truncated      bool
 }
 
 type FlowKind uint8
@@ -106,37 +95,23 @@ const (
 )
 
 type FlowRecord struct {
-	Ref                FlowRef
-	Kind               FlowKind
-	Origin             TrafficOrigin
-	Source             net.Destination
-	InitialDestination net.Destination
-	Opened             time.Duration
-	AccountingRoute    RouteStep
-	Routes             []RouteStep
-	Destinations       []net.Destination
-	Uplink             ByteFact
-	Downlink           ByteFact
-	State              FlowState
-	MetadataTruncated  bool
+	Ref                  FlowRef
+	Kind                 FlowKind
+	Origin               TrafficOrigin
+	Source               net.Destination
+	InitialDestination   net.Destination
+	Opened               time.Duration
+	SelectedRoute        RouteStep
+	EffectiveDestination net.Destination
+	LatestDestination    net.Destination
+	Uplink               ByteFact
+	Downlink             ByteFact
+	State                FlowState
 }
 
-type EndReason uint8
-
-const (
-	EndReasonUnknown EndReason = iota
-	EndReasonEOF
-	EndReasonLocalStop
-	EndReasonTimeout
-	EndReasonReadError
-	EndReasonWriteError
-	EndReasonRejected
-)
-
 type TerminalRecord struct {
-	Flow   FlowRecord
-	Ended  time.Duration
-	Reason EndReason
+	Flow  FlowRecord
+	Ended time.Duration
 }
 
 type TotalRecord struct {
@@ -146,40 +121,27 @@ type TotalRecord struct {
 	Downlink ByteFact
 }
 
-type LossFacts struct {
-	UntrackedAdmissions uint64
-	BucketAdmissionLoss uint64
-	TerminalOverwrite   uint64
-	Saturated           bool
-	MetadataTruncated   bool
-}
-
 type LiveSnapshot struct {
 	Sample Sample
 	Rows   []FlowRecord
-	Loss   LossFacts
 }
 
 type TotalsSnapshot struct {
 	Sample Sample
 	Rows   []TotalRecord
-	Loss   LossFacts
 }
 
 type TerminalSnapshot struct {
 	Sample Sample
 	Rows   []TerminalRecord
-	Loss   LossFacts
 }
 
 type CloseCode uint8
 
 const (
 	CloseCodeAccepted CloseCode = iota
-	CloseCodeAlreadyRequested
-	CloseCodeAlreadyEnded
+	CloseCodeNoAction
 	CloseCodeStaleRuntime
-	CloseCodeNotFound
 	CloseCodeUnsupportedOwner
 	CloseCodeFailed
 	CloseCodeNotStartedCanceled
@@ -188,15 +150,16 @@ const (
 type CloseOutcome struct {
 	Ref  FlowRef
 	Code CloseCode
+	Err  error
 }
 
 // FlowInspection is the optional direct-Go observation and local-control
 // capability implemented by the native statistics manager.
 type FlowInspection interface {
 	Info() InspectionInfo
-	ReadLive(context.Context) (LiveSnapshot, error)
-	ReadTerminals(context.Context) (TerminalSnapshot, error)
-	ReadTotals(context.Context) (TotalsSnapshot, error)
+	ReadLive() (LiveSnapshot, error)
+	ReadTerminals() (TerminalSnapshot, error)
+	ReadTotals() (TotalsSnapshot, error)
 	CloseFlows(context.Context, []FlowRef) ([]CloseOutcome, error)
 }
 
@@ -243,12 +206,10 @@ type Exchange interface {
 	// SetSource fills a source unavailable at admission once its native
 	// association identifies the peer. It never changes an existing source.
 	SetSource(net.Destination)
-	// PacketDestination records requested logical destinations, not egress IPs.
+	// PacketDestination replaces the latest observed requested destination,
+	// independently of delayed route attribution. It does not record history.
 	PacketDestination(net.Destination)
 	AddUplink(uint64)
 	AddDownlink(uint64)
-	MarkUplinkIncomplete()
-	MarkDownlinkIncomplete()
-	SetEndReason(EndReason)
 	Finish()
 }

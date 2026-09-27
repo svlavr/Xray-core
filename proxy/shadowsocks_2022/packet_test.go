@@ -130,14 +130,10 @@ func TestInspectionSS2022PacketCodecResults(t *testing.T) {
 				}
 				row := inspectionLive(t, view)
 				known := uint64(0)
-				incomplete := false
-				switch outcome {
-				case "complete":
+				if outcome == "complete" {
 					known = 8
-				default:
-					incomplete = true
 				}
-				if row.Uplink.Known != 7 || row.Downlink.Known != known || row.Downlink.Incomplete != incomplete {
+				if row.Uplink.Known != 7 || row.Downlink.Known != known {
 					t.Fatalf("packet result: %+v", row)
 				}
 			})

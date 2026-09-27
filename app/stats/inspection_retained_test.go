@@ -1,7 +1,6 @@
 package stats
 
 import (
-	"context"
 	"sync"
 	"testing"
 
@@ -32,7 +31,6 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 			first := xnet.UDPDestination(xnet.LocalHostIP, 53)
 			second := xnet.UDPDestination(xnet.LocalHostIP, 54)
 			flow.PacketDestination(first)
-			before := flow.snapshot()
 			flow.Rebind(test.runtime, test.origin)
 			flow.AddUplink(100)
 			flow.AddDownlink(200)
@@ -40,19 +38,19 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 			flow.Rebind(store.runtime, fs.TrafficOriginUser) // conflict cannot be repaired by a later matching carrier
 			row := flow.snapshot()
 			if test.conflict {
-				if len(row.Destinations) != 1 || row.Destinations[0] != first {
-					t.Fatalf("conflict changed packet attribution: %+v", row.Destinations)
+				if row.LatestDestination != first {
+					t.Fatalf("conflict changed packet attribution: %+v", row.LatestDestination)
 				}
-				if row.Uplink.Known != 7 || row.Downlink.Known != 11 || row.Origin != fs.TrafficOriginUser || !row.Uplink.Incomplete || !row.Downlink.Incomplete || before.Uplink.Incomplete || before.Downlink.Incomplete {
+				if row.Uplink.Known != 7 || row.Downlink.Known != 11 || row.Origin != fs.TrafficOriginUser {
 					t.Fatalf("conflict facts: %+v", row)
 				}
 			} else if row.Uplink.Known != 107 || row.Downlink.Known != 211 || flow.provenanceConflict {
 				t.Fatalf("matching facts: %+v", row)
-			} else if len(row.Destinations) != 2 || row.Destinations[1] != second {
-				t.Fatalf("matching carrier lost packet attribution: %+v", row.Destinations)
+			} else if row.LatestDestination != second {
+				t.Fatalf("matching carrier lost packet attribution: %+v", row.LatestDestination)
 			}
 			flow.Finish()
-			page, _ := store.ReadTerminals(context.Background())
+			page, _ := store.ReadTerminals()
 			if len(page.Rows) != 1 || page.Rows[0].Flow.Ref != row.Ref {
 				t.Fatal("fence replaced logical reference")
 			}
@@ -85,29 +83,28 @@ func TestInspectionRetainedFenceRejectsConcurrentLateCredit(t *testing.T) {
 	flow.Finish()
 }
 
-func TestInspectionIncompleteAssociationDoesNotContaminateLegBucket(t *testing.T) {
+func TestInspectionAssociationCompletionKeepsLegBucket(t *testing.T) {
 	store := testInspectionStore(t, fs.ObservationOptions{})
 	flow := store.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-	flow.MarkUplinkIncomplete()
-	flow.MarkDownlinkIncomplete()
+
 	leg := flow.NewLeg()
 	leg.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1, Tag: "leg"}})
 	leg.BindRoute()
 	leg.AddUplink(7)
 	flow.Finish()
-	page, _ := store.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 7 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ := store.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 7 {
 		t.Fatalf("owner-end association snapshot: %+v", page)
 	}
 	leg.Finish()
-	page, _ = store.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 7 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ = store.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 7 {
 		t.Fatalf("association retirement lost facts: %+v", page)
 	}
-	totals, _ := store.ReadTotals(context.Background())
+	totals, _ := store.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 1 && (row.Uplink.Known != 7 || row.Uplink.Incomplete || row.Downlink.Incomplete) {
-			t.Fatalf("root incompleteness contaminated leg bucket: %+v", row)
+		if row.Outbound.Serial == 1 && (row.Uplink.Known != 7) {
+			t.Fatalf("association completion contaminated leg bucket: %+v", row)
 		}
 	}
 }

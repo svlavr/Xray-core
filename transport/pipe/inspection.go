@@ -29,8 +29,5 @@ func (w *inspectionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if accepted {
 		w.receipt.AddDownlink(size)
 	}
-	if err != nil {
-		w.receipt.SetEndReason(stats.EndReasonWriteError)
-	}
 	return err
 }

@@ -73,24 +73,24 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 			}
 			var selected fs.FlowRecord
 			inspectionWait(t, func() bool {
-				live, err := view.ReadLive(context.Background())
+				live, err := view.ReadLive()
 				if err != nil || len(live.Rows) != 2 {
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) || row.Uplink.Incomplete || row.Downlink.Incomplete {
+					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
 						return false
 					}
-					if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Tag != "socks-proxy" || row.AccountingRoute.Outbound.Serial == 0 ||
-						row.InitialDestination != destination || len(row.Destinations) != 1 || row.Destinations[0] != destination || row.Uplink.Incomplete || row.Downlink.Incomplete {
+					if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "socks-proxy" || row.SelectedRoute.Outbound.Serial == 0 ||
+						row.InitialDestination != destination || row.LatestDestination != destination {
 						t.Fatalf("SOCKS UDP logical facts: %+v", row)
 					}
 					if variant == "resolved" {
-						if !row.AccountingRoute.Effective.Address.Family().IsIP() || row.AccountingRoute.Effective.Port != destination.Port {
-							t.Fatalf("resolved logical target: %+v", row.AccountingRoute)
+						if !row.EffectiveDestination.Address.Family().IsIP() || row.EffectiveDestination.Port != destination.Port {
+							t.Fatalf("resolved logical target: %+v", row.SelectedRoute)
 						}
-					} else if row.AccountingRoute.Effective != destination {
-						t.Fatalf("physical server became logical target: %+v", row.AccountingRoute)
+					} else if row.EffectiveDestination != destination {
+						t.Fatalf("physical server became logical target: %+v", row.SelectedRoute)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.UDPAddr).Port) {
 						selected = row
@@ -103,12 +103,12 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 				t.Fatalf("SOCKS UDP exact stop: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
-				return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected.Ref && page.Rows[0].Reason == fs.EndReasonLocalStop
+				page, err := view.ReadTerminals()
+				return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected.Ref
 			})
 			extra := []byte("SOCKS UDP sibling survives")
 			inspectionUDPExchange(t, sibling, address, extra, mask)
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			if err != nil || len(live.Rows) != 1 {
 				t.Fatalf("sibling live facts: %+v %v", live, err)
 			}
@@ -116,10 +116,10 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 				t.Fatalf("sibling stop: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				return err == nil && len(page.Rows) == 2
 			})
-			totals, err := view.ReadTotals(context.Background())
+			totals, err := view.ReadTotals()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -127,7 +127,7 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 			var up, down uint64
 			for _, total := range totals.Rows {
 				if total.Uplink.Known != 0 || total.Downlink.Known != 0 {
-					if total.Outbound != selected.AccountingRoute.Outbound || total.Origin != fs.TrafficOriginUser || total.Uplink.Incomplete || total.Downlink.Incomplete {
+					if total.Outbound != selected.SelectedRoute.Outbound || total.Origin != fs.TrafficOriginUser {
 						t.Fatalf("SOCKS UDP totals: %+v", total)
 					}
 					up += total.Uplink.Known
@@ -156,12 +156,12 @@ func TestFlowInspectionSOCKSUDPOutboundRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil || len(page.Rows) != 1 {
 			return false
 		}
 		row := page.Rows[0].Flow
-		if row.Kind != fs.FlowKindUDPAssociation || row.AccountingRoute.Outbound.Tag != "socks-proxy" || row.AccountingRoute.Outbound.Serial == 0 || row.Uplink.Known != 0 || row.Downlink.Known != 0 || row.Uplink.Incomplete || row.Downlink.Incomplete {
+		if row.Kind != fs.FlowKindUDPAssociation || row.SelectedRoute.Outbound.Tag != "socks-proxy" || row.SelectedRoute.Outbound.Serial == 0 || row.Uplink.Known != 0 || row.Downlink.Known != 0 {
 			t.Fatalf("failed UDP handshake fabricated payload: %+v", row)
 		}
 		return true

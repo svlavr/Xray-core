@@ -132,14 +132,9 @@ type responseReceiptWriter struct {
 func (w *responseReceiptWriter) Write(p []byte) (int, error) {
 	n, err := w.Writer.Write(p)
 	if n < 0 || n > len(p) {
-		w.receipt.MarkDownlinkIncomplete()
-		w.receipt.SetEndReason(stats.EndReasonWriteError)
 		return n, err
 	}
 	w.receipt.AddDownlink(uint64(n))
-	if err != nil || n != len(p) {
-		w.receipt.SetEndReason(stats.EndReasonWriteError)
-	}
 	return n, err
 }
 
@@ -302,12 +297,8 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			observation.Exchange.Unassign()
 			// ReadRequest may have prefetched later keep-alive bytes. The exact
 			// consumed request serialization is unavailable without a second parser.
-			observation.Exchange.MarkUplinkIncomplete()
 		}
 		err := response.Write(responseWriter)
-		if observation != nil && err == nil {
-			observation.Exchange.SetEndReason(stats.EndReasonRejected)
-		}
 		return err
 	}
 
@@ -339,9 +330,6 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
-		if observation != nil {
-			observation.Exchange.SetEndReason(stats.EndReasonRejected)
-		}
 		return err
 	}
 	owner.attach(link)
@@ -356,9 +344,6 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		requestWriter := buf.NewBufferedWriter(link.Writer)
 		common.Must(requestWriter.SetBuffered(false))
 		if err := request.Write(requestWriter); err != nil {
-			if observation != nil {
-				observation.Exchange.SetEndReason(stats.EndReasonWriteError)
-			}
 			return errors.New("failed to write whole request").Base(err).AtWarning()
 		}
 		return nil
@@ -381,9 +366,6 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			defer response.Body.Close()
 		} else {
 			errors.LogWarningInner(ctx, err, "failed to read response from ", request.Host)
-			if observation != nil {
-				observation.Exchange.SetEndReason(stats.EndReasonReadError)
-			}
 			response = &http.Response{
 				Status:        "Service Unavailable",
 				StatusCode:    503,

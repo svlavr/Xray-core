@@ -79,29 +79,34 @@ func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
 		t.Fatal("native write did not start")
 	}
 	flow.Finish()
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 2 || page.Rows[0].Flow.Downlink.Incomplete {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 2 {
 		t.Errorf("owner-end write snapshot: %+v %v", page, err)
 	}
 	close(release)
 	if err := <-done; !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals(context.Background())
+	page, err = view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact.Known != 2 || fact.Incomplete {
+	if calls != 2 || fact.Known != 2 {
 		t.Fatalf("native partial result: calls=%d fact=%+v", calls, fact)
 	}
-	totals, _ := view.ReadTotals(context.Background())
-	var incomplete bool
+	totals, _ := view.ReadTotals()
+	var found bool
 	for _, total := range totals.Rows {
-		incomplete = incomplete || total.Downlink.Incomplete
+		if total.Outbound.Serial == 1 && total.Origin == fs.TrafficOriginUser {
+			found = true
+			if total.Downlink.Known != 2 {
+				t.Fatalf("native partial total: %+v", total)
+			}
+		}
 	}
-	if !incomplete {
-		t.Fatalf("late error missing from totals: %+v", totals)
+	if !found {
+		t.Fatalf("native partial total missing: %+v", totals)
 	}
 }
 
@@ -223,7 +228,7 @@ func TestInspectionWireGuardStopPendingVirtualDial(t *testing.T) {
 	go func() { done <- h.Process(ctx, link, inspectionWGProcessDialer{}) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -221,8 +221,8 @@ func (g *masqueFirstDatagramGate) Snapshot() (sources int, forwarded uint64, err
 
 func inspectionMasqueTCPRow(t *testing.T, row fs.FlowRecord, target xnet.Destination, known uint64) {
 	t.Helper()
-	route := row.AccountingRoute
-	if row.Ref.ID == 0 || row.Kind != fs.FlowKindTCP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != target || row.Uplink != (fs.ByteFact{Known: known}) || row.Downlink != (fs.ByteFact{Known: known}) || route.Selection != fs.SelectionDefault || route.Outbound.Tag != "masque-inspected" || route.Outbound.Serial == 0 || route.Original != target || route.SelectedTarget != target || route.Effective != target || len(row.Routes) != 1 || row.Routes[0] != route {
+	route := row.SelectedRoute
+	if row.Ref.ID == 0 || row.Kind != fs.FlowKindTCP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != target || row.Uplink != (fs.ByteFact{Known: known}) || row.Downlink != (fs.ByteFact{Known: known}) || route.Selection != fs.SelectionDefault || route.Outbound.Tag != "masque-inspected" || route.Outbound.Serial == 0 || route.SelectedTarget != target || row.EffectiveDestination != target || row.SelectedRoute != route {
 		t.Fatalf("logical MASQUE TCP flow: %+v", row)
 	}
 }
@@ -263,7 +263,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 	wantBytes := map[xnet.Destination]uint64{firstSource: uint64(len(firstPayload)), siblingSource: uint64(len(siblingPayload))}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -316,13 +316,13 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 	var udpRef fs.FlowRef
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
 			if row.Kind == fs.FlowKindUDPAssociation && row.Uplink.Known == uint64(len(udpPayload)) && row.Downlink.Known == uint64(len(udpPayload)) {
-				if row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Tag != "masque-inspected" || row.AccountingRoute.Effective != udpTarget || row.Downlink.Known != row.Uplink.Known {
+				if row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "masque-inspected" || row.EffectiveDestination != udpTarget || row.Downlink.Known != row.Uplink.Known {
 					t.Fatalf("logical MASQUE UDP flow: %+v", row)
 				}
 				udpRef = row.Ref
@@ -343,13 +343,13 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 	deadline = time.Now().Add(5 * time.Second)
 	var stoppedUDP bool
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range page.Rows {
 			if row.Flow.Ref == udpRef {
-				if row.Reason != fs.EndReasonLocalStop || row.Flow.Uplink.Known != uint64(len(udpPayload)) || row.Flow.Downlink.Known != uint64(len(udpPayload)) {
+				if row.Flow.Uplink.Known != uint64(len(udpPayload)) || row.Flow.Downlink.Known != uint64(len(udpPayload)) {
 					t.Fatalf("stopped MASQUE UDP terminal: %+v", row)
 				}
 				stoppedUDP = true
@@ -372,7 +372,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 	inspectionMasqueExchange(t, replacement, replacementPayload)
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -386,16 +386,16 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 				want := uint64(len(firstPayload) + len(siblingPayload) + len(extra) + len(udpPayload) + len(replacementPayload) + len(postStopTCP))
 				totalDeadline := time.Now().Add(5 * time.Second)
 				for time.Now().Before(totalDeadline) {
-					totals, err := view.ReadTotals(context.Background())
+					totals, err := view.ReadTotals()
 					if err != nil {
 						t.Fatal(err)
 					}
 					var up, down uint64
 					for _, total := range totals.Rows {
-						if total.Origin != fs.TrafficOriginUser || total.Uplink.Known == 0 && total.Downlink.Known == 0 && !total.Uplink.Incomplete && !total.Downlink.Incomplete {
+						if total.Origin != fs.TrafficOriginUser || total.Uplink.Known == 0 && total.Downlink.Known == 0 {
 							continue
 						}
-						if total.Outbound.Tag != "masque-inspected" || total.Outbound.Serial == 0 || total.Uplink.Incomplete || total.Downlink.Incomplete {
+						if total.Outbound.Tag != "masque-inspected" || total.Outbound.Serial == 0 {
 							t.Fatalf("unexpected MASQUE USER bucket: %+v", total)
 						}
 						up += total.Uplink.Known
@@ -434,7 +434,7 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 	var firstRef fs.FlowRef
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -460,7 +460,7 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 	var siblingRef fs.FlowRef
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -502,20 +502,20 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 	deadline = time.Now().Add(5 * time.Second)
 	var firstStopped, siblingStillLive bool
 	for time.Now().Before(deadline) {
-		terminals, err := view.ReadTerminals(context.Background())
+		terminals, err := view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range terminals.Rows {
 			if row.Flow.Ref == firstRef {
 				inspectionMasqueTCPRow(t, row.Flow, tcpTarget, 0)
-				if row.Flow.State != fs.FlowStateEnded || row.Reason != fs.EndReasonLocalStop {
+				if row.Flow.State != fs.FlowStateEnded {
 					t.Fatalf("first MASQUE terminal reason: %+v", row)
 				}
 				firstStopped = true
 			}
 		}
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -546,7 +546,7 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 	inspectionMasqueExchange(t, sibling, payload)
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -560,13 +560,13 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 				if sources != 1 || forwarded == 0 || relayErr != nil {
 					t.Fatalf("successful shared MASQUE carrier: sources=%d forwarded=%d err=%v", sources, forwarded, relayErr)
 				}
-				totals, err := view.ReadTotals(context.Background())
+				totals, err := view.ReadTotals()
 				if err != nil {
 					t.Fatal(err)
 				}
 				var userRows int
 				for _, total := range totals.Rows {
-					if total.Origin != fs.TrafficOriginUser || total.Uplink.Known == 0 && total.Downlink.Known == 0 && !total.Uplink.Incomplete && !total.Downlink.Incomplete {
+					if total.Origin != fs.TrafficOriginUser || total.Uplink.Known == 0 && total.Downlink.Known == 0 {
 						continue
 					}
 					userRows++

@@ -45,15 +45,6 @@ func (e *dnsTCPExchange) AddUplink(value uint64) {
 	}
 }
 
-func (e *dnsTCPExchange) finishUplink() {
-	e.mu.Lock()
-	incomplete := e.prefixRemaining != 0 || e.bodyRemaining != 0
-	e.mu.Unlock()
-	if incomplete {
-		e.Exchange.MarkUplinkIncomplete()
-	}
-}
-
 // dnsTCPQueryOwner owns only one routed DNS request connection. Close may race
 // Dispatch returning its link; Attach closes that late connection immediately
 // when local control already stopped the request.
@@ -84,9 +75,6 @@ func (o *dnsTCPQueryOwner) attach(conn net.Conn) error {
 }
 
 func (o *dnsTCPQueryOwner) Close() error {
-	if o.exchange != nil {
-		o.exchange.finishUplink()
-	}
 	return o.closeResources()
 }
 
@@ -113,7 +101,6 @@ func (o *dnsTCPQueryOwner) closeResources() error {
 func (o *dnsTCPQueryOwner) finish() {
 	o.endOnce.Do(func() {
 		if o.exchange != nil {
-			o.exchange.finishUplink()
 			o.exchange.Finish()
 		}
 		_ = o.closeResources()
@@ -124,8 +111,6 @@ func (o *dnsTCPQueryOwner) markWriteError() {
 	if o == nil || o.exchange == nil {
 		return
 	}
-	o.exchange.MarkUplinkIncomplete()
-	o.exchange.SetEndReason(stats.EndReasonWriteError)
 }
 
 func (o *dnsTCPQueryOwner) recordResponseRead(n int64, expected int64, err error) {
@@ -135,25 +120,18 @@ func (o *dnsTCPQueryOwner) recordResponseRead(n int64, expected int64, err error
 	if n > 0 {
 		o.exchange.AddDownlink(uint64(n))
 	}
-	if err != nil || n != expected {
-		o.exchange.MarkDownlinkIncomplete()
-		o.exchange.SetEndReason(stats.EndReasonReadError)
-	}
 }
 
 func (o *dnsTCPQueryOwner) markResponseError() {
 	if o == nil || o.exchange == nil {
 		return
 	}
-	o.exchange.MarkDownlinkIncomplete()
-	o.exchange.SetEndReason(stats.EndReasonReadError)
 }
 
 func (o *dnsTCPQueryOwner) markResponseDecodeError() {
 	if o == nil || o.exchange == nil {
 		return
 	}
-	o.exchange.SetEndReason(stats.EndReasonReadError)
 }
 
 func beginRoutedDNSTCPObservation(ctx context.Context, destination net.Destination, bodySize uint64) (context.Context, *dnsTCPQueryOwner) {

@@ -2,7 +2,6 @@ package shadowsocks_2022
 
 import (
 	"context"
-	"io"
 	"sync"
 
 	"github.com/xtls/xray-core/common/net"
@@ -79,11 +78,6 @@ func (c *inspectionConn) Read(p []byte) (int, error) {
 	if n > 0 {
 		c.receipt.AddUplink(uint64(n))
 	}
-	if err == io.EOF {
-		c.receipt.SetEndReason(stats.EndReasonEOF)
-	} else if err != nil {
-		c.receipt.SetEndReason(stats.EndReasonReadError)
-	}
 	return n, err
 }
 
@@ -96,9 +90,7 @@ func (c *inspectionConn) Write(p []byte) (int, error) {
 		if n < len(p) {
 			// The opaque codec proves prior completed plaintext units through n,
 			// but exposes no lower result for its failing unit. Never guess it.
-			c.receipt.MarkDownlinkIncomplete()
 		}
-		c.receipt.SetEndReason(stats.EndReasonWriteError)
 	}
 	return n, err
 }

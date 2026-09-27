@@ -1,7 +1,6 @@
 package core_test
 
 import (
-	"context"
 	"io"
 	"net"
 	"testing"
@@ -36,7 +35,7 @@ func TestFlowInspectionSOCKS4DecodedRejectedCommand(t *testing.T) {
 	}
 	var terminal fs.TerminalRecord
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil || len(page.Rows) != 1 {
 			return false
 		}
@@ -45,7 +44,7 @@ func TestFlowInspectionSOCKS4DecodedRejectedCommand(t *testing.T) {
 	})
 	flow := terminal.Flow
 	destination := cnet.TCPDestination(cnet.LocalHostIP, 80)
-	if flow.Kind != fs.FlowKindTCP || flow.Origin != fs.TrafficOriginUser || flow.InitialDestination != destination || flow.AccountingRoute.Selection != fs.SelectionUnknown || flow.AccountingRoute.Outbound.Serial != 0 || len(flow.Routes) != 0 || flow.Uplink.Known != 0 || flow.Downlink.Known != 0 || flow.Uplink.Incomplete || flow.Downlink.Incomplete || terminal.Reason != fs.EndReasonRejected {
+	if flow.Kind != fs.FlowKindTCP || flow.Origin != fs.TrafficOriginUser || flow.InitialDestination != destination || flow.SelectedRoute.Selection != fs.SelectionUnknown || flow.SelectedRoute.Outbound.Serial != 0 || flow.Uplink.Known != 0 || flow.Downlink.Known != 0 {
 		t.Fatalf("decoded SOCKS4 rejection facts: %+v", terminal)
 	}
 
@@ -64,7 +63,7 @@ func TestFlowInspectionSOCKS4DecodedRejectedCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	incomplete.Close()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("incomplete SOCKS4 header admitted a flow: %+v %v", page.Rows, err)
 	}
@@ -101,7 +100,7 @@ func TestFlowInspectionSOCKS4AuthBeforeTargetNoAdmission(t *testing.T) {
 	if _, err := io.Copy(io.Discard, conn); err != nil {
 		t.Fatal(err)
 	}
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 0 {
 		t.Fatalf("pre-target auth created logical admission: %+v %v", page.Rows, err)
 	}

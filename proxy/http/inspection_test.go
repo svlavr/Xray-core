@@ -141,8 +141,6 @@ func startObservedHTTP2Endpoint(t *testing.T, client *Client, manager *appstats.
 	observation := session.LogicalObservationFromContext(ctx)
 	observation.Exchange.Route(fs.RouteStep{
 		Outbound:       fs.OutboundRef{Runtime: view.Info().Runtime, Serial: serial, Tag: "http-proxy"},
-		Original:       target,
-		RouteTarget:    target,
 		SelectedTarget: target,
 	})
 	done := make(chan error, 1)
@@ -209,18 +207,18 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 
 	var selected fs.FlowRef
 	waitHTTPInspection(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil || len(live.Rows) != 2 {
 			return false
 		}
 		for _, row := range live.Rows {
-			if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) || row.Uplink.Incomplete || row.Downlink.Incomplete {
+			if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
 				return false
 			}
-			if row.AccountingRoute.Outbound.Tag != "http-proxy" || row.AccountingRoute.Outbound.Serial == 0 || row.AccountingRoute.Effective != target || row.Uplink.Incomplete || row.Downlink.Incomplete {
+			if row.SelectedRoute.Outbound.Tag != "http-proxy" || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != target {
 				t.Fatalf("live HTTP/2 receipt: %+v", row)
 			}
-			if row.AccountingRoute.Outbound.Serial == 1 {
+			if row.SelectedRoute.Outbound.Serial == 1 {
 				selected = row.Ref
 			}
 		}
@@ -231,8 +229,8 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 		t.Fatalf("exact stream close: %+v %v", outcomes, err)
 	}
 	waitHTTPInspection(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected && page.Rows[0].Reason == fs.EndReasonLocalStop
+		page, _ := view.ReadTerminals()
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected
 	})
 	select {
 	case <-first.done:
@@ -249,11 +247,11 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 	}
 	second.conn.Close()
 	waitHTTPInspection(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 2
 	})
 	want := uint64(2*len(payload) + len(extra))
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatalf("HTTP/2 totals: %+v %v", totals, err)
 	}
@@ -267,7 +265,7 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 			continue
 		}
 		selectedBuckets++
-		if row.Outbound.Tag != "http-proxy" || row.Origin != fs.TrafficOriginUser || row.Uplink.Incomplete || row.Downlink.Incomplete {
+		if row.Outbound.Tag != "http-proxy" || row.Origin != fs.TrafficOriginUser {
 			t.Fatalf("HTTP/2 total attribution: %+v", row)
 		}
 		up += row.Uplink.Known

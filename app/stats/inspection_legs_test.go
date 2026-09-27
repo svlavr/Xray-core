@@ -10,7 +10,7 @@ import (
 )
 
 func TestInspectionRayAttributionAndCompletion(t *testing.T) {
-	s := testInspectionStore(t, fs.ObservationOptions{MaxRouteSteps: 1})
+	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { return nil })
 	a, b := root.NewLeg(), root.NewLeg()
 	if a.Ref() != root.Ref() || b.Ref() != root.Ref() || a.NewLeg() != nil {
@@ -35,23 +35,23 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	}
 	a.Finish()
 	b.Finish()
-	page, _ := s.ReadTerminals(context.Background())
+	page, _ := s.ReadTerminals()
 	if len(page.Rows) != 1 {
 		t.Fatalf("association terminal count: %d", len(page.Rows))
 	}
 	a.AddUplink(13)
 	a.Finish()
 	root.Finish()
-	page, _ = s.ReadTerminals(context.Background())
+	page, _ = s.ReadTerminals()
 	f := page.Rows[0].Flow
-	if len(f.Routes) != 1 || f.Ref != root.Ref() || f.Uplink.Known != 8 || f.Downlink.Known != 18 || f.AccountingRoute.Outbound.Serial != 12 || f.AccountingRoute.Effective != newDest || f.Routes[0].Outbound.Serial != 11 || !f.MetadataTruncated {
+	if f.Ref != root.Ref() || f.Uplink.Known != 8 || f.Downlink.Known != 18 || f.SelectedRoute.Outbound.Serial != 12 || f.EffectiveDestination != newDest {
 		t.Fatalf("association facts: %+v", f)
 	}
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		switch row.Outbound.Serial {
 		case 0:
-			if row.Uplink.Known != 0 || row.Downlink.Known != 0 || row.Uplink.Incomplete || row.Downlink.Incomplete {
+			if row.Uplink.Known != 0 || row.Downlink.Known != 0 {
 				t.Fatalf("inactive root fabricated unassigned facts: %+v", row)
 			}
 		case 11:
@@ -66,32 +66,32 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	}
 }
 
-func TestInspectionRayPendingUnassignedAndIncomplete(t *testing.T) {
+func TestInspectionRayPendingUnassignedCredit(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginInternal, xnet.Destination{}, xnet.Destination{}, nil)
 	a, b := root.NewLeg(), root.NewLeg()
 	a.AddUplink(3)
-	a.MarkDownlinkIncomplete()
+
 	a.Unassign()
 	a.Finish() // No consuming route: only this ray's pending bytes are unassigned.
 	b.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 8}})
 	b.AddUplink(5)
-	b.MarkDownlinkIncomplete()
+
 	b.BindRoute()
 	c := root.NewLeg()
 	c.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 8}})
 	c.BindRoute()
-	c.MarkUplinkIncomplete()
-	totals, _ := s.ReadTotals(context.Background())
+
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 8 && (row.Uplink.Known != 5 || !row.Uplink.Incomplete || !row.Downlink.Incomplete) {
+		if row.Outbound.Serial == 8 && (row.Uplink.Known != 5) {
 			t.Fatalf("independent leg incompleteness: %+v", row)
 		}
 	}
 	b.Finish()
 	c.Finish()
 	root.Finish()
-	totals, _ = s.ReadTotals(context.Background())
+	totals, _ = s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Origin == fs.TrafficOriginInternal && row.Outbound.Serial == 0 && row.Uplink.Known != 3 {
 			t.Fatalf("unassigned pending credit: %+v", row)
@@ -107,19 +107,19 @@ func TestInspectionFinishedRayLateFactsReachLiveRoot(t *testing.T) {
 	leg.BindRoute()
 	leg.Finish()
 	leg.AddUplink(9)
-	leg.MarkDownlinkIncomplete()
+
 	root.Finish()
 
-	page, _ := s.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 9 || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ := s.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 9 {
 		t.Fatalf("late leg facts missing from root snapshot: %+v", page)
 	}
 	leg.AddUplink(4)
-	pageAgain, _ := s.ReadTerminals(context.Background())
+	pageAgain, _ := s.ReadTerminals()
 	if pageAgain.Rows[0].Flow.Uplink.Known != 9 {
 		t.Fatalf("terminal snapshot changed after root finish: %+v", pageAgain)
 	}
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Outbound.Serial == 7 && row.Uplink.Known == 13 {
 			return
@@ -135,18 +135,17 @@ func TestInspectionSelectedUnclaimedRayIsUnassigned(t *testing.T) {
 	leg.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: 19, Tag: "selected-only"}})
 	leg.AddUplink(5)
 	leg.Unassign()
-	leg.MarkUplinkIncomplete()
-	leg.MarkDownlinkIncomplete()
+
 	leg.Finish()
 	root.Finish()
 
-	page, _ := s.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || len(page.Rows[0].Flow.Routes) != 1 || page.Rows[0].Flow.Routes[0].Outbound.Serial != 19 || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ := s.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 19 {
 		t.Fatalf("selected route became a consuming owner: %+v", page)
 	}
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Origin == fs.TrafficOriginUser && row.Outbound.Serial == 0 && row.Uplink.Known == 5 && row.Uplink.Incomplete && row.Downlink.Incomplete {
+		if row.Origin == fs.TrafficOriginUser && row.Outbound.Serial == 0 && row.Uplink.Known == 5 {
 			return
 		}
 	}
@@ -154,7 +153,7 @@ func TestInspectionSelectedUnclaimedRayIsUnassigned(t *testing.T) {
 }
 
 func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
-	s := testInspectionStore(t, fs.ObservationOptions{MaxDestinations: 2})
+	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	leg := root.NewLeg()
 	destination := xnet.UDPDestination(xnet.DomainAddress("late.example"), 53)
@@ -164,23 +163,22 @@ func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
 	leg.Finish()
 	root.Finish()
 
-	page, _ := s.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 || page.Rows[0].Flow.Downlink.Known != 0 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete || len(page.Rows[0].Flow.Routes) != 0 || len(page.Rows[0].Flow.Destinations) != 0 {
+	page, _ := s.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 || page.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("pre-classification terminal: %+v", page)
 	}
 	leg.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 31, Tag: "ordinary"}})
 	leg.BindRoute()
 	leg.AddUplink(17)
-	leg.SetEndReason(fs.EndReasonWriteError)
 
-	again, _ := s.ReadTerminals(context.Background())
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink.Known != 0 || len(again.Rows[0].Flow.Routes) != 0 || again.Rows[0].Reason != fs.EndReasonUnknown {
+	again, _ := s.ReadTerminals()
+	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("late route changed immutable terminal: %+v", again)
 	}
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Outbound.Serial == 31 {
-			if row.Uplink.Known != 28 || row.Downlink.Known != 13 || row.Uplink.Incomplete || row.Downlink.Incomplete {
+			if row.Uplink.Known != 28 || row.Downlink.Known != 13 {
 				t.Fatalf("late ordinary totals: %+v", row)
 			}
 			return
@@ -200,52 +198,28 @@ func TestInspectionRouteThenOwnerEndBeforeBind(t *testing.T) {
 	leg.Finish()
 	root.Finish()
 
-	page, _ := s.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 23 || len(page.Rows[0].Flow.Destinations) != 1 || page.Rows[0].Flow.Destinations[0] != destination || len(page.Rows[0].Flow.Routes) != 1 || page.Rows[0].Flow.Routes[0].Outbound.Serial != 35 || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ := s.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 23 || page.Rows[0].Flow.LatestDestination != destination || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 35 {
 		t.Fatalf("route-before-bind lower bound: %+v", page)
 	}
 	leg.BindRoute()
 	leg.AddDownlink(29)
 	leg.FinishSelectedLeg()
 
-	again, _ := s.ReadTerminals(context.Background())
-	if len(again.Rows) != 1 || again.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 || again.Rows[0].Flow.Downlink.Known != 0 {
+	again, _ := s.ReadTerminals()
+	if len(again.Rows) != 1 || again.Rows[0].Flow.SelectedRoute.Outbound.Serial != 35 || again.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("late claim changed immutable terminal: %+v", again)
 	}
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Outbound.Serial == 35 {
-			if row.Uplink.Known != 23 || row.Downlink.Known != 29 || row.Uplink.Incomplete || row.Downlink.Incomplete {
+			if row.Uplink.Known != 23 || row.Downlink.Known != 29 {
 				t.Fatalf("late claim totals: %+v", row)
 			}
 			return
 		}
 	}
 	t.Fatalf("late claim bucket missing: %+v", totals)
-}
-
-func TestInspectionPendingRouteCountSaturationIsNotDecremented(t *testing.T) {
-	s := testInspectionStore(t, fs.ObservationOptions{})
-	root := s.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
-	root.mu.Lock()
-	root.pendingRoutes = math.MaxUint64
-	root.mu.Unlock()
-	leg := root.NewLeg().(*inspectionExchange)
-	if leg.pending.counted {
-		t.Fatal("saturated pending leg was counted")
-	}
-	leg.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: 38, Tag: "saturated-leg"}})
-	leg.BindRoute()
-	root.mu.Lock()
-	pendingRoutes := root.pendingRoutes
-	root.mu.Unlock()
-	if pendingRoutes != math.MaxUint64 {
-		t.Fatalf("uncounted leg decremented saturated count: %d", pendingRoutes)
-	}
-	page, _ := s.ReadLive(context.Background())
-	if page.Loss.UntrackedAdmissions != 1 || len(page.Rows) != 1 || !page.Rows[0].Uplink.Incomplete || !page.Rows[0].Downlink.Incomplete {
-		t.Fatalf("saturated pending loss: %+v", page)
-	}
 }
 
 func TestInspectionEarlyFinishedSelectedLegWithoutClaimIsUnassigned(t *testing.T) {
@@ -258,13 +232,13 @@ func TestInspectionEarlyFinishedSelectedLegWithoutClaimIsUnassigned(t *testing.T
 	leg.FinishSelectedLeg()
 	root.Finish()
 
-	page, _ := s.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || len(page.Rows[0].Flow.Routes) != 1 || page.Rows[0].Flow.Routes[0].Outbound.Serial != 37 || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 || page.Rows[0].Flow.Uplink.Known != 19 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ := s.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 37 || page.Rows[0].Flow.Uplink.Known != 19 {
 		t.Fatalf("selected no-claim terminal: %+v", page)
 	}
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Origin == fs.TrafficOriginUser && row.Outbound.Serial == 0 && row.Uplink.Known == 19 && row.Uplink.Incomplete && row.Downlink.Incomplete {
+		if row.Origin == fs.TrafficOriginUser && row.Outbound.Serial == 0 && row.Uplink.Known == 19 {
 			return
 		}
 	}
@@ -284,12 +258,12 @@ func TestInspectionRayOverflowIsLocal(t *testing.T) {
 		leg.Finish()
 	}
 	root.Finish()
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 1 && (row.Uplink.Known != math.MaxUint64 || !row.Uplink.Incomplete || row.Downlink.Incomplete) {
+		if row.Outbound.Serial == 1 && (row.Uplink.Known != math.MaxUint64) {
 			t.Fatalf("saturated ray: %+v", row)
 		}
-		if row.Outbound.Serial == 2 && (row.Uplink.Known != 3 || row.Uplink.Incomplete) {
+		if row.Outbound.Serial == 2 && (row.Uplink.Known != 3) {
 			t.Fatalf("root overflow contaminated another ray: %+v", row)
 		}
 	}
@@ -311,11 +285,11 @@ func TestInspectionTCPAttemptLegsKeepPerRouteTotals(t *testing.T) {
 	}
 	root.Finish()
 
-	page, _ := s.ReadTerminals(context.Background())
+	page, _ := s.ReadTerminals()
 	if len(page.Rows) != 1 || page.Rows[0].Flow.Kind != fs.FlowKindTCP || page.Rows[0].Flow.Uplink.Known != 23 || page.Rows[0].Flow.Downlink.Known != 43 {
 		t.Fatalf("TCP attempt root: %+v", page)
 	}
-	totals, _ := s.ReadTotals(context.Background())
+	totals, _ := s.ReadTotals()
 	for _, serial := range []uint64{41, 42} {
 		var found bool
 		for _, total := range totals.Rows {

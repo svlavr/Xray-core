@@ -30,12 +30,9 @@ import (
 )
 
 type dnsTCPTestExchange struct {
-	uplink             atomic.Uint64
-	downlink           atomic.Uint64
-	uplinkIncomplete   atomic.Bool
-	downlinkIncomplete atomic.Bool
-	finished           atomic.Uint32
-	reason             atomic.Uint32
+	uplink   atomic.Uint64
+	downlink atomic.Uint64
+	finished atomic.Uint32
 }
 
 func (*dnsTCPTestExchange) Ref() stats.FlowRef                          { return stats.FlowRef{} }
@@ -50,12 +47,7 @@ func (*dnsTCPTestExchange) SetSource(net.Destination)                   {}
 func (*dnsTCPTestExchange) PacketDestination(net.Destination)           {}
 func (e *dnsTCPTestExchange) AddUplink(n uint64)                        { e.uplink.Add(n) }
 func (e *dnsTCPTestExchange) AddDownlink(n uint64)                      { e.downlink.Add(n) }
-func (e *dnsTCPTestExchange) MarkUplinkIncomplete()                     { e.uplinkIncomplete.Store(true) }
-
-func (e *dnsTCPTestExchange) MarkDownlinkIncomplete() { e.downlinkIncomplete.Store(true) }
-
-func (e *dnsTCPTestExchange) SetEndReason(reason stats.EndReason) { e.reason.Store(uint32(reason)) }
-func (e *dnsTCPTestExchange) Finish()                             { e.finished.Add(1) }
+func (e *dnsTCPTestExchange) Finish()                                   { e.finished.Add(1) }
 
 type dnsTCPCloseCountingConn struct {
 	closed atomic.Uint32
@@ -100,7 +92,6 @@ func (d *dnsTCPBlockingDispatcher) Dispatch(ctx context.Context, destination net
 	}
 	observation.Exchange.Route(stats.RouteStep{
 		Selection:      stats.SelectionDefault,
-		Original:       destination,
 		SelectedTarget: destination,
 	})
 	observation.Exchange.BindRoute()
@@ -124,21 +115,14 @@ func TestDNSTCPExchangeFramingAndPartialResponse(t *testing.T) {
 	exchange.AddUplink(3)
 	exchange.AddUplink(32)
 	exchange.AddUplink(5) // replay/overflow after the body is already complete
-	exchange.finishUplink()
 	if got := root.uplink.Load(); got != 5 {
 		t.Fatalf("decoded uplink: got %d want 5", got)
-	}
-	if root.uplinkIncomplete.Load() {
-		t.Fatal("complete framed query marked incomplete")
 	}
 
 	owner := &dnsTCPQueryOwner{exchange: exchange}
 	owner.recordResponseRead(3, 7, io.ErrUnexpectedEOF)
 	if got := root.downlink.Load(); got != 3 {
 		t.Fatalf("partial decoded downlink: got %d want 3", got)
-	}
-	if !root.downlinkIncomplete.Load() || stats.EndReason(root.reason.Load()) != stats.EndReasonReadError {
-		t.Fatalf("partial response facts: incomplete=%v reason=%v", root.downlinkIncomplete.Load(), root.reason.Load())
 	}
 }
 
@@ -205,7 +189,7 @@ func TestRoutedDNSTCPCloseCancelsDispatchBeforeLateAttach(t *testing.T) {
 
 	var ref stats.FlowRef
 	waitDNSTCPRows(t, func() (int, error) {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		if readErr == nil && len(live.Rows) == 1 {
 			ref = live.Rows[0].Ref
 		}
@@ -237,11 +221,11 @@ func TestRoutedDNSTCPCloseCancelsDispatchBeforeLateAttach(t *testing.T) {
 	if got := dispatcher.writer.closed.Load(); got != 1 {
 		t.Fatalf("late writer close count: got %d want 1", got)
 	}
-	terminals, err := view.ReadTerminals(context.Background())
+	terminals, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(terminals.Rows) != 1 || terminals.Rows[0].Reason != stats.EndReasonLocalStop || !terminals.Rows[0].Flow.Uplink.Incomplete {
+	if len(terminals.Rows) != 1 || terminals.Rows[0].Flow.State != stats.FlowStateEnded {
 		t.Fatalf("stopped dispatch terminal: %+v", terminals.Rows)
 	}
 }
@@ -282,8 +266,8 @@ func TestDNSTCPQueryOwnerAttachCloseRaceAndSibling(t *testing.T) {
 		if got := siblingConn.closed.Load(); got != 0 {
 			t.Fatalf("iteration %d sibling was closed: %d", i, got)
 		}
-		if !root.uplinkIncomplete.Load() || root.finished.Load() != 1 {
-			t.Fatalf("iteration %d owner finish: incomplete=%v finish=%d", i, root.uplinkIncomplete.Load(), root.finished.Load())
+		if root.finished.Load() != 1 {
+			t.Fatalf("iteration %d owner finish: finish=%d", i, root.finished.Load())
 		}
 		sibling.finish()
 	}
@@ -409,7 +393,7 @@ func TestRoutedDNSTCPObservationSuccess(t *testing.T) {
 	var terminals stats.TerminalSnapshot
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		terminals, err = view.ReadTerminals(context.Background())
+		terminals, err = view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -425,14 +409,11 @@ func TestRoutedDNSTCPObservationSuccess(t *testing.T) {
 	if row.Flow.Origin != stats.TrafficOriginInternal || row.Flow.Kind != stats.FlowKindTCP || row.Flow.InitialDestination.String() != "tcp:"+listener.Addr().String() {
 		t.Fatalf("routed DNS identity: %+v", row.Flow)
 	}
-	if len(row.Flow.Routes) != 1 || row.Flow.AccountingRoute.Outbound.Tag != "direct" {
+	if row.Flow.SelectedRoute.Outbound.Tag != "direct" {
 		t.Fatalf("routed DNS route: %+v", row.Flow)
 	}
-	if row.Flow.Uplink.Known != wantSizes.query || row.Flow.Downlink.Known != wantSizes.response || row.Flow.Uplink.Incomplete || row.Flow.Downlink.Incomplete {
+	if row.Flow.Uplink.Known != wantSizes.query || row.Flow.Downlink.Known != wantSizes.response {
 		t.Fatalf("routed DNS bytes: uplink=%+v downlink=%+v want=%+v", row.Flow.Uplink, row.Flow.Downlink, wantSizes)
-	}
-	if row.Reason != stats.EndReasonUnknown {
-		t.Fatalf("successful routed DNS end reason: got %v want unknown", row.Reason)
 	}
 }
 
@@ -529,7 +510,7 @@ func TestRoutedDNSTCPExactStopKeepsSibling(t *testing.T) {
 	}
 	var firstRef stats.FlowRef
 	waitDNSTCPRows(t, func() (int, error) {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		if readErr == nil && len(live.Rows) == 1 {
 			firstRef = live.Rows[0].Ref
 		}
@@ -543,7 +524,7 @@ func TestRoutedDNSTCPExactStopKeepsSibling(t *testing.T) {
 		t.Fatal("second routed DNS request did not arrive")
 	}
 	waitDNSTCPRows(t, func() (int, error) {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		return len(live.Rows), readErr
 	}, 2)
 
@@ -575,28 +556,36 @@ func TestRoutedDNSTCPExactStopKeepsSibling(t *testing.T) {
 	releaseFirst()
 
 	waitDNSTCPRows(t, func() (int, error) {
-		terminals, readErr := view.ReadTerminals(context.Background())
+		terminals, readErr := view.ReadTerminals()
 		return len(terminals.Rows), readErr
 	}, 2)
-	terminals, err := view.ReadTerminals(context.Background())
+	terminals, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var successfulDownlink uint64
+	for _, row := range terminals.Rows {
+		if row.Flow.Ref != firstRef {
+			successfulDownlink += row.Flow.Downlink.Known
+		}
+	}
+	if successfulDownlink == 0 {
+		t.Fatal("successful sibling has no decoded response bytes")
+	}
 	for _, row := range terminals.Rows {
 		if row.Flow.Ref == firstRef {
-			// CloseFlows publishes the owner snapshot after exact close. The
-			// unblocked read may report its uncertainty later to the aggregate.
-			if row.Reason != stats.EndReasonLocalStop {
+			// CloseFlows publishes the owner snapshot after exact close.
+			if row.Flow.State != stats.FlowStateEnded || row.Flow.Downlink.Known != 0 {
 				t.Fatalf("stopped terminal: %+v", row)
 			}
-			totals, totalsErr := view.ReadTotals(context.Background())
+			totals, totalsErr := view.ReadTotals()
 			if totalsErr != nil {
 				t.Fatal(totalsErr)
 			}
 			for _, total := range totals.Rows {
 				if total.Outbound.Tag == "direct" && total.Origin == stats.TrafficOriginInternal {
-					if !total.Downlink.Incomplete {
-						t.Fatalf("late stopped-read aggregate: %+v", total)
+					if total.Downlink.Known != successfulDownlink {
+						t.Fatalf("stopped-read aggregate credited bytes: %+v", total)
 					}
 					return
 				}

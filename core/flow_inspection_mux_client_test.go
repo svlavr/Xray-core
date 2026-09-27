@@ -49,7 +49,7 @@ func TestFlowInspectionMuxClientUDP(t *testing.T) {
 			}
 			var ref fs.FlowRef
 			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive(context.Background())
+				live, _ := view.ReadLive()
 				if len(live.Rows) != 1 {
 					return false
 				}
@@ -57,7 +57,7 @@ func TestFlowInspectionMuxClientUDP(t *testing.T) {
 				if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
 					return false
 				}
-				if row.AccountingRoute.Outbound.Tag != outbound.Tag || row.AccountingRoute.Effective != destination || len(row.Destinations) != 1 || row.Destinations[0] != destination {
+				if row.SelectedRoute.Outbound.Tag != outbound.Tag || row.EffectiveDestination != destination || row.LatestDestination != destination {
 					t.Fatalf("UDP child facts: %+v", row)
 				}
 				ref = row.Ref
@@ -68,8 +68,8 @@ func TestFlowInspectionMuxClientUDP(t *testing.T) {
 				t.Fatalf("close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref && page.Rows[0].Reason == fs.EndReasonLocalStop
+				page, _ := view.ReadTerminals()
+				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref
 			})
 			inspectionOutboundTotals(t, view, outbound.Tag, uint64(len(payload)))
 		})

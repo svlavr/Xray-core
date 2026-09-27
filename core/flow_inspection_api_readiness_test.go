@@ -136,12 +136,12 @@ func TestFlowInspectionUDPEarlyStopPublication(t *testing.T) {
 			if parent.Err() != nil || siblingStops.Load() != 0 {
 				t.Fatal("early root stop canceled parent or sibling")
 			}
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != sibling.Ref() {
 				t.Fatalf("sibling inventory: %+v %v", live, err)
 			}
-			terminals, err := view.ReadTerminals(context.Background())
-			if err != nil || len(terminals.Rows) != 1 || terminals.Rows[0].Flow.Ref != early.stopped || terminals.Rows[0].Reason != fs.EndReasonLocalStop {
+			terminals, err := view.ReadTerminals()
+			if err != nil || len(terminals.Rows) != 1 || terminals.Rows[0].Flow.Ref != early.stopped {
 				t.Fatalf("early terminal: %+v %v", terminals, err)
 			}
 		})

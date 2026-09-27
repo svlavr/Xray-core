@@ -69,7 +69,7 @@ func muxWait(t *testing.T, signal <-chan struct{}) {
 
 func muxCheckTerminal(t *testing.T, view fs.FlowInspection, count int) {
 	t.Helper()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != count {
 		t.Fatalf("terminal count %d: %+v %v", count, page, err)
 	}

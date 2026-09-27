@@ -56,7 +56,6 @@ func (d *dnsUDPBlockingDispatcher) Dispatch(ctx context.Context, destination net
 	}
 	observation.Exchange.Route(featurestats.RouteStep{
 		Selection:      featurestats.SelectionDefault,
-		Original:       destination,
 		SelectedTarget: destination,
 	})
 	observation.Exchange.BindRoute()
@@ -101,7 +100,7 @@ func (d *dnsUDPBlackholeDispatcher) Dispatch(ctx context.Context, destination ne
 	if observation == nil || observation.Exchange == nil {
 		return nil, io.ErrUnexpectedEOF
 	}
-	observation.Exchange.Route(featurestats.RouteStep{Selection: featurestats.SelectionDefault, Original: destination, SelectedTarget: destination})
+	observation.Exchange.Route(featurestats.RouteStep{Selection: featurestats.SelectionDefault, SelectedTarget: destination})
 	observation.Exchange.BindRoute()
 	return &transport.Link{Reader: d.reader, Writer: d.writer}, nil
 }
@@ -168,7 +167,7 @@ func TestRoutedDNSUDPCloseCancelsBlockedDispatchAndWakesAAAA(t *testing.T) {
 
 	var ref featurestats.FlowRef
 	waitDNSTCPRows(t, func() (int, error) {
-		live, readErr := view.ReadLive(context.Background())
+		live, readErr := view.ReadLive()
 		if readErr == nil && len(live.Rows) == 1 {
 			ref = live.Rows[0].Ref
 		}
@@ -201,8 +200,8 @@ func TestRoutedDNSUDPCloseCancelsBlockedDispatchAndWakesAAAA(t *testing.T) {
 	if dispatcher.reader.interrupted.Load() == 0 || dispatcher.writer.closed.Load() == 0 {
 		t.Fatalf("late UDP link not cleaned: reader=%d writer=%d", dispatcher.reader.interrupted.Load(), dispatcher.writer.closed.Load())
 	}
-	terminals, err := view.ReadTerminals(context.Background())
-	if err != nil || len(terminals.Rows) != 1 || terminals.Rows[0].Reason != featurestats.EndReasonLocalStop {
+	terminals, err := view.ReadTerminals()
+	if err != nil || len(terminals.Rows) != 1 || terminals.Rows[0].Flow.State != featurestats.FlowStateEnded {
 		t.Fatalf("stopped UDP terminal: %+v err=%v", terminals.Rows, err)
 	}
 }
@@ -225,10 +224,10 @@ func TestRoutedDNSUDPCallerTimeoutRetiresBlackholeResources(t *testing.T) {
 		t.Fatal("blackhole lookup waited for periodic request cleanup")
 	}
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
-	live, err := view.ReadLive(context.Background())
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 0 {
 		t.Fatalf("blackhole query retained live resources: %+v err=%v", live.Rows, err)
 	}
@@ -275,11 +274,11 @@ func TestRoutedDNSUDPForcedIDCollisionRetiresDisplacedOwner(t *testing.T) {
 		t.Fatal("displaced owner was not woken")
 	}
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("collision terminal/loss: %+v err=%v", page.Rows, err)
 	}
 	second.finishCanceled()
@@ -320,7 +319,7 @@ func TestRoutedDNSUDPPartialLossPrecedesFinalResponseTerminal(t *testing.T) {
 	// lock notification until after B delivers the final matched response.
 	server.Lock()
 	delete(server.requests, firstID)
-	lost := server.retireObservedRequestLocked(firstReq, true)
+	lost := server.retireObservedRequestLocked(firstReq)
 	server.Unlock()
 	if lost.owner != owner || lost.done {
 		t.Fatalf("first retirement: %+v", lost)
@@ -331,20 +330,20 @@ func TestRoutedDNSUDPPartialLossPrecedesFinalResponseTerminal(t *testing.T) {
 	lost.owner.requestLost(errDNSUDPRequestIDCollision, lost.done)
 
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || !page.Rows[0].Flow.Downlink.Incomplete || page.Rows[0].Flow.Downlink.Known != wantDownlink {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != wantDownlink {
 		t.Fatalf("partial-loss terminal: %+v err=%v", page.Rows, err)
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, total := range totals.Rows {
 		if total.Outbound.Tag == "partial-loss" && total.Origin == featurestats.TrafficOriginInternal {
-			if !total.Downlink.Incomplete || total.Downlink.Known != wantDownlink {
+			if total.Downlink.Known != wantDownlink {
 				t.Fatalf("partial-loss selected totals: %+v", total)
 			}
 			return
@@ -372,8 +371,8 @@ func TestRoutedDNSUDPCapacityFallsBackWithoutPrivateRay(t *testing.T) {
 	if owner != nil {
 		t.Fatal("capacity overflow allocated a private UDP dispatcher owner")
 	}
-	live, err := view.ReadLive(context.Background())
-	if err != nil || len(live.Rows) != 1 || live.Loss.UntrackedAdmissions != 1 {
+	live, err := view.ReadLive()
+	if err != nil || len(live.Rows) != 1 {
 		t.Fatalf("capacity fallback facts: %+v err=%v", live, err)
 	}
 	retained.Finish()
@@ -533,10 +532,10 @@ func TestRoutedDNSUDPImmediateCallerCancelAfterSuccessKeepsExactFacts(t *testing
 		}
 	}
 	waitDNSTCPRows(t, func() (int, error) {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return len(page.Rows), readErr
 	}, 1)
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,22 +543,19 @@ func TestRoutedDNSUDPImmediateCallerCancelAfterSuccessKeepsExactFacts(t *testing
 	if row.Flow.Kind != featurestats.FlowKindUDPAssociation || row.Flow.Origin != featurestats.TrafficOriginInternal || row.Flow.InitialDestination != destination {
 		t.Fatalf("routed DNS UDP identity: %+v", row.Flow)
 	}
-	if len(row.Flow.Routes) != 1 || row.Flow.AccountingRoute.Outbound.Tag != "direct" {
+	if row.Flow.SelectedRoute.Outbound.Tag != "direct" {
 		t.Fatalf("routed DNS UDP route: %+v", row.Flow)
 	}
-	if row.Flow.Uplink.Known != want.query || row.Flow.Downlink.Known != want.response || row.Flow.Uplink.Incomplete || row.Flow.Downlink.Incomplete {
+	if row.Flow.Uplink.Known != want.query || row.Flow.Downlink.Known != want.response {
 		t.Fatalf("routed DNS UDP bytes: uplink=%+v downlink=%+v want=%+v", row.Flow.Uplink, row.Flow.Downlink, want)
 	}
-	if row.Reason != featurestats.EndReasonUnknown {
-		t.Fatalf("successful routed DNS UDP end reason: %v", row.Reason)
-	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, total := range totals.Rows {
 		if total.Outbound.Tag == "direct" && total.Origin == featurestats.TrafficOriginInternal {
-			if total.Uplink.Known != want.query || total.Downlink.Known != want.response || total.Uplink.Incomplete || total.Downlink.Incomplete {
+			if total.Uplink.Known != want.query || total.Downlink.Known != want.response {
 				t.Fatalf("immediate-cancel INTERNAL totals: %+v want=%+v", total, want)
 			}
 			return

@@ -2,7 +2,6 @@ package shadowsocks_2022
 
 import (
 	"context"
-	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -66,12 +65,6 @@ func (c *inspectionPacketConn) readResult(n int, destination M.Socksaddr, err er
 		}
 		c.receipt.AddUplink(uint64(n))
 	}
-	if err != nil {
-		if errors.Is(err, io.ErrShortBuffer) {
-			c.receipt.MarkUplinkIncomplete()
-		}
-		c.receipt.SetEndReason(stats.EndReasonReadError)
-	}
 }
 
 func (c *inspectionPacketConn) ReadPacket(buffer *B.Buffer) (M.Socksaddr, error) {
@@ -101,8 +94,6 @@ func (c *inspectionPacketConn) WritePacket(buffer *B.Buffer, destination M.Socks
 	if err == nil {
 		c.receipt.AddDownlink(payload)
 	} else {
-		c.receipt.MarkDownlinkIncomplete()
-		c.receipt.SetEndReason(stats.EndReasonWriteError)
 	}
 	return err
 }

@@ -108,20 +108,20 @@ func TestObserveUDPPacketReceiptsOriginsAndTerminalGate(t *testing.T) {
 			}
 			flow := observation.Exchange
 			finish()
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
 				t.Fatalf("owner-end UDP snapshot: %+v %v", page, err)
 			}
 			flow.AddDownlink(1)
-			page, err = view.ReadTerminals(context.Background())
+			page, err = view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("UDP terminal: %+v %v", page, err)
 			}
 			row := page.Rows[0]
-			if row.Flow.Origin != fs.TrafficOrigin(test.origin) || row.Flow.Uplink.Known != uint64(len("firstsecond")) || row.Flow.Downlink.Known != 0 || !row.Flow.Downlink.Incomplete || row.Reason != fs.EndReasonWriteError || len(row.Flow.Destinations) != 2 || row.Flow.Destinations[0] != destinations[0] || row.Flow.Destinations[1] != destinations[1] {
+			if row.Flow.Origin != fs.TrafficOrigin(test.origin) || row.Flow.Uplink.Known != uint64(len("firstsecond")) || row.Flow.Downlink.Known != 0 || row.Flow.LatestDestination != destinations[1] {
 				t.Fatalf("UDP terminal receipts: %+v", row)
 			}
-			totals, _ := view.ReadTotals(context.Background())
+			totals, _ := view.ReadTotals()
 			var down uint64
 			for _, total := range totals.Rows {
 				down += total.Downlink.Known

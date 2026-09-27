@@ -59,10 +59,7 @@ func TestReadOutboundStatsMissingManagerPreservesAvailableFacts(t *testing.T) {
 	statsManager := instance.GetFeature(featurestats.ManagerType()).(featurestats.Manager)
 	registerOutboundCounter(t, statsManager, "no-manager", outboundStatsUplinkSuffix).Add(29)
 	want := core.OutboundStats{
-		PolicyManagerAvailable: true,
-		StatsManagerAvailable:  true,
 		Uplink: core.OutboundStatsDirection{
-			PolicyEnabled:  true,
 			CounterPresent: true,
 			Bytes:          29,
 		},
@@ -84,11 +81,8 @@ func TestReadOutboundStatsEmptyTag(t *testing.T) {
 	downlink.Add(13)
 
 	want := core.OutboundStats{
-		OutboundManagerAvailable: true,
-		PolicyManagerAvailable:   true,
-		StatsManagerAvailable:    true,
-		Uplink:                   core.OutboundStatsDirection{PolicyEnabled: true},
-		Downlink:                 core.OutboundStatsDirection{PolicyEnabled: true},
+		Uplink:   core.OutboundStatsDirection{},
+		Downlink: core.OutboundStatsDirection{},
 	}
 	if got := core.ReadOutboundStats(fixture.instance, ""); got != want {
 		t.Fatalf("empty tag result: got %+v want %+v", got, want)
@@ -100,14 +94,11 @@ func TestReadOutboundStatsMissingTagReadsIndependentFacts(t *testing.T) {
 	registerOutboundCounter(t, fixture.stats, "retained", outboundStatsUplinkSuffix).Add(41)
 
 	want := core.OutboundStats{
-		OutboundManagerAvailable: true,
-		PolicyManagerAvailable:   true,
-		StatsManagerAvailable:    true,
 		Uplink: core.OutboundStatsDirection{
 			CounterPresent: true,
 			Bytes:          41,
 		},
-		Downlink: core.OutboundStatsDirection{PolicyEnabled: true},
+		Downlink: core.OutboundStatsDirection{},
 	}
 	if got := core.ReadOutboundStats(fixture.instance, "retained"); got != want {
 		t.Fatalf("missing tag result: got %+v want %+v", got, want)
@@ -118,11 +109,8 @@ func TestReadOutboundStatsNoopStatsManager(t *testing.T) {
 	fixture := newOutboundStatsFixture(t, true, true, false, "noop")
 
 	want := core.OutboundStats{
-		OutboundManagerAvailable: true,
-		PolicyManagerAvailable:   true,
-		HandlerPresent:           true,
-		Uplink:                   core.OutboundStatsDirection{PolicyEnabled: true},
-		Downlink:                 core.OutboundStatsDirection{PolicyEnabled: true},
+		Uplink:   core.OutboundStatsDirection{},
+		Downlink: core.OutboundStatsDirection{},
 	}
 	if got := core.ReadOutboundStats(fixture.instance, "noop"); got != want {
 		t.Fatalf("noop stats result: got %+v want %+v", got, want)
@@ -132,12 +120,7 @@ func TestReadOutboundStatsNoopStatsManager(t *testing.T) {
 func TestReadOutboundStatsHandlerWithDisabledPolicy(t *testing.T) {
 	fixture := newOutboundStatsFixture(t, false, false, true, "disabled")
 
-	want := core.OutboundStats{
-		OutboundManagerAvailable: true,
-		PolicyManagerAvailable:   true,
-		StatsManagerAvailable:    true,
-		HandlerPresent:           true,
-	}
+	want := core.OutboundStats{}
 	if got := core.ReadOutboundStats(fixture.instance, "disabled"); got != want {
 		t.Fatalf("disabled policy result: got %+v want %+v", got, want)
 	}
@@ -147,16 +130,10 @@ func TestReadOutboundStatsValuesArePresentAndNonDestructive(t *testing.T) {
 	fixture := newOutboundStatsFixture(t, true, true, true, "values")
 
 	zero := core.OutboundStats{
-		OutboundManagerAvailable: true,
-		PolicyManagerAvailable:   true,
-		StatsManagerAvailable:    true,
-		HandlerPresent:           true,
 		Uplink: core.OutboundStatsDirection{
-			PolicyEnabled:  true,
 			CounterPresent: true,
 		},
 		Downlink: core.OutboundStatsDirection{
-			PolicyEnabled:  true,
 			CounterPresent: true,
 		},
 	}
@@ -462,16 +439,10 @@ func transformOutboundStatsPayload(payload []byte, mask byte) []byte {
 
 func zeroRealOutboundStats() core.OutboundStats {
 	return core.OutboundStats{
-		OutboundManagerAvailable: true,
-		PolicyManagerAvailable:   true,
-		StatsManagerAvailable:    true,
-		HandlerPresent:           true,
 		Uplink: core.OutboundStatsDirection{
-			PolicyEnabled:  true,
 			CounterPresent: true,
 		},
 		Downlink: core.OutboundStatsDirection{
-			PolicyEnabled:  true,
 			CounterPresent: true,
 		},
 	}
@@ -499,16 +470,11 @@ func TestReadOutboundStatsRetainsCountersAfterHandlerRemoval(t *testing.T) {
 	}
 
 	want := core.OutboundStats{
-		OutboundManagerAvailable: true,
-		PolicyManagerAvailable:   true,
-		StatsManagerAvailable:    true,
 		Uplink: core.OutboundStatsDirection{
-			PolicyEnabled:  true,
 			CounterPresent: true,
 			Bytes:          5,
 		},
 		Downlink: core.OutboundStatsDirection{
-			PolicyEnabled:  true,
 			CounterPresent: true,
 			Bytes:          -7,
 		},
@@ -538,7 +504,7 @@ func TestReadOutboundStatsConcurrentCounterUpdates(t *testing.T) {
 
 	for {
 		observation := core.ReadOutboundStats(fixture.instance, "concurrent")
-		if !observation.HandlerPresent || !observation.Uplink.CounterPresent || !observation.Downlink.CounterPresent {
+		if !observation.Uplink.CounterPresent || !observation.Downlink.CounterPresent {
 			t.Fatalf("concurrent observation lost stable facts: %+v", observation)
 		}
 		select {

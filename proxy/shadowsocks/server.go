@@ -115,7 +115,6 @@ func writeUDPResponse(ctx context.Context, conn stat.Connection, packet *udp_pro
 	payload := packet.Payload
 	n := uint64(payload.Len())
 	if request == nil {
-		proxy.RecordPacketWrite(receipt, n, 0, 0, nil)
 		payload.Release()
 		return
 	}
@@ -131,13 +130,12 @@ func writeUDPResponse(ctx context.Context, conn stat.Connection, packet *udp_pro
 	data, err := EncodeUDPPacket(request, payload.Bytes())
 	payload.Release()
 	if err != nil {
-		proxy.RecordPacketWrite(receipt, n, 0, 0, nil)
 		errors.LogWarningInner(ctx, err, "failed to encode UDP packet")
 		return
 	}
 
-	written, writeErr := conn.Write(data.Bytes())
-	proxy.RecordPacketWrite(receipt, n, int(data.Len()), written, writeErr)
+	written, _ := conn.Write(data.Bytes())
+	proxy.RecordPacketWrite(receipt, n, int(data.Len()), written)
 	data.Release()
 }
 
@@ -335,9 +333,6 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
 		return errors.New("connection ends").Base(err)
-	}
-	if observation != nil {
-		observation.Exchange.SetEndReason(stats.EndReasonEOF)
 	}
 
 	return nil

@@ -77,7 +77,7 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 			exchange(sibling, first, siblingPayload, 0x19)
 			var original fs.FlowRef
 			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive(context.Background())
+				live, _ := view.ReadLive()
 				for _, row := range live.Rows {
 					if row.Uplink.Known == uint64(len(payload)) && row.Downlink.Known == row.Uplink.Known {
 						original = row.Ref
@@ -89,27 +89,27 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 			transport.Conn = dial()
 			exchange(client, second, extra, 0x37)
 			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive(context.Background())
+				live, _ := view.ReadLive()
 				for _, row := range live.Rows {
 					if row.Ref == original {
-						return row.Uplink.Known == uint64(len(payload)+len(extra)) && row.Downlink.Known == row.Uplink.Known && len(row.Destinations) == 2
+						return row.Uplink.Known == uint64(len(payload)+len(extra)) && row.Downlink.Known == row.Uplink.Known
 					}
 				}
 				return false
 			})
 			inspectionClosePacketCallback(t, view, original)
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == original
 			})
 			// The same wire session creates a fresh logical admission after stop.
 			exchange(client, first, payload, 0x19)
 			exchange(sibling, second, siblingPayload, 0x37)
-			inspectionWait(t, func() bool { live, _ := view.ReadLive(context.Background()); return len(live.Rows) == 2 })
+			inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 2 })
 			if err := instance.GetFeature(fin.ManagerType()).(fin.Manager).RemoveHandler(context.Background(), "ss2022-receiver"); err != nil {
 				t.Fatal(err)
 			}
-			inspectionWait(t, func() bool { live, _ := view.ReadLive(context.Background()); return len(live.Rows) == 0 })
+			inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 0 })
 		})
 	}
 }

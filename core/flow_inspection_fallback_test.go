@@ -67,7 +67,7 @@ func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 	actual := cnet.DestinationFromAddr(target.Addr())
 	var firstRow fs.FlowRecord
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len(payload)) || live.Rows[0].Downlink.Known != uint64(len(payload)) {
 			return false
 		}
@@ -80,7 +80,7 @@ func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 	if xver != 0 {
 		first.Close()
 		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals(context.Background())
+			page, _ := view.ReadTerminals()
 			return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == firstRow.Ref && page.Rows[0].Flow.Uplink.Known == uint64(len(payload)) && page.Rows[0].Flow.Downlink.Known == uint64(len(payload))
 		})
 		return
@@ -90,7 +90,7 @@ func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 	sibling := inspectionFallbackClient(t, address, siblingPayload)
 	inspectionFallbackResponse(t, sibling, siblingPayload)
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		return err == nil && len(live.Rows) == 2
 	})
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
@@ -107,13 +107,13 @@ func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 	inspectionFallbackResponse(t, sibling, extra)
 	sibling.Close()
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		if len(page.Rows) != 2 {
 			return false
 		}
 		for _, row := range page.Rows {
 			if row.Flow.Ref == firstRow.Ref {
-				return row.Reason == fs.EndReasonLocalStop
+				return row.Flow.State == fs.FlowStateEnded
 			}
 		}
 		return false
@@ -258,15 +258,15 @@ func inspectionFallbackResponse(t *testing.T, conn net.Conn, want []byte) {
 
 func assertFallbackFacts(t *testing.T, row fs.FlowRecord, configured, effective cnet.Destination, payload uint64) {
 	t.Helper()
-	route := row.AccountingRoute
-	if row.Kind != fs.FlowKindTCP || row.InitialDestination != configured || route.Selection != fs.SelectionUnknown || route.Outbound.Serial != 0 || route.Outbound.Tag != "" || route.Original != configured || route.RouteTarget != configured || route.SelectedTarget != configured || route.Effective != effective || row.Uplink.Known != payload || row.Downlink.Known != payload || row.Uplink.Incomplete || row.Downlink.Incomplete {
+	route := row.SelectedRoute
+	if row.Kind != fs.FlowKindTCP || row.InitialDestination != configured || route.Selection != fs.SelectionUnknown || route.Outbound.Serial != 0 || route.Outbound.Tag != "" || route.SelectedTarget != configured || row.EffectiveDestination != effective || row.Uplink.Known != payload || row.Downlink.Known != payload {
 		t.Fatalf("fallback facts: %+v", row)
 	}
 }
 
 func assertFallbackTotals(t *testing.T, view fs.FlowInspection, want uint64) {
 	t.Helper()
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,9 +280,6 @@ func assertFallbackTotals(t *testing.T, view fs.FlowInspection, want uint64) {
 		}
 		uplink += row.Uplink.Known
 		downlink += row.Downlink.Known
-		if (row.Uplink.Known != 0 || row.Downlink.Known != 0) && (row.Uplink.Incomplete || row.Downlink.Incomplete) {
-			t.Fatalf("fallback totals lost no-route reason: %+v", row)
-		}
 	}
 	if uplink != want || downlink != want {
 		t.Fatalf("fallback totals %d/%d, want %d", uplink, downlink, want)
@@ -303,8 +300,8 @@ func inspectionFallbackDialFailure(t *testing.T, protocol string) {
 		t.Fatalf("failed fallback dial returned %d, %v", n, err)
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
-		return len(page.Rows) == 1 && page.Rows[0].Reason == fs.EndReasonRejected && page.Rows[0].Flow.Uplink.Known == 0 && page.Rows[0].Flow.Downlink.Known == 0 && page.Rows[0].Flow.AccountingRoute.Selection == fs.SelectionUnknown
+		page, _ := view.ReadTerminals()
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink.Known == 0 && page.Rows[0].Flow.Downlink.Known == 0 && page.Rows[0].Flow.SelectedRoute.Selection == fs.SelectionUnknown
 	})
 }
 
@@ -351,12 +348,12 @@ func inspectionFallbackPeerReset(t *testing.T, protocol string) {
 		t.Fatalf("reset fallback returned %d, %v", n, err)
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		if len(page.Rows) != 1 {
 			return false
 		}
 		row := page.Rows[0]
-		if row.Reason != fs.EndReasonReadError || row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != uint64(len(payload)) {
+		if row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != uint64(len(payload)) {
 			t.Fatalf("post-dial reset lost error or payload facts: %+v", row)
 		}
 		return true

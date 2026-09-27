@@ -59,8 +59,8 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						}
 						var ref fs.FlowRef
 						inspectionWait(t, func() bool {
-							live, _ := view.ReadLive(context.Background())
-							if len(live.Rows) != 1 || len(live.Rows[0].Routes) == 0 || live.Rows[0].Routes[0].Selection != fs.SelectionRejected || live.Rows[0].Uplink.Known != uint64(len(payload)) {
+							live, _ := view.ReadLive()
+							if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Selection != fs.SelectionRejected || live.Rows[0].Uplink.Known != uint64(len(payload)) {
 								return false
 							}
 							ref = live.Rows[0].Ref
@@ -68,8 +68,8 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						})
 						inspectionClosePacketCallback(t, view, ref)
 						inspectionWait(t, func() bool {
-							page, _ := view.ReadTerminals(context.Background())
-							return len(page.Rows) == 1 && page.Rows[0].Reason == fs.EndReasonLocalStop && page.Rows[0].Flow.Downlink.Known == 0
+							page, _ := view.ReadTerminals()
+							return len(page.Rows) == 1 && page.Rows[0].Flow.Downlink.Known == 0
 						})
 						return
 					}
@@ -85,7 +85,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 					}
 					var first, other fs.FlowRecord
 					inspectionWait(t, func() bool {
-						live, _ := view.ReadLive(context.Background())
+						live, _ := view.ReadLive()
 						if len(live.Rows) != 2 {
 							return false
 						}
@@ -99,29 +99,29 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						return first.Ref.ID != 0 && other.Ref.ID != 0 && first.Downlink.Known == first.Uplink.Known && other.Downlink.Known == uint64(len(payload))
 					})
 					for _, row := range []fs.FlowRecord{first, other} {
-						if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Tag != "direct" || row.AccountingRoute.Outbound.Serial == 0 || row.Uplink.Incomplete || row.Downlink.Incomplete {
+						if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "direct" || row.SelectedRoute.Outbound.Serial == 0 {
 							t.Fatalf("callback facts: %+v", row)
 						}
 					}
-					if first.InitialDestination != firstDest || len(first.Destinations) != 2 {
+					if first.InitialDestination != firstDest {
 						t.Fatalf("packet destinations: %+v", first)
 					}
 					inspectionClosePacketCallback(t, view, first.Ref)
 					inspectionWait(t, func() bool {
-						page, _ := view.ReadTerminals(context.Background())
-						return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Reason == fs.EndReasonLocalStop && page.Rows[0].Flow.Downlink.Known == uint64(len(payload)+len(extra))
+						page, _ := view.ReadTerminals()
+						return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink.Known == uint64(len(payload)+len(extra))
 					})
 					inspectionSOCKSPacket(t, sibling, siblingRelay, secondDest, extra, 0x37)
 					inspectionClosePacketCallback(t, view, other.Ref)
 					inspectionWait(t, func() bool {
-						page, _ := view.ReadTerminals(context.Background())
+						page, _ := view.ReadTerminals()
 						return len(page.Rows) == 2
 					})
 					_, replacement, replacementRelay := inspectionSOCKSAssociation(t, address)
 					inspectionSOCKSPacket(t, replacement, replacementRelay, firstDest, payload, 0x19)
 					var replacementRef fs.FlowRef
 					inspectionWait(t, func() bool {
-						live, _ := view.ReadLive(context.Background())
+						live, _ := view.ReadLive()
 						if len(live.Rows) != 1 || live.Rows[0].Downlink.Known != uint64(len(payload)) {
 							return false
 						}
@@ -133,7 +133,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 					}
 					inspectionClosePacketCallback(t, view, replacementRef)
 					inspectionWait(t, func() bool {
-						page, _ := view.ReadTerminals(context.Background())
+						page, _ := view.ReadTerminals()
 						return len(page.Rows) == 3
 					})
 					inspectionOutboundTotals(t, view, "direct", uint64(3*len(payload)+2*len(extra)))

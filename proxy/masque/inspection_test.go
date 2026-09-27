@@ -123,13 +123,13 @@ func TestInspectionMasqueTCPClaimBeforeTunnelFailure(t *testing.T) {
 		t.Fatal("failed tunnel establishment succeeded")
 	}
 	finish()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
-	route := page.Rows[0].Flow.AccountingRoute
-	if route.Outbound.Tag != "masque-test" || route.Effective != target {
-		t.Fatalf("logical MASQUE route: %+v", route)
+	route := page.Rows[0].Flow.SelectedRoute
+	if route.Outbound.Tag != "masque-test" || page.Rows[0].Flow.EffectiveDestination != target {
+		t.Fatalf("logical MASQUE route: %+v", page.Rows[0].Flow)
 	}
 }
 
@@ -178,8 +178,8 @@ func TestInspectionMasqueFirstRequestStopDuringEstablishment(t *testing.T) {
 		t.Fatalf("first request exact stop: %+v %v", outcomes, err)
 	}
 	finish()
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Ref != observation.Exchange.Ref() || page.Rows[0].Reason != fs.EndReasonLocalStop {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Ref != observation.Exchange.Ref() {
 		t.Fatalf("first request terminal: %+v %v", page, err)
 	}
 	if carrierCtx.Err() != nil {
@@ -230,11 +230,11 @@ func TestInspectionMasqueStopVirtualAssociation(t *testing.T) {
 	go func() { done <- client.Process(ctx, link, inspectionDialer{}) }()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(live.Rows) == 1 && live.Rows[0].AccountingRoute.Outbound.Tag == "masque-test" {
+		if len(live.Rows) == 1 && live.Rows[0].SelectedRoute.Outbound.Tag == "masque-test" {
 			break
 		}
 		if time.Now().After(deadline) {

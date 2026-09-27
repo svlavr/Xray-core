@@ -31,16 +31,14 @@ func TestInspectionDeferredEndpointRawAndDecoded(t *testing.T) {
 			gate := &deferredEndpointReceipt{Exchange: root}
 			gate.AddUplink(7)
 			gate.AddDownlink(5)
-			gate.MarkUplinkIncomplete()
-			gate.SetEndReason(fs.EndReasonReadError)
+
 			if decoded {
 				if gate.selectDecoded() != root || gate.selectDecoded() != nil {
 					t.Fatal("decoded claim was not one-shot")
 				}
 				gate.AddUplink(100)
 				gate.AddDownlink(100)
-				gate.MarkDownlinkIncomplete()
-				gate.SetEndReason(fs.EndReasonWriteError)
+
 				root.AddUplink(11)
 				root.AddDownlink(13)
 			} else {
@@ -52,7 +50,7 @@ func TestInspectionDeferredEndpointRawAndDecoded(t *testing.T) {
 				}
 			}
 			gate.Finish()
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("terminal: %+v %v", page, err)
 			}
@@ -61,7 +59,7 @@ func TestInspectionDeferredEndpointRawAndDecoded(t *testing.T) {
 			if decoded {
 				wantUp, wantDown = 11, 13
 			}
-			if flow.Uplink.Known != wantUp || flow.Downlink.Known != wantDown || flow.Uplink.Incomplete != !decoded || page.Rows[0].Reason != map[bool]fs.EndReason{false: fs.EndReasonReadError, true: fs.EndReasonUnknown}[decoded] {
+			if flow.Uplink.Known != wantUp || flow.Downlink.Known != wantDown {
 				t.Fatalf("deferred facts: %+v", page.Rows[0])
 			}
 		})
@@ -105,8 +103,8 @@ func TestInspectionDecodedClaimAfterSniffReplay(t *testing.T) {
 	decoded.AddUplink(uint64(message.Len()))
 	message.Release()
 	root.Finish()
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) || page.Rows[0].Flow.Uplink.Incomplete {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) {
 		t.Fatalf("sniffed DNS payload included framing: %+v %v", page.Rows, err)
 	}
 }
@@ -135,8 +133,8 @@ func TestInspectionDeferredUDPStopBeforeClaim(t *testing.T) {
 	if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref}); err != nil {
 		t.Fatal(err)
 	}
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) || page.Rows[0].Reason != fs.EndReasonLocalStop {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) {
 		t.Fatalf("pre-claim exact stop lost pending input: %+v %v", page.Rows, err)
 	}
 }

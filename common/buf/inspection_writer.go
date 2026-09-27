@@ -51,13 +51,12 @@ func (r *inspectionPrefixReceipt) AddDownlink(n uint64) {
 	r.Exchange.AddDownlink(n)
 }
 
-func (r *inspectionPrefixReceipt) SetEndReason(reason stats.EndReason) {
-	if reason == stats.EndReasonWriteError {
-		// A failed native flush releases the entire pending buffer. Its
-		// unaccepted header tail is not part of any subsequent payload write.
-		r.remaining = 0
+func discardFailedPrefix(receipt stats.Exchange) {
+	if prefixed, ok := receipt.(*inspectionPrefixReceipt); ok {
+		// BufferedWriter discarded the failed buffer. Its unaccepted header
+		// tail cannot be subtracted from the next independent payload write.
+		prefixed.remaining = 0
 	}
-	r.Exchange.SetEndReason(reason)
 }
 
 func (w *inspectionSequentialWriter) Write(payload []byte) (int, error) {
@@ -78,8 +77,7 @@ func recordBufferOperation(receipt stats.Exchange, size uint64, err error) {
 		}
 		return
 	}
-	receipt.MarkDownlinkIncomplete()
-	receipt.SetEndReason(stats.EndReasonWriteError)
+	discardFailedPrefix(receipt)
 }
 
 func writeBytesInspection(writer io.Writer, payload []byte, receipt stats.Exchange) (int, error) {
@@ -88,7 +86,7 @@ func writeBytesInspection(writer io.Writer, payload []byte, receipt stats.Exchan
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		receipt.SetEndReason(stats.EndReasonWriteError)
+		discardFailedPrefix(receipt)
 	}
 	return n, err
 }
@@ -102,8 +100,7 @@ func writeScalarInspection(writer io.Writer, payload []byte, receipt stats.Excha
 }
 
 // AttachWriterReceipt wraps a known native endpoint writer with opt-in receipt
-// accounting. Unsupported writers keep their identity and report unavailable
-// result facts. For BufferedWriter, pre-binding buffered bytes must be framing,
+// accounting. Unsupported writers keep their identity and add no byte facts. For BufferedWriter, pre-binding buffered bytes must be framing,
 // and every later successful operation must be decoded payload.
 func AttachWriterReceipt(writer Writer, receipt stats.Exchange) Writer {
 	if buffered, ok := writer.(*BufferedWriter); ok {
@@ -133,7 +130,7 @@ func attachWriterReceipt(writer Writer, receipt stats.Exchange) Writer {
 	case interface{ WithWriterReceipt(stats.Exchange) Writer }:
 		return w.WithWriterReceipt(receipt)
 	default:
-		receipt.MarkDownlinkIncomplete()
+
 		return writer
 	}
 }

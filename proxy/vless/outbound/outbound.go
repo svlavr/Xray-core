@@ -5,7 +5,6 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
-	goerrors "errors"
 	"reflect"
 	"strings"
 	"sync"
@@ -31,7 +30,6 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vless"
 	"github.com/xtls/xray-core/proxy/vless/encoding"
@@ -398,14 +396,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		responseAddons, err := encoding.DecodeResponseHeader(conn, request)
 		if err != nil {
-			if observation != nil {
-				reason := stats.EndReasonReadError
-				var timeout interface{ Timeout() bool }
-				if goerrors.As(err, &timeout) && timeout.Timeout() {
-					reason = stats.EndReasonTimeout
-				}
-				observation.Exchange.SetEndReason(reason)
-			}
 			return errors.New("failed to decode response header").Base(err).AtInfo()
 		}
 
@@ -423,29 +413,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if requestAddons.Flow == vless.XRV {
-			var receipt stats.Exchange
-			if observation != nil {
-				receipt = observation.Exchange
-			}
-			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx, receipt)
+			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer
 			err = buf.Copy(serverReader, clientWriter, buf.UpdateActivity(timer))
-			if observation != nil {
-				switch {
-				case err == nil:
-					observation.Exchange.SetEndReason(stats.EndReasonEOF)
-				case buf.IsReadError(err):
-					reason := stats.EndReasonReadError
-					var timeout interface{ Timeout() bool }
-					if goerrors.As(err, &timeout) && timeout.Timeout() {
-						reason = stats.EndReasonTimeout
-					}
-					observation.Exchange.SetEndReason(reason)
-				case buf.IsWriteError(err):
-					// The actual endpoint writer owns its accepted result and cause.
-				}
-			}
 		}
 
 		if err != nil {

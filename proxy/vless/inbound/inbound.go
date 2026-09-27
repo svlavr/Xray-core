@@ -429,9 +429,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				}
 				return nil
 			}); err != nil {
-				if observation != nil {
-					observation.SetEndReason(stats.EndReasonRejected)
-				}
 				return errors.New("failed to dial to " + fb.Dest).Base(err).AtWarning()
 			}
 			defer conn.Close()
@@ -495,16 +492,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 						pro.Write([]byte{byte(p1 >> 8), byte(p1), byte(p2 >> 8), byte(p2)})
 					}
 					if err := serverWriter.WriteMultiBuffer(buf.MultiBuffer{pro}); err != nil {
-						if observation != nil {
-							observation.SetEndReason(stats.EndReasonWriteError)
-						}
 						return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err).AtWarning()
 					}
 				}
 				if err := buf.Copy(fallbackReader, serverWriter, buf.UpdateActivity(timer)); err != nil {
-					if observation != nil && buf.IsWriteError(err) {
-						observation.SetEndReason(stats.EndReasonWriteError)
-					}
 					return errors.New("failed to fallback request payload").Base(err).AtInfo()
 				}
 				return nil
@@ -518,9 +509,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			getResponse := func() error {
 				defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 				if err := buf.Copy(serverReader, writer, buf.UpdateActivity(timer)); err != nil {
-					if observation != nil && buf.IsReadError(err) {
-						observation.SetEndReason(stats.EndReasonReadError)
-					}
 					return errors.New("failed to deliver response payload").Base(err).AtInfo()
 				}
 				return nil
@@ -566,7 +554,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	carrier := request.Address.Family().IsDomain() && request.Address.Domain() == "v1.mux.cool"
 	var observation *session.LogicalObservation
 	var observationCleanup func()
-	responsePrepared := false
 	if ordinary && !carrier {
 		kind := stats.FlowKindTCP
 		if request.Command == protocol.RequestCommandUDP {
@@ -575,9 +562,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, h.stats, connection, request.Destination(), kind)
 		if observationCleanup != nil {
 			defer func() {
-				if !responsePrepared {
-					observation.Exchange.SetEndReason(stats.EndReasonRejected)
-				}
 				observationCleanup()
 			}()
 		}
@@ -665,7 +649,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	clientWriter := encoding.EncodeBodyAddons(bufferWriter, request, requestAddons, trafficState, false, ctx, connection, nil)
 	bufferWriter.SetFlushNext()
-	responsePrepared = true
 
 	if request.Command == protocol.RequestCommandRvs {
 		ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginInternal)
@@ -687,9 +670,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		defer cursor.Interrupt()
 	}
 	if err := dispatch.DispatchLink(ctx, request.Destination(), link); err != nil {
-		if observation != nil {
-			observation.Exchange.SetEndReason(stats.EndReasonRejected)
-		}
 		return errors.New("failed to dispatch request").Base(err)
 	}
 	return nil

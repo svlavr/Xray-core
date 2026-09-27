@@ -55,14 +55,14 @@ func TestFlowInspectionXUDPRetainedRebind(t *testing.T) {
 		inspectionSOCKSPacket(t, client, relay, destination, []byte(payload), mask)
 		var row fs.FlowRecord
 		inspectionWait(t, func() bool {
-			live, _ := view.ReadLive(context.Background())
+			live, _ := view.ReadLive()
 			if len(live.Rows) != 1 {
 				return false
 			}
 			row = live.Rows[0]
 			return row.Uplink.Known == uint64(len(payload)) && row.Downlink.Known == uint64(len(payload))
 		})
-		if row.Source.Port != cnet.Port(source.Port) || row.AccountingRoute.Outbound.Tag != "vmess-proxy" || row.AccountingRoute.Effective != destination {
+		if row.Source.Port != cnet.Port(source.Port) || row.SelectedRoute.Outbound.Tag != "vmess-proxy" || row.EffectiveDestination != destination {
 			t.Fatalf("client binding: %+v", row)
 		}
 		if row.Ref == prior {
@@ -80,10 +80,10 @@ func TestFlowInspectionXUDPRetainedRebind(t *testing.T) {
 		if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
 			t.Fatalf("client stop: %+v %v", out, err)
 		}
-		inspectionWait(t, func() bool { live, _ := view.ReadLive(context.Background()); return len(live.Rows) == 0 })
+		inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 0 })
 		control.Close()
 	}
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 2 {
 		t.Fatalf("client terminals: %+v %v", page, err)
 	}

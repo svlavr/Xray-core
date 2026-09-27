@@ -303,9 +303,6 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer, receipt stats.Exc
 		eb, err := w.seal(rawBytes[:nBytes])
 		if err != nil {
 			buf.ReleaseMulti(mb2Write)
-			if receipt != nil {
-				receipt.SetEndReason(stats.EndReasonWriteError)
-			}
 			return err
 		}
 		mb2Write = append(mb2Write, eb)
@@ -373,10 +370,6 @@ func (w *AuthenticationWriter) writeBatch(mb buf.MultiBuffer, receipt stats.Exch
 				receipt.AddDownlink(payload)
 			}
 		} else {
-			if payload != 0 {
-				receipt.MarkDownlinkIncomplete()
-			}
-			receipt.SetEndReason(stats.EndReasonWriteError)
 		}
 	}
 	return err

@@ -1,7 +1,6 @@
 package core_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/xtls/xray-core/app/router"
@@ -30,12 +29,12 @@ func TestControlStatsP3WindowsProcessIdentity(t *testing.T) {
 	dest := startOutboundStatsTCPServer(t)
 	inspectionSOCKS(t, address, dest, []byte("real Windows socket owner"))
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil || len(live.Rows) != 1 {
 			return false
 		}
 		row := live.Rows[0]
-		if row.AccountingRoute.Outbound.Tag != "p3-process" || row.AccountingRoute.RuleTag != "process-only" || row.AccountingRoute.Outbound.Serial == 0 {
+		if row.SelectedRoute.Outbound.Tag != "p3-process" || row.SelectedRoute.RuleTag != "process-only" || row.SelectedRoute.Outbound.Serial == 0 {
 			t.Fatalf("native socket PID lookup did not select process rule: %+v", row)
 		}
 		return true

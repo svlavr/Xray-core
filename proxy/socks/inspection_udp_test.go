@@ -70,22 +70,22 @@ func TestSOCKSUDPResponseReceipts(t *testing.T) {
 				t.Fatal("response did not release input")
 			}
 			flow.Finish()
-			page, _ := view.ReadTerminals(context.Background())
+			page, _ := view.ReadTerminals()
 			if len(page.Rows) != 1 {
 				t.Fatal("missing response terminal")
 			}
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full", "full-error":
-				if fact.Known != want || fact.Incomplete {
+				if fact.Known != want {
 					t.Fatalf("full datagram receipt: %+v", fact)
 				}
 			case "partial-error":
-				if fact.Known != 0 || !fact.Incomplete {
+				if fact.Known != 0 {
 					t.Fatalf("partial datagram receipt: %+v", fact)
 				}
 			default:
-				if fact.Known != 0 || fact.Incomplete {
+				if fact.Known != 0 {
 					t.Fatalf("drop receipt: %+v", fact)
 				}
 			}

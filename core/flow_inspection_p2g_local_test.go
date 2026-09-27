@@ -69,8 +69,8 @@ func TestFlowInspectionP2GHTTPAuthHandshakeExcluded(t *testing.T) {
 		t.Fatalf("authentication response: %+v %v", response, err)
 	}
 	response.Body.Close()
-	live, liveErr := view.ReadLive(context.Background())
-	terminals, terminalErr := view.ReadTerminals(context.Background())
+	live, liveErr := view.ReadLive()
+	terminals, terminalErr := view.ReadTerminals()
 	if liveErr != nil || terminalErr != nil || len(live.Rows) != 0 || len(terminals.Rows) != 0 {
 		t.Fatalf("authentication handshake admitted payload work: live=%+v terminals=%+v errors=%v/%v", live.Rows, terminals.Rows, liveErr, terminalErr)
 	}
@@ -110,11 +110,11 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 			t.Fatalf("response %d: %q %v", i, body, err)
 		}
 		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals(context.Background())
+			page, _ := view.ReadTerminals()
 			return len(page.Rows) == i+1
 		})
 	}
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 2 {
 		t.Fatalf("HTTP request terminals: %+v %v", page.Rows, err)
 	}
@@ -122,7 +122,7 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 		t.Fatal("keep-alive requests reused one FlowRef")
 	}
 	for _, row := range page.Rows {
-		if row.Flow.Kind != fs.FlowKindTCP || row.Flow.AccountingRoute.Outbound.Tag != "direct" || row.Flow.AccountingRoute.Outbound.Serial == 0 || row.Flow.Uplink.Known == 0 || row.Flow.Downlink.Known <= uint64(len("origin:/one")) || row.Flow.Uplink.Incomplete || row.Flow.Downlink.Incomplete {
+		if row.Flow.Kind != fs.FlowKindTCP || row.Flow.SelectedRoute.Outbound.Tag != "direct" || row.Flow.SelectedRoute.Outbound.Serial == 0 || row.Flow.Uplink.Known == 0 || row.Flow.Downlink.Known <= uint64(len("origin:/one")) {
 			t.Fatalf("HTTP request receipt: %+v", row)
 		}
 	}
@@ -142,12 +142,12 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 	}
 	badResponse.Body.Close()
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 3
 	})
-	page, _ = view.ReadTerminals(context.Background())
+	page, _ = view.ReadTerminals()
 	local := page.Rows[2]
-	if local.Reason != fs.EndReasonRejected || local.Flow.AccountingRoute.Outbound.Serial != 0 || len(local.Flow.Routes) != 0 || local.Flow.Uplink.Known != 0 || !local.Flow.Uplink.Incomplete || local.Flow.Downlink.Known == 0 || local.Flow.Downlink.Incomplete {
+	if local.Flow.SelectedRoute.Outbound.Serial != 0 || local.Flow.Uplink.Known != 0 || local.Flow.Downlink.Known == 0 {
 		t.Fatalf("local HTTP response receipt: %+v", local)
 	}
 }
@@ -182,8 +182,8 @@ func TestFlowInspectionP2GHTTPRequestExactStop(t *testing.T) {
 	}
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
-		live, _ := view.ReadLive(context.Background())
-		if len(live.Rows) != 1 || live.Rows[0].AccountingRoute.Outbound.Serial == 0 {
+		live, _ := view.ReadLive()
+		if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Outbound.Serial == 0 {
 			return false
 		}
 		ref = live.Rows[0].Ref
@@ -194,8 +194,8 @@ func TestFlowInspectionP2GHTTPRequestExactStop(t *testing.T) {
 		t.Fatalf("HTTP request stop: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref && page.Rows[0].Reason == fs.EndReasonLocalStop
+		page, _ := view.ReadTerminals()
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref
 	})
 	stoppedResponse, err := stdhttp.ReadResponse(reader, nil)
 	if err != nil || stoppedResponse.StatusCode != stdhttp.StatusServiceUnavailable {
@@ -283,12 +283,12 @@ func TestFlowInspectionP2GVLESSDecodedRejectionBeforeResponse(t *testing.T) {
 		t.Fatal("VLESS XRV UDP request unexpectedly succeeded")
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1
 	})
-	page, _ := view.ReadTerminals(context.Background())
+	page, _ := view.ReadTerminals()
 	row := page.Rows[0]
-	if row.Reason != fs.EndReasonRejected || row.Flow.InitialDestination != request.Destination() || row.Flow.AccountingRoute.Outbound.Serial != 0 || len(row.Flow.Routes) != 0 || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
+	if row.Flow.InitialDestination != request.Destination() || row.Flow.SelectedRoute.Outbound.Serial != 0 || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
 		t.Fatalf("VLESS pre-response rejection: %+v", row)
 	}
 }
@@ -308,12 +308,12 @@ func TestFlowInspectionP2GHysteriaResponsePreparationFailure(t *testing.T) {
 		t.Fatal("Hysteria response preparation unexpectedly succeeded")
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1
 	})
-	page, _ := view.ReadTerminals(context.Background())
+	page, _ := view.ReadTerminals()
 	row := page.Rows[0]
-	if row.Reason != fs.EndReasonRejected || row.Flow.AccountingRoute.Outbound.Serial != 0 || len(row.Flow.Routes) != 0 || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
+	if row.Flow.SelectedRoute.Outbound.Serial != 0 || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
 		t.Fatalf("Hysteria pre-response rejection: %+v", row)
 	}
 }
@@ -334,11 +334,11 @@ func TestFlowInspectionP2GNaturalEOF(t *testing.T) {
 			client := inspectionSOCKS(t, address, destination, payload)
 			client.Close()
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 1
 			})
-			page, _ := view.ReadTerminals(context.Background())
-			if page.Rows[0].Reason != fs.EndReasonEOF || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) || page.Rows[0].Flow.Downlink.Known != uint64(len(payload)) {
+			page, _ := view.ReadTerminals()
+			if page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) || page.Rows[0].Flow.Downlink.Known != uint64(len(payload)) {
 				t.Fatalf("natural EOF receipt: %+v", page.Rows[0])
 			}
 		})

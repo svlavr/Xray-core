@@ -182,7 +182,7 @@ func (s *ClassicNameServer) RequestsCleanup() error {
 			if s.requests[id] == req {
 				delete(s.requests, id)
 			}
-			if retirement := s.retireObservedRequestLocked(req, true); retirement.owner != nil || retirement.release != nil {
+			if retirement := s.retireObservedRequestLocked(req); retirement.owner != nil || retirement.release != nil {
 				retired = append(retired, retirement)
 			}
 		}
@@ -242,7 +242,7 @@ func (s *ClassicNameServer) handleResponse(ctx context.Context, packet *udp_prot
 					delete(req.owner.requests, id)
 				}
 			} else {
-				retirement = s.retireObservedRequestLocked(req, false)
+				retirement = s.retireObservedRequestLocked(req)
 			}
 		}
 	}
@@ -280,7 +280,7 @@ func (s *ClassicNameServer) handleResponse(ctx context.Context, packet *udp_prot
 			newReq.msg = &newMsg
 			if !s.addPendingRequest(&newReq) {
 				s.Lock()
-				failed := s.retireObservedRequestLocked(&newReq, true)
+				failed := s.retireObservedRequestLocked(&newReq)
 				s.Unlock()
 				s.finishRequestRetirement(failed, context.Canceled)
 				if newReq.owner != nil {
@@ -326,7 +326,7 @@ func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) bool {
 	id := req.msg.ID
 	var displaced dnsUDPRequestRetirement
 	if previous := s.requests[id]; previous != nil && previous != req {
-		displaced = s.retireObservedRequestLocked(previous, true)
+		displaced = s.retireObservedRequestLocked(previous)
 	}
 	req.expire = time.Now().Add(time.Second * 8)
 	if req.owner != nil {
@@ -349,7 +349,7 @@ func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) bool {
 	return true
 }
 
-func (s *ClassicNameServer) retireObservedRequestLocked(req *udpDnsRequest, partialLoss bool) dnsUDPRequestRetirement {
+func (s *ClassicNameServer) retireObservedRequestLocked(req *udpDnsRequest) dnsUDPRequestRetirement {
 	if req == nil || req.retired {
 		return dnsUDPRequestRetirement{}
 	}
@@ -359,9 +359,6 @@ func (s *ClassicNameServer) retireObservedRequestLocked(req *udpDnsRequest, part
 	if req.owner != nil {
 		if req.owner.requests[req.msg.ID] == req {
 			delete(req.owner.requests, req.msg.ID)
-		}
-		if partialLoss {
-			req.owner.partialLoss = true
 		}
 		if req.owner.unresolved > 0 {
 			req.owner.unresolved--
@@ -519,7 +516,7 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 		}
 		if !s.addPendingRequest(udpReq) {
 			s.Lock()
-			failed := s.retireObservedRequestLocked(udpReq, true)
+			failed := s.retireObservedRequestLocked(udpReq)
 			s.Unlock()
 			s.finishRequestRetirement(failed, context.Canceled)
 			item.buf.Release()
@@ -540,7 +537,7 @@ func (s *ClassicNameServer) Close() error {
 	retired := make([]dnsUDPRequestRetirement, 0, len(s.requests))
 	for id, req := range s.requests {
 		delete(s.requests, id)
-		retired = append(retired, s.retireObservedRequestLocked(req, true))
+		retired = append(retired, s.retireObservedRequestLocked(req))
 	}
 	owners := make([]*dnsUDPResourceOwner, 0, len(s.resourceOwners))
 	for owner := range s.resourceOwners {

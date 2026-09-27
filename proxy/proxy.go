@@ -404,10 +404,6 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 	w.trafficState.mu.Unlock()
 	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
-		if w.receipt != nil {
-			w.receipt.MarkDownlinkIncomplete()
-			w.receipt.SetEndReason(stats.EndReasonWriteError)
-		}
 		return err
 	}
 	if w.receipt != nil && payload != 0 {
@@ -796,9 +792,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				if !handled {
 					return readV(ctx, reader, writer, timer, readCounter)
 				}
-				if err == nil || errors.Cause(err) == io.EOF {
-					rawReceipt.markReadError(io.EOF)
-				}
 				if err != nil && errors.Cause(err) != io.EOF {
 					return err
 				}
@@ -830,7 +823,6 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 		}
 		if err != nil {
-			(&rawCopyReceipt{exchange: endpointWriterReceipt(writer)}).markReadError(err)
 			if errors.Cause(err) == io.EOF {
 				return nil
 			}
@@ -841,17 +833,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 
 func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer signal.ActivityUpdater, readCounter stats.Counter) error {
 	errors.LogDebug(ctx, "CopyRawConn (maybe) readv")
-	receipt := endpointWriterReceipt(writer)
 	if err := buf.Copy(reader, writer, buf.UpdateActivity(timer), buf.AddToStatCounter(readCounter)); err != nil {
-		switch {
-		case buf.IsReadError(err):
-			(&rawCopyReceipt{exchange: receipt}).markReadError(errors.Cause(err))
-		case buf.IsWriteError(err):
-			// The actual endpoint writer records its accepted result and cause.
-		}
 		return errors.New("failed to process response").Base(err)
 	}
-	(&rawCopyReceipt{exchange: receipt}).markReadError(io.EOF)
 	return nil
 }
 

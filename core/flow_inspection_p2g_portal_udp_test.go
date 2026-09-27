@@ -125,25 +125,25 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	portalPayload := "same-domain UDP child"
 	portalRay.Dispatch(context.Background(), portalDestination, buf.FromBytes([]byte(portalPayload)))
 	inspectionWait(t, func() bool {
-		live, readErr := view.ReadLive(context.Background())
-		return readErr == nil && len(live.Rows) == 1 && len(live.Rows[0].Routes) == 2 && live.Rows[0].Uplink.Known == uint64(len(dataPayload)+len(portalPayload))
+		live, readErr := view.ReadLive()
+		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink.Known == uint64(len(dataPayload)+len(portalPayload))
 	})
 	portalRay.RemoveRay()
 	root.Finish()
 
 	inspectionWait(t, func() bool {
-		page, readErr := view.ReadTerminals(context.Background())
+		page, readErr := view.ReadTerminals()
 		return readErr == nil && len(page.Rows) == 1
 	})
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	flow := page.Rows[0].Flow
-	if flow.Uplink.Known != uint64(len(dataPayload)+len(portalPayload)) || flow.Downlink.Known != uint64(len(dataPayload)) || len(flow.Destinations) != 2 || flow.Destinations[0] != dataDestination || flow.Destinations[1] != portalDestination || len(flow.Routes) != 2 || flow.Routes[0].Outbound.Tag != "udp-data" || flow.Routes[1].Outbound.Tag != "portal" {
+	if flow.Uplink.Known != uint64(len(dataPayload)+len(portalPayload)) || flow.Downlink.Known != uint64(len(dataPayload)) || flow.LatestDestination != portalDestination || flow.SelectedRoute.Outbound.Tag != "portal" {
 		t.Fatalf("mixed association facts: %+v", page.Rows[0])
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,14 +164,14 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	onlyPayload := "only Portal UDP child"
 	onlyRay.Dispatch(context.Background(), portalDestination, buf.FromBytes([]byte(onlyPayload)))
 	inspectionWait(t, func() bool {
-		live, readErr := view.ReadLive(context.Background())
-		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink.Known == uint64(len(onlyPayload)) && len(live.Rows[0].Routes) == 1 && live.Rows[0].Routes[0].Outbound.Tag == "portal"
+		live, readErr := view.ReadLive()
+		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink.Known == uint64(len(onlyPayload)) && live.Rows[0].SelectedRoute.Outbound.Tag == "portal"
 	})
 	onlyRay.RemoveRay()
 	onlyRoot.Finish()
 	inspectionWait(t, func() bool {
-		page, readErr := view.ReadTerminals(context.Background())
-		return readErr == nil && len(page.Rows) == 2 && page.Rows[1].Flow.Uplink.Known == uint64(len(onlyPayload)) && page.Rows[1].Flow.Routes[0].Outbound.Tag == "portal"
+		page, readErr := view.ReadTerminals()
+		return readErr == nil && len(page.Rows) == 2 && page.Rows[1].Flow.Uplink.Known == uint64(len(onlyPayload)) && page.Rows[1].Flow.SelectedRoute.Outbound.Tag == "portal"
 	})
 }
 
@@ -200,20 +200,20 @@ func TestFlowInspectionP2GUDPCustomHandlerReturnStaysPending(t *testing.T) {
 	}
 	ray.RemoveRay()
 	root.Finish()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("unclaimed terminal: %+v %v", page, err)
 	}
 	flow := page.Rows[0].Flow
-	if len(flow.Routes) != 1 || flow.Routes[0].Outbound.Tag != "no-claim" || flow.AccountingRoute.Outbound.Serial != 0 || flow.Uplink.Known != uint64(len(payload)) || !flow.Uplink.Incomplete || !flow.Downlink.Incomplete {
+	if flow.SelectedRoute.Outbound.Tag != "no-claim" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(payload)) {
 		t.Fatalf("custom pending facts: %+v", page.Rows[0])
 	}
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, total := range totals.Rows {
-		if total.Uplink.Known != 0 || total.Downlink.Known != 0 || total.Uplink.Incomplete || total.Downlink.Incomplete {
+		if total.Uplink.Known != 0 || total.Downlink.Known != 0 {
 			t.Fatalf("custom handler return settled pending credit: %+v", total)
 		}
 	}
@@ -244,25 +244,25 @@ func TestFlowInspectionP2GNativeHandlerReturnSettlesNoClaim(t *testing.T) {
 	payload := "native selected no claim"
 	ray.Dispatch(context.Background(), cnet.UDPDestination(cnet.DomainAddress("native-no-claim.invalid"), 443), buf.FromBytes([]byte(payload)))
 	inspectionWait(t, func() bool {
-		totals, readErr := view.ReadTotals(context.Background())
+		totals, readErr := view.ReadTotals()
 		if readErr != nil {
 			return false
 		}
 		for _, total := range totals.Rows {
 			if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 {
-				return total.Uplink.Known == uint64(len(payload)) && total.Uplink.Incomplete && total.Downlink.Incomplete
+				return total.Uplink.Known == uint64(len(payload))
 			}
 		}
 		return false
 	})
 	ray.RemoveRay()
 	root.Finish()
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("native no-claim terminal: %+v %v", page, err)
 	}
 	flow := page.Rows[0].Flow
-	if len(flow.Routes) != 1 || flow.Routes[0].Outbound.Tag != "native-no-claim" || flow.AccountingRoute.Outbound.Serial != 0 || flow.Uplink.Known != uint64(len(payload)) || !flow.Uplink.Incomplete || !flow.Downlink.Incomplete {
+	if flow.SelectedRoute.Outbound.Tag != "native-no-claim" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(payload)) {
 		t.Fatalf("native no-claim facts: %+v", page.Rows[0])
 	}
 }

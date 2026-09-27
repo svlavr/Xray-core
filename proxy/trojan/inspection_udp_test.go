@@ -70,22 +70,22 @@ func TestInspectionTrojanPacketWriteResults(t *testing.T) {
 				}
 			}
 			flow.Finish()
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("packet terminal: %+v %v", page, err)
 			}
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full-error":
-				if calls != 1 || fact.Known != 5 || fact.Incomplete {
+				if calls != 1 || fact.Known != 5 {
 					t.Fatalf("complete frame plus error: %+v", fact)
 				}
 			case "second-short-nil":
-				if calls != 2 || fact.Known != 5 || !fact.Incomplete {
+				if calls != 2 || fact.Known != 5 {
 					t.Fatalf("completed frame before partial: %+v", fact)
 				}
 			default:
-				if calls != 0 || fact.Known != 0 || fact.Incomplete {
+				if calls != 0 || fact.Known != 0 {
 					t.Fatalf("encoding drop: %+v", fact)
 				}
 			}
@@ -154,15 +154,15 @@ func TestInspectionTrojanUDPLateRequestCompletion(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("native task.Run did not return on cancellation")
 	}
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 0 {
 		t.Fatalf("parent return fabricated completion: %+v %v", page, err)
 	}
-	live, err := view.ReadLive(context.Background())
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len("admitted request")) {
 		t.Fatalf("late request lost admission: %+v %v", live, err)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
 		known += total.Uplink.Known
@@ -173,7 +173,7 @@ func TestInspectionTrojanUDPLateRequestCompletion(t *testing.T) {
 	releaseOnce.Do(func() { close(reader.release) })
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		page, err = view.ReadTerminals(context.Background())
+		page, err = view.ReadTerminals()
 		if err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Uplink.Known == uint64(len("admitted request")) {
 			break
 		}

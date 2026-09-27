@@ -101,12 +101,12 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 			}
 			var selected fs.FlowRecord
 			inspectionWait(t, func() bool {
-				live, err := view.ReadLive(context.Background())
+				live, err := view.ReadLive()
 				if err != nil || len(live.Rows) != 2 {
 					return false
 				}
 				for _, row := range live.Rows {
-					if len(row.Destinations) == 2 {
+					if row.LatestDestination == secondDest {
 						selected = row
 					}
 				}
@@ -115,7 +115,7 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 			// The association begins before the first datagram with unavailable
 			// peer and target. The first accepted packet fills the native peer;
 			// destinations and the consuming route arrive with actual rays.
-			if selected.Kind != fs.FlowKindUDPAssociation || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.InitialDestination.IsValid() || selected.AccountingRoute.Outbound.Tag != "direct" || selected.AccountingRoute.Outbound.Serial == 0 || len(selected.Routes) != 1 || len(selected.Destinations) != 2 || selected.Uplink.Incomplete || selected.Downlink.Incomplete {
+			if selected.Kind != fs.FlowKindUDPAssociation || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.InitialDestination.IsValid() || selected.SelectedRoute.Outbound.Tag != "direct" || selected.SelectedRoute.Outbound.Serial == 0 {
 				t.Fatalf("association facts: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
@@ -129,16 +129,16 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 				t.Fatal(err)
 			}
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
-				return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected.Ref && page.Rows[0].Reason == fs.EndReasonLocalStop
+				page, err := view.ReadTerminals()
+				return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected.Ref
 			})
 			inspectionSOCKSPacket(t, sibling, siblingRelay, secondDest, extra, 0x37)
 			siblingControl.Close()
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				return err == nil && len(page.Rows) == 2
 			})
-			totals, err := view.ReadTotals(context.Background())
+			totals, err := view.ReadTotals()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,7 +146,7 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 			for _, row := range totals.Rows {
 				up += row.Uplink.Known
 				down += row.Downlink.Known
-				if row.Uplink.Known != 0 && (row.Outbound != selected.AccountingRoute.Outbound || row.Uplink.Incomplete || row.Downlink.Incomplete) {
+				if row.Uplink.Known != 0 && (row.Outbound != selected.SelectedRoute.Outbound) {
 					t.Fatalf("association totals: %+v", row)
 				}
 			}
@@ -163,14 +163,14 @@ func TestFlowInspectionSOCKSUDPInboundPreFirstPayload(t *testing.T) {
 	control, _, _ := inspectionSOCKSAssociation(t, address)
 	var association fs.FlowRecord
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil || len(live.Rows) != 1 {
 			return false
 		}
 		association = live.Rows[0]
 		return association.Ref.ID != 0
 	})
-	if association.Kind != fs.FlowKindUDPAssociation || association.Origin != fs.TrafficOriginUser || association.Source.IsValid() || association.InitialDestination.IsValid() || len(association.Destinations) != 0 || len(association.Routes) != 0 || association.Uplink.Known != 0 || association.Downlink.Known != 0 || association.Uplink.Incomplete || association.Downlink.Incomplete {
+	if association.Kind != fs.FlowKindUDPAssociation || association.Origin != fs.TrafficOriginUser || association.Source.IsValid() || association.InitialDestination.IsValid() || association.Uplink.Known != 0 || association.Downlink.Known != 0 {
 		t.Fatalf("pre-first association: %+v", association)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{association.Ref})
@@ -184,8 +184,8 @@ func TestFlowInspectionSOCKSUDPInboundPreFirstPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
-		return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == association.Ref && page.Rows[0].Reason == fs.EndReasonLocalStop
+		page, err := view.ReadTerminals()
+		return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == association.Ref
 	})
 }
 
@@ -204,12 +204,12 @@ func TestFlowInspectionSOCKSUDPInboundRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspectionWait(t, func() bool {
-		live, _ := view.ReadLive(context.Background())
-		return len(live.Rows) == 1 && len(live.Rows[0].Routes) != 0 && live.Rows[0].Routes[0].Selection == fs.SelectionRejected
+		live, _ := view.ReadLive()
+		return len(live.Rows) == 1 && live.Rows[0].SelectedRoute.Selection == fs.SelectionRejected
 	})
 	control.Close()
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink.Known == uint64(len("rejected payload")) && page.Rows[0].Flow.Downlink.Known == 0
 	})
 }
@@ -227,8 +227,8 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 	}
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
-		live, _ := view.ReadLive(context.Background())
-		if len(live.Rows) != 1 || len(live.Rows[0].Routes) == 0 || live.Rows[0].Routes[0].Selection != fs.SelectionRejected {
+		live, _ := view.ReadLive()
+		if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Selection != fs.SelectionRejected {
 			return false
 		}
 		ref = live.Rows[0].Ref
@@ -239,11 +239,11 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 		t.Fatalf("stop after ray rejection: %+v %v", result, err)
 	}
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals(context.Background())
+		page, _ := view.ReadTerminals()
 		if len(page.Rows) != 1 {
 			return false
 		}
-		if page.Rows[0].Reason != fs.EndReasonLocalStop {
+		if page.Rows[0].Flow.State != fs.FlowStateEnded {
 			t.Fatalf("earlier ray rejection defeated exact association stop: %+v", page.Rows[0])
 		}
 		return true

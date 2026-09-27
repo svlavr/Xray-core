@@ -69,8 +69,8 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 	if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref}); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := view.ReadTerminals(context.Background())
-	if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Uplink.Known != uint64(len(wire)) || terminal.Rows[0].Flow.Downlink.Known != 0 || terminal.Rows[0].Reason != fs.EndReasonLocalStop {
+	terminal, err := view.ReadTerminals()
+	if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Uplink.Known != uint64(len(wire)) || terminal.Rows[0].Flow.Downlink.Known != 0 {
 		t.Fatalf("owner-close snapshot: %+v %v", terminal.Rows, err)
 	}
 	close(lookup.release)
@@ -81,14 +81,14 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		totals, err := view.ReadTotals(context.Background())
+		totals, err := view.ReadTotals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range totals.Rows {
-			if row.Outbound.Tag == "dns" && row.Downlink.Incomplete {
-				again, err := view.ReadTerminals(context.Background())
-				if err != nil || len(again.Rows) != 1 || again.Rows[0].Flow.Downlink.Known != 0 || again.Rows[0].Reason != fs.EndReasonLocalStop {
+			if row.Outbound.Tag == "dns" {
+				again, err := view.ReadTerminals()
+				if err != nil || len(again.Rows) != 1 || again.Rows[0].Flow.Downlink.Known != 0 {
 					t.Fatalf("late callback rewrote terminal: %+v %v", again.Rows, err)
 				}
 				return

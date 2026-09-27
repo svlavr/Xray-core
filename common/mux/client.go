@@ -16,7 +16,6 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/xudp"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -387,11 +386,6 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
-		if s.inspection != nil {
-			if !meta.Option.Has(OptionError) {
-				s.inspection.SetEndReason(stats.EndReasonEOF)
-			}
-		}
 		s.Close(false)
 	}
 	if meta.Option.Has(OptionData) {

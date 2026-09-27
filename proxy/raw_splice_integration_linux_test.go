@@ -91,9 +91,6 @@ func TestRawSpliceCallerReadyPrefix(t *testing.T) {
 	if exchange.downlink.Load() != uint64(len(prefix)+len(raw)) {
 		t.Fatal("retained prefix was lost or counted twice")
 	}
-	if got := stats.EndReason(exchange.reason.Load()); got != stats.EndReasonEOF {
-		t.Fatalf("raw splice end reason = %v, want EOF", got)
-	}
 }
 
 func TestRawSpliceCallerOmitsPipeResidue(t *testing.T) {
@@ -164,9 +161,6 @@ func TestRawSpliceCallerReadvFallback(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) || exchange.downlink.Load() != uint64(len(payload)) {
 		t.Fatal("fallback lost, dropped or doubled payload")
-	}
-	if got := stats.EndReason(exchange.reason.Load()); got != stats.EndReasonEOF {
-		t.Fatalf("readv fallback end reason = %v, want EOF", got)
 	}
 }
 
@@ -285,7 +279,6 @@ func BenchmarkRawCopyProgress(b *testing.B) {
 						b.Fatal(err)
 					}
 					if flow != nil {
-						flow.SetEndReason(stats.EndReasonEOF)
 						flow.Finish()
 					}
 					sw.Close()

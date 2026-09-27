@@ -316,9 +316,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 		bodyReader, err := svrSession.DecodeRequestBody(request, reader)
 		if err != nil {
-			if observation != nil {
-				observation.Exchange.SetEndReason(stats.EndReasonReadError)
-			}
 			return errors.New("failed to start decoding").Base(err)
 		}
 		if observation != nil {

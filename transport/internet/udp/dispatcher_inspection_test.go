@@ -55,7 +55,7 @@ func (e *inspectionLegFinish) FinishSelectedLeg() {
 
 func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
-	view, _ := manager.EnableInspection(fs.ObservationOptions{MaxDestinations: 2})
+	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
 	dest := net.UDPDestination(net.LocalHostIP, 53)
 	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, dest, nil)
@@ -84,20 +84,20 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	d.Dispatch(context.Background(), dest, buf.FromBytes([]byte("pending input")))
 	lifecycleWait(t, legFinished)
 	root.Finish()
-	page, _ := view.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 || len(page.Rows[0].Flow.Routes) != 0 || len(page.Rows[0].Flow.Destinations) != 0 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ := view.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("owner-end pending snapshot: %+v", page)
 	}
 	close(roleSelected)
 	lifecycleWait(t, selectedDone)
-	again, _ := view.ReadTerminals(context.Background())
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink.Known != 0 || len(again.Rows[0].Flow.Routes) != 0 || len(again.Rows[0].Flow.Destinations) != 0 {
+	again, _ := view.ReadTerminals()
+	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink.Known != 0 {
 		t.Fatalf("selected role changed immutable terminal: %+v", again)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
 		if total.Outbound.Serial == 41 {
-			if total.Uplink.Known != uint64(len("pending input")) || total.Downlink.Known != 0 || total.Uplink.Incomplete || total.Downlink.Incomplete {
+			if total.Uplink.Known != uint64(len("pending input")) || total.Downlink.Known != 0 {
 				t.Fatalf("late ordinary total: %+v", total)
 			}
 			return
@@ -125,13 +125,13 @@ func TestUDPDispatcherInspectionSynchronousRejection(t *testing.T) {
 	}
 	d.RemoveRay()
 	root.Finish()
-	page, _ := view.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || len(page.Rows[0].Flow.Routes) == 0 || page.Rows[0].Flow.Uplink.Known != want || page.Rows[0].Flow.Downlink.Known != 0 || page.Rows[0].Flow.Routes[0].Selection != fs.SelectionRejected {
+	page, _ := view.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != want || page.Rows[0].Flow.Downlink.Known != 0 || page.Rows[0].Flow.SelectedRoute.Selection != fs.SelectionRejected {
 		t.Fatalf("synchronous rejection lost decoded custody: %+v", page.Rows)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
-		if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 && (total.Uplink.Known != want || total.Uplink.Incomplete) {
+		if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 && (total.Uplink.Known != want) {
 			t.Fatalf("rejected unassigned total: %+v", total)
 		}
 	}
@@ -194,18 +194,18 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 	lifecycleWait(t, secondDone)
 	d.RemoveRay()
 	root.Finish()
-	page, _ := view.ReadTerminals(context.Background())
+	page, _ := view.ReadTerminals()
 	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 18 || page.Rows[0].Flow.Downlink.Known != 12 {
 		t.Fatalf("owner-end association snapshot: %+v", page)
 	}
 	close(releaseFirst)
 	lifecycleWait(t, firstDone)
-	page, _ = view.ReadTerminals(context.Background())
+	page, _ = view.ReadTerminals()
 	row := page.Rows[0].Flow
-	if row.Ref != root.Ref() || row.Uplink.Known != 18 || row.Downlink.Known != 12 || len(row.Routes) != 2 || row.AccountingRoute.Outbound.Serial != 2 {
+	if row.Ref != root.Ref() || row.Uplink.Known != 18 || row.Downlink.Known != 12 || row.SelectedRoute.Outbound.Serial != 2 {
 		t.Fatalf("overlapping ray facts: %+v", row)
 	}
-	totals, _ := view.ReadTotals(context.Background())
+	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
 		if total.Outbound.Serial != 0 && (total.Uplink.Known != 9 || total.Downlink.Known != 12) {
 			t.Fatalf("late callback moved buckets: %+v", total)
@@ -232,8 +232,8 @@ func TestUDPDispatcherInspectionUnclaimedOwner(t *testing.T) {
 	d.RemoveRay()
 	root.Finish()
 	lifecycleWait(t, done)
-	page, _ := view.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 {
+	page, _ := view.ReadTerminals()
+	if len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
 		t.Fatalf("unclaimed owner snapshot: %+v", page)
 	}
 }
@@ -278,7 +278,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 	if n, err := conn.WriteTo(payload, destination.RawNetAddr()); err != nil || n != len(payload) {
 		t.Fatalf("WriteTo %d/%d: %v", n, len(payload), err)
 	}
-	live, err := view.ReadLive(context.Background())
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != 0 {
 		t.Fatalf("WriteTo submission credited execution bytes: %+v %v", live, err)
 	}
@@ -300,13 +300,13 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(n) || len(flow.Destinations) != 1 || flow.Destinations[0] != destination || flow.AccountingRoute.Outbound.Serial != 17 {
+			if flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(n) || flow.LatestDestination != destination || flow.SelectedRoute.Outbound.Serial != 17 {
 				t.Fatalf("API dispatcher facts: %+v", flow)
 			}
 			return
@@ -360,7 +360,7 @@ func TestInspectionDispatcherAPINaturalEndDrainsBeforeFinish(t *testing.T) {
 	if !c.done.Done() {
 		t.Fatal("native ray did not end")
 	}
-	if page, _ := view.ReadTerminals(context.Background()); len(page.Rows) != 0 {
+	if page, _ := view.ReadTerminals(); len(page.Rows) != 0 {
 		t.Fatalf("native EOF finished root before queued response read: %+v", page.Rows)
 	}
 	read := make([]byte, len(responsePayload))
@@ -368,13 +368,13 @@ func TestInspectionDispatcherAPINaturalEndDrainsBeforeFinish(t *testing.T) {
 	if err != nil || n != len(responsePayload) {
 		t.Fatalf("read queued response %d/%d: %v", n, len(responsePayload), err)
 	}
-	if page, _ := view.ReadTerminals(context.Background()); len(page.Rows) != 0 {
+	if page, _ := view.ReadTerminals(); len(page.Rows) != 0 {
 		t.Fatalf("last queued response finished before caller observed EOF: %+v", page.Rows)
 	}
 	if _, _, err := packetConn.ReadFrom(read); !errors.Is(err, io.EOF) {
 		t.Fatalf("post-drain read: %v", err)
 	}
-	page, _ := view.ReadTerminals(context.Background())
+	page, _ := view.ReadTerminals()
 	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != uint64(len(responsePayload)) {
 		t.Fatalf("post-drain terminal: %+v", page.Rows)
 	}
@@ -419,8 +419,8 @@ func TestInspectionDispatcherAPIExplicitCloseDrainsCache(t *testing.T) {
 	if !late.IsEmpty() || len(c.cache) != 0 {
 		t.Fatalf("callback enqueued after close: empty=%v cache=%d", late.IsEmpty(), len(c.cache))
 	}
-	page, _ := view.ReadTerminals(context.Background())
-	if len(page.Rows) != 1 || !page.Rows[0].Flow.Downlink.Incomplete {
+	page, _ := view.ReadTerminals()
+	if len(page.Rows) != 1 {
 		t.Fatalf("explicit-close loss facts: %+v", page.Rows)
 	}
 }
@@ -474,7 +474,7 @@ func TestInspectionDispatcherAPIReadCloseSamePacket(t *testing.T) {
 	if read.n != 0 && (read.n != len("racing response") || read.err != nil) {
 		t.Fatalf("returned read: %d %v", read.n, read.err)
 	}
-	page, err := view.ReadTerminals(context.Background())
+	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != uint64(read.n) || !payload.IsEmpty() {
 		t.Fatalf("read/close terminal: %+v %v released=%v", page.Rows, err, payload.IsEmpty())
 	}
@@ -518,7 +518,7 @@ func TestInspectionDispatcherAPIUnclaimedEndReconcilesBeforeEOF(t *testing.T) {
 		t.Fatalf("EOF reached caller before ray reconciliation: %v", err)
 	case <-time.After(30 * time.Millisecond):
 	}
-	if page, _ := view.ReadTerminals(context.Background()); len(page.Rows) != 0 {
+	if page, _ := view.ReadTerminals(); len(page.Rows) != 0 {
 		c.dispatcher.Unlock()
 		t.Fatalf("unclaimed root published before ray reconciliation: %+v", page.Rows)
 	}
@@ -531,8 +531,8 @@ func TestInspectionDispatcherAPIUnclaimedEndReconcilesBeforeEOF(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("unclaimed ray did not retire")
 	}
-	page, err := view.ReadTerminals(context.Background())
-	if err != nil || len(page.Rows) != 1 || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 {
+	page, err := view.ReadTerminals()
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
 		t.Fatalf("unclaimed root terminal: %+v %v", page.Rows, err)
 	}
 }

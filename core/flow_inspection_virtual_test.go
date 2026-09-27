@@ -162,16 +162,13 @@ func inspectionWireGuardRow(t *testing.T, view fs.FlowInspection, kind fs.FlowKi
 	t.Helper()
 	var found fs.FlowRecord
 	inspectionWait(t, func() bool {
-		live, err := view.ReadLive(context.Background())
+		live, err := view.ReadLive()
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
 			if row.Kind != kind || row.Uplink.Known != uplink || row.Downlink.Known != downlink {
 				continue
-			}
-			if row.Uplink.Incomplete || row.Downlink.Incomplete {
-				return false
 			}
 			found = row
 			return true
@@ -183,10 +180,10 @@ func inspectionWireGuardRow(t *testing.T, view fs.FlowInspection, kind fs.FlowKi
 
 func inspectionWireGuardAssertRow(t *testing.T, row fs.FlowRecord, initial cnet.Destination, outbound string, effective cnet.Destination) {
 	t.Helper()
-	if row.Origin != fs.TrafficOriginUser || row.InitialDestination != initial || row.AccountingRoute.Outbound.Tag != outbound || row.AccountingRoute.Outbound.Serial == 0 || row.AccountingRoute.Effective != effective || row.Uplink.Incomplete || row.Downlink.Incomplete {
+	if row.Origin != fs.TrafficOriginUser || row.InitialDestination != initial || row.SelectedRoute.Outbound.Tag != outbound || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != effective {
 		t.Fatalf("WireGuard logical facts: %+v", row)
 	}
-	if row.Kind == fs.FlowKindUDPAssociation && initial.IsValid() && (len(row.Destinations) != 1 || row.Destinations[0] != initial) {
+	if row.Kind == fs.FlowKindUDPAssociation && initial.IsValid() && (row.LatestDestination != initial) {
 		t.Fatalf("WireGuard UDP destinations: %+v", row)
 	}
 }
@@ -198,14 +195,14 @@ func inspectionWireGuardStop(t *testing.T, view fs.FlowInspection, ref fs.FlowRe
 		t.Fatalf("WireGuard exact stop: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range page.Rows {
 			if row.Flow.Ref == ref {
-				if row.Reason != fs.EndReasonLocalStop {
-					t.Fatalf("WireGuard stopped terminal: %+v", row)
+				if row.Flow.State != fs.FlowStateEnded {
+					t.Fatalf("WireGuard did not end: %+v", row)
 				}
 				return true
 			}
@@ -276,7 +273,7 @@ func TestFlowInspectionWireGuardTCPUDP(t *testing.T) {
 	// SOCKS admits the UDP association before its first packet; the original
 	// destination is unavailable, while the packet destination is recorded.
 	inspectionWireGuardAssertRow(t, clientUDP, cnet.Destination{}, "wireguard-client", virtualUDP)
-	if len(clientUDP.Destinations) != 1 || clientUDP.Destinations[0] != virtualUDP {
+	if clientUDP.LatestDestination != virtualUDP {
 		t.Fatalf("WireGuard client UDP destinations: %+v", clientUDP)
 	}
 	inspectionWireGuardAssertRow(t, serverUDP, virtualUDP, "wireguard-server-direct", udpDestination)

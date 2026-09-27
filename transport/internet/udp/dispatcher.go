@@ -76,8 +76,7 @@ func (v *Dispatcher) RemoveRay() {
 	if v.conn != nil {
 		if observation := v.conn.observation; observation != nil && observation.ReturnedLink.CompareAndSwap(true, false) {
 			observation.Exchange.Unassign()
-			observation.Exchange.MarkUplinkIncomplete()
-			observation.Exchange.MarkDownlinkIncomplete()
+
 			observation.Exchange.Finish()
 		}
 		v.conn.Close()
@@ -157,9 +156,9 @@ func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*
 		cancel()
 		err = errors.New("failed to dispatch request to ", dest).Base(err)
 		if observation != nil {
-			observation.Exchange.Route(stats.RouteStep{Selection: stats.SelectionRejected, Original: dest, SelectedTarget: dest})
+			observation.Exchange.Route(stats.RouteStep{Selection: stats.SelectionRejected, SelectedTarget: dest})
 			observation.Exchange.BindRoute()
-			observation.Exchange.SetEndReason(stats.EndReasonRejected)
+
 			observation.Exchange.Finish()
 			return &connEntry{observation: observation}, err
 		}
@@ -219,8 +218,6 @@ func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, cal
 		if conn.observation != nil {
 			if conn.observation.ReturnedLink.Load() {
 				conn.observation.Exchange.Unassign()
-				conn.observation.Exchange.MarkUplinkIncomplete()
-				conn.observation.Exchange.MarkDownlinkIncomplete()
 			}
 			conn.observation.Exchange.Finish()
 		}
@@ -303,9 +300,6 @@ func (c *dispatcherConn) callback(ctx context.Context, packet *udp.Packet) {
 	}
 	c.mu.Lock()
 	if c.closed {
-		if receipt != nil {
-			receipt.MarkDownlinkIncomplete()
-		}
 		packet.Payload.Release()
 		c.mu.Unlock()
 		return
@@ -313,9 +307,6 @@ func (c *dispatcherConn) callback(ctx context.Context, packet *udp.Packet) {
 	select {
 	case c.cache <- dispatcherPacket{packet: packet, receipt: receipt}:
 	default:
-		if receipt != nil {
-			receipt.MarkDownlinkIncomplete()
-		}
 		packet.Payload.Release()
 	}
 	c.mu.Unlock()
@@ -344,9 +335,6 @@ packet:
 	packet := cached.packet
 	c.mu.Lock()
 	if c.closed {
-		if cached.receipt != nil {
-			cached.receipt.MarkDownlinkIncomplete()
-		}
 		packet.Payload.Release()
 		c.mu.Unlock()
 		return 0, nil, io.EOF
@@ -386,9 +374,6 @@ func (c *dispatcherConn) Close() error {
 	for {
 		select {
 		case cached := <-c.cache:
-			if cached.receipt != nil {
-				cached.receipt.MarkDownlinkIncomplete()
-			}
 			cached.packet.Payload.Release()
 		default:
 			c.mu.Unlock()

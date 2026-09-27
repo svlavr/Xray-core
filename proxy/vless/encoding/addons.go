@@ -130,13 +130,8 @@ func (w *MultiLengthPacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt s
 		return nil
 	}
 	err := w.Writer.WriteMultiBuffer(mb2Write)
-	if receipt != nil {
-		if err != nil {
-			receipt.MarkDownlinkIncomplete()
-			receipt.SetEndReason(stats.EndReasonWriteError)
-		} else if payload != 0 {
-			receipt.AddDownlink(payload)
-		}
+	if receipt != nil && err == nil && payload != 0 {
+		receipt.AddDownlink(payload)
 	}
 	return err
 }

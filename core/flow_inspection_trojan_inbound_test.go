@@ -35,12 +35,12 @@ func TestFlowInspectionTrojanInboundRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil || len(page.Rows) != 1 {
 			return false
 		}
 		row := page.Rows[0]
-		if row.Reason != fs.EndReasonRejected || row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.Uplink.Incomplete || row.Flow.Downlink.Incomplete || row.Flow.AccountingRoute.Outbound.Serial != 0 {
+		if row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.SelectedRoute.Outbound.Serial != 0 {
 			t.Fatalf("Trojan rejected receipt: %+v", row)
 		}
 		return true
@@ -67,31 +67,30 @@ func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
 	}
 	client.Close()
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
-		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) || !page.Rows[0].Flow.Uplink.Incomplete || !page.Rows[0].Flow.Downlink.Incomplete {
+		page, err := view.ReadTerminals()
+		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) {
 			return false
 		}
-		if len(page.Rows[0].Flow.Routes) != 1 || page.Rows[0].Flow.Routes[0].Outbound.Tag != "unclaimed" || page.Rows[0].Flow.AccountingRoute.Outbound.Serial != 0 {
+		if page.Rows[0].Flow.SelectedRoute.Outbound.Tag != "unclaimed" || page.Rows[0].Flow.SelectedRoute.Outbound.Serial == 0 {
 			t.Fatalf("Trojan unclaimed route: %+v", page.Rows[0].Flow)
 		}
 		return true
 	})
-	totals, err := view.ReadTotals(context.Background())
+	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatalf("Trojan unclaimed totals: %+v %v", totals, err)
 	}
 	var known uint64
-	var incomplete bool
+
 	for _, row := range totals.Rows {
 		if row.Outbound.Serial != 0 {
 			t.Fatalf("Trojan unclaimed owner acquired an outbound: %+v", row)
 		}
 		if row.Origin == fs.TrafficOriginUser {
 			known += row.Uplink.Known
-			incomplete = incomplete || row.Uplink.Incomplete || row.Downlink.Incomplete
 		}
 	}
-	if known != uint64(len(payload)) || !incomplete {
+	if known != uint64(len(payload)) {
 		t.Fatalf("Trojan unclaimed totals: %+v", totals)
 	}
 }

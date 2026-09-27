@@ -488,7 +488,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	if _, ok := link.Reader.(*buf.InspectionReader); !ok {
 		observation = nil
 	}
-	step := stats.RouteStep{Leg: 1, Selection: stats.SelectionDefault, Original: ob.OriginalTarget, RouteTarget: ob.RouteTarget, SelectedTarget: ob.Target}
+	step := stats.RouteStep{Selection: stats.SelectionDefault, SelectedTarget: ob.Target}
 	resolve := func(tag string, useDefault bool) outbound.Handler {
 		if observation != nil || routeReceipt != nil {
 			step.Outbound.Tag = tag
@@ -508,7 +508,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		if observation != nil {
 			observation.Exchange.Route(step)
 			observation.Exchange.BindRoute()
-			observation.Exchange.SetEndReason(stats.EndReasonRejected)
+
 		}
 		if routeReceipt != nil {
 			routeReceipt.Offer(step)

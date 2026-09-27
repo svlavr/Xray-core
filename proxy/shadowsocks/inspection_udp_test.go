@@ -68,22 +68,22 @@ func TestInspectionShadowsocksUDPResponseMapping(t *testing.T) {
 				t.Fatal("input payload was not released")
 			}
 			flow.Finish()
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("response terminal: %+v %v", page, err)
 			}
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full-error":
-				if calls != 1 || fact.Known != want || fact.Incomplete {
+				if calls != 1 || fact.Known != want {
 					t.Fatalf("accepted encrypted packet: %+v", fact)
 				}
 			case "short-nil":
-				if calls != 1 || fact.Known != 0 || !fact.Incomplete {
+				if calls != 1 || fact.Known != 0 {
 					t.Fatalf("partial encrypted packet: %+v", fact)
 				}
 			default:
-				if calls != 0 || fact.Known != 0 || fact.Incomplete {
+				if calls != 0 || fact.Known != 0 {
 					t.Fatalf("encoding drop: %+v, writes %d", fact, calls)
 				}
 			}

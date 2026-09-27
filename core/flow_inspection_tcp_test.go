@@ -127,7 +127,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 			inspectionResponse(t, second, payload)
 			var selected fs.FlowRecord
 			inspectionWait(t, func() bool {
-				live, err := view.ReadLive(context.Background())
+				live, err := view.ReadLive()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -138,14 +138,8 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
 						return false
 					}
-					if row.Kind != fs.FlowKindTCP || row.Origin != fs.TrafficOriginUser || row.AccountingRoute.Outbound.Serial == 0 || row.AccountingRoute.Outbound.Tag != "direct" || row.InitialDestination != destination || row.AccountingRoute.RouteTarget.Address.Domain() != "p2.invalid" {
+					if row.Kind != fs.FlowKindTCP || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Serial == 0 || row.SelectedRoute.Outbound.Tag != "direct" || row.InitialDestination != destination {
 						t.Fatalf("admission/route: %+v", row)
-					}
-					if row.Uplink.Incomplete || row.Downlink.Incomplete {
-						return false
-					}
-					if row.Uplink.Incomplete || row.Downlink.Incomplete {
-						t.Fatalf("live byte facts: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
 						selected = row
@@ -159,7 +153,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 				t.Fatalf("exact close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -167,7 +161,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 					return false
 				}
 				ended := page.Rows[0]
-				if ended.Flow.Ref != selected.Ref || ended.Reason != fs.EndReasonLocalStop || ended.Flow.Uplink.Known != uint64(len(payload)) || ended.Flow.Downlink.Known != uint64(len(payload)) {
+				if ended.Flow.Ref != selected.Ref || ended.Flow.Uplink.Known != uint64(len(payload)) || ended.Flow.Downlink.Known != uint64(len(payload)) {
 					t.Fatalf("terminal: %+v", ended)
 				}
 				return true
@@ -184,11 +178,11 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 			inspectionResponse(t, second, extra)
 			second.Close()
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 2
 			})
 			inspectionTCPTotals(t, view, uint64(2*len(payload)+len(extra)))
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			if err != nil || len(live.Rows) != 0 {
 				t.Fatalf("retained live endpoints: %+v %v", live, err)
 			}
@@ -199,7 +193,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 func inspectionTCPTotals(t *testing.T, view fs.FlowInspection, want uint64) {
 	t.Helper()
 	inspectionWait(t, func() bool {
-		totals, err := view.ReadTotals(context.Background())
+		totals, err := view.ReadTotals()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -208,10 +202,7 @@ func inspectionTCPTotals(t *testing.T, view fs.FlowInspection, want uint64) {
 			if row.Uplink.Known == 0 && row.Downlink.Known == 0 {
 				continue
 			}
-			if row.Uplink.Incomplete || row.Downlink.Incomplete {
-				return false
-			}
-			if row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" || row.Uplink.Incomplete || row.Downlink.Incomplete {
+			if row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" {
 				t.Fatalf("total attribution/accuracy: %+v", row)
 			}
 			up += row.Uplink.Known
@@ -281,7 +272,7 @@ func TestFlowInspectionHTTPDelegationKeepAliveControl(t *testing.T) {
 		}
 	}
 	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals(context.Background())
+		page, err := view.ReadTerminals()
 		if err != nil || len(page.Rows) != 2 {
 			return false
 		}
@@ -289,13 +280,13 @@ func TestFlowInspectionHTTPDelegationKeepAliveControl(t *testing.T) {
 			t.Fatal("pipelined HTTP requests reused one FlowRef")
 		}
 		for _, row := range page.Rows {
-			if row.Flow.Kind != fs.FlowKindTCP || row.Flow.AccountingRoute.Outbound.Tag != "direct" || row.Flow.AccountingRoute.Outbound.Serial == 0 || row.Flow.Uplink.Known == 0 || row.Flow.Downlink.Known == 0 || row.Flow.Uplink.Incomplete || row.Flow.Downlink.Incomplete {
+			if row.Flow.Kind != fs.FlowKindTCP || row.Flow.SelectedRoute.Outbound.Tag != "direct" || row.Flow.SelectedRoute.Outbound.Serial == 0 || row.Flow.Uplink.Known == 0 || row.Flow.Downlink.Known == 0 {
 				t.Fatalf("plain HTTP request receipt: %+v", row)
 			}
 		}
 		return true
 	})
-	live, err := view.ReadLive(context.Background())
+	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 0 {
 		t.Fatalf("completed plain HTTP request remained live: %+v %v", live, err)
 	}
@@ -315,7 +306,7 @@ func TestFlowInspectionTCPAdmissionsRejected(t *testing.T) {
 			payload := []byte("GET / HTTP/1.1\r\nHost: rejected.invalid\r\n\r\n")
 			inspectionTCPClient(t, kind, address, destination, payload)
 			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals(context.Background())
+				page, err := view.ReadTerminals()
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -323,7 +314,7 @@ func TestFlowInspectionTCPAdmissionsRejected(t *testing.T) {
 					return false
 				}
 				final := page.Rows[0]
-				if final.Reason != fs.EndReasonRejected || final.Flow.Uplink.Known != uint64(len(payload)) || final.Flow.Downlink.Known != 0 || final.Flow.AccountingRoute.Outbound.Serial != 0 {
+				if final.Flow.Uplink.Known != uint64(len(payload)) || final.Flow.Downlink.Known != 0 || final.Flow.SelectedRoute.Outbound.Serial != 0 {
 					t.Fatalf("rejected receipt: %+v", final)
 				}
 				return true

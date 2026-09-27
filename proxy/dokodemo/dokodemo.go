@@ -265,7 +265,7 @@ func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchan
 			n, writeErr := conn.WriteTo(b.Bytes(), w.back)
 			err = writeErr
 			if receipt != nil {
-				proxy.RecordUnframedPacketWrite(receipt, int(b.Len()), n, err)
+				proxy.RecordUnframedPacketWrite(receipt, int(b.Len()), n)
 			}
 			if err != nil {
 				errors.LogInfo(context.Background(), err.Error())
@@ -282,7 +282,7 @@ func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchan
 			n, writeErr := conn.WriteTo(b.Bytes(), w.back)
 			err = writeErr
 			if receipt != nil {
-				proxy.RecordUnframedPacketWrite(receipt, int(b.Len()), n, err)
+				proxy.RecordUnframedPacketWrite(receipt, int(b.Len()), n)
 			}
 			b.Release()
 			if err != nil {

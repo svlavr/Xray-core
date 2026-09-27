@@ -27,7 +27,6 @@ type dnsUDPQueryOwner struct {
 	unresolved    int                       // guarded by server.Lock
 	errors        chan<- error
 	closed        bool // guarded by server.Lock
-	partialLoss   bool // guarded by server.Lock
 	finishOnce    sync.Once
 	resource      *dnsUDPResourceOwner
 	exchangeReady chan struct{}
@@ -141,7 +140,6 @@ func (o *dnsUDPQueryOwner) Close() error {
 		o.closeResources()
 		// Once the pending IDs are removed, no further collision or expiry can
 		// add a loss that this exact-stop terminal would miss.
-		o.applyPartialLoss(nil)
 	})
 	return nil
 }
@@ -167,7 +165,7 @@ func (o *dnsUDPQueryOwner) closeResources() {
 		if o.server.requests[id] == req {
 			delete(o.server.requests, id)
 		}
-		retired = append(retired, o.server.retireObservedRequestLocked(req, true))
+		retired = append(retired, o.server.retireObservedRequestLocked(req))
 	}
 	o.unresolved = 0
 	o.server.Unlock()
@@ -215,11 +213,6 @@ func (o *dnsUDPQueryOwner) rejectUnadmitted(err error) {
 
 func (o *dnsUDPQueryOwner) finishCanceled() {
 	o.finishOnce.Do(func() {
-		o.applyPartialLoss(nil)
-		if exchange := o.exchangeIfReady(); exchange != nil {
-			exchange.MarkUplinkIncomplete()
-			exchange.MarkDownlinkIncomplete()
-		}
 		o.closeResources()
 		if exchange := o.exchangeIfReady(); exchange != nil {
 			exchange.Finish()
@@ -236,7 +229,7 @@ func (o *dnsUDPQueryOwner) responseMatched(ctx context.Context, payloadSize uint
 		// The response callback is the last consumer of the decoded payload.
 		// Settle the sole native ray and root before cache publication can wake
 		// QueryIP and cancel its caller context.
-		o.applyPartialLoss(ctx)
+
 		if observation := session.LogicalObservationFromContext(ctx); observation != nil && observation.Exchange != nil {
 			observation.Exchange.Finish()
 		}
@@ -245,25 +238,6 @@ func (o *dnsUDPQueryOwner) responseMatched(ctx context.Context, payloadSize uint
 			exchange.Finish()
 		}
 	})
-}
-
-func (o *dnsUDPQueryOwner) applyPartialLoss(ctx context.Context) {
-	o.server.RLock()
-	partialLoss := o.partialLoss
-	o.server.RUnlock()
-	if !partialLoss {
-		return
-	}
-	exchange := o.exchangeIfReady()
-	if exchange == nil {
-		return
-	}
-	exchange.MarkDownlinkIncomplete()
-	if ctx != nil {
-		if observation := session.LogicalObservationFromContext(ctx); observation != nil && observation.Exchange != nil {
-			observation.Exchange.MarkDownlinkIncomplete()
-		}
-	}
 }
 
 func (o *dnsUDPQueryOwner) recordDownlink(ctx context.Context, payloadSize uint64) {
@@ -283,17 +257,10 @@ func (o *dnsUDPQueryOwner) recordDownlink(ctx context.Context, payloadSize uint6
 func (o *dnsUDPQueryOwner) requestLost(err error, done bool) {
 	exchange := o.exchangeIfReady()
 	if !done {
-		if exchange != nil {
-			exchange.MarkDownlinkIncomplete()
-		}
 		o.signalErrors(1, err)
 		return
 	}
 	o.finishOnce.Do(func() {
-		o.applyPartialLoss(nil)
-		if exchange != nil {
-			exchange.MarkDownlinkIncomplete()
-		}
 		o.closeResources()
 		if exchange != nil {
 			exchange.Finish()

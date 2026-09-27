@@ -68,7 +68,7 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 			inspectionMuxWirePacket(t, a, ar, 1, global, destination, "known")
 			var first fs.FlowRecord
 			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive(context.Background())
+				live, _ := view.ReadLive()
 				if len(live.Rows) != 1 {
 					return false
 				}
@@ -89,28 +89,27 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 			inspectionMuxWirePacket(t, b, br, 2, global, destination, "ambiguous")
 			c, cr := inspectionMuxWire(t, owner, fs.TrafficOriginUser)
 			inspectionMuxWirePacket(t, c, cr, 3, global, destination, "still fenced")
-			live, err := view.ReadLive(context.Background())
+			live, err := view.ReadLive()
 			if err != nil || len(live.Rows) != 1 {
 				t.Fatalf("retained rows: %+v %v", live, err)
 			}
 			row := live.Rows[0]
-			if row.Ref != first.Ref || row.Origin != fs.TrafficOriginUser || row.Uplink.Known != 5 || row.Downlink.Known != 5 || !row.Uplink.Incomplete || !row.Downlink.Incomplete {
+			if row.Ref != first.Ref || row.Origin != fs.TrafficOriginUser || row.Uplink.Known != 5 || row.Downlink.Known != 5 {
 				t.Fatalf("fenced result: %+v", row)
 			}
 			if otherView != nil {
-				foreign, _ := otherView.ReadLive(context.Background())
+				foreign, _ := otherView.ReadLive()
 				if len(foreign.Rows) != 0 {
 					t.Fatal("foreign runtime acquired old association ref")
 				}
 			}
-			totals, _ := view.ReadTotals(context.Background())
+			totals, _ := view.ReadTotals()
 			var known uint64
-			var incomplete bool
+
 			for _, bucket := range totals.Rows {
 				known += bucket.Uplink.Known
-				incomplete = incomplete || bucket.Uplink.Incomplete || bucket.Downlink.Incomplete
 			}
-			if known != 5 || !incomplete {
+			if known != 5 {
 				t.Fatalf("fenced totals: %+v", totals)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{first.Ref})
@@ -118,7 +117,7 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 				t.Fatalf("retained close: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals(context.Background())
+				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref
 			})
 		})

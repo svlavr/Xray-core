@@ -61,12 +61,12 @@ func TestFlowInspectionP2BAuthenticatedRejection(t *testing.T) {
 			t.Fatal(err)
 		}
 		inspectionWait(t, func() bool {
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				return false
 			}
 			row := page.Rows[0]
-			if row.Reason != fs.EndReasonRejected || row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.AccountingRoute.Outbound.Serial != 0 || row.Flow.Downlink.Incomplete {
+			if row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.SelectedRoute.Outbound.Serial != 0 {
 				t.Fatalf("authenticated rejection: %+v", row)
 			}
 			return true

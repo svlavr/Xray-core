@@ -137,12 +137,12 @@ func TestInspectionDokodemoNativeFakeUDP(t *testing.T) {
 			t.Fatal("Process did not finish")
 		}
 		if enabled {
-			page, err := view.ReadTerminals(context.Background())
+			page, err := view.ReadTerminals()
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("terminal: %+v %v", page, err)
 			}
 			f := page.Rows[0].Flow
-			if f.Uplink.Known != 7 || f.Downlink.Known != 16 || f.Downlink.Incomplete || f.InitialDestination != target {
+			if f.Uplink.Known != 7 || f.Downlink.Known != 16 || f.InitialDestination != target {
 				t.Fatalf("native facts: %+v", f)
 			}
 		}

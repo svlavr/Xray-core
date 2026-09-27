@@ -15,16 +15,11 @@ import (
 
 type inspectionReceipt struct {
 	fs.Exchange
-	up, down   atomic.Uint64
-	reason     atomic.Uint32
-	incomplete atomic.Bool
+	up, down atomic.Uint64
 }
 
-func (r *inspectionReceipt) AddUplink(n uint64)               { r.up.Add(n) }
-func (r *inspectionReceipt) AddDownlink(n uint64)             { r.down.Add(n) }
-func (r *inspectionReceipt) MarkUplinkIncomplete()            { r.incomplete.Store(true) }
-func (r *inspectionReceipt) MarkDownlinkIncomplete()          { r.incomplete.Store(true) }
-func (r *inspectionReceipt) SetEndReason(reason fs.EndReason) { r.reason.Store(uint32(reason)) }
+func (r *inspectionReceipt) AddUplink(n uint64)   { r.up.Add(n) }
+func (r *inspectionReceipt) AddDownlink(n uint64) { r.down.Add(n) }
 
 type inspectionReader struct {
 	started chan struct{}
@@ -126,7 +121,7 @@ func TestInspectionWriterBatchErrorIsCoarse(t *testing.T) {
 			}
 			writer = buf.AttachWriterReceipt(writer, receipt)
 			err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("abc")), buf.FromBytes([]byte("defgh"))})
-			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 || !receipt.incomplete.Load() || fs.EndReason(receipt.reason.Load()) != fs.EndReasonWriteError {
+			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 {
 				t.Fatalf("prefix %d err %v", receipt.down.Load(), err)
 			}
 		})
@@ -154,8 +149,8 @@ func TestInspectionWriterBatchErrorsAreCoarse(t *testing.T) {
 				mb = append(mb, buf.FromBytes([]byte("second")))
 			}
 			err := writer.WriteMultiBuffer(mb)
-			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 || !receipt.incomplete.Load() || fs.EndReason(receipt.reason.Load()) != fs.EndReasonWriteError {
-				t.Fatalf("known=%d reason=%d err=%v", receipt.down.Load(), receipt.reason.Load(), err)
+			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 {
+				t.Fatalf("known=%d err=%v", receipt.down.Load(), err)
 			}
 		})
 	}
@@ -172,8 +167,8 @@ func TestInspectionWriterReadFromUsesReceiptPath(t *testing.T) {
 		t.Fatal("observed vector writer lost ReaderFrom")
 	}
 	n, err := readerFrom.ReadFrom(strings.NewReader("payload"))
-	if n != 7 || !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 || !receipt.incomplete.Load() || fs.EndReason(receipt.reason.Load()) != fs.EndReasonWriteError {
-		t.Fatalf("read-from n=%d known=%d reason=%d err=%v", n, receipt.down.Load(), receipt.reason.Load(), err)
+	if n != 7 || !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 {
+		t.Fatalf("read-from n=%d known=%d err=%v", n, receipt.down.Load(), err)
 	}
 }
 
@@ -194,8 +189,8 @@ func TestInspectionWriterDirectWriteUsesReceiptPath(t *testing.T) {
 				t.Fatal("observed writer lost io.Writer")
 			}
 			n, err := direct.Write([]byte("payload"))
-			if n != 2 || !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 2 || fs.EndReason(receipt.reason.Load()) != fs.EndReasonWriteError {
-				t.Fatalf("write n=%d known=%d reason=%d err=%v", n, receipt.down.Load(), receipt.reason.Load(), err)
+			if n != 2 || !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 2 {
+				t.Fatalf("write n=%d known=%d err=%v", n, receipt.down.Load(), err)
 			}
 		})
 	}
@@ -331,9 +326,6 @@ func TestInspectionBufferedWriterUnsupportedLowerIsUnchanged(t *testing.T) {
 	}
 	if got := buf.AttachWriterReceipt(writer, receipt); got != writer || buf.WriterReceipt(got) != nil {
 		t.Fatal("unsupported buffered writer acquired a false receipt")
-	}
-	if !receipt.incomplete.Load() {
-		t.Fatal("unsupported buffered writer did not report unavailable result")
 	}
 	if err := writer.SetBuffered(false); err != nil || lower.got != "header" {
 		t.Fatalf("unsupported writer state changed: %q %v", lower.got, err)
