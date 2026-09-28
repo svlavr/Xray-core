@@ -131,7 +131,7 @@ func TestSS2022MultiUserUDPIdentityHeader(t *testing.T) {
 	if err != nil || string(decoded.Payload) != "packet" {
 		t.Fatalf("body: %+v %v", decoded, err)
 	}
-	session := server.sessions.GetOrCreate(decoded.SessionID, decoded.SessionID)
+	session := server.sessions.GetOrCreate(decoded.SessionID)
 	userBlock, _ := method.NewBlock(user)
 	if err := session.EnsureServerState(method, userBlock, nil, user); err != nil {
 		t.Fatal(err)

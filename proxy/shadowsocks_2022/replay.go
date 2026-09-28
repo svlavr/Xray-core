@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/utils"
 )
 
@@ -74,11 +73,8 @@ func (f *SlidingWindow) CheckAndAdd(counter uint64) bool {
 
 type ServerUDPSession struct {
 	sync.Mutex
-	SessionID    uint64
 	RemoteCipher atomic.Pointer[cipher.AEAD]
 	Window       SlidingWindow
-	User         *protocol.MemoryUser
-	UserPSK      []byte
 	LastActive   atomic.Int64 // Unix timestamp in seconds
 
 	ServerSessionID   uint64
@@ -113,16 +109,14 @@ func NewUDPSessionManager[K comparable](timeout time.Duration) *UDPSessionManage
 	}
 }
 
-func (m *UDPSessionManager[K]) GetOrCreate(key K, sessionID uint64) *ServerUDPSession {
+func (m *UDPSessionManager[K]) GetOrCreate(key K) *ServerUDPSession {
 	now := time.Now().Unix()
 	if s, ok := m.sessions.Load(key); ok {
 		s.LastActive.Store(now)
 		return s
 	}
 
-	s := &ServerUDPSession{
-		SessionID: sessionID,
-	}
+	s := new(ServerUDPSession)
 	s.LastActive.Store(now)
 
 	actual, loaded := m.sessions.LoadOrStore(key, s)

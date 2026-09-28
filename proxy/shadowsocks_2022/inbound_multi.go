@@ -387,7 +387,7 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 				continue
 			}
 			association := multiUDPKey{sessionID: sessionID, user: currentUser}
-			sessionItem := i.udpSessions.GetOrCreate(association, sessionID)
+			sessionItem := i.udpSessions.GetOrCreate(association)
 			sessionItem.Lock()
 			if !sessionItem.Window.Check(packetID) {
 				sessionItem.Unlock()
@@ -560,7 +560,7 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 }
 
 func (i *MultiUserInbound) encodeServerUDPPacket(key multiUDPKey, userPSK []byte, userBlock cipher.Block, dest net.Destination, payload []byte) ([]byte, error) {
-	sessionItem := i.udpSessions.GetOrCreate(key, key.sessionID)
+	sessionItem := i.udpSessions.GetOrCreate(key)
 	if err := sessionItem.EnsureServerState(i.method, userBlock, nil, userPSK); err != nil {
 		return nil, err
 	}
