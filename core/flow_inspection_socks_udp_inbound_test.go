@@ -202,19 +202,21 @@ func TestFlowInspectionSOCKSUDPInboundRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	control, client, relay := inspectionSOCKSAssociation(t, address)
-	message, _ := socks.EncodeUDPPacket(&protocol.RequestHeader{Address: cnet.LocalHostIP, Port: 53}, []byte("rejected payload"))
+	payload := []byte("rejected payload")
+	message, _ := socks.EncodeUDPPacket(&protocol.RequestHeader{Address: cnet.LocalHostIP, Port: 53}, payload)
 	defer message.Release()
 	if _, err := client.WriteToUDP(message.Bytes(), relay); err != nil {
 		t.Fatal(err)
 	}
 	inspectionWait(t, func() bool {
-		live, _ := view.ReadLive()
-		return len(live.Rows) == 1 && live.Rows[0].Outbound.Serial == 0
+		live, err := view.ReadLive()
+		return err == nil && len(live.Rows) == 1 && live.Rows[0].Outbound.Serial == 0 &&
+			live.Rows[0].Uplink == uint64(len(payload)) && live.Rows[0].Downlink == 0
 	})
 	control.Close()
 	inspectionWait(t, func() bool {
 		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == uint64(len("rejected payload")) && page.Rows[0].Flow.Downlink == 0
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == uint64(len(payload)) && page.Rows[0].Flow.Downlink == 0
 	})
 }
 
@@ -224,15 +226,17 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, client, relay := inspectionSOCKSAssociation(t, address)
-	message, _ := socks.EncodeUDPPacket(&protocol.RequestHeader{Address: cnet.LocalHostIP, Port: 53}, []byte("rejected before exact stop"))
+	payload := []byte("rejected before exact stop")
+	message, _ := socks.EncodeUDPPacket(&protocol.RequestHeader{Address: cnet.LocalHostIP, Port: 53}, payload)
 	defer message.Release()
 	if _, err := client.WriteToUDP(message.Bytes(), relay); err != nil {
 		t.Fatal(err)
 	}
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
-		live, _ := view.ReadLive()
-		if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial != 0 {
+		live, err := view.ReadLive()
+		if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Serial != 0 ||
+			live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != 0 {
 			return false
 		}
 		ref = live.Rows[0].Ref
@@ -244,9 +248,7 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 	}
 	inspectionWait(t, func() bool {
 		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 {
-			return false
-		}
-		return true
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref &&
+			page.Rows[0].Flow.Uplink == uint64(len(payload)) && page.Rows[0].Flow.Downlink == 0
 	})
 }
