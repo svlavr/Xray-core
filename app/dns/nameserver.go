@@ -67,12 +67,12 @@ func newServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 			return NewLocalNameServer(), nil
 		case strings.EqualFold(u.Scheme, "https"): // DNS-over-HTTPS Remote mode
 			if dispatcher == nil {
-				return nil, &readyDependencyError{name: "dispatcher"}
+				return nil, errors.New("missing ready DNS dependency: dispatcher")
 			}
 			return NewDoHNameServer(u, dispatcher, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 		case strings.EqualFold(u.Scheme, "h2c"): // DNS-over-HTTPS h2c Remote mode
 			if dispatcher == nil {
-				return nil, &readyDependencyError{name: "dispatcher"}
+				return nil, errors.New("missing ready DNS dependency: dispatcher")
 			}
 			return NewDoHNameServer(u, dispatcher, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 		case strings.EqualFold(u.Scheme, "https+local"): // DNS-over-HTTPS Local mode
@@ -83,14 +83,14 @@ func newServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 			return NewQUICNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.Scheme, "tcp"): // DNS-over-TCP Remote mode
 			if dispatcher == nil {
-				return nil, &readyDependencyError{name: "dispatcher"}
+				return nil, errors.New("missing ready DNS dependency: dispatcher")
 			}
 			return NewTCPNameServer(u, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.Scheme, "tcp+local"): // DNS-over-TCP Local mode
 			return NewTCPLocalNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.String(), "fakedns"):
 			if fake == nil {
-				return nil, &readyDependencyError{name: "FakeDNS engine"}
+				return nil, errors.New("missing ready DNS dependency: FakeDNS engine")
 			}
 			return NewFakeDNSServer(fake), nil
 		}
@@ -100,7 +100,7 @@ func newServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 	}
 	if dest.Network == net.Network_UDP { // UDP classic DNS mode
 		if dispatcher == nil {
-			return nil, &readyDependencyError{name: "dispatcher"}
+			return nil, errors.New("missing ready DNS dependency: dispatcher")
 		}
 		return NewClassicNameServer(dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 	}

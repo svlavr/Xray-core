@@ -32,11 +32,11 @@ func inspectionOnlyMuxFlow(t *testing.T, view fs.FlowInspection, conn net.Conn, 
 			return false
 		}
 		r := live.Rows[0]
-		if r.InitialDestination != destination || r.SelectedRoute.Outbound.Tag != tag || r.SelectedRoute.Outbound.Serial == 0 || r.EffectiveDestination != destination || r.Origin != fs.TrafficOriginUser {
+		if r.InitialDestination != destination || r.Outbound.Tag != tag || r.Outbound.Serial == 0 || r.EffectiveDestination != destination || r.Origin != fs.TrafficOriginUser {
 			t.Fatalf("MUX logical owner: %+v", r)
 		}
 		ref = r.Ref
-		return r.Uplink.Known == uint64(len(payload)) && r.Downlink.Known == uint64(len(payload))
+		return r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload))
 	})
 	page, err := view.ReadTerminals()
 	if err != nil || len(page.Rows) != 0 {
@@ -50,8 +50,8 @@ func inspectionOnlyMuxFlow(t *testing.T, view fs.FlowInspection, conn net.Conn, 
 	totals, _ := view.ReadTotals()
 	var up, down uint64
 	for _, r := range totals.Rows {
-		up += r.Uplink.Known
-		down += r.Downlink.Known
+		up += r.Uplink
+		down += r.Downlink
 	}
 	if up != uint64(len(payload)) || down != up {
 		t.Fatalf("MUX framing/control counted: %d/%d", up, down)
@@ -108,9 +108,9 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 						return false
 					}
 					row = live.Rows[0]
-					return row.Uplink.Known == total && row.Downlink.Known == total
+					return row.Uplink == total && row.Downlink == total
 				})
-				if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "direct" || row.EffectiveDestination != destination {
+				if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "direct" || row.EffectiveDestination != destination {
 					t.Fatalf("server facts: %+v", row)
 				}
 				if i > 0 && row.Ref != retainedRef {
@@ -121,7 +121,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 				inspectionWait(t, func() bool {
 					live, _ := local.ReadLive()
 					for _, r := range live.Rows {
-						if r.Source.Port == cnet.Port(client.LocalAddr().(*net.UDPAddr).Port) && r.Uplink.Known == uint64(len(payload)) && r.Downlink.Known == uint64(len(payload)) {
+						if r.Source.Port == cnet.Port(client.LocalAddr().(*net.UDPAddr).Port) && r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload)) {
 							clientRef = r.Ref
 							return true
 						}
@@ -129,7 +129,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 					return false
 				})
 				out, err := local.CloseFlows(context.Background(), []fs.FlowRef{clientRef})
-				if err != nil || out[0].Code != fs.CloseCodeAccepted {
+				if err != nil || out[0].Err != nil {
 					t.Fatalf("client stop: %+v %v", out, err)
 				}
 				inspectionWait(t, func() bool { live, _ := local.ReadLive(); return len(live.Rows) == 0 })
@@ -137,7 +137,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 			}
 			if test.retained {
 				out, err := remote.CloseFlows(context.Background(), []fs.FlowRef{retainedRef})
-				if err != nil || out[0].Code != fs.CloseCodeAccepted {
+				if err != nil || out[0].Err != nil {
 					t.Fatalf("retained stop: %+v %v", out, err)
 				}
 			}

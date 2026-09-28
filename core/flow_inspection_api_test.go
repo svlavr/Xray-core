@@ -81,7 +81,7 @@ func TestFlowInspectionAPIDialTCPOrigins(t *testing.T) {
 				t.Fatal(err)
 			}
 			flow := inspectionAPITerminal(t, view).Flow
-			if flow.Kind != fs.FlowKindTCP || flow.Origin != origin || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) || flow.SelectedRoute.Outbound.Tag != "direct" || flow.SelectedRoute.Outbound.Serial == 0 {
+			if flow.Kind != net.Network_TCP || flow.Origin != origin || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 {
 				t.Fatalf("API TCP facts: %+v", flow)
 			}
 		})
@@ -110,7 +110,7 @@ func TestFlowInspectionAPIDialUDPStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Kind != fs.FlowKindUDPAssociation || flow.Origin != fs.TrafficOriginInternal || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) || flow.LatestDestination != destination {
+	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) || flow.LatestDestination != destination {
 		t.Fatalf("API UDP stream facts: %+v", flow)
 	}
 }
@@ -138,7 +138,7 @@ func TestFlowInspectionAPIDialUDPPacketConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Kind != fs.FlowKindUDPAssociation || flow.Origin != fs.TrafficOriginInternal || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(n) || flow.LatestDestination != destination || flow.SelectedRoute.Outbound.Tag != "direct" || flow.SelectedRoute.Outbound.Serial == 0 {
+	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.LatestDestination != destination || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 {
 		t.Fatalf("API PacketConn facts: %+v", flow)
 	}
 }
@@ -166,7 +166,7 @@ func TestFlowInspectionAPITaggedForcedHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Origin != fs.TrafficOriginControlledMeasurement || flow.SelectedRoute.Selection != fs.SelectionForced || flow.SelectedRoute.Outbound.Tag != "direct" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) {
+	if flow.Origin != fs.TrafficOriginControlledMeasurement || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) {
 		t.Fatalf("tagged API facts: %+v", flow)
 	}
 }
@@ -194,7 +194,7 @@ func TestFlowInspectionAPILoopbackContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := inspectionAPITerminal(t, view)
-	if page.Flow.Origin != fs.TrafficOriginUnknown || page.Flow.SelectedRoute.Outbound.Tag != "direct" || page.Flow.Uplink.Known != uint64(len(payload)) || page.Flow.Downlink.Known != uint64(len(payload)) {
+	if page.Flow.Origin != fs.TrafficOriginUnknown || page.Flow.Outbound.Tag != "direct" || page.Flow.Uplink != uint64(len(payload)) || page.Flow.Downlink != uint64(len(payload)) {
 		t.Fatalf("loopback API continuation: %+v", page)
 	}
 }
@@ -215,14 +215,14 @@ func TestFlowInspectionAPILocalStop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Outbound.Serial == 0 {
+		if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial == 0 {
 			return false
 		}
 		ref = live.Rows[0].Ref
 		return true
 	})
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("close API root: %+v %v", outcomes, err)
 	}
 	terminal := inspectionAPITerminal(t, view)
@@ -260,7 +260,7 @@ func TestFlowInspectionAPIExistingRootContinuation(t *testing.T) {
 	}
 	root.Finish()
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Ref != root.Ref() || flow.Origin != fs.TrafficOriginUser || flow.SelectedRoute.Outbound.Tag != "direct" || flow.Uplink.Known != 0 || flow.Downlink.Known != 0 {
+	if flow.Ref != root.Ref() || flow.Origin != fs.TrafficOriginUser || flow.Outbound.Tag != "direct" || flow.Uplink != 0 || flow.Downlink != 0 {
 		t.Fatalf("existing-root continuation: %+v", flow)
 	}
 }
@@ -316,7 +316,7 @@ func TestFlowInspectionAPIDialerProxyPhysicalContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Origin != fs.TrafficOriginUser || flow.SelectedRoute.Outbound.Tag != "direct" || flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(len(payload)) {
+	if flow.Origin != fs.TrafficOriginUser || flow.Outbound.Tag != "direct" || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) {
 		t.Fatalf("dialerProxy physical continuation: %+v", flow)
 	}
 	totals, err := view.ReadTotals()

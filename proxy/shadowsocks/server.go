@@ -194,7 +194,7 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			destination := request.Destination()
 			if flow == nil && store != nil {
 				var cancel context.CancelFunc
-				ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, conn, destination, stats.FlowKindUDPAssociation)
+				ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, conn, destination, net.Network_UDP)
 				if flow != nil {
 					udpServer.Observation = flow
 					defer cancel()
@@ -267,7 +267,7 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
-	ctx, observation, cleanup := proxy.BeginReturnedObservation(ctx, s.statsManager, conn, dest, stats.FlowKindTCP)
+	ctx, observation, cleanup := proxy.BeginReturnedObservation(ctx, s.statsManager, conn, dest, net.Network_TCP)
 	if cleanup != nil {
 		defer cleanup()
 	}

@@ -41,13 +41,13 @@ func inspectionPacketFlow(t *testing.T) (fs.Exchange, fs.FlowInspection) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { manager.Close() })
-	flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, func() error { return nil })
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, func() error { return nil })
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	return flow, view
 }
 
-func inspectionPacketFact(t *testing.T, view fs.FlowInspection) fs.ByteFact {
+func inspectionPacketFact(t *testing.T, view fs.FlowInspection) uint64 {
 	t.Helper()
 	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 {
@@ -78,7 +78,7 @@ func TestInspectionVLESSPacketPrefixResults(t *testing.T) {
 				known = 0
 				incomplete = true
 			}
-			if fact.Known != known {
+			if fact != known {
 				t.Fatalf("decoded operation result: %+v, want %d/%v", fact, known, incomplete)
 			}
 		})
@@ -95,7 +95,7 @@ func TestInspectionVLESSPacketDropsAndAttachment(t *testing.T) {
 		t.Fatal("disabled writer identity changed")
 	}
 	attached := native.WithWriterReceipt(flow)
-	if attached == native || buf.WriterReceipt(attached) != flow || inspectionPacketFact(t, view).Known != 0 {
+	if attached == native || buf.WriterReceipt(attached) != flow || inspectionPacketFact(t, view) != 0 {
 		t.Fatal("decoded packet owner was not attached")
 	}
 	other, otherView := inspectionPacketFlow(t)
@@ -112,7 +112,7 @@ func TestInspectionVLESSPacketDropsAndAttachment(t *testing.T) {
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("ok"))}); err != nil {
 		t.Fatal(err)
 	}
-	if fact := inspectionPacketFact(t, otherView); fact.Known != 2 {
+	if fact := inspectionPacketFact(t, otherView); fact != 2 {
 		t.Fatalf("drop/next packet: %+v", fact)
 	}
 	if output.Len() != 6 {
@@ -147,12 +147,12 @@ func TestInspectionVLESSPacketLateWriteAfterStop(t *testing.T) {
 		t.Fatal("write did not start")
 	}
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || out[0].Code != fs.CloseCodeAccepted {
+	if err != nil || out[0].Err != nil {
 		t.Fatalf("stop: %+v %v", out, err)
 	}
 	flow.Finish()
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("owner-end packet snapshot: %+v", page)
 	}
 	release.Do(func() { close(output.release) })
@@ -165,13 +165,13 @@ func TestInspectionVLESSPacketLateWriteAfterStop(t *testing.T) {
 		t.Fatal("late write did not finish")
 	}
 	page, _ = view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("late packet result: %+v", page)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
-		known += total.Downlink.Known
+		known += total.Downlink
 	}
 	if known != 4 {
 		t.Fatalf("late packet totals: %+v", totals)

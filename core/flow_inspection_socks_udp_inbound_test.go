@@ -114,16 +114,16 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 						selected = row
 					}
 				}
-				return selected.Uplink.Known == uint64(len(payload)+len(extra)) && selected.Downlink.Known == selected.Uplink.Known
+				return selected.Uplink == uint64(len(payload)+len(extra)) && selected.Downlink == selected.Uplink
 			})
 			// The association begins before the first datagram with unavailable
 			// peer and target. The first accepted packet fills the native peer;
 			// destinations and the consuming route arrive with actual rays.
-			if selected.Kind != fs.FlowKindUDPAssociation || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.InitialDestination.IsValid() || selected.SelectedRoute.Outbound.Tag != "direct" || selected.SelectedRoute.Outbound.Serial == 0 {
+			if selected.Kind != cnet.Network_UDP || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.InitialDestination.IsValid() || selected.Outbound.Tag != "direct" || selected.Outbound.Serial == 0 {
 				t.Fatalf("association facts: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || out[0].Code != fs.CloseCodeAccepted {
+			if err != nil || out[0].Err != nil {
 				t.Fatalf("exact association stop: %+v %v", out, err)
 			}
 			control.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -148,9 +148,9 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 			}
 			var up, down uint64
 			for _, row := range totals.Rows {
-				up += row.Uplink.Known
-				down += row.Downlink.Known
-				if row.Uplink.Known != 0 && (row.Outbound != selected.SelectedRoute.Outbound) {
+				up += row.Uplink
+				down += row.Downlink
+				if row.Uplink != 0 && (row.Outbound != selected.Outbound) {
 					t.Fatalf("association totals: %+v", row)
 				}
 			}
@@ -174,11 +174,11 @@ func TestFlowInspectionSOCKSUDPInboundPreFirstPayload(t *testing.T) {
 		association = live.Rows[0]
 		return association.Ref.ID != 0
 	})
-	if association.Kind != fs.FlowKindUDPAssociation || association.Origin != fs.TrafficOriginUser || association.Source.IsValid() || association.InitialDestination.IsValid() || association.Uplink.Known != 0 || association.Downlink.Known != 0 {
+	if association.Kind != cnet.Network_UDP || association.Origin != fs.TrafficOriginUser || association.Source.IsValid() || association.InitialDestination.IsValid() || association.Uplink != 0 || association.Downlink != 0 {
 		t.Fatalf("pre-first association: %+v", association)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{association.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("pre-first exact stop: %+v %v", outcomes, err)
 	}
 	control.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -209,12 +209,12 @@ func TestFlowInspectionSOCKSUDPInboundRejected(t *testing.T) {
 	}
 	inspectionWait(t, func() bool {
 		live, _ := view.ReadLive()
-		return len(live.Rows) == 1 && live.Rows[0].SelectedRoute.Selection == fs.SelectionRejected
+		return len(live.Rows) == 1 && live.Rows[0].Outbound.Serial == 0
 	})
 	control.Close()
 	inspectionWait(t, func() bool {
 		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink.Known == uint64(len("rejected payload")) && page.Rows[0].Flow.Downlink.Known == 0
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == uint64(len("rejected payload")) && page.Rows[0].Flow.Downlink == 0
 	})
 }
 
@@ -232,23 +232,20 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
 		live, _ := view.ReadLive()
-		if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Selection != fs.SelectionRejected {
+		if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial != 0 {
 			return false
 		}
 		ref = live.Rows[0].Ref
 		return true
 	})
 	result, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || result[0].Code != fs.CloseCodeAccepted {
+	if err != nil || result[0].Err != nil {
 		t.Fatalf("stop after ray rejection: %+v %v", result, err)
 	}
 	inspectionWait(t, func() bool {
 		page, _ := view.ReadTerminals()
 		if len(page.Rows) != 1 {
 			return false
-		}
-		if page.Rows[0].Flow.State != fs.FlowStateEnded {
-			t.Fatalf("earlier ray rejection defeated exact association stop: %+v", page.Rows[0])
 		}
 		return true
 	})

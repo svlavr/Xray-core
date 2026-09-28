@@ -34,8 +34,8 @@ func TestInspectionTrojanPacketWriteResults(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { manager.Close() })
-			flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+			flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 			flow.BindRoute()
 			calls := 0
 			writer := &PacketWriter{Target: net.UDPDestination(net.LocalHostIP, 53), Writer: inspectionPacketWrite(func(p []byte) (int, error) {
@@ -77,15 +77,15 @@ func TestInspectionTrojanPacketWriteResults(t *testing.T) {
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full-error":
-				if calls != 1 || fact.Known != 5 {
+				if calls != 1 || fact != 5 {
 					t.Fatalf("complete frame plus error: %+v", fact)
 				}
 			case "second-short-nil":
-				if calls != 2 || fact.Known != 5 {
+				if calls != 2 || fact != 5 {
 					t.Fatalf("completed frame before partial: %+v", fact)
 				}
 			default:
-				if calls != 0 || fact.Known != 0 {
+				if calls != 0 || fact != 0 {
 					t.Fatalf("encoding drop: %+v", fact)
 				}
 			}
@@ -159,13 +159,13 @@ func TestInspectionTrojanUDPLateRequestCompletion(t *testing.T) {
 		t.Fatalf("parent return fabricated completion: %+v %v", page, err)
 	}
 	live, err := view.ReadLive()
-	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len("admitted request")) {
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != uint64(len("admitted request")) {
 		t.Fatalf("late request lost admission: %+v %v", live, err)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
-		known += total.Uplink.Known
+		known += total.Uplink
 	}
 	if known != uint64(len("admitted request")) {
 		t.Fatalf("late request total: %+v", totals)
@@ -174,7 +174,7 @@ func TestInspectionTrojanUDPLateRequestCompletion(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		page, err = view.ReadTerminals()
-		if err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Uplink.Known == uint64(len("admitted request")) {
+		if err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == uint64(len("admitted request")) {
 			break
 		}
 		if time.Now().After(deadline) {

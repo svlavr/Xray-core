@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	cnet "github.com/xtls/xray-core/common/net"
 	fs "github.com/xtls/xray-core/features/stats"
 )
 
@@ -41,26 +42,26 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 			var first fs.FlowRecord
 			inspectionWait(t, func() bool {
 				live, _ := view.ReadLive()
-				if len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len(payload)) || live.Rows[0].Downlink.Known != uint64(len(payload)) {
+				if len(live.Rows) != 1 || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != uint64(len(payload)) {
 					return false
 				}
 				first = live.Rows[0]
 				return true
 			})
-			if first.Kind != fs.FlowKindUDPAssociation || first.Origin != fs.TrafficOriginUser || first.SelectedRoute.Outbound.Tag != "direct" || first.SelectedRoute.Outbound.Serial == 0 || first.InitialDestination != destination {
+			if first.Kind != cnet.Network_UDP || first.Origin != fs.TrafficOriginUser || first.Outbound.Tag != "direct" || first.Outbound.Serial == 0 || first.InitialDestination != destination {
 				t.Fatalf("supplied packet facts: %+v", first)
 			}
 			inspectionUDPExchange(t, sibling, address, payload, 0x19)
 			inspectionClosePacketCallback(t, view, first.Ref)
 			inspectionWait(t, func() bool {
 				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink.Known == uint64(len(payload))
+				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink == uint64(len(payload))
 			})
 			inspectionUDPExchange(t, sibling, address, extra, 0x19)
 			var other fs.FlowRef
 			inspectionWait(t, func() bool {
 				live, _ := view.ReadLive()
-				if len(live.Rows) != 1 || live.Rows[0].Downlink.Known != uint64(len(payload)+len(extra)) {
+				if len(live.Rows) != 1 || live.Rows[0].Downlink != uint64(len(payload)+len(extra)) {
 					return false
 				}
 				other = live.Rows[0].Ref
@@ -87,11 +88,11 @@ func TestFlowInspectionP2BHysteriaPacketDestinations(t *testing.T) {
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
 		live, _ := view.ReadLive()
-		if len(live.Rows) != 1 || live.Rows[0].Downlink.Known != uint64(len(payload)+len(extra)) {
+		if len(live.Rows) != 1 || live.Rows[0].Downlink != uint64(len(payload)+len(extra)) {
 			return false
 		}
 		row := live.Rows[0]
-		if row.InitialDestination != first || row.Uplink.Known != row.Downlink.Known {
+		if row.InitialDestination != first || row.Uplink != row.Downlink {
 			t.Fatalf("Hysteria packet destinations: %+v", row)
 		}
 		ref = row.Ref

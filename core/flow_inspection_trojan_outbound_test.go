@@ -76,14 +76,14 @@ func inspectionOutboundTotals(t *testing.T, view fs.FlowInspection, tag string, 
 		}
 		var up, down uint64
 		for _, row := range totals.Rows {
-			if row.Uplink.Known == 0 && row.Downlink.Known == 0 {
+			if row.Uplink == 0 && row.Downlink == 0 {
 				continue
 			}
 			if row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
 				t.Fatalf("outbound attribution: %+v", row)
 			}
-			up += row.Uplink.Known
-			down += row.Downlink.Known
+			up += row.Uplink
+			down += row.Downlink
 		}
 		if up == want && down == want {
 			return
@@ -126,10 +126,10 @@ func inspectionOutboundTCP(t *testing.T, config func(*testing.T) *core.OutboundH
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
+					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.SelectedRoute.Outbound.Tag != outbound.Tag || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
+					if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("outbound TCP live facts: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -139,7 +139,7 @@ func inspectionOutboundTCP(t *testing.T, config func(*testing.T) *core.OutboundH
 				return selected.ID != 0
 			})
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected})
-			if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(out) != 1 || out[0].Err != nil {
 				t.Fatalf("outbound exact stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
@@ -191,24 +191,24 @@ func inspectionOutboundUDP(t *testing.T, config func(*testing.T) *core.OutboundH
 			var selected fs.FlowRecord
 			inspectionWait(t, func() bool {
 				live, _ := view.ReadLive()
-				if len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len(payload)) || live.Rows[0].Downlink.Known != uint64(len(payload)) {
+				if len(live.Rows) != 1 || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != uint64(len(payload)) {
 					return false
 				}
 				selected = live.Rows[0]
 				return true
 			})
-			if selected.Kind != fs.FlowKindUDPAssociation || selected.InitialDestination != destination || selected.SelectedRoute.Outbound.Tag != outbound.Tag || selected.SelectedRoute.Outbound.Serial == 0 || selected.LatestDestination != destination {
+			if selected.Kind != cnet.Network_UDP || selected.InitialDestination != destination || selected.Outbound.Tag != outbound.Tag || selected.Outbound.Serial == 0 || selected.LatestDestination != destination {
 				t.Fatalf("outbound UDP live facts: %+v", selected)
 			}
 			if variant == "resolved" {
 				if !selected.EffectiveDestination.Address.Family().IsIP() || selected.EffectiveDestination.Port != destination.Port {
-					t.Fatalf("resolved target: %+v", selected.SelectedRoute)
+					t.Fatalf("resolved target: %+v", selected)
 				}
 			} else if selected.EffectiveDestination != destination {
-				t.Fatalf("physical server replaced logical target: %+v", selected.SelectedRoute)
+				t.Fatalf("physical server replaced logical target: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(out) != 1 || out[0].Err != nil {
 				t.Fatalf("outbound UDP stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
@@ -253,7 +253,7 @@ func inspectionOutboundPreparationFailure(t *testing.T, outbound *core.OutboundH
 			return false
 		}
 		row := page.Rows[0].Flow
-		if row.SelectedRoute.Outbound.Tag != outbound.Tag || row.SelectedRoute.Outbound.Serial == 0 || row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != 0 {
+		if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Uplink != uint64(len(payload)) || row.Downlink != 0 {
 			t.Fatalf("failed preparation lost sniff credit or invented payload: %+v", row)
 		}
 		return true

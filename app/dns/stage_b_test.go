@@ -19,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
@@ -150,6 +151,11 @@ func TestStageBExplicitEmptyAndNoCandidate(t *testing.T) {
 	before := calls.Load()
 	if result := ApplyConfig(context.Background(), client, &Config{}); result.Applied || result.Err == nil {
 		t.Fatalf("empty explicit apply: %+v", result)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if result := ApplyConfig(canceled, client, active); result.Applied || !go_errors.Is(result.Err, context.Canceled) {
+		t.Fatalf("canceled preparation changed publication: %+v", result)
 	}
 	stageBLookup(t, client, "active.test", net.IP{192, 0, 2, 40})
 	if calls.Load() != before+1 {
@@ -290,7 +296,7 @@ func stageBManualFeature(t *testing.T, server Server) *DNS {
 	option := featuredns.IPOption{IPv4Enable: true, IPv6Enable: true}
 	resolver := &DNS{hosts: hosts, ipOption: &option, ctx: context.Background(), clients: []*Client{{server: server, ipOption: &option, timeoutMs: time.Second}}}
 	feature := &DNS{ctx: context.Background()}
-	feature.initRuntime(nil, nil, resolver)
+	feature.initRuntime(resolver)
 	return feature
 }
 
@@ -336,6 +342,7 @@ func TestStageBTimedCleanupKeepsBoundedOwner(t *testing.T) {
 	block := make(chan struct{})
 	old := &stageBBlockingServer{started: make(chan struct{}), closeBlock: block}
 	feature := stageBManualFeature(t, old)
+	feature.runtime.current.resolver.clients[0].tag = "old"
 	t.Cleanup(func() {
 		select {
 		case <-block:
@@ -351,6 +358,10 @@ func TestStageBTimedCleanupKeepsBoundedOwner(t *testing.T) {
 	result := ApplyConfig(ctx, feature, cfg)
 	if !result.Applied || !go_errors.Is(result.Err, context.DeadlineExceeded) {
 		t.Fatalf("timed publication: %+v", result)
+	}
+	if !feature.IsOwnLink(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "old"})) ||
+		!feature.IsOwnLink(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "new"})) {
+		t.Fatal("published and closing resolver tags must both be recognized")
 	}
 	stageBLookup(t, feature, "new.test", net.IP{192, 0, 2, 71})
 	if next := ApplyConfig(context.Background(), feature, cfg); next.Applied || next.Err == nil {
@@ -369,6 +380,9 @@ func TestStageBTimedCleanupKeepsBoundedOwner(t *testing.T) {
 			t.Fatal("closing owner did not finish")
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if feature.IsOwnLink(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "old"})) {
+		t.Fatal("closed resolver tag remained active")
 	}
 }
 
@@ -623,23 +637,21 @@ func TestStageBDNSNoInternalRowsOffOn(t *testing.T) {
 	}
 }
 
-func TestStageBDNSOwnerLoopMarker(t *testing.T) {
-	client, err := New(context.Background(), &Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := featuredns.ContextWithOwner(context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance)), client.runtime.contextOwner)
+func TestStageBNativeOwnLinkTag(t *testing.T) {
+	client := stageBManualFeature(t, &stageBBlockingServer{started: make(chan struct{})})
+	client.runtime.current.resolver.clients[0].tag = "resolver"
+	ctx := session.ContextWithInbound(context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance)), &session.Inbound{Tag: "resolver"})
 	if !client.IsOwnLink(ctx) || !client.IsOwnLink(toDnsContext(ctx, "resolver.test")) {
-		t.Fatal("own routed DNS marker lost")
+		t.Fatal("native resolver tag lost from routed DNS context")
 	}
-	if client.IsOwnLink(featuredns.ContextWithOwner(ctx, featuredns.NewContextOwner())) {
-		t.Fatal("foreign resolver marker accepted")
+	if client.IsOwnLink(session.ContextWithInbound(ctx, &session.Inbound{Tag: "foreign"})) || client.IsOwnLink(context.Background()) {
+		t.Fatal("foreign or missing inbound tag accepted")
 	}
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if client.IsOwnLink(ctx) {
-		t.Fatal("closed resolver marker remained active")
+		t.Fatal("closed resolver tag remained active")
 	}
 }
 func (s *silentCachedServer) Close() error { return s.cache.Close() }

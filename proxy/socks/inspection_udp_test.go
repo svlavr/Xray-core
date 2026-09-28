@@ -32,8 +32,8 @@ func TestSOCKSUDPResponseReceipts(t *testing.T) {
 			manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
 			view, _ := manager.EnableInspection(fs.ObservationOptions{})
 			defer manager.Close()
-			flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}})
+			flow := manager.Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Serial: 1})
 			flow.BindRoute()
 			ctx := session.ContextWithLogicalObservation(context.Background(), &session.LogicalObservation{Exchange: flow})
 			request := &protocol.RequestHeader{Address: cnet.LocalHostIP, Port: 53}
@@ -77,15 +77,15 @@ func TestSOCKSUDPResponseReceipts(t *testing.T) {
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full", "full-error":
-				if fact.Known != want {
+				if fact != want {
 					t.Fatalf("full datagram receipt: %+v", fact)
 				}
 			case "partial-error":
-				if fact.Known != 0 {
+				if fact != 0 {
 					t.Fatalf("partial datagram receipt: %+v", fact)
 				}
 			default:
-				if fact.Known != 0 {
+				if fact != 0 {
 					t.Fatalf("drop receipt: %+v", fact)
 				}
 			}

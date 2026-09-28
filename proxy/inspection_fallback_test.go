@@ -58,7 +58,7 @@ func TestObserveFallbackRetainsInputAndUnknownRoute(t *testing.T) {
 	}
 	configured := cnet.TCPDestination(cnet.DomainAddress("configured.invalid"), 8443)
 	row := live.Rows[0]
-	if row.InitialDestination != configured || row.SelectedRoute.Selection != fs.SelectionUnknown || row.SelectedRoute.Outbound.Serial != 0 || row.SelectedRoute.SelectedTarget != configured || row.EffectiveDestination != effective || row.Uplink.Known != 9 {
+	if row.InitialDestination != configured || row.Outbound.Serial != 0 || row.EffectiveDestination != effective || row.Uplink != 9 {
 		t.Fatalf("fallback facts: %+v", row)
 	}
 }
@@ -82,7 +82,7 @@ func TestObserveFallbackMalformedTargetIsUnknown(t *testing.T) {
 		t.Fatalf("live fallback: %+v %v", live, err)
 	}
 	row := live.Rows[0]
-	if row.InitialDestination.IsValid() || row.SelectedRoute.SelectedTarget.IsValid() || row.EffectiveDestination.IsValid() {
+	if row.InitialDestination.IsValid() || row.EffectiveDestination.IsValid() {
 		t.Fatalf("malformed fallback fabricated a target: %+v", row)
 	}
 }

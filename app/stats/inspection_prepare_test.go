@@ -13,7 +13,7 @@ func TestInspectionPreparedCarrierNeverRegisters(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1})
 	flow := s.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.TCPDestination(xnet.DomainAddress(strings.Repeat("x", 500)), 80), nil)
 	flow.AddUplink(17)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}})
+	flow.Route(fs.OutboundRef{Serial: 1})
 	if flow.Ref() != (fs.FlowRef{}) {
 		t.Fatal("prepared endpoint is addressable")
 	}
@@ -33,11 +33,11 @@ func TestInspectionPreparedCarrierNeverRegisters(t *testing.T) {
 		t.Fatalf("carrier published state: %+v %+v", live, page)
 	}
 	for _, row := range totals.Rows {
-		if row.Uplink.Known != 0 || row.Downlink.Known != 0 {
+		if row.Uplink != 0 || row.Downlink != 0 {
 			t.Fatalf("carrier totals: %+v", row)
 		}
 	}
-	logical := s.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+	logical := s.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	if logical.Ref().ID != 1 {
 		t.Fatal("carrier consumed logical ID/capacity")
 	}
@@ -48,15 +48,15 @@ func TestInspectionPreparedLogicalBindingAndFailure(t *testing.T) {
 	for _, failed := range []bool{false, true} {
 		s := testInspectionStore(t, fs.ObservationOptions{})
 		flow := s.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
-		opened := flow.snapshot().Opened
+		opened := flow.record.Opened
 		flow.AddUplink(11)
-		flow.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: 1, Tag: "forward"}})
+		flow.Route(fs.OutboundRef{Serial: 1, Tag: "forward"})
 		live, _ := s.ReadLive()
 		if len(live.Rows) != 0 {
 			t.Fatal("forwarding selection published endpoint")
 		}
 		if !failed {
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 2, Tag: "consume"}})
+			flow.Route(fs.OutboundRef{Serial: 2, Tag: "consume"})
 			var wg sync.WaitGroup
 			for range 8 {
 				wg.Add(1)
@@ -77,7 +77,7 @@ func TestInspectionPreparedLogicalBindingAndFailure(t *testing.T) {
 		if failed {
 			want = 11
 		}
-		if len(page.Rows) != 1 || page.Rows[0].Flow.Opened != opened || page.Rows[0].Flow.Uplink.Known != want {
+		if len(page.Rows) != 1 || page.Rows[0].Flow.Opened != opened || page.Rows[0].Flow.Uplink != want {
 			t.Fatalf("early facts lost: %+v", page)
 		}
 	}
@@ -86,7 +86,7 @@ func TestInspectionPreparedLogicalBindingAndFailure(t *testing.T) {
 func TestInspectionPreparedCapacityIsCheckedAtBinding(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1})
 	a := s.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-	b := s.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+	b := s.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	a.AddUplink(5)
 	a.BindRoute()
 	a.BindRoute()
@@ -96,7 +96,7 @@ func TestInspectionPreparedCapacityIsCheckedAtBinding(t *testing.T) {
 	a.Finish()
 	b.Finish()
 	totals, _ := s.ReadTotals()
-	if findTotal(t, totals.Rows, 0, fs.TrafficOriginUser).Uplink.Known != 5 {
+	if findTotal(t, totals.Rows, 0, fs.TrafficOriginUser).Uplink != 5 {
 		t.Fatal("overflow lost actual payload")
 	}
 }

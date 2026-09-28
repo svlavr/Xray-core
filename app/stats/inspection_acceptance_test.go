@@ -3,7 +3,6 @@ package stats
 import (
 	"context"
 	"fmt"
-	"math"
 	"runtime"
 	"strings"
 	"sync"
@@ -28,8 +27,8 @@ func acceptanceOwnedExchange(store *inspectionStore, carrier bool) (fs.Exchange,
 	if carrier {
 		return store.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, stop), ref
 	}
-	exchange := store.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, stop)
-	exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1, Tag: "direct"}})
+	exchange := store.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, stop)
+	exchange.Route(fs.OutboundRef{Serial: 1, Tag: "direct"})
 	exchange.BindRoute()
 	return exchange, ref
 }
@@ -58,11 +57,11 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if row := findTotal(t, totals.Rows, 1, fs.TrafficOriginUser); row.Downlink.Known != 8 {
+		if row := findTotal(t, totals.Rows, 1, fs.TrafficOriginUser); row.Downlink != 8 {
 			t.Fatalf("late total: %+v", row)
 		}
 		terminal, err := store.ReadTerminals()
-		if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Downlink.Known != 3 {
+		if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Downlink != 3 {
 			t.Fatalf("terminal changed: %+v %v", terminal, err)
 		}
 		runtime.KeepAlive(exchange)
@@ -93,13 +92,13 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 	t.Run("leg-end-keeps-root-stop", func(t *testing.T) {
 		store := testInspectionStore(t, fs.ObservationOptions{})
 		var stopped atomic.Int32
-		root := store.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { stopped.Add(1); return nil })
+		root := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { stopped.Add(1); return nil })
 		leg := root.NewLeg()
-		leg.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}})
+		leg.Route(fs.OutboundRef{Serial: 1})
 		leg.BindRoute()
 		leg.Finish()
 		outcomes, err := store.CloseFlows(context.Background(), []fs.FlowRef{root.Ref()})
-		if err != nil || outcomes[0].Code != fs.CloseCodeAccepted || stopped.Load() != 1 {
+		if err != nil || outcomes[0].Err != nil || stopped.Load() != 1 {
 			t.Fatalf("leg ending removed root stop: %+v %v", outcomes, err)
 		}
 	})
@@ -108,8 +107,8 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 	store := testInspectionStore(t, fs.ObservationOptions{MaxTerminals: 2})
 	add := func(n int) {
-		e := store.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-		e.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}, RuleTag: "original"})
+		e := store.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+		e.Route(fs.OutboundRef{Serial: 1, Tag: "original"})
 		e.BindRoute()
 		e.AddUplink(uint64(n))
 		e.Finish()
@@ -132,10 +131,10 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 					return
 				}
 				for j := range page.Rows {
-					if page.Rows[j].Flow.SelectedRoute.RuleTag != "original" {
+					if page.Rows[j].Flow.Outbound.Tag != "original" {
 						t.Error("another reader mutated store")
 					}
-					page.Rows[j].Flow.SelectedRoute.RuleTag = "reader mutation"
+					page.Rows[j].Flow.Outbound.Tag = "reader mutation"
 				}
 				_, _ = store.ReadLive()
 				_, _ = store.ReadTotals()
@@ -146,7 +145,7 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 		add(i)
 	}
 	wg.Wait()
-	if len(slow.Rows) != 1 || slow.Rows[0].Flow.Ref != savedRef || slow.Rows[0].Flow.Uplink.Known != 1 || slow.Rows[0].Flow.SelectedRoute.RuleTag != "original" {
+	if len(slow.Rows) != 1 || slow.Rows[0].Flow.Ref != savedRef || slow.Rows[0].Flow.Uplink != 1 || slow.Rows[0].Flow.Outbound.Tag != "original" {
 		t.Fatal("retained reader snapshot changed")
 	}
 	fresh, err := store.ReadTerminals()
@@ -154,33 +153,8 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 		t.Fatalf("fresh bounded view: %+v %v", fresh, err)
 	}
 	outcomes, err := store.CloseFlows(context.Background(), []fs.FlowRef{savedRef, fresh.Rows[0].Flow.Ref})
-	if err != nil || outcomes[0].Code != fs.CloseCodeNoAction || outcomes[1].Code != fs.CloseCodeNoAction {
+	if err != nil || outcomes[0].Err != nil || outcomes[1].Err != nil {
 		t.Fatalf("retention close outcomes: %+v %v", outcomes, err)
-	}
-}
-
-func TestInspectionAcceptanceExhaustionPreservesTotals(t *testing.T) {
-	store := testInspectionStore(t, fs.ObservationOptions{})
-	store.nextID = math.MaxUint64
-	for i := 0; i < 2; i++ {
-		e := store.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-		if e == nil || e.Ref() != (fs.FlowRef{}) {
-			t.Fatal("exhaustion wrapped or rejected native receipt")
-		}
-		e.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}})
-		e.BindRoute()
-		e.AddUplink(7)
-		e.Finish()
-	}
-	totals, err := store.ReadTotals()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if store.nextID != math.MaxUint64 {
-		t.Fatalf("exhaustion wrapped ID: %d", store.nextID)
-	}
-	if row := findTotal(t, totals.Rows, 1, fs.TrafficOriginUser); row.Uplink.Known != 14 {
-		t.Fatalf("exhaustion lost native byte facts: %+v", row)
 	}
 }
 
@@ -189,12 +163,12 @@ func TestInspectionAcceptanceStopRequestedIsVisible(t *testing.T) {
 	entered, proceed := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(proceed) })
-	e := store.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { close(entered); <-proceed; return nil })
+	e := store.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { close(entered); <-proceed; return nil })
 	done := make(chan struct{})
 	go func() { defer close(done); _, _ = store.CloseFlows(context.Background(), []fs.FlowRef{e.Ref()}) }()
 	<-entered
 	live, err := store.ReadLive()
-	if err != nil || len(live.Rows) != 1 || live.Rows[0].State != fs.FlowStateStopRequested {
+	if err != nil || len(live.Rows) != 1 || e.NewLeg() != nil {
 		t.Errorf("stop in progress: %+v %v", live, err)
 	}
 	once.Do(func() { close(proceed) })
@@ -203,11 +177,11 @@ func TestInspectionAcceptanceStopRequestedIsVisible(t *testing.T) {
 
 func acceptanceFillMetadata(store *inspectionStore, serial uint64, index int) *inspectionExchange {
 	domain := func(label string) xnet.Destination {
-		return xnet.UDPDestination(xnet.DomainAddress(fmt.Sprintf("%08d-%s-", index, label)+strings.Repeat("d", maxMetadataString)), 53)
+		return xnet.UDPDestination(xnet.DomainAddress(fmt.Sprintf("%08d-%s-", index, label)+strings.Repeat("d", 300)), 53)
 	}
-	e := store.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, domain("source"), domain("initial"), nil).(*inspectionExchange)
+	e := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, domain("source"), domain("initial"), nil).(*inspectionExchange)
 	for i := 0; i < 4; i++ {
-		e.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: serial, Tag: strings.Repeat("t", maxMetadataString)}, RuleTag: strings.Repeat("r", maxMetadataString), SelectedTarget: domain("selected")})
+		e.Route(fs.OutboundRef{Serial: serial, Tag: strings.Repeat("t", 300)})
 		e.Effective(domain("effective"))
 	}
 	e.BindRoute()
@@ -228,7 +202,7 @@ func TestInspectionAcceptanceDefaultCapRetainedHeap(t *testing.T) {
 	}
 	for i := 0; i < int(store.limits.MaxTerminals); i++ {
 		e := acceptanceFillMetadata(store, uint64(i+1), i)
-		if len(e.record.SelectedRoute.Outbound.Tag) != maxMetadataString || !e.record.LatestDestination.IsValid() {
+		if len(e.record.Outbound.Tag) != 300 || !e.record.LatestDestination.IsValid() {
 			t.Fatalf("latest bounded metadata missing: %+v", e.record)
 		}
 		e.Finish()

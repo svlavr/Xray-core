@@ -40,7 +40,7 @@ func TestFlowInspectionTrojanInboundRejected(t *testing.T) {
 			return false
 		}
 		row := page.Rows[0]
-		if row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.SelectedRoute.Outbound.Serial != 0 {
+		if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Serial != 0 {
 			t.Fatalf("Trojan rejected receipt: %+v", row)
 		}
 		return true
@@ -68,10 +68,10 @@ func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
 	client.Close()
 	inspectionWait(t, func() bool {
 		page, err := view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) {
+		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(payload)) {
 			return false
 		}
-		if page.Rows[0].Flow.SelectedRoute.Outbound.Tag != "unclaimed" || page.Rows[0].Flow.SelectedRoute.Outbound.Serial == 0 {
+		if page.Rows[0].Flow.Outbound.Tag != "unclaimed" || page.Rows[0].Flow.Outbound.Serial == 0 {
 			t.Fatalf("Trojan unclaimed route: %+v", page.Rows[0].Flow)
 		}
 		return true
@@ -87,7 +87,7 @@ func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
 			t.Fatalf("Trojan unclaimed owner acquired an outbound: %+v", row)
 		}
 		if row.Origin == fs.TrafficOriginUser {
-			known += row.Uplink.Known
+			known += row.Uplink
 		}
 	}
 	if known != uint64(len(payload)) {

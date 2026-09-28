@@ -91,7 +91,7 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	root := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+	root := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
 	dispatcherFeature := instance.GetFeature(routing.DispatcherType()).(routing.Dispatcher)
 	responses := make(chan string, 1)
 	callback := func(ctx context.Context, packet *protocoludp.Packet) {
@@ -126,7 +126,7 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	portalRay.Dispatch(context.Background(), portalDestination, buf.FromBytes([]byte(portalPayload)))
 	inspectionWait(t, func() bool {
 		live, readErr := view.ReadLive()
-		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink.Known == uint64(len(dataPayload)+len(portalPayload))
+		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink == uint64(len(dataPayload)+len(portalPayload))
 	})
 	portalRay.RemoveRay()
 	root.Finish()
@@ -140,7 +140,7 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := page.Rows[0].Flow
-	if flow.Uplink.Known != uint64(len(dataPayload)+len(portalPayload)) || flow.Downlink.Known != uint64(len(dataPayload)) || flow.LatestDestination != portalDestination || flow.SelectedRoute.Outbound.Tag != "portal" {
+	if flow.Uplink != uint64(len(dataPayload)+len(portalPayload)) || flow.Downlink != uint64(len(dataPayload)) || flow.LatestDestination != portalDestination || flow.Outbound.Tag != "portal" {
 		t.Fatalf("mixed association facts: %+v", page.Rows[0])
 	}
 	totals, err := view.ReadTotals()
@@ -149,8 +149,8 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	}
 	var up, down uint64
 	for _, total := range totals.Rows {
-		up += total.Uplink.Known
-		down += total.Downlink.Known
+		up += total.Uplink
+		down += total.Downlink
 	}
 	if up != uint64(len(dataPayload)+len(portalPayload)) || down != uint64(len(dataPayload)) {
 		t.Fatalf("mixed association totals: %d/%d", up, down)
@@ -158,20 +158,20 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 
 	// A packet-started association whose only ray targets the Portal domain
 	// is still logical UDP data. It must not disappear as a physical carrier.
-	onlyRoot := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+	onlyRoot := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
 	onlyRay := internetudp.NewDispatcher(dispatcherFeature, func(_ context.Context, packet *protocoludp.Packet) { packet.Payload.Release() })
 	onlyRay.Observation = onlyRoot
 	onlyPayload := "only Portal UDP child"
 	onlyRay.Dispatch(context.Background(), portalDestination, buf.FromBytes([]byte(onlyPayload)))
 	inspectionWait(t, func() bool {
 		live, readErr := view.ReadLive()
-		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink.Known == uint64(len(onlyPayload)) && live.Rows[0].SelectedRoute.Outbound.Tag == "portal"
+		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink == uint64(len(onlyPayload)) && live.Rows[0].Outbound.Tag == "portal"
 	})
 	onlyRay.RemoveRay()
 	onlyRoot.Finish()
 	inspectionWait(t, func() bool {
 		page, readErr := view.ReadTerminals()
-		return readErr == nil && len(page.Rows) == 2 && page.Rows[1].Flow.Uplink.Known == uint64(len(onlyPayload)) && page.Rows[1].Flow.SelectedRoute.Outbound.Tag == "portal"
+		return readErr == nil && len(page.Rows) == 2 && page.Rows[1].Flow.Uplink == uint64(len(onlyPayload)) && page.Rows[1].Flow.Outbound.Tag == "portal"
 	})
 }
 
@@ -185,7 +185,7 @@ func TestFlowInspectionP2GUDPCustomHandlerReturnStaysPending(t *testing.T) {
 	if err := instance.GetFeature(routing.RouterType()).(routing.Router).AddRule(serial.ToTypedMessage(&router.Config{Rule: []*router.RoutingRule{{Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: "no-claim"}}}}), true); err != nil {
 		t.Fatal(err)
 	}
-	root := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+	root := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
 	ray := internetudp.NewDispatcher(instance.GetFeature(routing.DispatcherType()).(routing.Dispatcher), func(_ context.Context, packet *protocoludp.Packet) {
 		packet.Payload.Release()
 		t.Error("non-consuming handler returned a packet")
@@ -205,7 +205,7 @@ func TestFlowInspectionP2GUDPCustomHandlerReturnStaysPending(t *testing.T) {
 		t.Fatalf("unclaimed terminal: %+v %v", page, err)
 	}
 	flow := page.Rows[0].Flow
-	if flow.SelectedRoute.Outbound.Tag != "no-claim" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(payload)) {
+	if flow.Outbound.Tag != "no-claim" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(payload)) {
 		t.Fatalf("custom pending facts: %+v", page.Rows[0])
 	}
 	totals, err := view.ReadTotals()
@@ -213,7 +213,7 @@ func TestFlowInspectionP2GUDPCustomHandlerReturnStaysPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, total := range totals.Rows {
-		if total.Uplink.Known != 0 || total.Downlink.Known != 0 {
+		if total.Uplink != 0 || total.Downlink != 0 {
 			t.Fatalf("custom handler return settled pending credit: %+v", total)
 		}
 	}
@@ -235,7 +235,7 @@ func TestFlowInspectionP2GNativeHandlerReturnSettlesNoClaim(t *testing.T) {
 	if err := instance.GetFeature(routing.RouterType()).(routing.Router).AddRule(serial.ToTypedMessage(&router.Config{Rule: []*router.RoutingRule{{Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: "native-no-claim"}}}}), true); err != nil {
 		t.Fatal(err)
 	}
-	root := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+	root := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
 	ray := internetudp.NewDispatcher(instance.GetFeature(routing.DispatcherType()).(routing.Dispatcher), func(_ context.Context, packet *protocoludp.Packet) {
 		packet.Payload.Release()
 		t.Error("rejected native handler returned a packet")
@@ -250,7 +250,7 @@ func TestFlowInspectionP2GNativeHandlerReturnSettlesNoClaim(t *testing.T) {
 		}
 		for _, total := range totals.Rows {
 			if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 {
-				return total.Uplink.Known == uint64(len(payload))
+				return total.Uplink == uint64(len(payload))
 			}
 		}
 		return false
@@ -262,7 +262,7 @@ func TestFlowInspectionP2GNativeHandlerReturnSettlesNoClaim(t *testing.T) {
 		t.Fatalf("native no-claim terminal: %+v %v", page, err)
 	}
 	flow := page.Rows[0].Flow
-	if flow.SelectedRoute.Outbound.Tag != "native-no-claim" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(payload)) {
+	if flow.Outbound.Tag != "native-no-claim" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(payload)) {
 		t.Fatalf("native no-claim facts: %+v", page.Rows[0])
 	}
 }

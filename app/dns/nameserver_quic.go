@@ -373,26 +373,20 @@ func (s *QUICNameServer) Close() error {
 	}
 	var errs []error
 	if conn != nil {
-		if err := conn.CloseWithError(0, "DNS resolver closed"); err != nil {
-			errs = append(errs, err)
-		} else {
-			s.Lock()
-			if s.connection == conn {
-				s.connection = nil
-			}
-			s.Unlock()
+		_ = conn.CloseWithError(0, "DNS resolver closed")
+		s.Lock()
+		if s.connection == conn {
+			s.connection = nil
 		}
+		s.Unlock()
 	}
 	if transport != nil {
-		if err := transport.Close(); err != nil {
-			errs = append(errs, err)
-		} else {
-			s.Lock()
-			if s.transport == transport {
-				s.transport = nil
-			}
-			s.Unlock()
+		_ = transport.Close()
+		s.Lock()
+		if s.transport == transport {
+			s.transport = nil
 		}
+		s.Unlock()
 	}
 	if packetConn != nil {
 		if err := packetConn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {

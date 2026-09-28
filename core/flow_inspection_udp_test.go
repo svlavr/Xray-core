@@ -139,10 +139,10 @@ func inspectionUDPRow(t *testing.T, view fs.FlowInspection, source cnet.Port, de
 			if row.Source.Port != source {
 				continue
 			}
-			if row.Uplink.Known != uplink || row.Downlink.Known != downlink {
+			if row.Uplink != uplink || row.Downlink != downlink {
 				return false
 			}
-			if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.InitialDestination != destination || row.SelectedRoute.Outbound.Serial == 0 || row.SelectedRoute.Outbound.Tag != "direct" || row.LatestDestination != destination {
+			if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != destination || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" || row.LatestDestination != destination {
 				t.Fatalf("UDP logical facts: %+v", row)
 			}
 			found = row
@@ -172,7 +172,7 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 		t.Fatalf("effective target: got %v want %v", selected.EffectiveDestination, destination)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("exact UDP stop: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {
@@ -182,9 +182,6 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 		}
 		for _, row := range page.Rows {
 			if row.Flow.Ref == selected.Ref {
-				if row.Flow.State != fs.FlowStateEnded {
-					t.Fatalf("stopped UDP did not end: %+v", row)
-				}
 				return true
 			}
 		}
@@ -198,7 +195,7 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 		t.Fatal("same-source datagram reused the stopped association")
 	}
 	outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeNoAction {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("stale ref affected replacement: %+v %v", outcomes, err)
 	}
 	siblingExtra := []byte("sibling after exact stop")
@@ -211,7 +208,7 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 	}
 	refs := []fs.FlowRef{live.Rows[0].Ref, live.Rows[1].Ref}
 	outcomes, err = view.CloseFlows(context.Background(), refs)
-	if err != nil || len(outcomes) != 2 || outcomes[0].Code != fs.CloseCodeAccepted || outcomes[1].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 2 || outcomes[0].Err != nil || outcomes[1].Err != nil {
 		t.Fatalf("cleanup UDP associations: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {
@@ -232,10 +229,10 @@ func TestFlowInspectionSuppliedUDPResolvedTarget(t *testing.T) {
 	inspectionUDPExchange(t, client, inbound, payload, mask)
 	row := inspectionUDPRow(t, view, cnet.Port(client.LocalAddr().(*net.UDPAddr).Port), requested, uint64(len(payload)), uint64(len(payload)))
 	if !row.EffectiveDestination.Address.Family().IsIP() || row.EffectiveDestination.Port != requested.Port {
-		t.Fatalf("resolved effective target: %+v", row.SelectedRoute)
+		t.Fatalf("resolved effective target: %+v", row)
 	}
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(out) != 1 || out[0].Err != nil {
 		t.Fatalf("close resolved association: %+v %v", out, err)
 	}
 }
@@ -316,9 +313,9 @@ func inspectionUDPBatchThrough(t *testing.T, instance *core.Instance, view fs.Fl
 			return false
 		}
 		row = live.Rows[0]
-		return row.Uplink.Known == uint64(len(got)) && row.Downlink.Known == uint64(len(got))
+		return row.Uplink == uint64(len(got)) && row.Downlink == uint64(len(got))
 	})
-	if row.Kind != fs.FlowKindUDPAssociation || row.InitialDestination != destinations[0] || row.LatestDestination != destinations[1] || row.SelectedRoute.Outbound.Tag != outboundTag {
+	if row.Kind != cnet.Network_UDP || row.InitialDestination != destinations[0] || row.LatestDestination != destinations[1] || row.Outbound.Tag != outboundTag {
 		t.Fatalf("batch association facts: %+v", row)
 	}
 	totals, err := view.ReadTotals()
@@ -327,19 +324,19 @@ func inspectionUDPBatchThrough(t *testing.T, instance *core.Instance, view fs.Fl
 	}
 	var up, down uint64
 	for _, total := range totals.Rows {
-		if total.Uplink.Known != 0 || total.Downlink.Known != 0 {
+		if total.Uplink != 0 || total.Downlink != 0 {
 			if total.Outbound.Tag != outboundTag || total.Outbound.Serial == 0 || total.Origin != fs.TrafficOriginUser {
 				t.Fatalf("batch total attribution: %+v", total)
 			}
-			up += total.Uplink.Known
-			down += total.Downlink.Known
+			up += total.Uplink
+			down += total.Downlink
 		}
 	}
 	if up != uint64(len(got)) || down != uint64(len(got)) {
 		t.Fatalf("batch totals: %d/%d want %d", up, down, len(got))
 	}
 	results, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || len(results) != 1 || results[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(results) != 1 || results[0].Err != nil {
 		t.Fatalf("batch close: %+v %v", results, err)
 	}
 	select {
@@ -352,6 +349,6 @@ func inspectionUDPBatchThrough(t *testing.T, instance *core.Instance, view fs.Fl
 	}
 	inspectionWait(t, func() bool {
 		page, err := view.ReadTerminals()
-		return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Uplink.Known == uint64(len(got)) && page.Rows[0].Flow.Downlink.Known == uint64(len(got))
+		return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == uint64(len(got)) && page.Rows[0].Flow.Downlink == uint64(len(got))
 	})
 }

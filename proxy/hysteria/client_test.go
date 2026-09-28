@@ -130,8 +130,8 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { manager.Close() })
-			flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+			flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 			flow.BindRoute()
 			failure := errors.New("packet result failure")
 			calls := 0
@@ -189,15 +189,15 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full", "full-error", "fragments", "last-fragment-full-error":
-				if fact.Known != 512 {
+				if fact != 512 {
 					t.Fatalf("complete packet result: %+v", fact)
 				}
 			case "short-nil", "middle-fragment-error":
-				if fact.Known != 0 {
+				if fact != 0 {
 					t.Fatalf("partial packet result: %+v", fact)
 				}
 			default:
-				if fact.Known != 0 {
+				if fact != 0 {
 					t.Fatalf("no accepted packet: %+v", fact)
 				}
 			}
@@ -212,8 +212,8 @@ func TestInspectionHysteriaPacketBatchFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { manager.Close() })
-	flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	calls := 0
 	native := &UDPWriter{addr: "127.0.0.1:53", writer: udpWriterFunc(func(p []byte) (int, error) {
@@ -243,7 +243,7 @@ func TestInspectionHysteriaPacketBatchFailure(t *testing.T) {
 		t.Fatal("missing batch terminal")
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact.Known != 5 {
+	if calls != 2 || fact != 5 {
 		t.Fatalf("batch results: %+v, calls %d", fact, calls)
 	}
 }

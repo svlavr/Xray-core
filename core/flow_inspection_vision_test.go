@@ -174,14 +174,14 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 						return false
 					}
 					for _, candidate := range live.Rows {
-						if candidate.Uplink.Known == wire.written.Load() && candidate.Downlink.Known == wire.read.Load() {
+						if candidate.Uplink == wire.written.Load() && candidate.Downlink == wire.read.Load() {
 							row = candidate
 							return true
 						}
 					}
 					return false
 				})
-				if row.SelectedRoute.Outbound.Tag != tag || row.SelectedRoute.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
+				if row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
 					t.Fatalf("Vision live facts: %+v", row)
 				}
 				if count == 1 {
@@ -191,11 +191,11 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 					}
 					var up, down uint64
 					for _, total := range totals.Rows {
-						up += total.Uplink.Known
-						down += total.Downlink.Known
+						up += total.Uplink
+						down += total.Downlink
 					}
-					if up != row.Uplink.Known || down != row.Downlink.Known {
-						t.Fatalf("active Vision totals %d/%d, live %d/%d", up, down, row.Uplink.Known, row.Downlink.Known)
+					if up != row.Uplink || down != row.Downlink {
+						t.Fatalf("active Vision totals %d/%d, live %d/%d", up, down, row.Uplink, row.Downlink)
 					}
 				}
 				return row
@@ -205,7 +205,7 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			burst(first, "second low-rate burst while both endpoints remain open")
 			secondRow := check(receiving, "direct", 1)
 			check(sending, "vision", 1)
-			if firstRow.Ref != secondRow.Ref || secondRow.Downlink.Known <= firstRow.Downlink.Known {
+			if firstRow.Ref != secondRow.Ref || secondRow.Downlink <= firstRow.Downlink {
 				t.Fatal("raw transition lost active progress or continuity")
 			}
 			// The second write publishes native inbound splice readiness only
@@ -213,14 +213,14 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			burst(first, "third burst through both native splice handoffs")
 			thirdRow := check(receiving, "direct", 1)
 			check(sending, "vision", 1)
-			if thirdRow.Ref != firstRow.Ref || thirdRow.Downlink.Known <= secondRow.Downlink.Known {
+			if thirdRow.Ref != firstRow.Ref || thirdRow.Downlink <= secondRow.Downlink {
 				t.Fatal("inbound raw pump lost progress")
 			}
 			sibling, siblingWire := connect()
 			burst(sibling, "raw sibling")
 			check(receiving, "direct", 2)
 			outcomes, err := receiving.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 				t.Fatalf("Vision stop: %+v %v", outcomes, err)
 			}
 			if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
@@ -236,11 +236,8 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 					}
 					var up, down uint64
 					for _, row := range page.Rows {
-						if row.Flow.State != fs.FlowStateEnded {
-							t.Fatalf("Vision flow did not end: %+v", row)
-						}
-						up += row.Flow.Uplink.Known
-						down += row.Flow.Downlink.Known
+						up += row.Flow.Uplink
+						down += row.Flow.Downlink
 					}
 					if up != wire.written.Load()+siblingWire.written.Load() || down != wire.read.Load()+siblingWire.read.Load() {
 						t.Fatalf("Vision terminal double count: %d/%d want %d/%d", up, down, wire.written.Load()+siblingWire.written.Load(), wire.read.Load()+siblingWire.read.Load())
@@ -248,8 +245,8 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 					totals, _ := view.ReadTotals()
 					var totalUp, totalDown uint64
 					for _, row := range totals.Rows {
-						totalUp += row.Uplink.Known
-						totalDown += row.Downlink.Known
+						totalUp += row.Uplink
+						totalDown += row.Downlink
 					}
 					if totalUp != up || totalDown != down {
 						t.Fatal("Vision totals disagree with terminal facts")

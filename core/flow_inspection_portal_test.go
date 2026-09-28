@@ -80,7 +80,7 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 					return false
 				}
 				for _, r := range live.Rows {
-					if r.InitialDestination != dest || r.Origin != fs.TrafficOriginUser || r.SelectedRoute.Outbound.Tag != "portal" || r.Uplink.Known != uint64(len(payload)) || r.Downlink.Known != uint64(len(payload)) {
+					if r.InitialDestination != dest || r.Origin != fs.TrafficOriginUser || r.Outbound.Tag != "portal" || r.Uplink != uint64(len(payload)) || r.Downlink != uint64(len(payload)) {
 						return false
 					}
 					first = r.Ref
@@ -88,7 +88,7 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 				return true
 			})
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{first})
-			if err != nil || out[0].Code != fs.CloseCodeAccepted {
+			if err != nil || out[0].Err != nil {
 				t.Fatalf("stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
@@ -107,9 +107,9 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 			totals, _ := view.ReadTotals()
 			var up, down uint64
 			for _, r := range totals.Rows {
-				up += r.Uplink.Known
-				down += r.Downlink.Known
-				if r.Uplink.Known > 0 && r.Outbound.Tag != "portal" {
+				up += r.Uplink
+				down += r.Downlink
+				if r.Uplink > 0 && r.Outbound.Tag != "portal" {
 					t.Fatalf("carrier/control bucket: %+v", r)
 				}
 			}
@@ -188,14 +188,14 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 			return false
 		}
 		row := live.Rows[0]
-		if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.InitialDestination != logicalDestination || row.SelectedRoute.Outbound.Tag != "portal" || row.Uplink.Known != uint64(len(firstPayload)) || row.Downlink.Known != uint64(len(firstPayload)) {
+		if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != logicalDestination || row.Outbound.Tag != "portal" || row.Uplink != uint64(len(firstPayload)) || row.Downlink != uint64(len(firstPayload)) {
 			return false
 		}
 		firstRef = row.Ref
 		return true
 	})
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRef})
-	if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(out) != 1 || out[0].Err != nil {
 		t.Fatalf("stop first UDP child: %+v %v", out, err)
 	}
 	inspectionWait(t, func() bool {
@@ -210,7 +210,7 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	inspectionUDPExchange(t, second, address, secondPayload, mask)
 	inspectionWait(t, func() bool {
 		live, readErr := view.ReadLive()
-		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Ref != firstRef && live.Rows[0].SelectedRoute.Outbound.Tag == "portal" && live.Rows[0].Uplink.Known == uint64(len(secondPayload)) && live.Rows[0].Downlink.Known == uint64(len(secondPayload))
+		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Ref != firstRef && live.Rows[0].Outbound.Tag == "portal" && live.Rows[0].Uplink == uint64(len(secondPayload)) && live.Rows[0].Downlink == uint64(len(secondPayload))
 	})
 	totals, err := view.ReadTotals()
 	if err != nil {
@@ -218,9 +218,9 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	}
 	var up, down uint64
 	for _, row := range totals.Rows {
-		up += row.Uplink.Known
-		down += row.Downlink.Known
-		if row.Uplink.Known != 0 && row.Outbound.Tag != "portal" {
+		up += row.Uplink
+		down += row.Downlink
+		if row.Uplink != 0 && row.Outbound.Tag != "portal" {
 			t.Fatalf("reverse carrier counted as a logical outbound: %+v", row)
 		}
 	}
@@ -277,7 +277,7 @@ func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
 			return false
 		}
 		r := live.Rows[0]
-		return r.InitialDestination == target && r.SelectedRoute.Outbound.Tag == "same-domain" && r.EffectiveDestination == dest && r.Uplink.Known == uint64(len(payload)) && r.Downlink.Known == uint64(len(payload))
+		return r.InitialDestination == target && r.Outbound.Tag == "same-domain" && r.EffectiveDestination == dest && r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload))
 	})
 	conn.Close()
 	inspectionWait(t, func() bool {

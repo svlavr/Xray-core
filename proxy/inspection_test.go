@@ -41,8 +41,8 @@ func TestRecordPacketWritePartialZeroPayload(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer manager.Close()
-			flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1}})
+			flow := manager.Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Serial: 1})
 			flow.BindRoute()
 			proxy.RecordPacketWrite(flow, test.payload, 10, 3)
 			flow.Finish()
@@ -50,7 +50,7 @@ func TestRecordPacketWritePartialZeroPayload(t *testing.T) {
 			if err != nil || len(page.Rows) != 1 {
 				t.Fatalf("packet terminal: %+v %v", page, err)
 			}
-			want := fs.ByteFact{}
+			want := uint64(0)
 			if page.Rows[0].Flow.Downlink != want {
 				t.Fatalf("partial packet facts: %+v", page.Rows[0])
 			}
@@ -61,14 +61,14 @@ func TestRecordPacketWritePartialZeroPayload(t *testing.T) {
 func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 	for _, mode := range []string{"direct", "deferred"} {
 		for _, test := range []struct {
-			name string
-			err  error
-			want fs.CloseCode
+			name        string
+			err         error
+			wantFailure bool
 		}{
-			{name: "network closed", err: net.ErrClosed, want: fs.CloseCodeAccepted},
-			{name: "pipe closed", err: io.ErrClosedPipe, want: fs.CloseCodeAccepted},
-			{name: "joined owner failure", err: errors.Join(net.ErrClosed, errors.New("owner cleanup failed")), want: fs.CloseCodeFailed},
-			{name: "native failure", err: errors.New("native close failed"), want: fs.CloseCodeFailed},
+			{name: "network closed", err: net.ErrClosed},
+			{name: "pipe closed", err: io.ErrClosedPipe},
+			{name: "joined owner failure", err: errors.Join(net.ErrClosed, errors.New("owner cleanup failed")), wantFailure: true},
+			{name: "native failure", err: errors.New("native close failed"), wantFailure: true},
 		} {
 			t.Run(mode+"/"+test.name, func(t *testing.T) {
 				manager := new(appstats.Manager)
@@ -83,7 +83,7 @@ func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 				destination := cnet.TCPDestination(cnet.LocalHostIP, 443)
 				var flow fs.Exchange
 				if mode == "direct" {
-					_, observed, cancel := proxy.BeginObservedEndpoint(context.Background(), manager.Observation(), conn, destination, fs.FlowKindTCP)
+					_, observed, cancel := proxy.BeginObservedEndpoint(context.Background(), manager.Observation(), conn, destination, cnet.Network_TCP)
 					flow = observed
 					t.Cleanup(cancel)
 				} else {
@@ -92,11 +92,11 @@ func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 					flow = session.LogicalObservationFromContext(ctx).Exchange
 					t.Cleanup(finish)
 				}
-				flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "selected", Serial: 1}})
+				flow.Route(fs.OutboundRef{Tag: "selected", Serial: 1})
 				flow.BindRoute()
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-				if err != nil || len(outcomes) != 1 || outcomes[0].Code != test.want {
-					t.Fatalf("exact stop: %+v %v, want %v", outcomes, err, test.want)
+				if err != nil || len(outcomes) != 1 || (test.wantFailure && !errors.Is(outcomes[0].Err, test.err)) || (!test.wantFailure && outcomes[0].Err != nil) {
+					t.Fatalf("exact stop: %+v %v, want failure=%t", outcomes, err, test.wantFailure)
 				}
 				page, err := view.ReadTerminals()
 				if err != nil || len(page.Rows) != 1 {
@@ -145,7 +145,7 @@ func TestBeginReturnedObservationExcludesReservedCarrier(t *testing.T) {
 		cnet.TCPDestination(cnet.DomainAddress("v1.mux.cool"), 0),
 		cnet.UDPDestination(cnet.DomainAddress("v1.mux.cool"), 0),
 	} {
-		observed, observation, cleanup := proxy.BeginReturnedObservation(ctx, manager, conn, destination, fs.FlowKindTCP)
+		observed, observation, cleanup := proxy.BeginReturnedObservation(ctx, manager, conn, destination, cnet.Network_TCP)
 		if observed != ctx || observation != nil || cleanup != nil {
 			t.Fatal("reserved carrier was admitted")
 		}
@@ -187,8 +187,8 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { manager.Close() })
-			flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUnknown, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1, Tag: "selected"}})
+			flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUnknown, cnet.Destination{}, cnet.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Serial: 1, Tag: "selected"})
 			flow.AddUplink(7)
 			observation := &session.LogicalObservation{Exchange: flow}
 			ctx := context.Background()
@@ -211,7 +211,7 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 			if err != nil || len(live.Rows) != 1 {
 				t.Fatalf("live rows: %+v %v", live, err)
 			}
-			if live.Rows[0].SelectedRoute.Outbound.Tag != "selected" {
+			if live.Rows[0].Outbound.Tag != "selected" {
 				t.Fatalf("selection not visible: %+v", live.Rows[0])
 			}
 			totals, err := view.ReadTotals()
@@ -222,10 +222,10 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 			for _, total := range totals.Rows {
 				if total.Outbound.Serial == 1 {
 					bound = true
-					if total.Uplink.Known != 7 {
+					if total.Uplink != 7 {
 						t.Fatalf("bound credit: %+v", total)
 					}
-				} else if total.Uplink.Known != 0 {
+				} else if total.Uplink != 0 {
 					t.Fatalf("unexpected credit: %+v", total)
 				}
 			}
@@ -244,7 +244,7 @@ func TestNativeCopyTasksEarlyReturnKeepsHistoryImmutable(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { manager.Close() })
-		flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUnknown, cnet.Destination{}, cnet.Destination{}, nil)
+		flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUnknown, cnet.Destination{}, cnet.Destination{}, nil)
 		release := make(chan struct{})
 		t.Cleanup(func() {
 			select {
@@ -277,7 +277,7 @@ func TestNativeCopyTasksEarlyReturnKeepsHistoryImmutable(t *testing.T) {
 		}
 		flow.Finish()
 		page, err := view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
 			t.Fatalf("owner-end snapshot: %+v %v", page, err)
 		}
 		close(release)
@@ -287,13 +287,13 @@ func TestNativeCopyTasksEarlyReturnKeepsHistoryImmutable(t *testing.T) {
 			t.Fatal("copy task did not release")
 		}
 		page, err = view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
 			t.Fatalf("late receipt mutated history: %+v %v", page, err)
 		}
 		totals, _ := view.ReadTotals()
 		var known uint64
 		for _, row := range totals.Rows {
-			known += row.Uplink.Known
+			known += row.Uplink
 		}
 		if known != 7 {
 			t.Fatalf("late receipt missing from totals: %+v", totals)
@@ -334,7 +334,7 @@ func TestObserveTCPRetainedInputAndOwnerEnd(t *testing.T) {
 	}
 	finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Origin != fs.TrafficOriginInternal || page.Rows[0].Flow.Uplink.Known != 12 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Origin != fs.TrafficOriginInternal || page.Rows[0].Flow.Uplink != 12 {
 		t.Fatalf("owner-end snapshot: %+v %v", page, err)
 	}
 	if ctx.Err() != context.Canceled {
@@ -386,7 +386,7 @@ func TestObserveReturnedTCPDispatcherCleanupAndOwnerEnd(t *testing.T) {
 	if observation == nil || !observation.ReturnedLink.CompareAndSwap(true, false) {
 		t.Fatal("dispatcher role was not claimed")
 	}
-	observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "selected", Serial: 7}})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "selected", Serial: 7})
 	observation.Exchange.BindRoute()
 
 	releasePump := make(chan struct{})
@@ -411,7 +411,7 @@ func TestObserveReturnedTCPDispatcherCleanupAndOwnerEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if page, err := view.ReadTerminals(); err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+	if page, err := view.ReadTerminals(); err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
 		t.Fatalf("owner-end snapshot: %+v %v", page, err)
 	}
 	close(releasePump)
@@ -421,13 +421,13 @@ func TestObserveReturnedTCPDispatcherCleanupAndOwnerEnd(t *testing.T) {
 		t.Fatal("late inbound pump did not release")
 	}
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Tag != "selected" || page.Rows[0].Flow.Uplink.Known != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "selected" || page.Rows[0].Flow.Uplink != 0 {
 		t.Fatalf("late pump mutated history: %+v %v", page, err)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
-		known += row.Uplink.Known
+		known += row.Uplink
 	}
 	if known != 7 {
 		t.Fatalf("late pump missing from totals: %+v", totals)
@@ -451,10 +451,10 @@ func TestObserveReturnedTCPCleanupEndsUnclaimed(t *testing.T) {
 	}
 	finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
 		t.Fatalf("unclaimed owner-end snapshot: %+v %v", page, err)
 	}
-	observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionRule, RuleTag: "late", Outbound: fs.OutboundRef{Tag: "selected", Serial: 9}})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "selected", Serial: 9})
 	downstream := buf.NewInspectionReader(&buf.BufferedReader{Reader: buf.NewReader(strings.NewReader(""))}, observation.Exchange, nil)
 	downstream.InputAlreadyObserved = true
 	if claimed := proxy.ClaimObservedEndpoint(ctx, downstream, true); claimed != observation {
@@ -462,7 +462,7 @@ func TestObserveReturnedTCPCleanupEndsUnclaimed(t *testing.T) {
 	}
 	finish()
 	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
 		t.Fatalf("late attribution mutated owner-end history: %+v %v", page, err)
 	}
 }
@@ -485,7 +485,7 @@ func TestObserveReturnedTCPUnconsumedOwnerEndsIncomplete(t *testing.T) {
 	finish()
 	observation.Exchange.Finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
 		t.Fatalf("unconsumed owner snapshot: %+v %v", page, err)
 	}
 	totals, err := view.ReadTotals()
@@ -514,7 +514,7 @@ func TestObserveReturnedTCPRoleClaimAfterBoundStop(t *testing.T) {
 	// Statistical owner ending does not replace the native launch/cancel guard.
 	observation.Exchange.BindRoute()
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{observation.Exchange.Ref()})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("pre-dispatch stop: %+v %v", outcomes, err)
 	}
 	if !observation.ReturnedLink.CompareAndSwap(true, false) {

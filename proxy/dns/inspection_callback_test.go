@@ -53,7 +53,7 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 	ctx, finish := proxy.ObserveUDP(context.Background(), manager, local, target, link)
 	defer finish()
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "dns", Serial: 1}})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "dns", Serial: 1})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 	lookup := &blockedInspectionDNS{entered: make(chan struct{}), release: make(chan struct{})}
 	handler := &Handler{client: lookup, timeout: time.Minute}
@@ -70,7 +70,7 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	terminal, err := view.ReadTerminals()
-	if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Uplink.Known != uint64(len(wire)) || terminal.Rows[0].Flow.Downlink.Known != 0 {
+	if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Uplink != uint64(len(wire)) || terminal.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("owner-close snapshot: %+v %v", terminal.Rows, err)
 	}
 	close(lookup.release)
@@ -88,7 +88,7 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 		for _, row := range totals.Rows {
 			if row.Outbound.Tag == "dns" {
 				again, err := view.ReadTerminals()
-				if err != nil || len(again.Rows) != 1 || again.Rows[0].Flow.Downlink.Known != 0 {
+				if err != nil || len(again.Rows) != 1 || again.Rows[0].Flow.Downlink != 0 {
 					t.Fatalf("late callback rewrote terminal: %+v %v", again.Rows, err)
 				}
 				return

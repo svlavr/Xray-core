@@ -21,7 +21,7 @@ import (
 )
 
 func dispatchPacket(ctx context.Context, manager stats.Manager, conn N.PacketConn, destination net.Destination, writeAccess *sync.Mutex) error {
-	ctx, observation, finish := proxy.BeginReturnedObservation(ctx, manager, conn, destination, stats.FlowKindUDPAssociation)
+	ctx, observation, finish := proxy.BeginReturnedObservation(ctx, manager, conn, destination, net.Network_UDP)
 	observed := &inspectionPacketConn{PacketConn: conn, writeAccess: writeAccess}
 	if finish != nil {
 		defer finish()

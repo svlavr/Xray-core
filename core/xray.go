@@ -86,7 +86,6 @@ type Instance struct {
 	pendingResolutions         []resolution
 	pendingOptionalResolutions []resolution
 	running                    bool
-	started                    bool
 	resolveLock                sync.Mutex
 
 	ctx context.Context
@@ -264,7 +263,6 @@ func (s *Instance) Close() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
-	s.started = true
 	s.running = false
 
 	var errs []interface{}
@@ -393,7 +391,6 @@ func (s *Instance) Start() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
-	s.started = true
 	s.running = true
 	for _, f := range s.features {
 		if err := f.Start(); err != nil {

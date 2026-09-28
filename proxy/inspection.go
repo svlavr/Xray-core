@@ -22,7 +22,7 @@ import (
 // cleanup until DispatchLink returns. Disabled collection leaves the context and
 // link unchanged and returns nil cleanup.
 func ObserveTCP(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link) (context.Context, func()) {
-	return observeEndpoint(ctx, manager, conn, dest, link, stats.FlowKindTCP, false)
+	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_TCP, false)
 }
 
 // ObserveReturnedTCP binds the decoded endpoint before Dispatch returns its
@@ -30,7 +30,7 @@ func ObserveTCP(ctx context.Context, manager stats.Manager, conn net.Conn, dest 
 // requirements apply. The dispatcher consumes the one-shot role claim; its
 // cleanup releases only its cursor, while the actual endpoint owner finishes.
 func ObserveReturnedTCP(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, endpoint *transport.Link) (context.Context, func()) {
-	return observeEndpoint(ctx, manager, conn, dest, endpoint, stats.FlowKindTCP, true)
+	return observeEndpoint(ctx, manager, conn, dest, endpoint, net.Network_TCP, true)
 }
 
 // ObserveUDP attaches receipts to one exclusively owned, decoded UDP association.
@@ -38,7 +38,7 @@ func ObserveReturnedTCP(ctx context.Context, manager stats.Manager, conn net.Con
 // expose actual endpoint results, directly or through WithWriterReceipt.
 // The caller defers cleanup until DispatchLink returns, as for ObserveTCP.
 func ObserveUDP(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link) (context.Context, func()) {
-	return observeEndpoint(ctx, manager, conn, dest, link, stats.FlowKindUDPAssociation, false)
+	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_UDP, false)
 }
 
 // ObserveFallback admits one dispatcher-bypassing fallback exchange before its
@@ -57,14 +57,11 @@ func ObserveFallback(ctx context.Context, manager stats.Manager, conn io.Closer,
 	if err != nil {
 		destination = net.Destination{}
 	}
-	observedCtx, flow, cancel := BeginObservedEndpoint(ctx, store, conn, destination, stats.FlowKindTCP)
+	observedCtx, flow, cancel := BeginObservedEndpoint(ctx, store, conn, destination, net.Network_TCP)
 	if flow == nil {
 		return ctx, reader, nil, nil
 	}
-	flow.Route(stats.RouteStep{
-		Selection:      stats.SelectionUnknown,
-		SelectedTarget: destination,
-	})
+	flow.Route(stats.OutboundRef{})
 	flow.BindRoute()
 	cursor := ObserveDecodedReader(reader, flow, func() { cancel(); conn.Close() })
 	return observedCtx, cursor, flow, func() {
@@ -73,7 +70,7 @@ func ObserveFallback(ctx context.Context, manager stats.Manager, conn io.Closer,
 	}
 }
 
-func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link, kind stats.FlowKind, returned bool) (context.Context, func()) {
+func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link, kind net.Network, returned bool) (context.Context, func()) {
 	if isMuxCarrier(dest) {
 		return ctx, nil
 	}
@@ -90,7 +87,7 @@ func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, 
 	}
 	flow := observation.Exchange
 	cursor := ObserveDecodedReader(link.Reader, flow, func() { cancel(); conn.Close() })
-	if kind == stats.FlowKindUDPAssociation {
+	if kind == net.Network_UDP {
 		cursor.PacketDestination = dest
 	}
 	link.Reader = cursor
@@ -101,7 +98,7 @@ func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, 
 	}
 }
 
-func beginDeferredObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind stats.FlowKind) (context.Context, *session.LogicalObservation, context.CancelFunc) {
+func beginDeferredObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, *session.LogicalObservation, context.CancelFunc) {
 	store := ObservationStore(manager)
 	if store == nil {
 		return ctx, nil, nil
@@ -121,7 +118,7 @@ func beginDeferredObservation(ctx context.Context, manager stats.Manager, conn i
 		return closeObservedEndpoint(conn)
 	}
 	var flow stats.Exchange
-	if kind == stats.FlowKindTCP {
+	if kind == net.Network_TCP {
 		flow = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, dest, stop)
 	} else {
 		flow = store.Begin(kind, session.TrafficOriginFromContext(ctx), source, dest, stop)
@@ -137,7 +134,7 @@ func beginDeferredObservation(ctx context.Context, manager stats.Manager, conn i
 	return session.ContextWithLogicalObservation(observedCtx, observation), observation, cancel
 }
 
-func beginObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind stats.FlowKind, returned bool) (context.Context, *session.LogicalObservation, context.CancelFunc) {
+func beginObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network, returned bool) (context.Context, *session.LogicalObservation, context.CancelFunc) {
 	observedCtx, flow, cancel := BeginObservedEndpoint(ctx, ObservationStore(manager), conn, dest, kind)
 	if flow == nil {
 		return ctx, nil, nil
@@ -150,7 +147,7 @@ func beginObservation(ctx context.Context, manager stats.Manager, conn io.Closer
 // BeginReturnedObservation admits an exclusive codec endpoint before Dispatch.
 // The caller binds its decoded input and codec output when native preparation
 // produces them and defers cleanup until the endpoint owner returns.
-func BeginReturnedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind stats.FlowKind) (context.Context, *session.LogicalObservation, func()) {
+func BeginReturnedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, *session.LogicalObservation, func()) {
 	return beginOwnedObservation(ctx, manager, conn, dest, kind, true)
 }
 
@@ -158,7 +155,7 @@ func BeginReturnedObservation(ctx context.Context, manager stats.Manager, conn i
 // protocol response is prepared. The caller attaches decoded receipts only
 // after preparation succeeds, so response framing and failed preparation stay
 // outside logical payload accounting.
-func BeginSuppliedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind stats.FlowKind) (context.Context, *session.LogicalObservation, func()) {
+func BeginSuppliedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, *session.LogicalObservation, func()) {
 	return beginOwnedObservation(ctx, manager, conn, dest, kind, false)
 }
 
@@ -186,7 +183,7 @@ func BeginExecutionObservation(ctx context.Context, manager stats.Manager, owner
 	}
 }
 
-func beginOwnedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind stats.FlowKind, returned bool) (context.Context, *session.LogicalObservation, func()) {
+func beginOwnedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network, returned bool) (context.Context, *session.LogicalObservation, func()) {
 	// The native MUX dispatcher recognizes this reserved carrier address even
 	// when an incoming protocol command did not explicitly name MUX.
 	if isMuxCarrier(dest) {
@@ -231,7 +228,7 @@ func ObservationStore(manager stats.Manager) stats.AdmissionStore {
 // BeginObservedEndpoint admits an exclusively owned decoded endpoint without
 // changing I/O. The caller owns cancel and Finish, and must attach its actual
 // receipts before finishing the exchange.
-func BeginObservedEndpoint(ctx context.Context, store stats.AdmissionStore, conn io.Closer, dest net.Destination, kind stats.FlowKind) (context.Context, stats.Exchange, context.CancelFunc) {
+func BeginObservedEndpoint(ctx context.Context, store stats.AdmissionStore, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, stats.Exchange, context.CancelFunc) {
 	if store == nil {
 		return ctx, nil, nil
 	}
@@ -242,7 +239,7 @@ func BeginObservedEndpoint(ctx context.Context, store stats.AdmissionStore, conn
 	}
 	stop := func() error { cancel(); return closeObservedEndpoint(conn) }
 	var flow stats.Exchange
-	if kind == stats.FlowKindTCP {
+	if kind == net.Network_TCP {
 		flow = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, dest, stop)
 	} else {
 		flow = store.Begin(kind, session.TrafficOriginFromContext(ctx), source, dest, stop)

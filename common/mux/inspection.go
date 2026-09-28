@@ -56,7 +56,7 @@ func (w *ServerWorker) initializeInspection(ctx context.Context) {
 	if w.store == nil {
 		return
 	}
-	w.runtime = w.store.Info().Runtime
+	w.runtime = w.store.Runtime()
 	w.link.Writer = newInspectionOutput(w.link.Writer)
 }
 
@@ -67,9 +67,9 @@ func (w *ServerWorker) observeChild(ctx context.Context, dest net.Destination, s
 	if admission, ok := w.dispatcher.(interface{ InspectMuxChild(net.Destination) bool }); ok && !admission.InspectMuxChild(dest) {
 		return ctx, nil
 	}
-	kind := stats.FlowKindTCP
+	kind := net.Network_TCP
 	if dest.Network == net.Network_UDP {
-		kind = stats.FlowKindUDPAssociation
+		kind = net.Network_UDP
 	}
 	ctx = session.ContextWithLogicalObservation(ctx, nil)
 	ctx, observation, cleanup := proxy.BeginReturnedObservation(ctx, w.stats, childCloser{s}, dest, kind)
@@ -92,7 +92,7 @@ func (w *ServerWorker) observeRetained(ctx context.Context, dest net.Destination
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		source = inbound.Source
 	}
-	flow := w.store.Begin(stats.FlowKindUDPAssociation, session.TrafficOriginFromContext(ctx), source, dest, func() error { x.Interrupt(); return nil })
+	flow := w.store.Begin(net.Network_UDP, session.TrafficOriginFromContext(ctx), source, dest, func() error { x.Interrupt(); return nil })
 	if flow == nil {
 		cancel()
 		return original, nil

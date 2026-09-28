@@ -48,7 +48,7 @@ func beginTaggedObservation(ctx context.Context, instance *core.Instance, destin
 	if destination.Network == net.Network_TCP {
 		exchange = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
 	} else {
-		exchange = store.Begin(stats.FlowKindUDPAssociation, session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
+		exchange = store.Begin(net.Network_UDP, session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
 	}
 	owner.mu.Lock()
 	owner.exchange = exchange

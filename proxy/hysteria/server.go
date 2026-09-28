@@ -169,7 +169,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		var observation *session.LogicalObservation
 		var observationCleanup func()
 		if !dest.Address.Family().IsDomain() || dest.Address.Domain() != "v1.mux.cool" {
-			ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, s.stats, conn, dest, stats.FlowKindTCP)
+			ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, s.stats, conn, dest, net.Network_TCP)
 			if observationCleanup != nil {
 				defer func() {
 					observationCleanup()

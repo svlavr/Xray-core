@@ -49,11 +49,7 @@ func blackholeInspection(t *testing.T, link *transport.Link, network cnet.Networ
 	}
 	ctx, finish := observe(ctx, manager, conn, dest, link)
 	t.Cleanup(finish)
-	session.LogicalObservationFromContext(ctx).Exchange.Route(fs.RouteStep{
-		Selection:      fs.SelectionDefault,
-		Outbound:       fs.OutboundRef{Runtime: view.Info().Runtime, Serial: 1, Tag: "block"},
-		SelectedTarget: dest,
-	})
+	session.LogicalObservationFromContext(ctx).Exchange.Route(fs.OutboundRef{Runtime: view.Runtime(), Serial: 1, Tag: "block"})
 	return ctx, view, finish
 }
 
@@ -88,7 +84,7 @@ func TestInspectionBlackholePartialResponse(t *testing.T) {
 	}
 	finish()
 	terminal := blackholeTerminal(t, view)
-	if terminal.Flow.Downlink.Known != 0 || terminal.Flow.Uplink.Known != 0 || terminal.Flow.Origin != fs.TrafficOriginInternal {
+	if terminal.Flow.Downlink != 0 || terminal.Flow.Uplink != 0 || terminal.Flow.Origin != fs.TrafficOriginInternal {
 		t.Fatalf("prefix/error receipt: %+v", terminal)
 	}
 }
@@ -119,12 +115,12 @@ func TestInspectionBlackholePendingReadOwnerEnd(t *testing.T) {
 	}
 	finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
 		t.Fatalf("owner-end snapshot: %+v %v", page, err)
 	}
 	close(release)
 	terminal := blackholeTerminal(t, view)
-	if terminal.Flow.Uplink.Known != 0 {
+	if terminal.Flow.Uplink != 0 {
 		t.Fatalf("abandoned read credited or ending lost: %+v", terminal)
 	}
 }
@@ -150,12 +146,12 @@ func TestInspectionBlackholeDoesNotClaimInheritedContext(t *testing.T) {
 		if network == cnet.Network_UDP {
 			wantLive = 1
 		}
-		if len(live.Rows) != wantLive || wantLive == 1 && live.Rows[0].SelectedRoute.Outbound.Serial != 1 {
+		if len(live.Rows) != wantLive || wantLive == 1 && live.Rows[0].Outbound.Serial != 1 {
 			t.Fatalf("claimed an inherited-only endpoint: %+v", live)
 		}
 		finish()
 		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 1 {
+		if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 1 {
 			t.Fatalf("missing owner snapshot: %+v", page)
 		}
 		totals, err := view.ReadTotals()
@@ -220,12 +216,12 @@ func TestInspectionBlackholeUDPDrainOwnerEnd(t *testing.T) {
 	}
 	finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
 		t.Fatalf("owner-end UDP snapshot: %+v %v", page, err)
 	}
 	close(release)
 	terminal := blackholeTerminal(t, view)
-	if terminal.Flow.Kind != fs.FlowKindUDPAssociation || terminal.Flow.Uplink.Known != 0 || terminal.Flow.SelectedRoute.Outbound.Tag != "block" {
+	if terminal.Flow.Kind != cnet.Network_UDP || terminal.Flow.Uplink != 0 || terminal.Flow.Outbound.Tag != "block" {
 		t.Fatalf("UDP drain ending/custody: %+v", terminal)
 	}
 }

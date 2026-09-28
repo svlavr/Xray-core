@@ -78,19 +78,19 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
+					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "socks-proxy" || row.SelectedRoute.Outbound.Serial == 0 ||
+					if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "socks-proxy" || row.Outbound.Serial == 0 ||
 						row.InitialDestination != destination || row.LatestDestination != destination {
 						t.Fatalf("SOCKS UDP logical facts: %+v", row)
 					}
 					if variant == "resolved" {
 						if !row.EffectiveDestination.Address.Family().IsIP() || row.EffectiveDestination.Port != destination.Port {
-							t.Fatalf("resolved logical target: %+v", row.SelectedRoute)
+							t.Fatalf("resolved logical target: %+v", row)
 						}
 					} else if row.EffectiveDestination != destination {
-						t.Fatalf("physical server became logical target: %+v", row.SelectedRoute)
+						t.Fatalf("physical server became logical target: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.UDPAddr).Port) {
 						selected = row
@@ -99,7 +99,7 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 				return selected.Ref.ID != 0
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 				t.Fatalf("SOCKS UDP exact stop: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
@@ -112,7 +112,7 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 			if err != nil || len(live.Rows) != 1 {
 				t.Fatalf("sibling live facts: %+v %v", live, err)
 			}
-			if outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{live.Rows[0].Ref}); err != nil || outcomes[0].Code != fs.CloseCodeAccepted {
+			if outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{live.Rows[0].Ref}); err != nil || outcomes[0].Err != nil {
 				t.Fatalf("sibling stop: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
@@ -126,12 +126,12 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 			want := uint64(2*len(payload) + len(extra))
 			var up, down uint64
 			for _, total := range totals.Rows {
-				if total.Uplink.Known != 0 || total.Downlink.Known != 0 {
-					if total.Outbound != selected.SelectedRoute.Outbound || total.Origin != fs.TrafficOriginUser {
+				if total.Uplink != 0 || total.Downlink != 0 {
+					if total.Outbound != selected.Outbound || total.Origin != fs.TrafficOriginUser {
 						t.Fatalf("SOCKS UDP totals: %+v", total)
 					}
-					up += total.Uplink.Known
-					down += total.Downlink.Known
+					up += total.Uplink
+					down += total.Downlink
 				}
 			}
 			if up != want || down != want {
@@ -161,7 +161,7 @@ func TestFlowInspectionSOCKSUDPOutboundRejected(t *testing.T) {
 			return false
 		}
 		row := page.Rows[0].Flow
-		if row.Kind != fs.FlowKindUDPAssociation || row.SelectedRoute.Outbound.Tag != "socks-proxy" || row.SelectedRoute.Outbound.Serial == 0 || row.Uplink.Known != 0 || row.Downlink.Known != 0 {
+		if row.Kind != cnet.Network_UDP || row.Outbound.Tag != "socks-proxy" || row.Outbound.Serial == 0 || row.Uplink != 0 || row.Downlink != 0 {
 			t.Fatalf("failed UDP handshake fabricated payload: %+v", row)
 		}
 		return true

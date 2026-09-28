@@ -122,7 +122,7 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 		t.Fatal("keep-alive requests reused one FlowRef")
 	}
 	for _, row := range page.Rows {
-		if row.Flow.Kind != fs.FlowKindTCP || row.Flow.SelectedRoute.Outbound.Tag != "direct" || row.Flow.SelectedRoute.Outbound.Serial == 0 || row.Flow.Uplink.Known == 0 || row.Flow.Downlink.Known <= uint64(len("origin:/one")) {
+		if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Serial == 0 || row.Flow.Uplink == 0 || row.Flow.Downlink <= uint64(len("origin:/one")) {
 			t.Fatalf("HTTP request receipt: %+v", row)
 		}
 	}
@@ -147,7 +147,7 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 	})
 	page, _ = view.ReadTerminals()
 	local := page.Rows[2]
-	if local.Flow.SelectedRoute.Outbound.Serial != 0 || local.Flow.Uplink.Known != 0 || local.Flow.Downlink.Known == 0 {
+	if local.Flow.Outbound.Serial != 0 || local.Flow.Uplink != 0 || local.Flow.Downlink == 0 {
 		t.Fatalf("local HTTP response receipt: %+v", local)
 	}
 }
@@ -183,14 +183,14 @@ func TestFlowInspectionP2GHTTPRequestExactStop(t *testing.T) {
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
 		live, _ := view.ReadLive()
-		if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Outbound.Serial == 0 {
+		if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial == 0 {
 			return false
 		}
 		ref = live.Rows[0].Ref
 		return true
 	})
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("HTTP request stop: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {
@@ -288,7 +288,7 @@ func TestFlowInspectionP2GVLESSDecodedRejectionBeforeResponse(t *testing.T) {
 	})
 	page, _ := view.ReadTerminals()
 	row := page.Rows[0]
-	if row.Flow.InitialDestination != request.Destination() || row.Flow.SelectedRoute.Outbound.Serial != 0 || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
+	if row.Flow.InitialDestination != request.Destination() || row.Flow.Outbound.Serial != 0 || row.Flow.Uplink != 0 || row.Flow.Downlink != 0 {
 		t.Fatalf("VLESS pre-response rejection: %+v", row)
 	}
 }
@@ -313,7 +313,7 @@ func TestFlowInspectionP2GHysteriaResponsePreparationFailure(t *testing.T) {
 	})
 	page, _ := view.ReadTerminals()
 	row := page.Rows[0]
-	if row.Flow.SelectedRoute.Outbound.Serial != 0 || row.Flow.Uplink.Known != 0 || row.Flow.Downlink.Known != 0 {
+	if row.Flow.Outbound.Serial != 0 || row.Flow.Uplink != 0 || row.Flow.Downlink != 0 {
 		t.Fatalf("Hysteria pre-response rejection: %+v", row)
 	}
 }
@@ -338,7 +338,7 @@ func TestFlowInspectionP2GNaturalEOF(t *testing.T) {
 				return len(page.Rows) == 1
 			})
 			page, _ := view.ReadTerminals()
-			if page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) || page.Rows[0].Flow.Downlink.Known != uint64(len(payload)) {
+			if page.Rows[0].Flow.Uplink != uint64(len(payload)) || page.Rows[0].Flow.Downlink != uint64(len(payload)) {
 				t.Fatalf("natural EOF receipt: %+v", page.Rows[0])
 			}
 		})

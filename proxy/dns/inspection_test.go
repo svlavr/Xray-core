@@ -90,7 +90,7 @@ func TestInspectionDNSDecodedTCPReturn(t *testing.T) {
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.SelectedRoute.Outbound.Tag != "dns-local" || flow.SelectedRoute.Outbound.Serial == 0 || flow.Uplink.Known != uint64(len(requestBytes)) || flow.Downlink.Known != uint64(len(responseBytes)) {
+			if flow.Outbound.Tag != "dns-local" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(requestBytes)) || flow.Downlink != uint64(len(responseBytes)) {
 				t.Fatalf("decoded DNS facts: %+v; sizes %d/%d", flow, len(requestBytes), len(responseBytes))
 			}
 			return
@@ -226,7 +226,7 @@ func TestInspectionDNSDecodedUDPBranches(t *testing.T) {
 					flow := live.Rows[0]
 					// Peer delivery does not join the writer's accounting callback.
 					// Close only after the facts this test checks have been recorded.
-					if flow.Uplink.Known == uint64(len(wire)) && flow.Downlink.Known == uint64(n) {
+					if flow.Uplink == uint64(len(wire)) && flow.Downlink == uint64(n) {
 						if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref}); err != nil {
 							t.Fatal(err)
 						}
@@ -238,7 +238,7 @@ func TestInspectionDNSDecodedUDPBranches(t *testing.T) {
 				}
 				if len(page.Rows) == 1 {
 					flow := page.Rows[0].Flow
-					if flow.SelectedRoute.Outbound.Tag != "dns-out" || flow.Uplink.Known != uint64(len(wire)) || flow.Downlink.Known != uint64(n) {
+					if flow.Outbound.Tag != "dns-out" || flow.Uplink != uint64(len(wire)) || flow.Downlink != uint64(n) {
 						t.Fatalf("decoded UDP facts: %+v; sizes %d/%d", flow, len(wire), n)
 					}
 					return

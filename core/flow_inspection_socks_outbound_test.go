@@ -71,10 +71,10 @@ func TestFlowInspectionSOCKSOutbound(t *testing.T) {
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
+					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.SelectedRoute.Outbound.Tag != "socks-proxy" || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
+					if row.Outbound.Tag != "socks-proxy" || row.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("live proxy receipt: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -84,7 +84,7 @@ func TestFlowInspectionSOCKSOutbound(t *testing.T) {
 				return selected.ID != 0
 			})
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected})
-			if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(out) != 1 || out[0].Err != nil {
 				t.Fatalf("close: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
@@ -114,14 +114,14 @@ func TestFlowInspectionSOCKSOutbound(t *testing.T) {
 			totals, _ := view.ReadTotals()
 			var up, down uint64
 			for _, row := range totals.Rows {
-				if row.Uplink.Known == 0 && row.Downlink.Known == 0 {
+				if row.Uplink == 0 && row.Downlink == 0 {
 					continue
 				}
 				if row.Outbound.Tag != "socks-proxy" {
 					t.Fatalf("proxy totals: %+v", row)
 				}
-				up += row.Uplink.Known
-				down += row.Downlink.Known
+				up += row.Uplink
+				down += row.Downlink
 			}
 			if up != want || down != want {
 				t.Fatalf("handshake included or payload lost: %d/%d, want %d", up, down, want)
@@ -171,13 +171,13 @@ func TestFlowInspectionSOCKSOutboundHandshakeEnding(t *testing.T) {
 				t.Fatalf("native greeting: %v %v", greeting, err)
 			}
 			live, err := view.ReadLive()
-			if err != nil || len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Outbound.Tag != "socks-proxy" {
+			if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Tag != "socks-proxy" {
 				t.Fatalf("handshake owner: %+v %v", live, err)
 			}
 			ref := live.Rows[0].Ref
 			if stop {
 				out, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-				if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+				if err != nil || len(out) != 1 || out[0].Err != nil {
 					t.Fatalf("handshake stop: %+v %v", out, err)
 				}
 				page, _ := view.ReadTerminals()
@@ -200,11 +200,8 @@ func TestFlowInspectionSOCKSOutboundHandshakeEnding(t *testing.T) {
 					return false
 				}
 				row := page.Rows[0]
-				if row.Flow.Ref != ref || row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.SelectedRoute.Outbound.Tag != "socks-proxy" {
+				if row.Flow.Ref != ref || row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Tag != "socks-proxy" {
 					t.Fatalf("failed handshake receipt: %+v", row)
-				}
-				if row.Flow.State != fs.FlowStateEnded {
-					t.Fatalf("missing owner end: %+v", row)
 				}
 				return true
 			})

@@ -487,10 +487,8 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	if _, ok := link.Reader.(*buf.InspectionReader); !ok {
 		observation = nil
 	}
-	step := stats.RouteStep{Selection: stats.SelectionDefault, SelectedTarget: ob.Target}
 	resolve := func(tag string, useDefault bool) outbound.Handler {
 		if observation != nil {
-			step.Outbound.Tag = tag
 			if manager, ok := d.ohm.(outbound.HandlerResolver); ok {
 				h, id := manager.ResolveHandler(tag, useDefault)
 				serial = id
@@ -503,11 +501,8 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		return d.ohm.GetHandler(tag)
 	}
 	reject := func() {
-		step.Selection = stats.SelectionRejected
 		if observation != nil {
-			observation.Exchange.Route(step)
-			observation.Exchange.BindRoute()
-
+			observation.Exchange.Unassign()
 		}
 	}
 
@@ -516,7 +511,6 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	isPickRoute := 0
 	if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
 		ctx = session.SetForcedOutboundTagToContext(ctx, "")
-		step.Selection = stats.SelectionForced
 		if h := resolve(forcedOutboundTag, false); h != nil {
 			isPickRoute = 1
 			errors.LogInfo(ctx, "taking platform initialized detour [", forcedOutboundTag, "] for [", destination, "]")
@@ -531,8 +525,6 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	} else if d.router != nil {
 		if route, err := d.router.PickRoute(routingLink); err == nil {
 			outTag := route.GetOutboundTag()
-			step.Selection = stats.SelectionRule
-			step.RuleTag = route.GetRuleTag()
 			if h := resolve(outTag, false); h != nil {
 				isPickRoute = 2
 				if route.GetRuleTag() == "" {
@@ -571,9 +563,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		}
 	}
 	if observation != nil {
-		step.Outbound.Serial = serial
-		step.Outbound.Tag = handler.Tag()
-		observation.Exchange.Route(step)
+		observation.Exchange.Route(stats.OutboundRef{Serial: serial, Tag: handler.Tag()})
 	}
 	ob.Tag = handler.Tag()
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {

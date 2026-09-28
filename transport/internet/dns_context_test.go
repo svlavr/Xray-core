@@ -68,15 +68,16 @@ func (*bindingTestOutboundManager) RemoveHandler(context.Context, string) error 
 
 func (*bindingTestOutboundManager) ListHandlers(context.Context) []outbound.Handler { return nil }
 
+type dnsContextKey struct{}
+
 func TestLookupForIPContextUsesContextClientAndCancellation(t *testing.T) {
 	previous := dnsClient
 	t.Cleanup(func() { dnsClient = previous })
 	client := &contextAwareTestDNSClient{contextTestDNSClient: contextTestDNSClient{ip: net.IP{192, 0, 2, 1}}}
 	dnsClient = client
-	owner := featuredns.NewContextOwner()
-	ctx := featuredns.ContextWithOwner(context.Background(), owner)
+	ctx := context.WithValue(context.Background(), dnsContextKey{}, "lookup")
 	ips, err := LookupForIPContext(ctx, "example.test", DomainStrategy_USE_IP4, nil)
-	if err != nil || len(ips) != 1 || !featuredns.ContextOwnedBy(client.seen, owner) {
+	if err != nil || len(ips) != 1 || client.seen.Value(dnsContextKey{}) != "lookup" {
 		t.Fatalf("context lookup: ips=%v err=%v", ips, err)
 	}
 	canceled, cancel := context.WithCancel(ctx)
@@ -103,13 +104,12 @@ func TestDialSystemCanceledContextRejectsDialerProxy(t *testing.T) {
 	}
 }
 
-func TestDialSystemDialerProxyPreservesDNSOwnerAndTarget(t *testing.T) {
+func TestDialSystemDialerProxyPreservesContextAndTarget(t *testing.T) {
 	previousManager := obm
 	t.Cleanup(func() { obm = previousManager })
 	handler := &bindingTestOutboundHandler{contexts: make(chan context.Context, 1)}
 	obm = &bindingTestOutboundManager{handler: handler}
-	owner := featuredns.NewContextOwner()
-	ctx := featuredns.ContextWithOwner(context.Background(), owner)
+	ctx := context.WithValue(context.Background(), dnsContextKey{}, "redirect")
 	destination := net.TCPDestination(net.IPAddress([]byte{192, 0, 2, 9}), 443)
 	conn, err := DialSystem(ctx, destination, &SocketConfig{DialerProxy: "bound-proxy"})
 	if err != nil {
@@ -122,8 +122,8 @@ func TestDialSystemDialerProxyPreservesDNSOwnerAndTarget(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("handler was not dispatched")
 	}
-	if !featuredns.ContextOwnedBy(dispatchCtx, owner) {
-		t.Fatal("DNS owner marker lost")
+	if dispatchCtx.Value(dnsContextKey{}) != "redirect" {
+		t.Fatal("redirect context values lost")
 	}
 	outbounds := session.OutboundsFromContext(dispatchCtx)
 	if len(outbounds) == 0 || outbounds[len(outbounds)-1].Target != destination || outbounds[len(outbounds)-1].Tag != "bound-proxy" {

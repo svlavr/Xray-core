@@ -199,7 +199,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 				ctx = session.ContextWithInbound(ctx, &associationInbound)
 			}
 			var cancel context.CancelFunc
-			ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, tempUDPConn, net.Destination{}, stats.FlowKindUDPAssociation)
+			ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, tempUDPConn, net.Destination{}, net.Network_UDP)
 			if flow != nil {
 				defer cancel()
 				defer flow.Finish()

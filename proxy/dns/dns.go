@@ -250,7 +250,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 	}
 
 	if session.TimeoutOnlyFromContext(ctx) && receipt == nil {
-		ctx = dns.CopyContextOwner(context.Background(), ctx)
+		detached := context.Background()
+		if inbound := session.InboundFromContext(ctx); inbound != nil {
+			detached = session.ContextWithInbound(detached, &session.Inbound{Tag: inbound.Tag})
+		}
+		ctx = detached
 	}
 
 	ctx, cancel := context.WithCancel(ctx)

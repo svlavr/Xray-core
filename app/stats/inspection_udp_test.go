@@ -8,11 +8,11 @@ import (
 	featurestats "github.com/xtls/xray-core/features/stats"
 )
 
-func TestInspectionLatestPacketDestinationBoundedAndCopied(t *testing.T) {
+func TestInspectionLatestPacketDestinationPreservedAndCopied(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
-	flow := store.Begin(featurestats.FlowKindUDPAssociation, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+	flow := store.Begin(xnet.Network_UDP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	first := xnet.UDPDestination(xnet.DomainAddress("first.example"), 53)
-	second := xnet.UDPDestination(xnet.DomainAddress(strings.Repeat("d", maxMetadataString+20)), 443)
+	second := xnet.UDPDestination(xnet.DomainAddress(strings.Repeat("d", 275)), 443)
 	third := xnet.UDPDestination(xnet.DomainAddress("over-limit.example"), 123)
 	flow.PacketDestination(first)
 	flow.PacketDestination(first)
@@ -23,8 +23,8 @@ func TestInspectionLatestPacketDestinationBoundedAndCopied(t *testing.T) {
 		t.Fatalf("live packet destinations: %+v %v", live, err)
 	}
 	row := live.Rows[0]
-	if row.LatestDestination.Port != second.Port || len(row.LatestDestination.Address.Domain()) != maxMetadataString {
-		t.Fatalf("bounded latest packet destination: %+v", row)
+	if row.LatestDestination != second {
+		t.Fatalf("latest packet destination was rewritten: %+v", row)
 	}
 	live.Rows[0].LatestDestination = third
 	again, err := store.ReadLive()
@@ -47,7 +47,7 @@ func TestInspectionLatestPacketDestinationBoundedAndCopied(t *testing.T) {
 
 func TestInspectionLatestDestinationFollowsPacketsNotRouteCompletion(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
-	root := store.Begin(featurestats.FlowKindUDPAssociation, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+	root := store.Begin(xnet.Network_UDP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	older, newer := root.NewLeg(), root.NewLeg()
 	first := xnet.UDPDestination(xnet.DomainAddress("first.example"), 53)
 	last := xnet.UDPDestination(xnet.DomainAddress("last.example"), 443)
@@ -55,16 +55,16 @@ func TestInspectionLatestDestinationFollowsPacketsNotRouteCompletion(t *testing.
 	older.AddUplink(3)
 	newer.PacketDestination(last)
 	newer.AddUplink(5)
-	newer.Route(featurestats.RouteStep{Outbound: featurestats.OutboundRef{Serial: 2, Tag: "newer"}})
+	newer.Route(featurestats.OutboundRef{Serial: 2, Tag: "newer"})
 	newer.BindRoute()
-	older.Route(featurestats.RouteStep{Outbound: featurestats.OutboundRef{Serial: 1, Tag: "older"}})
+	older.Route(featurestats.OutboundRef{Serial: 1, Tag: "older"})
 	older.BindRoute()
 	live, err := store.ReadLive()
-	if err != nil || len(live.Rows) != 1 || live.Rows[0].LatestDestination != last || live.Rows[0].Uplink.Known != 8 {
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].LatestDestination != last || live.Rows[0].Uplink != 8 {
 		t.Fatalf("packet order changed by delayed route: %+v %v", live, err)
 	}
 	totals, _ := store.ReadTotals()
-	if findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Uplink.Known != 3 || findTotal(t, totals.Rows, 2, featurestats.TrafficOriginUser).Uplink.Known != 5 {
+	if findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Uplink != 3 || findTotal(t, totals.Rows, 2, featurestats.TrafficOriginUser).Uplink != 5 {
 		t.Fatalf("per-leg byte attribution changed: %+v", totals)
 	}
 }

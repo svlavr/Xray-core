@@ -135,10 +135,10 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
+					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Kind != fs.FlowKindTCP || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Serial == 0 || row.SelectedRoute.Outbound.Tag != "direct" || row.InitialDestination != destination {
+					if row.Kind != cnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" || row.InitialDestination != destination {
 						t.Fatalf("admission/route: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -149,7 +149,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 			})
 			inspectionTCPTotals(t, view, uint64(2*len(payload)))
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 				t.Fatalf("exact close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
@@ -161,7 +161,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 					return false
 				}
 				ended := page.Rows[0]
-				if ended.Flow.Ref != selected.Ref || ended.Flow.Uplink.Known != uint64(len(payload)) || ended.Flow.Downlink.Known != uint64(len(payload)) {
+				if ended.Flow.Ref != selected.Ref || ended.Flow.Uplink != uint64(len(payload)) || ended.Flow.Downlink != uint64(len(payload)) {
 					t.Fatalf("terminal: %+v", ended)
 				}
 				return true
@@ -199,14 +199,14 @@ func inspectionTCPTotals(t *testing.T, view fs.FlowInspection, want uint64) {
 		}
 		var up, down uint64
 		for _, row := range totals.Rows {
-			if row.Uplink.Known == 0 && row.Downlink.Known == 0 {
+			if row.Uplink == 0 && row.Downlink == 0 {
 				continue
 			}
 			if row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" {
 				t.Fatalf("total attribution/accuracy: %+v", row)
 			}
-			up += row.Uplink.Known
-			down += row.Downlink.Known
+			up += row.Uplink
+			down += row.Downlink
 		}
 		return up == want && down == want
 	})
@@ -280,7 +280,7 @@ func TestFlowInspectionHTTPDelegationKeepAliveControl(t *testing.T) {
 			t.Fatal("pipelined HTTP requests reused one FlowRef")
 		}
 		for _, row := range page.Rows {
-			if row.Flow.Kind != fs.FlowKindTCP || row.Flow.SelectedRoute.Outbound.Tag != "direct" || row.Flow.SelectedRoute.Outbound.Serial == 0 || row.Flow.Uplink.Known == 0 || row.Flow.Downlink.Known == 0 {
+			if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Serial == 0 || row.Flow.Uplink == 0 || row.Flow.Downlink == 0 {
 				t.Fatalf("plain HTTP request receipt: %+v", row)
 			}
 		}
@@ -314,7 +314,7 @@ func TestFlowInspectionTCPAdmissionsRejected(t *testing.T) {
 					return false
 				}
 				final := page.Rows[0]
-				if final.Flow.Uplink.Known != uint64(len(payload)) || final.Flow.Downlink.Known != 0 || final.Flow.SelectedRoute.Outbound.Serial != 0 {
+				if final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != 0 || final.Flow.Outbound.Serial != 0 {
 					t.Fatalf("rejected receipt: %+v", final)
 				}
 				return true

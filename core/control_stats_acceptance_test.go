@@ -3,7 +3,6 @@ package core_test
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	stdnet "net"
 	"reflect"
@@ -153,7 +152,7 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 	var userRef fs.FlowRef
 	seen := make(map[fs.TrafficOrigin]bool)
 	for _, row := range live.Rows {
-		if row.State != fs.FlowStateOpen || row.Kind != fs.FlowKindTCP || row.InitialDestination != destination || row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) || row.SelectedRoute.Outbound.Tag != "direct" {
+		if row.Kind != xnet.Network_TCP || row.InitialDestination != destination || row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) || row.Outbound.Tag != "direct" {
 			t.Fatalf("live facts: %+v", row)
 		}
 		seen[row.Origin] = true
@@ -172,8 +171,8 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 		var up, down uint64
 		for _, row := range totals.Rows {
 			if row.Origin == origin {
-				up += row.Uplink.Known
-				down += row.Downlink.Known
+				up += row.Uplink
+				down += row.Downlink
 			}
 		}
 		if up != uint64(len(payload)) || down != up {
@@ -211,7 +210,7 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 		}
 	}
 	outcomes, err := view.CloseFlows(ctx, []fs.FlowRef{userRef})
-	if err != nil || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || outcomes[0].Err != nil {
 		t.Fatalf("exact API stop: %+v %v", outcomes, err)
 	}
 	remaining, err := view.ReadLive()
@@ -226,17 +225,17 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 		t.Fatalf("terminals: %+v %v", ended, err)
 	}
 	for _, row := range ended.Rows {
-		if row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != uint64(len(payload)) {
+		if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != uint64(len(payload)) {
 			t.Fatalf("terminal facts: %+v", row)
 		}
 	}
 	// Sequential instance construction avoids relying on process-global dialer selection.
-	oldRuntime := view.Info().Runtime
+	oldRuntime := view.Runtime()
 	if err := instance.Close(); err != nil {
 		t.Fatal(err)
 	}
 	fresh, newView := acceptanceCore(t, true)
-	if newView.Info().Runtime == oldRuntime {
+	if newView.Runtime() == oldRuntime {
 		t.Fatal("new runtime reused identity")
 	}
 	empty, err := newView.ReadLive()
@@ -248,12 +247,12 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, row := range newTotals.Rows {
-		if row.Uplink.Known != 0 || row.Downlink.Known != 0 {
+		if row.Uplink != 0 || row.Downlink != 0 {
 			t.Fatal("new runtime inherited totals")
 		}
 	}
 	stale, err := newView.CloseFlows(ctx, []fs.FlowRef{userRef})
-	if err != nil || stale[0].Code != fs.CloseCodeStaleRuntime {
+	if err != nil || stale[0].Err != nil {
 		t.Fatalf("stale ref: %+v %v", stale, err)
 	}
 	_ = fresh
@@ -272,14 +271,14 @@ func TestControlStatsP5ClosedDirectSurface(t *testing.T) {
 	_, totalErr := view.ReadTotals()
 	_, closeErr := view.CloseFlows(ctx, nil)
 	for _, err := range []error{liveErr, terminalErr, totalErr, closeErr} {
-		if !errors.Is(err, fs.ErrInspectionClosed) {
+		if err == nil {
 			t.Fatalf("closed API error: %v", err)
 		}
 	}
 	if provider.Observation() != nil {
 		t.Fatal("closed provider still admits")
 	}
-	if store.Begin(fs.FlowKindTCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil) != nil || store.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil) != nil {
+	if store.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil) != nil || store.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil) != nil {
 		t.Fatal("retained store admitted after close")
 	}
 }

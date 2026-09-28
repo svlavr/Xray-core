@@ -280,3 +280,45 @@ func TestDNSPreparationSynchronousHelpers(t *testing.T) {
 		t.Fatalf("missing FakeDNS returned partial server: %v %v", server, err)
 	}
 }
+
+func TestDNSApplyUsesNativePerServerStrategyInheritance(t *testing.T) {
+	feature, err := New(context.Background(), &Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = feature.Close() })
+	server := preparationServer("localhost", "inherited")
+	server.QueryStrategy = QueryStrategy(99)
+	result := ApplyConfig(context.Background(), feature, &Config{
+		QueryStrategy: QueryStrategy_USE_IP4,
+		NameServer:    []*NameServer{server},
+	})
+	if !result.Applied || result.Err != nil {
+		t.Fatalf("native per-server strategy inheritance: %+v", result)
+	}
+	option := feature.runtime.current.resolver.clients[0].ipOption
+	if option == nil || !option.IPv4Enable || option.IPv6Enable {
+		t.Fatalf("server did not inherit global IPv4 strategy: %+v", option)
+	}
+}
+
+func TestDNSApplyUsesOwningCoreReadyFakeDNS(t *testing.T) {
+	instance, err := preparationCore(&Config{NameServer: []*NameServer{preparationServer("localhost", "default")}}, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Close() })
+	if err := instance.Start(); err != nil {
+		t.Fatal(err)
+	}
+	feature := instance.GetFeature(fdns.ClientType()).(*DNS)
+	result := ApplyConfig(context.Background(), feature, &Config{NameServer: []*NameServer{preparationServer("fakedns", "fake")}})
+	if !result.Applied || result.Err != nil {
+		t.Fatalf("ready FakeDNS apply: %+v", result)
+	}
+	fake := instance.GetFeature((*fdns.FakeDNSEngine)(nil)).(fdns.FakeDNSEngine)
+	server := feature.runtime.current.resolver.clients[0].server.(*FakeDNSServer)
+	if server.fakeDNSEngine != fake {
+		t.Fatal("applied resolver did not use its owning core's ready FakeDNS")
+	}
+}

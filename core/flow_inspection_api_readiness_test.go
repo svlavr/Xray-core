@@ -23,11 +23,11 @@ type apiEarlyStopStore struct {
 	stopped fs.FlowRef
 }
 
-func (s *apiEarlyStopStore) Begin(kind fs.FlowKind, origin fs.TrafficOrigin, source, destination xnet.Destination, stop func() error) fs.Exchange {
+func (s *apiEarlyStopStore) Begin(kind xnet.Network, origin fs.TrafficOrigin, source, destination xnet.Destination, stop func() error) fs.Exchange {
 	e := s.AdmissionStore.Begin(kind, origin, source, destination, stop)
 	s.stopped = e.Ref()
 	result, err := s.view.CloseFlows(context.Background(), []fs.FlowRef{e.Ref()})
-	if err != nil || len(result) != 1 || result[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(result) != 1 || result[0].Err != nil {
 		panic("early exact stop failed")
 	}
 	return e
@@ -86,7 +86,7 @@ func TestFlowInspectionUDPEarlyStopPublication(t *testing.T) {
 			}
 			raw := manager.Observation()
 			var siblingStops atomic.Int32
-			sibling := raw.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { siblingStops.Add(1); return nil })
+			sibling := raw.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { siblingStops.Add(1); return nil })
 			early := &apiEarlyStopStore{AdmissionStore: raw, view: view}
 			instance := new(core.Instance)
 			if err := instance.AddFeature(&apiEarlyStopManager{Manager: manager, store: early}); err != nil {

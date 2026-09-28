@@ -33,7 +33,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 						return false
 					}
 					flow := live.Rows[0]
-					if flow.Uplink.Known != want || flow.Downlink.Known != want {
+					if flow.Uplink != want || flow.Downlink != want {
 						return false
 					}
 					ref = flow.Ref
@@ -42,8 +42,8 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 						t.Fatal(err)
 					}
 					for _, row := range totals.Rows {
-						if row.Outbound.Serial == flow.SelectedRoute.Outbound.Serial && row.Origin == fs.TrafficOriginUser {
-							if row.Downlink.Known != want {
+						if row.Outbound.Serial == flow.Outbound.Serial && row.Origin == fs.TrafficOriginUser {
+							if row.Downlink != want {
 								return false
 							}
 							return true
@@ -60,7 +60,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 			inspectionResponse(t, conn, second)
 			check(uint64(len(first) + len(second)))
 			outcome, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-			if err != nil || outcome[0].Code != fs.CloseCodeAccepted {
+			if err != nil || outcome[0].Err != nil {
 				t.Fatalf("close: %+v %v", outcome, err)
 			}
 			inspectionWait(t, func() bool {
@@ -72,7 +72,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 					return false
 				}
 				final := page.Rows[0]
-				if final.Flow.Downlink.Known != uint64(len(first)+len(second)) {
+				if final.Flow.Downlink != uint64(len(first)+len(second)) {
 					t.Fatalf("raw final: %+v", final)
 				}
 				return true

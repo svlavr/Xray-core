@@ -555,9 +555,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	var observation *session.LogicalObservation
 	var observationCleanup func()
 	if ordinary && !carrier {
-		kind := stats.FlowKindTCP
+		kind := net.Network_TCP
 		if request.Command == protocol.RequestCommandUDP {
-			kind = stats.FlowKindUDPAssociation
+			kind = net.Network_UDP
 		}
 		ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, h.stats, connection, request.Destination(), kind)
 		if observationCleanup != nil {

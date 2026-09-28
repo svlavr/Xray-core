@@ -26,14 +26,15 @@ func (c *contextTestClient) LookupIPContext(ctx context.Context, _ string, _ fea
 	return []net.IP{{192, 0, 2, 1}}, 1, nil
 }
 
+type routingContextKey struct{}
+
 func TestResolvableContextPreservesOriginatingDNSContext(t *testing.T) {
-	owner := featuredns.NewContextOwner()
-	ctx := featuredns.ContextWithOwner(context.Background(), owner)
+	ctx := context.WithValue(context.Background(), routingContextKey{}, "origin")
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: net.TCPDestination(net.DomainAddress("owner.test"), 443)}})
 	client := new(contextTestClient)
 	resolved := ContextWithDNSClient(routingsession.AsRoutingContext(ctx), client)
 	ips := resolved.GetTargetIPs()
-	if len(ips) != 1 || !ips[0].Equal(net.IP{192, 0, 2, 1}) || !featuredns.ContextOwnedBy(client.seen, owner) {
-		t.Fatalf("originating DNS context lost: ips=%v owner=%v", ips, featuredns.ContextOwnedBy(client.seen, owner))
+	if len(ips) != 1 || !ips[0].Equal(net.IP{192, 0, 2, 1}) || client.seen.Value(routingContextKey{}) != "origin" {
+		t.Fatalf("originating DNS context lost: ips=%v context=%v", ips, client.seen)
 	}
 }

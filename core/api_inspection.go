@@ -23,7 +23,7 @@ type apiObservation struct {
 	cancel        context.CancelFunc
 }
 
-func beginAPIObservation(ctx context.Context, instance *Instance, destination net.Destination, kind stats.FlowKind, finishOnClose bool) (context.Context, *apiObservation) {
+func beginAPIObservation(ctx context.Context, instance *Instance, destination net.Destination, kind net.Network, finishOnClose bool) (context.Context, *apiObservation) {
 	if current := session.LogicalObservationFromContext(ctx); current != nil && current.Exchange != nil {
 		continuation := &session.LogicalObservation{Exchange: current.Exchange}
 		continuation.ReturnedLink.Store(true)
@@ -46,7 +46,7 @@ func beginAPIObservation(ctx context.Context, instance *Instance, destination ne
 		source = inbound.Source
 	}
 	var exchange stats.Exchange
-	if kind == stats.FlowKindTCP {
+	if kind == net.Network_TCP {
 		exchange = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, destination, owner.Close)
 	} else {
 		exchange = store.Begin(kind, session.TrafficOriginFromContext(ctx), source, destination, owner.Close)

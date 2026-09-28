@@ -52,8 +52,8 @@ func muxInspectionFlow(t *testing.T) (fs.Exchange, fs.FlowInspection) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { manager.Close() })
-	flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUser, net.Destination{}, net.TCPDestination(net.LocalHostIP, 80), nil)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_TCP, fs.TrafficOriginUser, net.Destination{}, net.TCPDestination(net.LocalHostIP, 80), nil)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	return flow, view
 }

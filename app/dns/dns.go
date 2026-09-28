@@ -63,14 +63,14 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			return nil, err
 		}
 		stable := &DNS{ctx: ctx}
-		stable.initRuntime(nil, nil, prepared)
+		stable.initRuntime(prepared)
 		return stable, nil
 	}
 	s := &DNS{ctx: ctx}
 	build := func(dispatcher routing.Dispatcher, fake dns.FakeDNSEngine) error {
 		prepared, err := buildDNS(ctx, config, dispatcher, fake)
 		if err == nil {
-			s.initRuntime(dispatcher, fake, prepared)
+			s.initRuntime(prepared)
 		}
 		return err
 	}
@@ -248,7 +248,7 @@ func (s *DNS) Start() error {
 // Close implements common.Closable.
 func (s *DNS) Close() error {
 	if s.runtime == nil {
-		return closeResolverResources(s)
+		return nil
 	}
 	rt := s.runtime
 	rt.closeMu.Lock()
@@ -297,13 +297,31 @@ func (s *DNS) Close() error {
 
 // IsOwnLink implements proxy.dns.ownLinkVerifier
 func (s *DNS) IsOwnLink(ctx context.Context) bool {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil {
+		return false
+	}
 	if s.runtime == nil {
+		for _, client := range s.clients {
+			if inbound.Tag == client.tag {
+				return true
+			}
+		}
 		return false
 	}
 	s.runtime.mu.Lock()
-	closed, owner := s.runtime.closed, s.runtime.contextOwner
+	current, closing := s.runtime.current, s.runtime.closing
 	s.runtime.mu.Unlock()
-	return !closed && dns.ContextOwnedBy(ctx, owner)
+	for _, owner := range []*resolverOwner{current, closing} {
+		if owner != nil {
+			for _, client := range owner.resolver.clients {
+				if inbound.Tag == client.tag {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // LookupIP implements dns.Client.
@@ -326,7 +344,7 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 	defer owner.release()
 	ownerCtx, releaseOwnerCtx := owningDNSContext(s.ctx, ctx)
 	defer releaseOwnerCtx()
-	queryCtx, cancel := context.WithCancel(dns.ContextWithOwner(ownerCtx, s.runtime.contextOwner))
+	queryCtx, cancel := context.WithCancel(ownerCtx)
 	stop := context.AfterFunc(owner.ctx, cancel)
 	defer stop()
 	defer cancel()
@@ -338,7 +356,6 @@ func owningDNSContext(ownerCtx, callCtx context.Context) (context.Context, func(
 	if core.FromContext(ownerCtx) != nil {
 		base = core.ToBackgroundDetachedContext(ownerCtx)
 	}
-	base = dns.CopyContextOwner(base, callCtx)
 	if inbound := session.InboundFromContext(callCtx); inbound != nil {
 		base = session.ContextWithInbound(base, inbound)
 	}

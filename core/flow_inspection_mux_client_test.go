@@ -54,17 +54,17 @@ func TestFlowInspectionMuxClientUDP(t *testing.T) {
 					return false
 				}
 				row := live.Rows[0]
-				if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
+				if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 					return false
 				}
-				if row.SelectedRoute.Outbound.Tag != outbound.Tag || row.EffectiveDestination != destination || row.LatestDestination != destination {
+				if row.Outbound.Tag != outbound.Tag || row.EffectiveDestination != destination || row.LatestDestination != destination {
 					t.Fatalf("UDP child facts: %+v", row)
 				}
 				ref = row.Ref
 				return true
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-			if err != nil || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || outcomes[0].Err != nil {
 				t.Fatalf("close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {

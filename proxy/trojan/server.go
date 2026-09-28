@@ -318,7 +318,7 @@ func (s *Server) handleUDPPayload(ctx context.Context, sessionPolicy policy.Sess
 				destination := *b.UDP
 				if flow == nil && store != nil {
 					var cancel context.CancelFunc
-					ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, conn, destination, stats.FlowKindUDPAssociation)
+					ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, conn, destination, net.Network_UDP)
 					if flow != nil {
 						udpServer.Observation = flow
 						defer cancel()

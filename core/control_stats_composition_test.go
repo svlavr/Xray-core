@@ -73,7 +73,7 @@ func controlOpen(t *testing.T, instance *core.Instance, view fs.FlowInspection, 
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
-			if !known[row.Ref] && row.SelectedRoute.Outbound.Serial != 0 && row.Downlink.Known > 0 {
+			if !known[row.Ref] && row.Outbound.Serial != 0 && row.Downlink > 0 {
 				found = row
 				return true
 			}
@@ -90,13 +90,10 @@ func controlRule(target string, network net.Network) *router.Config {
 	}}}
 }
 
-func controlRoute(t *testing.T, row fs.FlowRecord, tag string, selection fs.SelectionKind) {
+func controlRoute(t *testing.T, row fs.FlowRecord, tag string) {
 	t.Helper()
-	if row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != tag || row.SelectedRoute.Outbound.Serial == 0 || row.SelectedRoute.Selection != selection {
+	if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != tag || row.Outbound.Serial == 0 {
 		t.Fatalf("unexpected route: %+v", row)
-	}
-	if selection == fs.SelectionRule && row.SelectedRoute.RuleTag != "p3-rule" {
-		t.Fatalf("missing rule readback: %+v", row.SelectedRoute)
 	}
 }
 
@@ -117,7 +114,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 					}
 				}
 				unrelated, unrelatedRow := controlOpen(t, instance, view, dest)
-				controlRoute(t, unrelatedRow, "direct", fs.SelectionDefault)
+				controlRoute(t, unrelatedRow, "direct")
 				r := instance.GetFeature(frouting.RouterType()).(frouting.Router)
 				b := r.(frouting.BalancerOverrider)
 				config := controlRule("p3-a", network)
@@ -135,8 +132,8 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				}
 				first, firstRow := controlOpen(t, instance, view, dest)
 				second, secondRow := controlOpen(t, instance, view, dest)
-				controlRoute(t, firstRow, "p3-a", fs.SelectionRule)
-				controlRoute(t, secondRow, "p3-a", fs.SelectionRule)
+				controlRoute(t, firstRow, "p3-a")
+				controlRoute(t, secondRow, "p3-a")
 
 				// The caller captures exact refs BEFORE changing the route. Membership
 				// is bounded and deliberately excludes unrelated and future admissions.
@@ -146,7 +143,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				}
 				var captured []fs.FlowRef
 				for _, row := range live.Rows {
-					if row.SelectedRoute.Outbound == firstRow.SelectedRoute.Outbound {
+					if row.Outbound == firstRow.Outbound {
 						captured = append(captured, row.Ref)
 					}
 				}
@@ -163,7 +160,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				// This later admission still selects A after the failed update, but
 				// is outside the already captured set despite using the same owner.
 				uncaptured, uncapturedRow := controlOpen(t, instance, view, dest)
-				controlRoute(t, uncapturedRow, "p3-a", fs.SelectionRule)
+				controlRoute(t, uncapturedRow, "p3-a")
 				controlExchange(t, first, network)
 				if balanced {
 					if err := b.SetOverrideTarget("absent", "p3-b"); err == nil {
@@ -189,7 +186,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 					t.Fatal("published rule missing from inventory")
 				}
 				later, laterRow := controlOpen(t, instance, view, dest)
-				controlRoute(t, laterRow, "p3-b", fs.SelectionRule)
+				controlRoute(t, laterRow, "p3-b")
 				controlExchange(t, first, network)
 				controlExchange(t, second, network)
 				live, err = view.ReadLive()
@@ -198,7 +195,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				}
 				for _, row := range live.Rows {
 					if row.Ref == firstRow.Ref || row.Ref == secondRow.Ref {
-						controlRoute(t, row, "p3-a", fs.SelectionRule)
+						controlRoute(t, row, "p3-a")
 					}
 				}
 				outcomes, err := view.CloseFlows(context.Background(), captured)
@@ -206,7 +203,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 					t.Fatalf("close captured set: %+v %v", outcomes, err)
 				}
 				for i, outcome := range outcomes {
-					if outcome.Ref != captured[i] || outcome.Code != fs.CloseCodeAccepted {
+					if outcome.Ref != captured[i] || outcome.Err != nil {
 						t.Fatalf("captured close outcome: %+v", outcome)
 					}
 				}
@@ -228,12 +225,12 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 					if terminal.Flow.Ref != firstRow.Ref && terminal.Flow.Ref != secondRow.Ref {
 						t.Fatalf("wrong endpoint ended: %+v", terminal)
 					}
-					controlRoute(t, terminal.Flow, "p3-a", fs.SelectionRule)
+					controlRoute(t, terminal.Flow, "p3-a")
 				}
 				stale := laterRow.Ref
 				stale.Runtime[0] ^= 0xff
 				outcomes, err = view.CloseFlows(context.Background(), append(captured, stale))
-				if err != nil || len(outcomes) != 3 || outcomes[0].Code != fs.CloseCodeNoAction || outcomes[1].Code != fs.CloseCodeNoAction || outcomes[2].Code != fs.CloseCodeStaleRuntime {
+				if err != nil || len(outcomes) != 3 || outcomes[0].Err != nil || outcomes[1].Err != nil || outcomes[2].Err != nil {
 					t.Fatalf("repeat/stale results: %+v %v", outcomes, err)
 				}
 				controlExchange(t, unrelated, network)
@@ -249,7 +246,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 					t.Fatalf("native repeated removal: %v", err)
 				}
 				_, defaultRow := controlOpen(t, instance, view, dest)
-				controlRoute(t, defaultRow, "direct", fs.SelectionDefault)
+				controlRoute(t, defaultRow, "direct")
 			})
 		}
 	}
@@ -287,7 +284,7 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	established, oldRow := controlOpen(t, instance, view, original)
-	controlRoute(t, oldRow, "p3-dynamic", fs.SelectionRule)
+	controlRoute(t, oldRow, "p3-dynamic")
 	if err := core.AddOutboundHandler(instance, inspectionFreedom("p3-dynamic")); err == nil || m.GetHandler("p3-dynamic") != old {
 		t.Fatal("duplicate add replaced the current owner")
 	}
@@ -308,11 +305,11 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	newConn, newRow := controlOpen(t, instance, view, original)
-	controlRoute(t, newRow, "p3-dynamic", fs.SelectionRule)
-	if newRow.SelectedRoute.Outbound.Serial == oldRow.SelectedRoute.Outbound.Serial {
+	controlRoute(t, newRow, "p3-dynamic")
+	if newRow.Outbound.Serial == oldRow.Outbound.Serial {
 		t.Fatal("tag reuse reused the old incarnation")
 	}
-	if newRow.InitialDestination != original || newRow.SelectedRoute.SelectedTarget != original || newRow.EffectiveDestination != redirected || redirectedBytes.Load() == 0 {
+	if newRow.InitialDestination != original || newRow.EffectiveDestination != redirected || redirectedBytes.Load() == 0 {
 		t.Fatalf("redirect facts: %+v", newRow)
 	}
 	if err := core.AddOutboundHandler(instance, &core.OutboundHandlerConfig{Tag: "p3-block", ProxySettings: serial.ToTypedMessage(&blackhole.Config{})}); err != nil {
@@ -339,12 +336,9 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 	if err != nil || len(terminals.Rows) != 1 {
 		t.Fatalf("BLOCK terminal: %+v %v", terminals, err)
 	}
-	controlRoute(t, terminals.Rows[0].Flow, "p3-block", fs.SelectionRule)
-	if terminals.Rows[0].Flow.State != fs.FlowStateEnded {
-		t.Fatalf("BLOCK completion: %+v", terminals.Rows[0])
-	}
+	controlRoute(t, terminals.Rows[0].Flow, "p3-block")
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{oldRow.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("old incarnation exact stop: %+v %v", outcomes, err)
 	}
 	controlExchange(t, newConn, net.Network_TCP)
@@ -405,7 +399,7 @@ func TestControlStatsP3InboundLifecycle(t *testing.T) {
 		if err != nil || len(live.Rows) != 1 {
 			return false
 		}
-		controlRoute(t, live.Rows[0], "direct", fs.SelectionDefault)
+		controlRoute(t, live.Rows[0], "direct")
 		return true
 	})
 	if err := m.RemoveHandler(context.Background(), config.Tag); err != nil {
@@ -441,7 +435,7 @@ func TestControlStatsP3MissingProcessIdentity(t *testing.T) {
 	// API admission has no platform source identity. Failure to match the
 	// process rule falls through to a generic rule; it is not a fail-closed policy.
 	_, row := controlOpen(t, instance, view, startOutboundStatsTCPServer(t))
-	controlRoute(t, row, "direct", fs.SelectionRule)
+	controlRoute(t, row, "direct")
 	matcher := router.NewProcessNameMatcher([]string{"self/"})
 	if matcher.Apply(&rsession.Context{Inbound: &session.Inbound{Source: net.TCPDestination(net.LocalHostIP, 1)}}) {
 		t.Fatal("unknown network matched a process")

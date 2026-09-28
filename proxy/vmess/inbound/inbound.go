@@ -296,9 +296,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
 	var observation *session.LogicalObservation
 	if request.Command == protocol.RequestCommandTCP || request.Command == protocol.RequestCommandUDP {
-		kind := stats.FlowKindTCP
+		kind := net.Network_TCP
 		if request.Command == protocol.RequestCommandUDP {
-			kind = stats.FlowKindUDPAssociation
+			kind = net.Network_UDP
 		}
 		var cleanup func()
 		ctx, observation, cleanup = proxy.BeginReturnedObservation(ctx, h.statsManager, connection, request.Destination(), kind)

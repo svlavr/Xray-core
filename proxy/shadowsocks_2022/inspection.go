@@ -36,7 +36,7 @@ func dispatchTCP(ctx context.Context, manager stats.Manager, inboundConn, conn n
 			endpoint = owned
 		}
 	}
-	ctx, observation, finish := proxy.BeginReturnedObservation(ctx, manager, endpoint, destination, stats.FlowKindTCP)
+	ctx, observation, finish := proxy.BeginReturnedObservation(ctx, manager, endpoint, destination, net.Network_TCP)
 	if finish != nil {
 		defer finish()
 		observed := &inspectionConn{Conn: conn, endpoint: endpoint, receipt: observation.Exchange}

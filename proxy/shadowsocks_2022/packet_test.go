@@ -133,7 +133,7 @@ func TestInspectionSS2022PacketCodecResults(t *testing.T) {
 				if outcome == "complete" {
 					known = 8
 				}
-				if row.Uplink.Known != 7 || row.Downlink.Known != known {
+				if row.Uplink != 7 || row.Downlink != known {
 					t.Fatalf("packet result: %+v", row)
 				}
 			})

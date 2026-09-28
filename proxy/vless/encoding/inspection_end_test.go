@@ -41,9 +41,6 @@ func inspectionTerminal(t *testing.T, flow fs.Exchange, view fs.FlowInspection) 
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal page: %+v %v", page, err)
 	}
-	if page.Rows[0].Flow.State != fs.FlowStateEnded {
-		t.Fatalf("flow did not end: %+v", page.Rows[0])
-	}
 	return page.Rows[0]
 }
 
@@ -69,7 +66,7 @@ func TestInspectionXtlsReadNativeResults(t *testing.T) {
 			if (test.err == io.EOF) != (err == nil) {
 				t.Fatalf("XtlsRead error = %v", err)
 			}
-			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink.Known != 0 {
+			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink != 0 {
 				t.Fatalf("read result invented bytes: %+v", got)
 			}
 		})
@@ -84,7 +81,7 @@ func TestInspectionXtlsReadWriterCauseAndLocalStop(t *testing.T) {
 		if err == nil {
 			t.Fatal("writer failure was lost")
 		}
-		if got := inspectionTerminal(t, flow, view); got.Flow.Downlink.Known != 0 {
+		if got := inspectionTerminal(t, flow, view); got.Flow.Downlink != 0 {
 			t.Fatalf("failed opaque write invented bytes: %+v", got)
 		}
 	})
@@ -92,7 +89,7 @@ func TestInspectionXtlsReadWriterCauseAndLocalStop(t *testing.T) {
 	t.Run("local-stop", func(t *testing.T) {
 		flow, view := inspectionPacketFlow(t)
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 			t.Fatalf("stop: %+v %v", outcomes, err)
 		}
 		if err := XtlsRead(&inspectionEndReader{err: io.ErrUnexpectedEOF}, buf.NewWriter(io.Discard), inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background()); err == nil {
@@ -120,7 +117,7 @@ func TestInspectionXtlsReadRawFallbackResults(t *testing.T) {
 			flow, view := inspectionPacketFlow(t)
 			if test.localStop {
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-				if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+				if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 					t.Fatalf("stop: %+v %v", outcomes, err)
 				}
 			}
@@ -144,7 +141,7 @@ func TestInspectionXtlsReadRawFallbackResults(t *testing.T) {
 			if (test.writerErr == nil) != (err == nil) {
 				t.Fatalf("raw fallback error = %v", err)
 			}
-			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink.Known != test.wantBytes {
+			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink != test.wantBytes {
 				t.Fatalf("raw fallback counted bytes: %+v want %d", got, test.wantBytes)
 			}
 		})

@@ -60,9 +60,9 @@ func TestFlowInspectionXUDPRetainedRebind(t *testing.T) {
 				return false
 			}
 			row = live.Rows[0]
-			return row.Uplink.Known == uint64(len(payload)) && row.Downlink.Known == uint64(len(payload))
+			return row.Uplink == uint64(len(payload)) && row.Downlink == uint64(len(payload))
 		})
-		if row.Source.Port != cnet.Port(source.Port) || row.SelectedRoute.Outbound.Tag != "vmess-proxy" || row.EffectiveDestination != destination {
+		if row.Source.Port != cnet.Port(source.Port) || row.Outbound.Tag != "vmess-proxy" || row.EffectiveDestination != destination {
 			t.Fatalf("client binding: %+v", row)
 		}
 		if row.Ref == prior {
@@ -77,7 +77,7 @@ func TestFlowInspectionXUDPRetainedRebind(t *testing.T) {
 		}
 		retained = current
 		out, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-		if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+		if err != nil || len(out) != 1 || out[0].Err != nil {
 			t.Fatalf("client stop: %+v %v", out, err)
 		}
 		inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 0 })

@@ -9,7 +9,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
@@ -49,9 +48,9 @@ func StartInstance(configFormat string, configBytes []byte) (*Instance, error) {
 // xray:api:stable
 func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, error) {
 	ctx = toContext(ctx, v)
-	kind := stats.FlowKindTCP
+	kind := net.Network_TCP
 	if dest.Network == net.Network_UDP {
-		kind = stats.FlowKindUDPAssociation
+		kind = net.Network_UDP
 	}
 	ctx, observation := beginAPIObservation(ctx, v, dest, kind, true)
 
@@ -92,7 +91,7 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 // xray:api:beta
 func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
 	ctx = toContext(ctx, v)
-	ctx, observation := beginAPIObservation(ctx, v, net.Destination{}, stats.FlowKindUDPAssociation, false)
+	ctx, observation := beginAPIObservation(ctx, v, net.Destination{}, net.Network_UDP, false)
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {

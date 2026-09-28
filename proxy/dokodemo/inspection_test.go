@@ -86,8 +86,8 @@ func TestInspectionPacketWriterRawResults(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer manager.Close()
-				flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-				flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+				flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+				flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 				flow.BindRoute()
 				destination := net.UDPDestination(net.LocalHostIP, 53)
 				socket := &inspectionResultSocket{result: tc.n, err: tc.err}
@@ -107,7 +107,7 @@ func TestInspectionPacketWriterRawResults(t *testing.T) {
 					t.Fatalf("terminal: %+v %v", page, err)
 				}
 				fact := page.Rows[0].Flow.Downlink
-				if fact.Known != tc.known {
+				if fact != tc.known {
 					t.Fatalf("destination=%t fact=%+v", perDestination, fact)
 				}
 			}
@@ -122,8 +122,8 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	destination := net.UDPDestination(net.LocalHostIP, 53)
 	socket := &inspectionResultSocket{result: 2, err: io.ErrClosedPipe, entered: make(chan struct{}), release: make(chan struct{})}
@@ -140,7 +140,7 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 	}
 	flow.Finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("owner-end write snapshot: %+v %v", page, err)
 	}
 	closed := make(chan struct{})
@@ -159,13 +159,13 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if fact.Known != 0 {
+	if fact != 0 {
 		t.Fatalf("late write mutated history: %+v", fact)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
-		known += total.Downlink.Known
+		known += total.Downlink
 	}
 	if known != 2 {
 		t.Fatalf("late write totals: %+v", totals)

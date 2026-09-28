@@ -293,7 +293,7 @@ func TestFlowInspectionP2GVLESSResponseEnding(t *testing.T) {
 					return false
 				}
 				row := page.Rows[0]
-				if row.Flow.SelectedRoute.Outbound.Tag != outbound.Tag || row.Flow.SelectedRoute.Outbound.Serial == 0 || row.Flow.Downlink.Known != 0 {
+				if row.Flow.Outbound.Tag != outbound.Tag || row.Flow.Outbound.Serial == 0 || row.Flow.Downlink != 0 {
 					t.Fatalf("response ending facts: %+v", row)
 				}
 				return true
@@ -323,17 +323,17 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 			var row fs.FlowRecord
 			inspectionWait(t, func() bool {
 				live, err := view.ReadLive()
-				if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len(payload)) || live.Rows[0].Downlink.Known != uint64(len(payload)) {
+				if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != uint64(len(payload)) {
 					return false
 				}
 				row = live.Rows[0]
 				return true
 			})
-			if row.SelectedRoute.Outbound.Tag != outbound.Tag || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination {
+			if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.EffectiveDestination != destination {
 				t.Fatalf("Hysteria TCP facts: %+v", row)
 			}
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 				t.Fatalf("Hysteria TCP exact stop: %+v %v", outcomes, err)
 			}
 			if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
@@ -366,10 +366,10 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 				return false
 			}
 			for _, row := range live.Rows {
-				if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
+				if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 					return false
 				}
-				if row.SelectedRoute.Outbound.Tag != outbound.Tag || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination {
+				if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.EffectiveDestination != destination {
 					t.Fatalf("Hysteria UDP facts: %+v", row)
 				}
 				switch row.Source.Port {
@@ -382,17 +382,17 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 			return firstRow.Ref.ID != 0 && siblingRow.Ref.ID != 0
 		})
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 			t.Fatalf("Hysteria UDP exact stop: %+v %v", outcomes, err)
 		}
 		extra := []byte("sibling after exact stop")
 		inspectionUDPExchange(t, sibling, address, extra, mask)
 		inspectionWait(t, func() bool {
 			live, _ := view.ReadLive()
-			return len(live.Rows) == 1 && live.Rows[0].Ref == siblingRow.Ref && live.Rows[0].Uplink.Known == uint64(len(payload)+len(extra)) && live.Rows[0].Downlink.Known == uint64(len(payload)+len(extra))
+			return len(live.Rows) == 1 && live.Rows[0].Ref == siblingRow.Ref && live.Rows[0].Uplink == uint64(len(payload)+len(extra)) && live.Rows[0].Downlink == uint64(len(payload)+len(extra))
 		})
 		outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{siblingRow.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 			t.Fatalf("Hysteria UDP sibling close: %+v %v", outcomes, err)
 		}
 		inspectionOutboundTotals(t, view, outbound.Tag, uint64(2*len(payload)+len(extra)))
@@ -408,17 +408,17 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 		var row fs.FlowRecord
 		inspectionWait(t, func() bool {
 			live, err := view.ReadLive()
-			if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len(payload)) || live.Rows[0].Downlink.Known != uint64(len(payload)) {
+			if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != uint64(len(payload)) {
 				return false
 			}
 			row = live.Rows[0]
 			return true
 		})
-		if row.SelectedRoute.Outbound.Tag != outbound.Tag || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination {
+		if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.EffectiveDestination != destination {
 			t.Fatalf("fragmented UDP attribution: %+v", row)
 		}
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 			t.Fatalf("fragmented UDP close: %+v %v", outcomes, err)
 		}
 	})

@@ -44,8 +44,8 @@ func inspectionFlow(t *testing.T, close func() error) (fs.Exchange, fs.FlowInspe
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { manager.Close() })
-	flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, close)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, close)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	return flow, view
 }
@@ -138,7 +138,7 @@ func TestInspectionSS2022NativeCodecResults(t *testing.T) {
 				t.Fatal(err)
 			}
 			row := inspectionLive(t, view)
-			if row.Uplink.Known != 7 || row.Downlink.Known != uint64(test.known) {
+			if row.Uplink != 7 || row.Downlink != uint64(test.known) {
 				t.Fatalf("decoded receipts: %+v", row)
 			}
 		})
@@ -153,7 +153,7 @@ func TestInspectionSS2022ScalarPositiveError(t *testing.T) {
 			t.Fatalf("result: %d %v", n, err)
 		}
 		fact := inspectionLive(t, view).Downlink
-		if fact.Known != uint64(accepted) {
+		if fact != uint64(accepted) {
 			t.Fatalf("positive error: %+v", fact)
 		}
 	}
@@ -227,12 +227,12 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 		t.Fatal("write did not start")
 	}
 	result, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || result[0].Code != fs.CloseCodeAccepted {
+	if err != nil || result[0].Err != nil {
 		t.Fatalf("stop: %+v %v", result, err)
 	}
 	flow.Finish()
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("owner-end write snapshot: %+v", page)
 	}
 	once.Do(func() { close(release) })
@@ -245,13 +245,13 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 		t.Fatal("write did not finish")
 	}
 	page, _ = view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("late receipt: %+v", page)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
-		known += total.Downlink.Known
+		known += total.Downlink
 	}
 	if known != 4 {
 		t.Fatalf("late receipt totals: %+v", totals)

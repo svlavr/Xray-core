@@ -128,7 +128,7 @@ func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.H
 	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
 
 	go func() {
-		detached := dns.CopyContextOwner(context.WithoutCancel(ctx), ctx)
+		detached := context.WithoutCancel(ctx)
 		h.Dispatch(detached, &transport.Link{Reader: ur, Writer: dw})
 	}()
 	var readerOpt cnc.ConnectionOption

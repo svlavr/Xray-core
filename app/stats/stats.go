@@ -16,7 +16,6 @@ type Manager struct {
 	onlineMaps map[string]*OnlineMap
 	channels   map[string]*Channel
 	running    bool
-	started    bool
 	inspection *inspectionStore
 }
 
@@ -242,7 +241,6 @@ func (m *Manager) GetAllOnlineUsers() []string {
 func (m *Manager) Start() error {
 	m.access.Lock()
 	defer m.access.Unlock()
-	m.started = true
 	m.running = true
 	errs := []error{}
 	for _, channel := range m.channels {
@@ -260,7 +258,6 @@ func (m *Manager) Start() error {
 func (m *Manager) Close() error {
 	m.access.Lock()
 	defer m.access.Unlock()
-	m.started = true
 	m.running = false
 	if m.inspection != nil {
 		m.inspection.close()

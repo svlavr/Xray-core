@@ -56,7 +56,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 		var firstRow fs.FlowRecord
 		inspectionWait(t, func() bool {
 			live, err := view.ReadLive()
-			if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != uint64(len(payload)) || live.Rows[0].Downlink.Known != uint64(len(payload)) {
+			if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != uint64(len(payload)) {
 				return false
 			}
 			firstRow = live.Rows[0]
@@ -70,7 +70,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 			return err == nil && len(live.Rows) == 2
 		})
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 			t.Fatalf("supplied TCP exact stop: %+v %v", outcomes, err)
 		}
 		if pendingPeerEOF {
@@ -105,7 +105,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 				return siblingRef != firstRow.Ref
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{siblingRef})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 				t.Fatalf("pending sibling stop: %+v %v", outcomes, err)
 			}
 		}
@@ -116,7 +116,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 			}
 			for _, row := range page.Rows {
 				if row.Flow.Ref == firstRow.Ref {
-					return row.Flow.Uplink.Known == uint64(len(payload)) && row.Flow.Downlink.Known == uint64(len(payload))
+					return row.Flow.Uplink == uint64(len(payload)) && row.Flow.Downlink == uint64(len(payload))
 				}
 			}
 			return false
@@ -140,13 +140,13 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 			return false
 		}
 		row = live.Rows[0]
-		return row.SelectedRoute.Outbound.Tag == "direct" && row.SelectedRoute.Outbound.Serial != 0
+		return row.Outbound.Tag == "direct" && row.Outbound.Serial != 0
 	})
-	if row.Uplink.Known != 0 || row.Downlink.Known != 0 {
+	if row.Uplink != 0 || row.Downlink != 0 {
 		t.Fatalf("VLESS response framing credited before payload: %+v", row)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("VLESS early stop: %+v %v", outcomes, err)
 	}
 	if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
@@ -154,7 +154,7 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 	}
 	inspectionWait(t, func() bool {
 		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref && page.Rows[0].Flow.Downlink.Known == 0
+		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref && page.Rows[0].Flow.Downlink == 0
 	})
 	inspectionOutboundTotals(t, view, "direct", 0)
 }
@@ -203,7 +203,7 @@ func inspectionEnableOutboundMux(t *testing.T, outbound *core.OutboundHandlerCon
 
 func assertDecodedTCPReceiverFacts(t *testing.T, row fs.FlowRecord, destination cnet.Destination, payload uint64) {
 	t.Helper()
-	if row.Kind != fs.FlowKindTCP || row.InitialDestination != destination || row.SelectedRoute.Outbound.Tag != "direct" || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser || row.Uplink.Known != payload || row.Downlink.Known != payload {
+	if row.Kind != cnet.Network_TCP || row.InitialDestination != destination || row.Outbound.Tag != "direct" || row.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser || row.Uplink != payload || row.Downlink != payload {
 		t.Fatalf("supplied TCP facts: %+v", row)
 	}
 }

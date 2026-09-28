@@ -55,7 +55,7 @@ func inspectionHTTPOutboundTotals(t *testing.T, view fs.FlowInspection, want uin
 		var up, down uint64
 		for _, row := range totals.Rows {
 			if row.Outbound.Serial == 0 {
-				if row.Uplink.Known != 0 || row.Downlink.Known != 0 {
+				if row.Uplink != 0 || row.Downlink != 0 {
 					t.Fatalf("unexpected unassigned HTTP outbound credit: %+v", row)
 				}
 				continue
@@ -63,8 +63,8 @@ func inspectionHTTPOutboundTotals(t *testing.T, view fs.FlowInspection, want uin
 			if row.Outbound.Tag != "http-proxy" || row.Origin != fs.TrafficOriginUser {
 				t.Fatalf("HTTP outbound totals: %+v", row)
 			}
-			up += row.Uplink.Known
-			down += row.Downlink.Known
+			up += row.Uplink
+			down += row.Downlink
 		}
 		return up == want && down == want
 	})
@@ -96,10 +96,10 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.Uplink.Known != uint64(len(payload)) || row.Downlink.Known != uint64(len(payload)) {
+					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.SelectedRoute.Outbound.Tag != "http-proxy" || row.SelectedRoute.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
+					if row.Outbound.Tag != "http-proxy" || row.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("live proxy receipt: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -109,7 +109,7 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 				return selected.ID != 0
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 				t.Fatalf("close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
@@ -188,13 +188,13 @@ func TestFlowInspectionHTTPOutboundHandshakeEnding(t *testing.T) {
 				t.Fatalf("native CONNECT request: %q %v", request[:n], err)
 			}
 			live, err := view.ReadLive()
-			if err != nil || len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Outbound.Tag != "http-proxy" {
+			if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Tag != "http-proxy" {
 				t.Fatalf("handshake owner: %+v %v", live, err)
 			}
 			ref := live.Rows[0].Ref
 			if stop {
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-				if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+				if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 					t.Fatalf("handshake stop: %+v %v", outcomes, err)
 				}
 				page, _ := view.ReadTerminals()
@@ -215,11 +215,8 @@ func TestFlowInspectionHTTPOutboundHandshakeEnding(t *testing.T) {
 					return false
 				}
 				row := page.Rows[0]
-				if row.Flow.Ref != ref || row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.SelectedRoute.Outbound.Tag != "http-proxy" {
+				if row.Flow.Ref != ref || row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Tag != "http-proxy" {
 					t.Fatalf("failed handshake receipt: %+v", row)
-				}
-				if row.Flow.State != fs.FlowStateEnded {
-					t.Fatalf("missing owner end: %+v", row)
 				}
 				return true
 			})

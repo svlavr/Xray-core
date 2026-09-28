@@ -156,8 +156,7 @@ func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*
 		cancel()
 		err = errors.New("failed to dispatch request to ", dest).Base(err)
 		if observation != nil {
-			observation.Exchange.Route(stats.RouteStep{Selection: stats.SelectionRejected, SelectedTarget: dest})
-			observation.Exchange.BindRoute()
+			observation.Exchange.Unassign()
 
 			observation.Exchange.Finish()
 			return &connEntry{observation: observation}, err

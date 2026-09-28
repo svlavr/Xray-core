@@ -58,7 +58,7 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
 	dest := net.UDPDestination(net.LocalHostIP, 53)
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, dest, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, dest, nil)
 	legFinished := make(chan struct{})
 	roleSelected := make(chan struct{})
 	selectedDone := make(chan struct{})
@@ -74,7 +74,7 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 		go func() {
 			defer close(selectedDone)
 			<-roleSelected
-			observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: 41, Tag: "ordinary"}})
+			observation.Exchange.Route(fs.OutboundRef{Serial: 41, Tag: "ordinary"})
 			observation.Exchange.BindRoute()
 			observation.Exchange.(interface{ FinishSelectedLeg() }).FinishSelectedLeg()
 		}()
@@ -85,19 +85,19 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	lifecycleWait(t, legFinished)
 	root.Finish()
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
 		t.Fatalf("owner-end pending snapshot: %+v", page)
 	}
 	close(roleSelected)
 	lifecycleWait(t, selectedDone)
 	again, _ := view.ReadTerminals()
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink.Known != 0 {
+	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink != 0 {
 		t.Fatalf("selected role changed immutable terminal: %+v", again)
 	}
 	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
 		if total.Outbound.Serial == 41 {
-			if total.Uplink.Known != uint64(len("pending input")) || total.Downlink.Known != 0 {
+			if total.Uplink != uint64(len("pending input")) || total.Downlink != 0 {
 				t.Fatalf("late ordinary total: %+v", total)
 			}
 			return
@@ -111,7 +111,7 @@ func TestUDPDispatcherInspectionSynchronousRejection(t *testing.T) {
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
 	dest := net.UDPDestination(net.LocalHostIP, 53)
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, dest, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, dest, nil)
 	d := NewDispatcher(lifecycleDispatcher{dispatch: func(context.Context, net.Destination) (*transport.Link, error) {
 		return nil, errors.New("synchronous route rejection")
 	}}, func(context.Context, *protocoludp.Packet) { t.Error("rejected dispatch started a callback") })
@@ -126,12 +126,12 @@ func TestUDPDispatcherInspectionSynchronousRejection(t *testing.T) {
 	d.RemoveRay()
 	root.Finish()
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != want || page.Rows[0].Flow.Downlink.Known != 0 || page.Rows[0].Flow.SelectedRoute.Selection != fs.SelectionRejected {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != want || page.Rows[0].Flow.Downlink != 0 || page.Rows[0].Flow.Outbound.Serial != 0 {
 		t.Fatalf("synchronous rejection lost decoded custody: %+v", page.Rows)
 	}
 	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
-		if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 && (total.Uplink.Known != want) {
+		if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 && (total.Uplink != want) {
 			t.Fatalf("rejected unassigned total: %+v", total)
 		}
 	}
@@ -148,7 +148,7 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 	}
 	t.Cleanup(func() { manager.Close() })
 	dest := net.UDPDestination(net.LocalHostIP, 53)
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, dest, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, dest, nil)
 	var serial uint64
 	var outputs []*pipe.Writer
 	firstStarted, releaseFirst, firstDone, secondDone := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
@@ -158,7 +158,7 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 		if observation == nil || !observation.ReturnedLink.CompareAndSwap(true, false) {
 			t.Fatal("missing fresh ray claim")
 		}
-		observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionRule, Outbound: fs.OutboundRef{Serial: serial}})
+		observation.Exchange.Route(fs.OutboundRef{Serial: serial})
 		observation.Exchange.BindRoute()
 		r, w := pipe.New()
 		t.Cleanup(r.Interrupt)
@@ -195,19 +195,19 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 	d.RemoveRay()
 	root.Finish()
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 18 || page.Rows[0].Flow.Downlink.Known != 12 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 18 || page.Rows[0].Flow.Downlink != 12 {
 		t.Fatalf("owner-end association snapshot: %+v", page)
 	}
 	close(releaseFirst)
 	lifecycleWait(t, firstDone)
 	page, _ = view.ReadTerminals()
 	row := page.Rows[0].Flow
-	if row.Ref != root.Ref() || row.Uplink.Known != 18 || row.Downlink.Known != 12 || row.SelectedRoute.Outbound.Serial != 2 {
+	if row.Ref != root.Ref() || row.Uplink != 18 || row.Downlink != 12 || row.Outbound.Serial != 2 {
 		t.Fatalf("overlapping ray facts: %+v", row)
 	}
 	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
-		if total.Outbound.Serial != 0 && (total.Uplink.Known != 9 || total.Downlink.Known != 12) {
+		if total.Outbound.Serial != 0 && (total.Uplink != 9 || total.Downlink != 12) {
 			t.Fatalf("late callback moved buckets: %+v", total)
 		}
 	}
@@ -218,7 +218,7 @@ func TestUDPDispatcherInspectionUnclaimedOwner(t *testing.T) {
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
 	dest := net.UDPDestination(net.LocalHostIP, 53)
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUnknown, net.Destination{}, dest, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUnknown, net.Destination{}, dest, nil)
 	r, w := pipe.New()
 	t.Cleanup(r.Interrupt)
 	t.Cleanup(w.Interrupt)
@@ -233,7 +233,7 @@ func TestUDPDispatcherInspectionUnclaimedOwner(t *testing.T) {
 	root.Finish()
 	lifecycleWait(t, done)
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
 		t.Fatalf("unclaimed owner snapshot: %+v", page)
 	}
 }
@@ -249,7 +249,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 	}
 	t.Cleanup(func() { manager.Close() })
 	destination := net.UDPDestination(net.LocalHostIP, 53)
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
 	rootObservation := &session.LogicalObservation{Exchange: root, InputAtExecution: true}
 	rootObservation.ReturnedLink.Store(true)
 	ctx := session.ContextWithLogicalObservation(context.Background(), rootObservation)
@@ -261,7 +261,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 		if observation == nil || !observation.InputAtExecution || !observation.ReturnedLink.CompareAndSwap(true, false) {
 			t.Fatal("API ray did not retain execution-consumption custody")
 		}
-		observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 17, Tag: "api"}})
+		observation.Exchange.Route(fs.OutboundRef{Serial: 17, Tag: "api"})
 		observation.Exchange.BindRoute()
 		uplinkReader, uplinkWriter := pipe.New()
 		downlinkReader, downlinkWriter := pipe.New()
@@ -279,7 +279,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 		t.Fatalf("WriteTo %d/%d: %v", n, len(payload), err)
 	}
 	live, err := view.ReadLive()
-	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink.Known != 0 {
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != 0 {
 		t.Fatalf("WriteTo submission credited execution bytes: %+v %v", live, err)
 	}
 	mb, err := input.ReadMultiBuffer()
@@ -306,7 +306,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.Uplink.Known != uint64(len(payload)) || flow.Downlink.Known != uint64(n) || flow.LatestDestination != destination || flow.SelectedRoute.Outbound.Serial != 17 {
+			if flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.LatestDestination != destination || flow.Outbound.Serial != 17 {
 				t.Fatalf("API dispatcher facts: %+v", flow)
 			}
 			return
@@ -321,7 +321,7 @@ func TestInspectionDispatcherAPINaturalEndDrainsBeforeFinish(t *testing.T) {
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
 	destination := net.UDPDestination(net.LocalHostIP, 53)
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
 	rootObservation := &session.LogicalObservation{Exchange: root, InputAtExecution: true}
 	rootObservation.ReturnedLink.Store(true)
 	ctx := session.ContextWithLogicalObservation(context.Background(), rootObservation)
@@ -332,7 +332,7 @@ func TestInspectionDispatcherAPINaturalEndDrainsBeforeFinish(t *testing.T) {
 		if observation == nil || !observation.ReturnedLink.CompareAndSwap(true, false) {
 			t.Fatal("missing API ray observation")
 		}
-		observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 23, Tag: "api"}})
+		observation.Exchange.Route(fs.OutboundRef{Serial: 23, Tag: "api"})
 		observation.Exchange.BindRoute()
 		downlinkReader, downlinkWriter := pipe.New()
 		response = downlinkWriter
@@ -375,7 +375,7 @@ func TestInspectionDispatcherAPINaturalEndDrainsBeforeFinish(t *testing.T) {
 		t.Fatalf("post-drain read: %v", err)
 	}
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != uint64(len(responsePayload)) {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != uint64(len(responsePayload)) {
 		t.Fatalf("post-drain terminal: %+v", page.Rows)
 	}
 }
@@ -384,7 +384,7 @@ func TestInspectionDispatcherAPIExplicitCloseDrainsCache(t *testing.T) {
 	manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
 	rootObservation := &session.LogicalObservation{Exchange: root, InputAtExecution: true}
 	rootObservation.ReturnedLink.Store(true)
 	packetConn, err := DialDispatcher(session.ContextWithLogicalObservation(context.Background(), rootObservation), lifecycleDispatcher{})
@@ -393,7 +393,7 @@ func TestInspectionDispatcherAPIExplicitCloseDrainsCache(t *testing.T) {
 	}
 	c := packetConn.(*dispatcherConn)
 	leg := root.NewLeg()
-	leg.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 29, Tag: "api"}})
+	leg.Route(fs.OutboundRef{Serial: 29, Tag: "api"})
 	leg.BindRoute()
 	callbackCtx := session.ContextWithLogicalObservation(context.Background(), &session.LogicalObservation{Exchange: leg})
 	buffers := make([]*buf.Buffer, cap(c.cache))
@@ -429,7 +429,7 @@ func TestInspectionDispatcherAPIReadCloseSamePacket(t *testing.T) {
 	manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
 	rootObservation := &session.LogicalObservation{Exchange: root, InputAtExecution: true}
 	rootObservation.ReturnedLink.Store(true)
 	packetConn, err := DialDispatcher(session.ContextWithLogicalObservation(context.Background(), rootObservation), lifecycleDispatcher{})
@@ -438,7 +438,7 @@ func TestInspectionDispatcherAPIReadCloseSamePacket(t *testing.T) {
 	}
 	c := packetConn.(*dispatcherConn)
 	leg := root.NewLeg()
-	leg.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 31, Tag: "api"}})
+	leg.Route(fs.OutboundRef{Serial: 31, Tag: "api"})
 	leg.BindRoute()
 	payload := buf.New()
 	payload.WriteString("racing response")
@@ -475,7 +475,7 @@ func TestInspectionDispatcherAPIReadCloseSamePacket(t *testing.T) {
 		t.Fatalf("returned read: %d %v", read.n, read.err)
 	}
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != uint64(read.n) || !payload.IsEmpty() {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != uint64(read.n) || !payload.IsEmpty() {
 		t.Fatalf("read/close terminal: %+v %v released=%v", page.Rows, err, payload.IsEmpty())
 	}
 }
@@ -484,7 +484,7 @@ func TestInspectionDispatcherAPIUnclaimedEndReconcilesBeforeEOF(t *testing.T) {
 	manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
-	root := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
 	rootObservation := &session.LogicalObservation{Exchange: root, InputAtExecution: true}
 	rootObservation.ReturnedLink.Store(true)
 	ctx := session.ContextWithLogicalObservation(context.Background(), rootObservation)
@@ -532,7 +532,7 @@ func TestInspectionDispatcherAPIUnclaimedEndReconcilesBeforeEOF(t *testing.T) {
 		t.Fatal("unclaimed ray did not retire")
 	}
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.SelectedRoute.Outbound.Serial != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
 		t.Fatalf("unclaimed root terminal: %+v %v", page.Rows, err)
 	}
 }

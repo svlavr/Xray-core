@@ -41,8 +41,8 @@ func TestInspectionShadowsocksUDPResponseMapping(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { manager.Close() })
-			flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+			flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 			flow.BindRoute()
 			ctx := session.ContextWithLogicalObservation(context.Background(), &session.LogicalObservation{Exchange: flow})
 			if mode != "missing-header" {
@@ -75,15 +75,15 @@ func TestInspectionShadowsocksUDPResponseMapping(t *testing.T) {
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
 			case "full-error":
-				if calls != 1 || fact.Known != want {
+				if calls != 1 || fact != want {
 					t.Fatalf("accepted encrypted packet: %+v", fact)
 				}
 			case "short-nil":
-				if calls != 1 || fact.Known != 0 {
+				if calls != 1 || fact != 0 {
 					t.Fatalf("partial encrypted packet: %+v", fact)
 				}
 			default:
-				if calls != 0 || fact.Known != 0 {
+				if calls != 0 || fact != 0 {
 					t.Fatalf("encoding drop: %+v, writes %d", fact, calls)
 				}
 			}

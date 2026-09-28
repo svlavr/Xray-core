@@ -83,8 +83,8 @@ func TestVisionWriterPayloadPrefixes(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer manager.Close()
-			flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+			flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 			flow.BindRoute()
 			lower := &visionPrefixWriter{limit: test.limit}
 			if test.fail {
@@ -108,7 +108,7 @@ func TestVisionWriterPayloadPrefixes(t *testing.T) {
 			}
 			flow.Finish()
 			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != test.known {
+			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != test.known {
 				t.Fatalf("Vision prefix facts: %+v %v", page, err)
 			}
 		})
@@ -130,8 +130,8 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	state := proxy.NewTrafficState(bytes.Repeat([]byte{0xaa}, 16))
 	lower := visionBlockedWriter{make(chan struct{}), make(chan struct{})}
@@ -142,7 +142,7 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 	<-lower.entered
 	flow.Finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("owner-end Vision snapshot: %+v %v", page, err)
 	}
 	reader := proxy.NewVisionReader(buf.NewReader(bytes.NewReader([]byte("server banner"))), state, false, context.Background(), nil, nil, nil, nil)
@@ -161,13 +161,13 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 		t.Fatal(err)
 	}
 	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
 		t.Fatalf("pending Vision result lost: %+v %v", page, err)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {
-		known += total.Downlink.Known
+		known += total.Downlink
 	}
 	if known != 7 {
 		t.Fatalf("late Vision total: %+v", totals)

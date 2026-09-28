@@ -44,7 +44,7 @@ func TestFlowInspectionSOCKS4DecodedRejectedCommand(t *testing.T) {
 	})
 	flow := terminal.Flow
 	destination := cnet.TCPDestination(cnet.LocalHostIP, 80)
-	if flow.Kind != fs.FlowKindTCP || flow.Origin != fs.TrafficOriginUser || flow.InitialDestination != destination || flow.SelectedRoute.Selection != fs.SelectionUnknown || flow.SelectedRoute.Outbound.Serial != 0 || flow.Uplink.Known != 0 || flow.Downlink.Known != 0 {
+	if flow.Kind != cnet.Network_TCP || flow.Origin != fs.TrafficOriginUser || flow.InitialDestination != destination || flow.Outbound.Serial != 0 || flow.Uplink != 0 || flow.Downlink != 0 {
 		t.Fatalf("decoded SOCKS4 rejection facts: %+v", terminal)
 	}
 

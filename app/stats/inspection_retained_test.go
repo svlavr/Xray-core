@@ -23,8 +23,8 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := testInspectionStore(t, fs.ObservationOptions{})
-			flow := store.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
-			flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1, Tag: "selected"}})
+			flow := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
+			flow.Route(fs.OutboundRef{Serial: 1, Tag: "selected"})
 			flow.BindRoute()
 			flow.AddUplink(7)
 			flow.AddDownlink(11)
@@ -36,15 +36,15 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 			flow.AddDownlink(200)
 			flow.PacketDestination(second)
 			flow.Rebind(store.runtime, fs.TrafficOriginUser) // conflict cannot be repaired by a later matching carrier
-			row := flow.snapshot()
+			row := flow.record
 			if test.conflict {
 				if row.LatestDestination != first {
 					t.Fatalf("conflict changed packet attribution: %+v", row.LatestDestination)
 				}
-				if row.Uplink.Known != 7 || row.Downlink.Known != 11 || row.Origin != fs.TrafficOriginUser {
+				if row.Uplink != 7 || row.Downlink != 11 || row.Origin != fs.TrafficOriginUser {
 					t.Fatalf("conflict facts: %+v", row)
 				}
-			} else if row.Uplink.Known != 107 || row.Downlink.Known != 211 || flow.provenanceConflict {
+			} else if row.Uplink != 107 || row.Downlink != 211 || flow.provenanceConflict {
 				t.Fatalf("matching facts: %+v", row)
 			} else if row.LatestDestination != second {
 				t.Fatalf("matching carrier lost packet attribution: %+v", row.LatestDestination)
@@ -60,7 +60,7 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 
 func TestInspectionRetainedFenceRejectsConcurrentLateCredit(t *testing.T) {
 	store := testInspectionStore(t, fs.ObservationOptions{})
-	flow := store.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
+	flow := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
 	flow.BindRoute()
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -72,12 +72,16 @@ func TestInspectionRetainedFenceRejectsConcurrentLateCredit(t *testing.T) {
 		}
 	}()
 	flow.Rebind(fs.RuntimeID{2}, fs.TrafficOriginUser)
-	fenced := flow.snapshot()
+	flow.mu.Lock()
+	fenced := flow.record
+	flow.mu.Unlock()
 	wg.Wait()
 	flow.AddUplink(99)
 	flow.AddDownlink(99)
-	final := flow.snapshot()
-	if final.Uplink.Known != fenced.Uplink.Known || final.Downlink.Known != fenced.Downlink.Known {
+	flow.mu.Lock()
+	final := flow.record
+	flow.mu.Unlock()
+	if final.Uplink != fenced.Uplink || final.Downlink != fenced.Downlink {
 		t.Fatal("post-fence credit changed known lower bound")
 	}
 	flow.Finish()
@@ -85,25 +89,25 @@ func TestInspectionRetainedFenceRejectsConcurrentLateCredit(t *testing.T) {
 
 func TestInspectionAssociationCompletionKeepsLegBucket(t *testing.T) {
 	store := testInspectionStore(t, fs.ObservationOptions{})
-	flow := store.Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+	flow := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 
 	leg := flow.NewLeg()
-	leg.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Serial: 1, Tag: "leg"}})
+	leg.Route(fs.OutboundRef{Serial: 1, Tag: "leg"})
 	leg.BindRoute()
 	leg.AddUplink(7)
 	flow.Finish()
 	page, _ := store.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 7 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 7 {
 		t.Fatalf("owner-end association snapshot: %+v", page)
 	}
 	leg.Finish()
 	page, _ = store.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != 7 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 7 {
 		t.Fatalf("association retirement lost facts: %+v", page)
 	}
 	totals, _ := store.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 1 && (row.Uplink.Known != 7) {
+		if row.Outbound.Serial == 1 && (row.Uplink != 7) {
 			t.Fatalf("association completion contaminated leg bucket: %+v", row)
 		}
 	}

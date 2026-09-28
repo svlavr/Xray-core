@@ -27,7 +27,7 @@ func TestInspectionDeferredEndpointRawAndDecoded(t *testing.T) {
 			}
 			defer manager.Close()
 			root := manager.Observation().PrepareTCP(fs.TrafficOriginUser, cnet.Destination{}, cnet.TCPDestination(cnet.LocalHostIP, 53), nil)
-			root.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "dns", Serial: 1}})
+			root.Route(fs.OutboundRef{Tag: "dns", Serial: 1})
 			gate := &deferredEndpointReceipt{Exchange: root}
 			gate.AddUplink(7)
 			gate.AddDownlink(5)
@@ -59,7 +59,7 @@ func TestInspectionDeferredEndpointRawAndDecoded(t *testing.T) {
 			if decoded {
 				wantUp, wantDown = 11, 13
 			}
-			if flow.Uplink.Known != wantUp || flow.Downlink.Known != wantDown {
+			if flow.Uplink != wantUp || flow.Downlink != wantDown {
 				t.Fatalf("deferred facts: %+v", page.Rows[0])
 			}
 		})
@@ -84,7 +84,7 @@ func TestInspectionDecodedClaimAfterSniffReplay(t *testing.T) {
 	ctx, finish := ObserveTCP(context.Background(), manager, local, cnet.TCPDestination(cnet.LocalHostIP, 53), link)
 	defer finish()
 	root := session.LogicalObservationFromContext(ctx).Exchange
-	root.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "dns", Serial: 1}})
+	root.Route(fs.OutboundRef{Tag: "dns", Serial: 1})
 	go func() { _, _ = peer.Write(frame) }()
 	cursor := link.Reader.(*buf.InspectionReader)
 	sniff := buf.New()
@@ -104,7 +104,7 @@ func TestInspectionDecodedClaimAfterSniffReplay(t *testing.T) {
 	message.Release()
 	root.Finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(payload)) {
 		t.Fatalf("sniffed DNS payload included framing: %+v %v", page.Rows, err)
 	}
 }
@@ -134,7 +134,7 @@ func TestInspectionDeferredUDPStopBeforeClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink.Known != uint64(len(payload)) {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(payload)) {
 		t.Fatalf("pre-claim exact stop lost pending input: %+v %v", page.Rows, err)
 	}
 }

@@ -108,7 +108,7 @@ func TestSS2022RejectsDirectInboundPacketConn(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer manager.Close()
-					flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, cnet.Destination{}, target, nil)
+					flow := manager.Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, target, nil)
 					defer flow.Finish()
 					ctx = session.ContextWithLogicalObservation(ctx, &session.LogicalObservation{Exchange: flow})
 				}

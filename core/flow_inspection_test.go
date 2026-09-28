@@ -149,7 +149,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 					return false
 				}
 				for _, r := range rows {
-					if r.Uplink.Known != uint64(len(payload)) {
+					if r.Uplink != uint64(len(payload)) {
 						return false
 					}
 				}
@@ -157,13 +157,13 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			})
 			var selected fs.FlowRecord
 			for _, r := range rows {
-				if r.Origin != fs.TrafficOriginUser || r.SelectedRoute.Outbound.Serial == 0 || r.SelectedRoute.Outbound.Tag != "direct" {
+				if r.Origin != fs.TrafficOriginUser || r.Outbound.Serial == 0 || r.Outbound.Tag != "direct" {
 					t.Fatalf("bad admission/route: %+v", r)
 				}
 				if r.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
 					selected = r
 				}
-				if runtime.GOOS == "windows" && r.Downlink.Known != uint64(len(payload)) {
+				if runtime.GOOS == "windows" && r.Downlink != uint64(len(payload)) {
 					t.Fatalf("missing incremental output: %+v", r.Downlink)
 				}
 			}
@@ -171,7 +171,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				t.Fatal("first source not addressable")
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || out[0].Code != fs.CloseCodeAccepted {
+			if err != nil || out[0].Err != nil {
 				t.Fatalf("close %+v %v", out, err)
 			}
 			var terminal fs.TerminalRecord
@@ -188,11 +188,11 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				}
 				return false
 			})
-			if terminal.Flow.Uplink.Known != uint64(len(payload)) || terminal.Flow.Downlink.Known != uint64(len(payload)) || terminal.Flow.State != fs.FlowStateEnded {
+			if terminal.Flow.Uplink != uint64(len(payload)) || terminal.Flow.Downlink != uint64(len(payload)) {
 				t.Fatalf("final receipt: %+v", terminal)
 			}
 			out, err = view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || out[0].Code != fs.CloseCodeNoAction {
+			if err != nil || out[0].Err != nil {
 				t.Fatalf("repeat close %+v %v", out, err)
 			}
 			extra := []byte("sibling stays open")
@@ -209,8 +209,8 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			var up, down uint64
 			for _, r := range totals.Rows {
 				if r.Outbound.Serial != 0 && r.Origin == fs.TrafficOriginUser {
-					up += r.Uplink.Known
-					down += r.Downlink.Known
+					up += r.Uplink
+					down += r.Downlink
 				}
 			}
 			want := uint64(2*len(payload) + len(extra))
@@ -235,10 +235,10 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 				return false
 			}
 			row := page.Rows[i]
-			if row.Flow.Uplink.Known != 5 || row.Flow.Downlink.Known != 5 {
+			if row.Flow.Uplink != 5 || row.Flow.Downlink != 5 {
 				t.Fatalf("short final: %+v", row)
 			}
-			serials = append(serials, row.Flow.SelectedRoute.Outbound.Serial)
+			serials = append(serials, row.Flow.Outbound.Serial)
 			return true
 		})
 		if i == 0 {
@@ -263,7 +263,7 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 	for _, r := range totals.Rows {
 		if r.Outbound.Serial != 0 {
 			count++
-			if r.Uplink.Known != 5 || r.Downlink.Known != 5 {
+			if r.Uplink != 5 || r.Downlink != 5 {
 				t.Fatalf("bucket mixed: %+v", r)
 			}
 		}
@@ -295,7 +295,7 @@ func TestFlowInspectionRejectedSniffAndDisabled(t *testing.T) {
 		final = page.Rows[0]
 		return true
 	})
-	if final.Flow.Uplink.Known != uint64(len(request)) || final.Flow.SelectedRoute.Outbound.Serial != 0 {
+	if final.Flow.Uplink != uint64(len(request)) || final.Flow.Outbound.Serial != 0 {
 		t.Fatalf("rejected receipt: %+v", final)
 	}
 	totals, _ := view.ReadTotals()
@@ -305,7 +305,7 @@ func TestFlowInspectionRejectedSniffAndDisabled(t *testing.T) {
 			if r.Outbound.Serial != 0 {
 				t.Fatal("failed route credited outbound")
 			}
-			known += r.Uplink.Known
+			known += r.Uplink
 		}
 	}
 	if known != uint64(len(request)) {
@@ -322,14 +322,14 @@ func TestFlowInspectionRejectedSniffAndDisabled(t *testing.T) {
 	if provider.Observation() != nil {
 		t.Fatal("traffic enabled collection")
 	}
-	if _, err := core.EnableFlowInspection(disabled, fs.ObservationOptions{}); !errors.Is(err, fs.ErrInspectionTooLate) {
+	if _, err := core.EnableFlowInspection(disabled, fs.ObservationOptions{}); err == nil {
 		t.Fatalf("late enable: %v", err)
 	}
 }
 
 func TestFlowInspectionEnableBoundary(t *testing.T) {
 	bare := new(core.Instance)
-	if _, err := core.EnableFlowInspection(bare, fs.ObservationOptions{}); !errors.Is(err, fs.ErrInspectionUnavailable) {
+	if _, err := core.EnableFlowInspection(bare, fs.ObservationOptions{}); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("bare instance: %v", err)
 	}
 	instance, err := core.New(&core.Config{App: []*serial.TypedMessage{serial.ToTypedMessage(&appstats.Config{})}})
@@ -337,20 +337,17 @@ func TestFlowInspectionEnableBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { instance.Close() })
-	if _, err = core.EnableFlowInspection(instance, fs.ObservationOptions{MaxLive: 257}); !errors.Is(err, fs.ErrInspectionLimit) {
-		t.Fatalf("budget validation: %v", err)
-	}
-	view, err := core.EnableFlowInspection(instance, fs.ObservationOptions{MaxLive: 1})
+	view, err := core.EnableFlowInspection(instance, fs.ObservationOptions{MaxLive: 257})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = core.EnableFlowInspection(instance, fs.ObservationOptions{}); !errors.Is(err, fs.ErrInspectionAlreadyEnabled) {
+	if _, err = core.EnableFlowInspection(instance, fs.ObservationOptions{}); err == nil {
 		t.Fatalf("second enable: %v", err)
 	}
 	if err = instance.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := view.ReadLive(); !errors.Is(err, fs.ErrInspectionClosed) {
+	if _, err := view.ReadLive(); err == nil {
 		t.Fatalf("closed read: %v", err)
 	}
 }
@@ -419,14 +416,14 @@ func TestFlowInspectionForcedSelection(t *testing.T) {
 				final = page.Rows[0]
 				return true
 			})
-			if final.Flow.Uplink.Known != uint64(len(payload)) {
+			if final.Flow.Uplink != uint64(len(payload)) {
 				t.Fatalf("sniff credit: %+v", final)
 			}
 			if tag == "direct" {
-				if final.Flow.SelectedRoute.Selection != fs.SelectionForced || final.Flow.SelectedRoute.Outbound.Serial == 0 {
+				if final.Flow.Outbound.Serial == 0 {
 					t.Fatalf("forced selection: %+v", final)
 				}
-			} else if final.Flow.SelectedRoute.Outbound.Serial != 0 || final.Flow.SelectedRoute.Outbound.Tag != "missing" {
+			} else if final.Flow.Outbound.Serial != 0 || final.Flow.Outbound.Tag != "" {
 				t.Fatalf("missing forced selection: %+v", final)
 			}
 		})
@@ -474,7 +471,7 @@ func TestFlowInspectionForwardingAttribution(t *testing.T) {
 		final = page.Rows[0]
 		return true
 	})
-	if final.Flow.SelectedRoute.Outbound.Tag != "direct" || final.Flow.Uplink.Known != uint64(len(payload)) || final.Flow.Downlink.Known != uint64(len(payload)) {
+	if final.Flow.Outbound.Tag != "direct" || final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != uint64(len(payload)) {
 		t.Fatalf("forwarded flow: %+v", final)
 	}
 	totals, _ := view.ReadTotals()
@@ -484,8 +481,8 @@ func TestFlowInspectionForwardingAttribution(t *testing.T) {
 			t.Fatalf("forwarding bucket created: %+v", row)
 		}
 		if row.Outbound.Tag == "direct" {
-			up += row.Uplink.Known
-			down += row.Downlink.Known
+			up += row.Uplink
+			down += row.Downlink
 		}
 	}
 	if up != uint64(len(payload)) || down != up {
@@ -527,9 +524,9 @@ func TestFlowInspectionUnclaimedOwnerUsesUnassigned(t *testing.T) {
 			return false
 		}
 		ended = snapshot.Rows[0].Flow
-		return ended.Uplink.Known == uint64(len(payload))
+		return ended.Uplink == uint64(len(payload))
 	})
-	if ended.SelectedRoute.Outbound.Tag != "unclaimed" || ended.SelectedRoute.Outbound.Serial == 0 || ended.Uplink.Known != uint64(len(payload)) {
+	if ended.Outbound.Tag != "unclaimed" || ended.Outbound.Serial == 0 || ended.Uplink != uint64(len(payload)) {
 		t.Fatalf("unclaimed owner snapshot: %+v", ended)
 	}
 	totals, _ := view.ReadTotals()
@@ -539,7 +536,7 @@ func TestFlowInspectionUnclaimedOwnerUsesUnassigned(t *testing.T) {
 			t.Fatalf("unclaimed outbound bucket: %+v", row)
 		}
 		if row.Origin == fs.TrafficOriginUser {
-			known += row.Uplink.Known
+			known += row.Uplink
 		}
 	}
 	if known != uint64(len(payload)) {

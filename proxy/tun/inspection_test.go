@@ -73,8 +73,8 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	entered, release := make(chan struct{}), make(chan struct{})
 	dst := net.UDPDestination(net.LocalHostIP, 53)
@@ -114,7 +114,7 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 	}
 	flow.Finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 2 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 2 {
 		t.Errorf("owner-end write snapshot: %+v %v", page, err)
 	}
 	close(release)
@@ -129,7 +129,7 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 		t.Fatalf("counter: %d", counter.Value())
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact.Known != 2 {
+	if calls != 2 || fact != 2 {
 		t.Fatalf("native partial result: calls=%d fact=%+v", calls, fact)
 	}
 	totals, _ := view.ReadTotals()
@@ -137,7 +137,7 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 	for _, row := range totals.Rows {
 		if row.Outbound.Serial == 1 && row.Origin == fs.TrafficOriginUser {
 			found = true
-			if row.Downlink.Known != 2 {
+			if row.Downlink != 2 {
 				t.Fatalf("native partial total: %+v", row)
 			}
 		}
@@ -155,7 +155,7 @@ type inspectionDispatcher struct {
 
 func (d *inspectionDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
 	if observation := session.LogicalObservationFromContext(ctx); observation != nil {
-		observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+		observation.Exchange.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 		proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 	}
 	if d.entered != nil {
@@ -209,7 +209,7 @@ func TestInspectionTUNHandlerEnabledAndDisabled(t *testing.T) {
 					t.Fatalf("terminal: %+v %v", page, err)
 				}
 				f := page.Rows[0].Flow
-				if f.Origin != fs.TrafficOriginUser || f.Uplink.Known != 6 || f.Downlink.Known != 8 || f.SelectedRoute.Outbound.Tag != "direct" {
+				if f.Origin != fs.TrafficOriginUser || f.Uplink != 6 || f.Downlink != 8 || f.Outbound.Tag != "direct" {
 					t.Fatalf("endpoint: %+v", f)
 				}
 			}
@@ -272,8 +272,8 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, func() error { return nil })
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, func() error { return nil })
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	entered, release := make(chan struct{}), make(chan struct{})
 	calls := 0
@@ -298,12 +298,12 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 		t.Fatal("packet entry did not reach stop boundary")
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		close(release)
 		t.Fatalf("stop: %+v %v", outcomes, err)
 	}
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != uint64(len("head")) {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != uint64(len("head")) {
 		t.Errorf("owner-end batch snapshot: %+v %v", page, err)
 	}
 	close(release)
@@ -315,13 +315,13 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 3 || counter.Value() != int64(len("headtail")) || fact.Known != uint64(len("head")) {
+	if calls != 3 || counter.Value() != int64(len("headtail")) || fact != uint64(len("head")) {
 		t.Fatalf("late native batch: native=%d counter=%d fact=%+v", calls, counter.Value(), fact)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
-		known += row.Downlink.Known
+		known += row.Downlink
 	}
 	if known != uint64(len("headtail")) {
 		t.Fatalf("late packet totals: %+v", totals)

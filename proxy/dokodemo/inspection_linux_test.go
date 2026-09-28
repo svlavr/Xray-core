@@ -45,7 +45,7 @@ func (d *inspectionRedirectDispatcher) DispatchLink(ctx context.Context, dest ne
 		d.t.Errorf("redirect target: %v", dest)
 	}
 	if o := session.LogicalObservationFromContext(ctx); o != nil {
-		o.Exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+		o.Exchange.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 		proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 	}
 	mb, err := link.Reader.ReadMultiBuffer()
@@ -120,7 +120,7 @@ func TestInspectionDokodemoNativeFakeUDP(t *testing.T) {
 		if enabled {
 			ref := session.LogicalObservationFromContext(observed).Exchange.Ref()
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 				t.Fatalf("stop: %+v %v", outcomes, err)
 			}
 			select {
@@ -142,7 +142,7 @@ func TestInspectionDokodemoNativeFakeUDP(t *testing.T) {
 				t.Fatalf("terminal: %+v %v", page, err)
 			}
 			f := page.Rows[0].Flow
-			if f.Uplink.Known != 7 || f.Downlink.Known != 16 || f.InitialDestination != target {
+			if f.Uplink != 7 || f.Downlink != 16 || f.InitialDestination != target {
 				t.Fatalf("native facts: %+v", f)
 			}
 		}

@@ -44,8 +44,8 @@ func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	flow := manager.Observation().Begin(fs.FlowKindUDPAssociation, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	entered, release := make(chan struct{}), make(chan struct{})
 	dst := net.UDPDestination(net.LocalHostIP, 53)
@@ -80,7 +80,7 @@ func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
 	}
 	flow.Finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink.Known != 2 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 2 {
 		t.Errorf("owner-end write snapshot: %+v %v", page, err)
 	}
 	close(release)
@@ -92,7 +92,7 @@ func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
 	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact.Known != 2 {
+	if calls != 2 || fact != 2 {
 		t.Fatalf("native partial result: calls=%d fact=%+v", calls, fact)
 	}
 	totals, _ := view.ReadTotals()
@@ -100,7 +100,7 @@ func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
 	for _, total := range totals.Rows {
 		if total.Outbound.Serial == 1 && total.Origin == fs.TrafficOriginUser {
 			found = true
-			if total.Downlink.Known != 2 {
+			if total.Downlink != 2 {
 				t.Fatalf("native partial total: %+v", total)
 			}
 		}
@@ -221,7 +221,7 @@ func TestInspectionWireGuardStopPendingVirtualDial(t *testing.T) {
 	ctx, finish := proxy.ObserveTCP(context.Background(), manager, local, target, link)
 	defer finish()
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "wg-device", Serial: 1}})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "wg-device", Serial: 1})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 	ctx = session.ContextWithTimeoutOnly(ctx, true)
 	done := make(chan error, 1)

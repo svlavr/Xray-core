@@ -73,7 +73,7 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 					return false
 				}
 				first = live.Rows[0]
-				return first.Uplink.Known == 5 && first.Downlink.Known == 5
+				return first.Uplink == 5 && first.Downlink == 5
 			})
 			other := owner
 			origin := fs.TrafficOriginInternal
@@ -94,7 +94,7 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 				t.Fatalf("retained rows: %+v %v", live, err)
 			}
 			row := live.Rows[0]
-			if row.Ref != first.Ref || row.Origin != fs.TrafficOriginUser || row.Uplink.Known != 5 || row.Downlink.Known != 5 {
+			if row.Ref != first.Ref || row.Origin != fs.TrafficOriginUser || row.Uplink != 5 || row.Downlink != 5 {
 				t.Fatalf("fenced result: %+v", row)
 			}
 			if otherView != nil {
@@ -107,13 +107,13 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 			var known uint64
 
 			for _, bucket := range totals.Rows {
-				known += bucket.Uplink.Known
+				known += bucket.Uplink
 			}
 			if known != 5 {
 				t.Fatalf("fenced totals: %+v", totals)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{first.Ref})
-			if err != nil || out[0].Code != fs.CloseCodeAccepted {
+			if err != nil || out[0].Err != nil {
 				t.Fatalf("retained close: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {

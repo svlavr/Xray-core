@@ -2,34 +2,14 @@ package stats
 
 import (
 	"context"
-	"fmt"
-	"math"
-	"strings"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	xnet "github.com/xtls/xray-core/common/net"
 	featurestats "github.com/xtls/xray-core/features/stats"
 )
-
-const maxMetadataString = 255
-
-type byteCell struct {
-	known saturatingUint64
-}
-
-func (c *byteCell) addKnown(value uint64) {
-	if value == 0 {
-		return
-	}
-	c.known.add(value)
-}
-
-func (c *byteCell) snapshot() featurestats.ByteFact {
-	return featurestats.ByteFact{Known: c.known.load()}
-}
 
 type aggregateKey struct {
 	serial uint64
@@ -39,8 +19,8 @@ type aggregateKey struct {
 type aggregateCell struct {
 	outbound featurestats.OutboundRef
 	origin   featurestats.TrafficOrigin
-	uplink   byteCell
-	downlink byteCell
+	uplink   atomic.Uint64
+	downlink atomic.Uint64
 }
 
 func newAggregateCell(outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) *aggregateCell {
@@ -88,11 +68,11 @@ func (s *inspectionStore) elapsed() time.Duration {
 	return time.Since(s.epoch)
 }
 
-func (s *inspectionStore) Info() featurestats.InspectionInfo {
-	return featurestats.InspectionInfo{Runtime: s.runtime}
+func (s *inspectionStore) Runtime() featurestats.RuntimeID {
+	return s.runtime
 }
 
-func (s *inspectionStore) Begin(kind featurestats.FlowKind, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
+func (s *inspectionStore) Begin(kind xnet.Network, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
 	flow := s.prepare(kind, origin, source, destination, stop)
 	if flow != nil {
 		e := flow.(*inspectionExchange)
@@ -104,17 +84,14 @@ func (s *inspectionStore) Begin(kind featurestats.FlowKind, origin featurestats.
 }
 
 func (s *inspectionStore) PrepareTCP(origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
-	return s.prepare(featurestats.FlowKindTCP, origin, source, destination, stop)
+	return s.prepare(xnet.Network_TCP, origin, source, destination, stop)
 }
 
-func (s *inspectionStore) prepare(kind featurestats.FlowKind, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
+func (s *inspectionStore) prepare(kind xnet.Network, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
 	if s.closed.Load() {
 		return nil
 	}
 	origin = normalizeOrigin(origin)
-	source = cloneDestination(source)
-	destination = cloneDestination(destination)
-
 	exchange := &inspectionExchange{
 		inspectionFlow: &inspectionFlow{
 			store: s,
@@ -125,7 +102,6 @@ func (s *inspectionStore) prepare(kind featurestats.FlowKind, origin featurestat
 				Source:             source,
 				InitialDestination: destination,
 				Opened:             s.elapsed(),
-				State:              featurestats.FlowStateOpen,
 			},
 		},
 	}
@@ -145,7 +121,7 @@ func (e *inspectionExchange) registerLocked() {
 	if s.closed.Load() {
 		return
 	}
-	if uint32(len(s.live)) >= s.limits.MaxLive || s.nextID == math.MaxUint64 {
+	if uint32(len(s.live)) >= s.limits.MaxLive {
 		return
 	}
 	s.nextID++
@@ -155,7 +131,7 @@ func (e *inspectionExchange) registerLocked() {
 
 func (s *inspectionStore) ReadLive() (featurestats.LiveSnapshot, error) {
 	if s.closed.Load() {
-		return featurestats.LiveSnapshot{}, featurestats.ErrInspectionClosed
+		return featurestats.LiveSnapshot{}, errors.New("inspection closed")
 	}
 	s.mu.RLock()
 	rows := make([]*inspectionExchange, 0, len(s.live))
@@ -166,20 +142,21 @@ func (s *inspectionStore) ReadLive() (featurestats.LiveSnapshot, error) {
 
 	result := make([]featurestats.FlowRecord, 0, len(rows))
 	for _, exchange := range rows {
-		row := exchange.snapshot()
-		if row.State != featurestats.FlowStateEnded {
-			result = append(result, row)
+		exchange.mu.Lock()
+		if !exchange.published {
+			result = append(result, exchange.record)
 		}
+		exchange.mu.Unlock()
 	}
 	return featurestats.LiveSnapshot{
-		Sample: featurestats.Sample{Runtime: s.runtime, At: s.elapsed()},
-		Rows:   result,
+		At:   s.elapsed(),
+		Rows: result,
 	}, nil
 }
 
 func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
 	if s.closed.Load() {
-		return featurestats.TotalsSnapshot{}, featurestats.ErrInspectionClosed
+		return featurestats.TotalsSnapshot{}, errors.New("inspection closed")
 	}
 	s.mu.RLock()
 	cells := make([]*aggregateCell, 0, len(s.buckets)+len(s.unassigned))
@@ -196,19 +173,19 @@ func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
 		rows = append(rows, featurestats.TotalRecord{
 			Outbound: cell.outbound,
 			Origin:   cell.origin,
-			Uplink:   cell.uplink.snapshot(),
-			Downlink: cell.downlink.snapshot(),
+			Uplink:   cell.uplink.Load(),
+			Downlink: cell.downlink.Load(),
 		})
 	}
 	return featurestats.TotalsSnapshot{
-		Sample: featurestats.Sample{Runtime: s.runtime, At: s.elapsed()},
-		Rows:   rows,
+		At:   s.elapsed(),
+		Rows: rows,
 	}, nil
 }
 
 func (s *inspectionStore) ReadTerminals() (featurestats.TerminalSnapshot, error) {
 	if s.closed.Load() {
-		return featurestats.TerminalSnapshot{}, featurestats.ErrInspectionClosed
+		return featurestats.TerminalSnapshot{}, errors.New("inspection closed")
 	}
 
 	s.mu.RLock()
@@ -218,45 +195,40 @@ func (s *inspectionStore) ReadTerminals() (featurestats.TerminalSnapshot, error)
 	}
 	s.mu.RUnlock()
 	return featurestats.TerminalSnapshot{
-		Sample: featurestats.Sample{Runtime: s.runtime, At: s.elapsed()},
-		Rows:   rows,
+		At:   s.elapsed(),
+		Rows: rows,
 	}, nil
 }
 
 func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.FlowRef) ([]featurestats.CloseOutcome, error) {
 	if s.closed.Load() {
-		return nil, featurestats.ErrInspectionClosed
-	}
-	if len(refs) > int(s.limits.MaxClose) {
-		return nil, fmt.Errorf("%w: close batch", featurestats.ErrInspectionLimit)
+		return nil, errors.New("inspection closed")
 	}
 	outcomes := make([]featurestats.CloseOutcome, len(refs))
 	for i, ref := range refs {
 		outcomes[i].Ref = ref
-		if ctx.Err() != nil {
-			outcomes[i].Code = featurestats.CloseCodeNotStartedCanceled
+		if err := ctx.Err(); err != nil {
+			outcomes[i].Err = err
 			continue
 		}
 		if ref.Runtime != s.runtime {
-			outcomes[i].Code = featurestats.CloseCodeStaleRuntime
 			continue
 		}
 		exchange := s.lookup(ref.ID)
 		if exchange == nil {
-			outcomes[i].Code = featurestats.CloseCodeNoAction
 			continue
 		}
-		stop, code := exchange.requestStop()
-		outcomes[i].Code = code
+		stop, err := exchange.requestStop()
+		if err != nil {
+			outcomes[i].Err = err
+			continue
+		}
 		if stop == nil {
 			continue
 		}
-		err := stop()
+		err = stop()
 		exchange.Finish()
-		if err != nil {
-			outcomes[i].Code = featurestats.CloseCodeFailed
-			outcomes[i].Err = err
-		}
+		outcomes[i].Err = err
 	}
 	return outcomes, nil
 }
@@ -270,11 +242,11 @@ func (s *inspectionStore) lookup(id uint64) *inspectionExchange {
 	return nil
 }
 
-func (s *inspectionStore) bucketFor(step featurestats.RouteStep, origin featurestats.TrafficOrigin) *aggregateCell {
-	if step.Outbound.Serial == 0 || step.Outbound.Runtime != s.runtime {
+func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) *aggregateCell {
+	if outbound.Serial == 0 {
 		return s.unassigned[int(origin)]
 	}
-	key := aggregateKey{serial: step.Outbound.Serial, origin: origin}
+	key := aggregateKey{serial: outbound.Serial, origin: origin}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cell := s.buckets[key]; cell != nil {
@@ -286,7 +258,7 @@ func (s *inspectionStore) bucketFor(step featurestats.RouteStep, origin features
 	if uint32(len(s.buckets)) >= s.limits.MaxBuckets {
 		return s.unassigned[int(origin)]
 	}
-	cell := newAggregateCell(step.Outbound, origin)
+	cell := newAggregateCell(outbound, origin)
 	s.buckets[key] = cell
 	return cell
 }
@@ -333,10 +305,10 @@ type inspectionFlow struct {
 	store              *inspectionStore
 	registered         bool
 	stop               func() error
+	stopRequested      bool
 	mu                 sync.Mutex
 	record             featurestats.FlowRecord
 	routeSerial        uint64
-	selectedSerial     uint64
 	provenanceConflict bool
 }
 
@@ -344,7 +316,7 @@ type inspectionExchange struct {
 	*inspectionFlow
 	isLeg            bool
 	hasLegs          bool
-	route            featurestats.RouteStep
+	route            featurestats.OutboundRef
 	routeSeq         uint64
 	pending          *pendingCredit
 	bucket           *aggregateCell
@@ -363,18 +335,10 @@ type pendingCredit struct {
 	settled    bool
 }
 
-func addKnown(value *uint64, n uint64) {
-	if n > math.MaxUint64-*value {
-		*value = math.MaxUint64
-		return
-	}
-	*value += n
-}
-
 func (e *inspectionExchange) NewLeg() featurestats.Exchange {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || e.isLeg || (e.record.Kind != featurestats.FlowKindUDPAssociation && e.record.Kind != featurestats.FlowKindTCP) || e.record.State == featurestats.FlowStateStopRequested || e.published {
+	if e.excluded || e.isLeg || (e.record.Kind != xnet.Network_UDP && e.record.Kind != xnet.Network_TCP) || e.stopRequested || e.published {
 		return nil
 	}
 	e.hasLegs = true
@@ -398,24 +362,20 @@ func (e *inspectionExchange) ExcludeCarrier() bool {
 	return true
 }
 
-func (e *inspectionExchange) Route(step featurestats.RouteStep) {
+func (e *inspectionExchange) Route(outbound featurestats.OutboundRef) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.excluded || e.published || e.store == nil {
 		return
 	}
 	e.commitPendingLocked()
-	step.Outbound.Runtime = e.store.runtime
-	if e.routeSerial < math.MaxUint64 {
-		e.routeSerial++
-	}
-	step = cloneRouteStep(step)
-	e.record.SelectedRoute = step
-	e.record.EffectiveDestination = xnet.Destination{}
-	e.selectedSerial = e.routeSerial
+	outbound.Runtime = e.store.runtime
+	e.routeSerial++
 	e.routeSeq = e.routeSerial
+	e.record.Outbound = outbound
+	e.record.EffectiveDestination = xnet.Destination{}
 	if e.bucket == nil {
-		e.route = step
+		e.route = outbound
 	}
 }
 
@@ -431,11 +391,11 @@ func (e *inspectionExchange) Unassign() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.published {
-		e.bindLocked(featurestats.RouteStep{Selection: featurestats.SelectionUnknown})
+		e.bindLocked(featurestats.OutboundRef{})
 	}
 }
 
-func (e *inspectionExchange) bindLocked(step featurestats.RouteStep) {
+func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 	if e.excluded || e.bucket != nil {
 		return
 	}
@@ -443,16 +403,16 @@ func (e *inspectionExchange) bindLocked(step featurestats.RouteStep) {
 	if !e.isLeg {
 		e.registerLocked()
 	}
-	step.Outbound.Runtime = e.store.runtime
-	e.route = step
-	bucket := e.store.bucketFor(step, e.record.Origin)
+	outbound.Runtime = e.store.runtime
+	e.route = outbound
+	bucket := e.store.bucketFor(outbound, e.record.Origin)
 	e.bucket = bucket
-	up, down := e.record.Uplink.Known, e.record.Downlink.Known
+	up, down := e.record.Uplink, e.record.Downlink
 	if e.pending != nil {
 		up, down = e.pending.up, e.pending.down
 	}
-	bucket.uplink.addKnown(up)
-	bucket.downlink.addKnown(down)
+	bucket.uplink.Add(up)
+	bucket.downlink.Add(down)
 	e.settlePendingLocked()
 	e.pending = nil
 }
@@ -460,10 +420,10 @@ func (e *inspectionExchange) bindLocked(step featurestats.RouteStep) {
 func (e *inspectionExchange) Effective(destination xnet.Destination) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || e.published || e.routeSeq == 0 || e.routeSeq != e.selectedSerial {
+	if e.excluded || e.published || e.routeSeq == 0 || e.routeSeq != e.routeSerial {
 		return
 	}
-	e.record.EffectiveDestination = cloneDestination(destination)
+	e.record.EffectiveDestination = destination
 }
 
 func (e *inspectionExchange) SetSource(source xnet.Destination) {
@@ -475,7 +435,7 @@ func (e *inspectionExchange) SetSource(source xnet.Destination) {
 	if e.excluded || e.published || e.isLeg || e.record.Source.IsValid() {
 		return
 	}
-	e.record.Source = cloneDestination(source)
+	e.record.Source = source
 }
 
 func (e *inspectionExchange) PacketDestination(destination xnet.Destination) {
@@ -484,7 +444,7 @@ func (e *inspectionExchange) PacketDestination(destination xnet.Destination) {
 	if e.excluded || e.published || e.provenanceConflict || !destination.IsValid() {
 		return
 	}
-	e.record.LatestDestination = cloneDestination(destination)
+	e.record.LatestDestination = destination
 }
 
 func (e *inspectionExchange) AddUplink(value uint64) {
@@ -494,14 +454,14 @@ func (e *inspectionExchange) AddUplink(value uint64) {
 		return
 	}
 	if e.isLeg && e.pending != nil && !e.pending.classified {
-		addKnown(&e.pending.up, value)
+		e.pending.up += value
 		return
 	}
-	addKnown(&e.record.Uplink.Known, value)
+	e.record.Uplink += value
 	if e.bucket != nil {
-		e.bucket.uplink.addKnown(value)
+		e.bucket.uplink.Add(value)
 	} else if e.pending != nil {
-		addKnown(&e.pending.up, value)
+		e.pending.up += value
 	}
 }
 
@@ -512,14 +472,14 @@ func (e *inspectionExchange) AddDownlink(value uint64) {
 		return
 	}
 	if e.isLeg && e.pending != nil && !e.pending.classified {
-		addKnown(&e.pending.down, value)
+		e.pending.down += value
 		return
 	}
-	addKnown(&e.record.Downlink.Known, value)
+	e.record.Downlink += value
 	if e.bucket != nil {
-		e.bucket.downlink.addKnown(value)
+		e.bucket.downlink.Add(value)
 	} else if e.pending != nil {
-		addKnown(&e.pending.down, value)
+		e.pending.down += value
 	}
 }
 
@@ -529,7 +489,7 @@ func (e *inspectionExchange) Rebind(runtime featurestats.RuntimeID, origin featu
 	if e.excluded || e.published || e.provenanceConflict {
 		return
 	}
-	if runtime == (featurestats.RuntimeID{}) || runtime != e.store.runtime ||
+	if runtime != e.store.runtime ||
 		normalizeOrigin(origin) == featurestats.TrafficOriginUnknown || origin != e.record.Origin {
 		e.provenanceConflict = true
 	}
@@ -566,20 +526,17 @@ func (e *inspectionExchange) FinishSelectedLeg() {
 	}
 }
 
-func (e *inspectionExchange) requestStop() (func() error, featurestats.CloseCode) {
+func (e *inspectionExchange) requestStop() (func() error, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.published {
-		return nil, featurestats.CloseCodeNoAction
-	}
-	if e.record.State == featurestats.FlowStateStopRequested {
-		return nil, featurestats.CloseCodeNoAction
+	if e.published || e.stopRequested {
+		return nil, nil
 	}
 	if e.stop == nil {
-		return nil, featurestats.CloseCodeUnsupportedOwner
+		return nil, errors.ErrUnsupported
 	}
-	e.record.State = featurestats.FlowStateStopRequested
-	return e.stop, featurestats.CloseCodeAccepted
+	e.stopRequested = true
+	return e.stop, nil
 }
 
 func (e *inspectionExchange) completeLocked() *featurestats.TerminalRecord {
@@ -599,10 +556,10 @@ func (e *inspectionExchange) completeLocked() *featurestats.TerminalRecord {
 		if !e.selectedReturned {
 			return nil
 		}
-		e.bindLocked(featurestats.RouteStep{Selection: featurestats.SelectionUnknown})
+		e.bindLocked(featurestats.OutboundRef{})
 	}
 	if e.bucket == nil && !e.hasLegs {
-		e.bindLocked(featurestats.RouteStep{Selection: featurestats.SelectionUnknown})
+		e.bindLocked(featurestats.OutboundRef{})
 	}
 	if e.isLeg && !e.finishRequested {
 		return nil
@@ -613,8 +570,7 @@ func (e *inspectionExchange) completeLocked() *featurestats.TerminalRecord {
 	}
 	// Owner-end disables stop; late byte receipts only need the accounting state.
 	e.stop = nil
-	e.record.State = featurestats.FlowStateEnded
-	flow := e.snapshotLocked()
+	flow := e.record
 	return &featurestats.TerminalRecord{Flow: flow, Ended: e.store.elapsed()}
 }
 
@@ -630,18 +586,8 @@ func (e *inspectionExchange) commitPendingLocked() {
 		return
 	}
 	e.pending.classified = true
-	addKnown(&e.record.Uplink.Known, e.pending.up)
-	addKnown(&e.record.Downlink.Known, e.pending.down)
-}
-
-func (e *inspectionExchange) snapshot() featurestats.FlowRecord {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.snapshotLocked()
-}
-
-func (e *inspectionExchange) snapshotLocked() featurestats.FlowRecord {
-	return e.record
+	e.record.Uplink += e.pending.up
+	e.record.Downlink += e.pending.down
 }
 
 func normalizeOrigin(origin featurestats.TrafficOrigin) featurestats.TrafficOrigin {
@@ -651,35 +597,4 @@ func normalizeOrigin(origin featurestats.TrafficOrigin) featurestats.TrafficOrig
 	default:
 		return featurestats.TrafficOriginUnknown
 	}
-}
-
-func cloneRouteStep(step featurestats.RouteStep) featurestats.RouteStep {
-	step.Outbound.Tag = cloneMetadataString(step.Outbound.Tag)
-	step.RuleTag = cloneMetadataString(step.RuleTag)
-	step.SelectedTarget = cloneDestination(step.SelectedTarget)
-	return step
-}
-
-func cloneDestination(destination xnet.Destination) xnet.Destination {
-	if destination.Address == nil {
-		return destination
-	}
-	if destination.Address.Family().IsDomain() {
-		domain := cloneMetadataString(destination.Address.Domain())
-		destination.Address = xnet.DomainAddress(domain)
-		return destination
-	}
-	destination.Address = xnet.IPAddress(destination.Address.IP())
-	return destination
-}
-
-func cloneMetadataString(value string) string {
-	value = strings.ToValidUTF8(value, "\uFFFD")
-	if len(value) > maxMetadataString {
-		value = value[:maxMetadataString]
-		for !utf8.ValidString(value) {
-			value = value[:len(value)-1]
-		}
-	}
-	return strings.Clone(value)
 }

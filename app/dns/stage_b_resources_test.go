@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -335,28 +334,5 @@ func TestStageBDoHPooledSiblingCancellation(t *testing.T) {
 	server.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("whole nameserver close retained %d connections", remaining)
-	}
-}
-
-func TestStageBFailedProvisionalCleanupStaysOwned(t *testing.T) {
-	active := &stageBBlockingServer{}
-	stable := stageBManualFeature(t, active)
-	t.Cleanup(func() { _ = stable.Close() })
-	provisional := &stageBBlockingServer{closeErrs: []error{errors.New("provisional close failed"), nil}}
-	prepared := &DNS{clients: []*Client{{server: provisional}}}
-	if err := stable.closeUnpublished(prepared); err == nil {
-		t.Fatal("failed provisional cleanup reported success")
-	}
-	if stable.runtime.closing == nil || stable.runtime.closing.resolver != prepared || active.closes != 0 {
-		t.Fatal("failed provisional owner was lost or active resolver was closed")
-	}
-	if result := ApplyConfig(context.Background(), stable, &Config{NameServer: []*NameServer{preparationServer("localhost", "new")}}); result.Applied || result.Err == nil {
-		t.Fatalf("update displaced unfinished provisional owner: %+v", result)
-	}
-	if err := stable.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if stable.runtime.current != nil || stable.runtime.closing != nil || provisional.closes != 2 || active.closes != 1 {
-		t.Fatal("whole feature close did not complete both concrete owners")
 	}
 }

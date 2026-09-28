@@ -60,7 +60,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						var ref fs.FlowRef
 						inspectionWait(t, func() bool {
 							live, _ := view.ReadLive()
-							if len(live.Rows) != 1 || live.Rows[0].SelectedRoute.Selection != fs.SelectionRejected || live.Rows[0].Uplink.Known != uint64(len(payload)) {
+							if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial != 0 || live.Rows[0].Uplink != uint64(len(payload)) {
 								return false
 							}
 							ref = live.Rows[0].Ref
@@ -69,7 +69,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						inspectionClosePacketCallback(t, view, ref)
 						inspectionWait(t, func() bool {
 							page, _ := view.ReadTerminals()
-							return len(page.Rows) == 1 && page.Rows[0].Flow.Downlink.Known == 0
+							return len(page.Rows) == 1 && page.Rows[0].Flow.Downlink == 0
 						})
 						return
 					}
@@ -90,16 +90,16 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 							return false
 						}
 						for _, row := range live.Rows {
-							if row.Uplink.Known == uint64(len(payload)+len(extra)) {
+							if row.Uplink == uint64(len(payload)+len(extra)) {
 								first = row
 							} else {
 								other = row
 							}
 						}
-						return first.Ref.ID != 0 && other.Ref.ID != 0 && first.Downlink.Known == first.Uplink.Known && other.Downlink.Known == uint64(len(payload))
+						return first.Ref.ID != 0 && other.Ref.ID != 0 && first.Downlink == first.Uplink && other.Downlink == uint64(len(payload))
 					})
 					for _, row := range []fs.FlowRecord{first, other} {
-						if row.Kind != fs.FlowKindUDPAssociation || row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "direct" || row.SelectedRoute.Outbound.Serial == 0 {
+						if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "direct" || row.Outbound.Serial == 0 {
 							t.Fatalf("callback facts: %+v", row)
 						}
 					}
@@ -109,7 +109,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 					inspectionClosePacketCallback(t, view, first.Ref)
 					inspectionWait(t, func() bool {
 						page, _ := view.ReadTerminals()
-						return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink.Known == uint64(len(payload)+len(extra))
+						return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink == uint64(len(payload)+len(extra))
 					})
 					inspectionSOCKSPacket(t, sibling, siblingRelay, secondDest, extra, 0x37)
 					inspectionClosePacketCallback(t, view, other.Ref)
@@ -122,7 +122,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 					var replacementRef fs.FlowRef
 					inspectionWait(t, func() bool {
 						live, _ := view.ReadLive()
-						if len(live.Rows) != 1 || live.Rows[0].Downlink.Known != uint64(len(payload)) {
+						if len(live.Rows) != 1 || live.Rows[0].Downlink != uint64(len(payload)) {
 							return false
 						}
 						replacementRef = live.Rows[0].Ref
@@ -146,7 +146,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 func inspectionClosePacketCallback(t *testing.T, view fs.FlowInspection, ref fs.FlowRef) {
 	t.Helper()
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(out) != 1 || out[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(out) != 1 || out[0].Err != nil {
 		t.Fatalf("callback exact stop: %+v %v", out, err)
 	}
 }

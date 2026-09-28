@@ -66,7 +66,7 @@ func TestFlowInspectionP2BAuthenticatedRejection(t *testing.T) {
 				return false
 			}
 			row := page.Rows[0]
-			if row.Flow.Uplink.Known != uint64(len(payload)) || row.Flow.Downlink.Known != 0 || row.Flow.SelectedRoute.Outbound.Serial != 0 {
+			if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Serial != 0 {
 				t.Fatalf("authenticated rejection: %+v", row)
 			}
 			return true

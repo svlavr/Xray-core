@@ -47,13 +47,13 @@ func authenticationFlow(t *testing.T) (fs.Exchange, fs.FlowInspection) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { manager.Close() })
-	flow := manager.Observation().Begin(fs.FlowKindTCP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.RouteStep{Selection: fs.SelectionDefault, Outbound: fs.OutboundRef{Tag: "direct", Serial: 1}})
+	flow := manager.Observation().Begin(net.Network_TCP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
 	flow.BindRoute()
 	return flow, view
 }
 
-func authenticationFact(t *testing.T, view fs.FlowInspection) fs.ByteFact {
+func authenticationFact(t *testing.T, view fs.FlowInspection) uint64 {
 	t.Helper()
 	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 {
@@ -104,7 +104,7 @@ func TestInspectionAuthenticationPartialFrames(t *testing.T) {
 				if limit >= total-1 {
 					known = uint64(len(payload))
 				}
-				if fact.Known != known {
+				if fact != known {
 					t.Fatalf("limit %d, codec result %+v", limit, fact)
 				}
 				if output.Len() != limit {
@@ -124,7 +124,7 @@ func TestInspectionAuthenticationBufferingAndNativeBatch(t *testing.T) {
 		if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("first"))); err != nil {
 			t.Fatal(err)
 		}
-		if fact := authenticationFact(t, view); fact.Known != 5 || output.Len() != 0 {
+		if fact := authenticationFact(t, view); fact != 5 || output.Len() != 0 {
 			t.Fatalf("buffered payload credited: %+v", fact)
 		}
 		if err := buffered.SetBuffered(false); err != nil {
@@ -138,7 +138,7 @@ func TestInspectionAuthenticationBufferingAndNativeBatch(t *testing.T) {
 			t.Fatal(err)
 		}
 		finish()
-		if fact := authenticationFact(t, view); fact.Known != uint64(5+len(more)) {
+		if fact := authenticationFact(t, view); fact != uint64(5+len(more)) {
 			t.Fatalf("codec payload/framing: %+v", fact)
 		}
 		control := &authenticationOutput{limit: -1}
@@ -186,7 +186,7 @@ func TestInspectionAuthenticationFailedEmptyControlPreservesPayloadFacts(t *test
 			for _, row := range totals.Rows {
 				if row.Outbound.Serial == 1 && row.Origin == fs.TrafficOriginUser {
 					found = true
-					if row.Downlink != (fs.ByteFact{Known: 5}) {
+					if row.Downlink != 5 {
 						t.Fatalf("empty control contaminated payload facts: %+v", row.Downlink)
 					}
 				}
@@ -194,7 +194,7 @@ func TestInspectionAuthenticationFailedEmptyControlPreservesPayloadFacts(t *test
 			if !found {
 				t.Fatal("missing payload bucket")
 			}
-			if !ended && authenticationFact(t, view) != (fs.ByteFact{Known: 5}) {
+			if !ended && authenticationFact(t, view) != 5 {
 				t.Fatal("live bytes were contaminated")
 			}
 		})
@@ -231,7 +231,7 @@ func TestInspectionAuthenticationSealFailureKeepsOlderBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 4 {
+	if fact := authenticationFact(t, view); fact != 4 {
 		t.Fatalf("rollback erased older frame: %+v", fact)
 	}
 }
@@ -252,7 +252,7 @@ func TestInspectionAuthenticationPacketDropsAndAbandon(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 2 {
+	if fact := authenticationFact(t, view); fact != 2 {
 		t.Fatalf("packet seal drop: %+v", fact)
 	}
 	other, otherView := authenticationFlow(t)
@@ -267,7 +267,7 @@ func TestInspectionAuthenticationPacketDropsAndAbandon(t *testing.T) {
 	if abandoned.Len() != 0 {
 		t.Fatal("cleanup emitted a native-abandoned response")
 	}
-	if fact := authenticationFact(t, otherView); fact.Known != 9 {
+	if fact := authenticationFact(t, otherView); fact != 9 {
 		t.Fatalf("abandoned mapping: %+v", fact)
 	}
 }
@@ -287,7 +287,7 @@ func TestInspectionAuthenticationFailedFlushContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 6 {
+	if fact := authenticationFact(t, view); fact != 6 {
 		t.Fatalf("stale failed-frame mapping: %+v", fact)
 	}
 }
@@ -310,7 +310,7 @@ func TestInspectionAuthenticationUnavailableAndZeroProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	if fact := authenticationFact(t, view); fact.Known != 8 {
+	if fact := authenticationFact(t, view); fact != 8 {
 		t.Fatalf("decoded operation result: %+v", fact)
 	}
 	other, otherView := authenticationFlow(t)
@@ -324,7 +324,7 @@ func TestInspectionAuthenticationUnavailableAndZeroProgress(t *testing.T) {
 		t.Fatalf("zero progress result: %v", err)
 	}
 	release()
-	if fact := authenticationFact(t, otherView); fact.Known != 7 {
+	if fact := authenticationFact(t, otherView); fact != 7 {
 		t.Fatalf("zero acceptance mapping: %+v", fact)
 	}
 }

@@ -79,7 +79,7 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 			inspectionWait(t, func() bool {
 				live, _ := view.ReadLive()
 				for _, row := range live.Rows {
-					if row.Uplink.Known == uint64(len(payload)) && row.Downlink.Known == row.Uplink.Known {
+					if row.Uplink == uint64(len(payload)) && row.Downlink == row.Uplink {
 						original = row.Ref
 					}
 				}
@@ -92,7 +92,7 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 				live, _ := view.ReadLive()
 				for _, row := range live.Rows {
 					if row.Ref == original {
-						return row.Uplink.Known == uint64(len(payload)+len(extra)) && row.Downlink.Known == row.Uplink.Known
+						return row.Uplink == uint64(len(payload)+len(extra)) && row.Downlink == row.Uplink
 					}
 				}
 				return false

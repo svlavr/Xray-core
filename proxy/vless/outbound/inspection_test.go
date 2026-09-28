@@ -42,11 +42,7 @@ func preconnectInspection(t *testing.T, target cnet.Destination, flow string, co
 	}
 	observation := session.LogicalObservationFromContext(ctx)
 	if observation != nil {
-		observation.Exchange.Route(fs.RouteStep{
-			Selection:      fs.SelectionDefault,
-			Outbound:       fs.OutboundRef{Runtime: view.Info().Runtime, Serial: 1, Tag: "vless"},
-			SelectedTarget: target,
-		})
+		observation.Exchange.Route(fs.OutboundRef{Runtime: view.Runtime(), Serial: 1, Tag: "vless"})
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -94,7 +90,7 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(live.Rows) == 1 && live.Rows[0].SelectedRoute.Outbound.Tag == "vless" && live.Rows[0].EffectiveDestination == target {
+		if len(live.Rows) == 1 && live.Rows[0].Outbound.Tag == "vless" && live.Rows[0].EffectiveDestination == target {
 			ref = live.Rows[0].Ref
 			break
 		}
@@ -104,7 +100,7 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 		t.Fatal("ordinary endpoint was not claimed before preconnect wait")
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("exact stop: %+v %v", outcomes, err)
 	}
 	select {
@@ -160,7 +156,7 @@ func TestInspectionVLESSPreconnectCommandClaims(t *testing.T) {
 			}
 			observation := session.LogicalObservationFromContext(ctx)
 			live, err := view.ReadLive()
-			claimed := observation != nil && len(live.Rows) == 1 && live.Rows[0].SelectedRoute.Outbound.Serial != 0
+			claimed := observation != nil && len(live.Rows) == 1 && live.Rows[0].Outbound.Serial != 0
 			if err != nil || claimed != test.claimed {
 				t.Fatal("command claim disagrees with logical endpoint eligibility")
 			}

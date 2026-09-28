@@ -249,8 +249,8 @@ func BenchmarkRawCopyProgress(b *testing.B) {
 					}()
 					var flow stats.Exchange
 					if observed {
-						flow = manager.Observation().Begin(stats.FlowKindTCP, stats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-						flow.Route(stats.RouteStep{Selection: stats.SelectionDefault, Outbound: stats.OutboundRef{Serial: 1}})
+						flow = manager.Observation().Begin(xnet.Network_TCP, stats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+						flow.Route(stats.OutboundRef{Serial: 1})
 						flow.BindRoute()
 					}
 					b.StartTimer()

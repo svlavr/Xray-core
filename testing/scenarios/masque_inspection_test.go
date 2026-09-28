@@ -221,8 +221,7 @@ func (g *masqueFirstDatagramGate) Snapshot() (sources int, forwarded uint64, err
 
 func inspectionMasqueTCPRow(t *testing.T, row fs.FlowRecord, target xnet.Destination, known uint64) {
 	t.Helper()
-	route := row.SelectedRoute
-	if row.Ref.ID == 0 || row.Kind != fs.FlowKindTCP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != target || row.Uplink != (fs.ByteFact{Known: known}) || row.Downlink != (fs.ByteFact{Known: known}) || route.Selection != fs.SelectionDefault || route.Outbound.Tag != "masque-inspected" || route.Outbound.Serial == 0 || route.SelectedTarget != target || row.EffectiveDestination != target || row.SelectedRoute != route {
+	if row.Ref.ID == 0 || row.Kind != xnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != target || row.Uplink != known || row.Downlink != known || row.Outbound.Tag != "masque-inspected" || row.Outbound.Serial == 0 || row.EffectiveDestination != target {
 		t.Fatalf("logical MASQUE TCP flow: %+v", row)
 	}
 }
@@ -276,7 +275,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 				if !ok {
 					t.Fatalf("unexpected MASQUE source: %+v", row)
 				}
-				if row.Uplink.Known != want || row.Downlink.Known != want {
+				if row.Uplink != want || row.Downlink != want {
 					ready = false
 				}
 			}
@@ -296,7 +295,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 		t.Fatal("two logical MASQUE flows were not observed")
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRef})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("MASQUE exact stop: %+v %v", outcomes, err)
 	}
 	first.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -321,8 +320,8 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
-			if row.Kind == fs.FlowKindUDPAssociation && row.Uplink.Known == uint64(len(udpPayload)) && row.Downlink.Known == uint64(len(udpPayload)) {
-				if row.Origin != fs.TrafficOriginUser || row.SelectedRoute.Outbound.Tag != "masque-inspected" || row.EffectiveDestination != udpTarget || row.Downlink.Known != row.Uplink.Known {
+			if row.Kind == xnet.Network_UDP && row.Uplink == uint64(len(udpPayload)) && row.Downlink == uint64(len(udpPayload)) {
+				if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "masque-inspected" || row.EffectiveDestination != udpTarget || row.Downlink != row.Uplink {
 					t.Fatalf("logical MASQUE UDP flow: %+v", row)
 				}
 				udpRef = row.Ref
@@ -337,7 +336,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 		t.Fatal("MASQUE UDP association was not observed")
 	}
 	outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{udpRef})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
 		t.Fatalf("MASQUE UDP exact stop: %+v %v", outcomes, err)
 	}
 	deadline = time.Now().Add(5 * time.Second)
@@ -349,7 +348,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 		}
 		for _, row := range page.Rows {
 			if row.Flow.Ref == udpRef {
-				if row.Flow.Uplink.Known != uint64(len(udpPayload)) || row.Flow.Downlink.Known != uint64(len(udpPayload)) {
+				if row.Flow.Uplink != uint64(len(udpPayload)) || row.Flow.Downlink != uint64(len(udpPayload)) {
 					t.Fatalf("stopped MASQUE UDP terminal: %+v", row)
 				}
 				stoppedUDP = true
@@ -377,7 +376,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
-			if row.Kind == fs.FlowKindUDPAssociation && row.Uplink.Known == uint64(len(replacementPayload)) && row.Downlink.Known == row.Uplink.Known {
+			if row.Kind == xnet.Network_UDP && row.Uplink == uint64(len(replacementPayload)) && row.Downlink == row.Uplink {
 				if row.Ref == udpRef {
 					t.Fatal("stopped MASQUE UDP association was reused")
 				}
@@ -392,14 +391,14 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 					}
 					var up, down uint64
 					for _, total := range totals.Rows {
-						if total.Origin != fs.TrafficOriginUser || total.Uplink.Known == 0 && total.Downlink.Known == 0 {
+						if total.Origin != fs.TrafficOriginUser || total.Uplink == 0 && total.Downlink == 0 {
 							continue
 						}
 						if total.Outbound.Tag != "masque-inspected" || total.Outbound.Serial == 0 {
 							t.Fatalf("unexpected MASQUE USER bucket: %+v", total)
 						}
-						up += total.Uplink.Known
-						down += total.Downlink.Known
+						up += total.Uplink
+						down += total.Downlink
 					}
 					if up == want && down == want {
 						return
@@ -440,9 +439,6 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 		}
 		if len(live.Rows) == 1 {
 			inspectionMasqueTCPRow(t, live.Rows[0], tcpTarget, 0)
-			if live.Rows[0].State != fs.FlowStateOpen {
-				t.Fatalf("first MASQUE flow state while gated: %+v", live.Rows[0])
-			}
 			firstRef = live.Rows[0].Ref
 			break
 		}
@@ -467,9 +463,6 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 		if len(live.Rows) == 2 {
 			for _, row := range live.Rows {
 				inspectionMasqueTCPRow(t, row, tcpTarget, 0)
-				if row.State != fs.FlowStateOpen {
-					t.Fatalf("bound MASQUE flow state while gated: %+v", row)
-				}
 				if row.Ref != firstRef {
 					siblingRef = row.Ref
 				}
@@ -488,7 +481,7 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 	}
 
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRef})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Ref != firstRef || outcomes[0].Code != fs.CloseCodeAccepted {
+	if err != nil || len(outcomes) != 1 || outcomes[0].Ref != firstRef || outcomes[0].Err != nil {
 		t.Fatalf("first MASQUE exact stop: %+v %v", outcomes, err)
 	}
 	if err := first.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
@@ -509,9 +502,6 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 		for _, row := range terminals.Rows {
 			if row.Flow.Ref == firstRef {
 				inspectionMasqueTCPRow(t, row.Flow, tcpTarget, 0)
-				if row.Flow.State != fs.FlowStateEnded {
-					t.Fatalf("first MASQUE terminal reason: %+v", row)
-				}
 				firstStopped = true
 			}
 		}
@@ -523,9 +513,6 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 		for _, row := range live.Rows {
 			if row.Ref == siblingRef {
 				inspectionMasqueTCPRow(t, row, tcpTarget, 0)
-				if row.State != fs.FlowStateOpen {
-					t.Fatalf("sibling MASQUE flow state before carrier release: %+v", row)
-				}
 				siblingStillLive = true
 			}
 		}
@@ -551,11 +538,8 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
-			if row.Ref == siblingRef && row.Uplink.Known == uint64(len(payload)) && row.Downlink.Known == uint64(len(payload)) {
+			if row.Ref == siblingRef && row.Uplink == uint64(len(payload)) && row.Downlink == uint64(len(payload)) {
 				inspectionMasqueTCPRow(t, row, tcpTarget, uint64(len(payload)))
-				if row.State != fs.FlowStateOpen {
-					t.Fatalf("successful sibling MASQUE flow state: %+v", row)
-				}
 				sources, forwarded, relayErr := gate.Snapshot()
 				if sources != 1 || forwarded == 0 || relayErr != nil {
 					t.Fatalf("successful shared MASQUE carrier: sources=%d forwarded=%d err=%v", sources, forwarded, relayErr)
@@ -566,11 +550,11 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 				}
 				var userRows int
 				for _, total := range totals.Rows {
-					if total.Origin != fs.TrafficOriginUser || total.Uplink.Known == 0 && total.Downlink.Known == 0 {
+					if total.Origin != fs.TrafficOriginUser || total.Uplink == 0 && total.Downlink == 0 {
 						continue
 					}
 					userRows++
-					if total.Outbound.Tag != "masque-inspected" || total.Outbound.Serial == 0 || total.Uplink != (fs.ByteFact{Known: uint64(len(payload))}) || total.Downlink != (fs.ByteFact{Known: uint64(len(payload))}) {
+					if total.Outbound.Tag != "masque-inspected" || total.Outbound.Serial == 0 || total.Uplink != uint64(len(payload)) || total.Downlink != uint64(len(payload)) {
 						t.Fatalf("successful MASQUE USER total: %+v", total)
 					}
 				}

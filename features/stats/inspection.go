@@ -2,19 +2,9 @@ package stats
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
-)
-
-var (
-	ErrInspectionLimit          = errors.New("inspection limit exceeded")
-	ErrInspectionUnavailable    = errors.New("inspection unavailable")
-	ErrInspectionClosed         = errors.New("inspection closed")
-	ErrInspectionAlreadyEnabled = errors.New("inspection already enabled")
-	ErrInspectionTooLate        = errors.New("inspection enablement is too late")
-	ErrInspectionEntropy        = errors.New("inspection runtime entropy unavailable")
 )
 
 // TrafficOrigin is the low-level admission-origin fact. Session metadata
@@ -45,68 +35,20 @@ type ObservationOptions struct {
 	MaxLive      uint32
 	MaxTerminals uint32
 	MaxBuckets   uint32
-	MaxClose     uint32
 }
-
-type InspectionInfo struct {
-	Runtime RuntimeID
-}
-
-type ByteFact struct {
-	Known uint64
-}
-
-type Sample struct {
-	Runtime RuntimeID
-	At      time.Duration
-}
-
-type SelectionKind uint8
-
-const (
-	SelectionUnknown SelectionKind = iota
-	SelectionForced
-	SelectionRule
-	SelectionDefault
-	SelectionRejected
-)
-
-type RouteStep struct {
-	Selection      SelectionKind
-	Outbound       OutboundRef
-	RuleTag        string
-	SelectedTarget net.Destination
-}
-
-type FlowKind uint8
-
-const (
-	FlowKindUnknown FlowKind = iota
-	FlowKindTCP
-	FlowKindUDPAssociation
-)
-
-type FlowState uint8
-
-const (
-	FlowStateOpen FlowState = iota
-	FlowStateStopRequested
-	FlowStateEnded
-)
 
 type FlowRecord struct {
 	Ref                  FlowRef
-	Kind                 FlowKind
+	Kind                 net.Network
 	Origin               TrafficOrigin
 	Source               net.Destination
 	InitialDestination   net.Destination
 	Opened               time.Duration
-	SelectedRoute        RouteStep
+	Outbound             OutboundRef
 	EffectiveDestination net.Destination
 	LatestDestination    net.Destination
-	Uplink               ByteFact
-	Downlink             ByteFact
-	State                FlowState
+	Uplink               uint64
+	Downlink             uint64
 }
 
 type TerminalRecord struct {
@@ -117,46 +59,34 @@ type TerminalRecord struct {
 type TotalRecord struct {
 	Outbound OutboundRef
 	Origin   TrafficOrigin
-	Uplink   ByteFact
-	Downlink ByteFact
+	Uplink   uint64
+	Downlink uint64
 }
 
 type LiveSnapshot struct {
-	Sample Sample
-	Rows   []FlowRecord
+	At   time.Duration
+	Rows []FlowRecord
 }
 
 type TotalsSnapshot struct {
-	Sample Sample
-	Rows   []TotalRecord
+	At   time.Duration
+	Rows []TotalRecord
 }
 
 type TerminalSnapshot struct {
-	Sample Sample
-	Rows   []TerminalRecord
+	At   time.Duration
+	Rows []TerminalRecord
 }
 
-type CloseCode uint8
-
-const (
-	CloseCodeAccepted CloseCode = iota
-	CloseCodeNoAction
-	CloseCodeStaleRuntime
-	CloseCodeUnsupportedOwner
-	CloseCodeFailed
-	CloseCodeNotStartedCanceled
-)
-
 type CloseOutcome struct {
-	Ref  FlowRef
-	Code CloseCode
-	Err  error
+	Ref FlowRef
+	Err error
 }
 
 // FlowInspection is the optional direct-Go observation and local-control
 // capability implemented by the native statistics manager.
 type FlowInspection interface {
-	Info() InspectionInfo
+	Runtime() RuntimeID
 	ReadLive() (LiveSnapshot, error)
 	ReadTerminals() (TerminalSnapshot, error)
 	ReadTotals() (TotalsSnapshot, error)
@@ -173,8 +103,8 @@ type ObservationProvider interface {
 // AdmissionStore admits one decoded logical exchange. A nil stop callback
 // keeps observation available while making exact local stop unsupported.
 type AdmissionStore interface {
-	Info() InspectionInfo
-	Begin(FlowKind, TrafficOrigin, net.Destination, net.Destination, func() error) Exchange
+	Runtime() RuntimeID
+	Begin(net.Network, TrafficOrigin, net.Destination, net.Destination, func() error) Exchange
 	// PrepareTCP keeps endpoint facts local until the consuming role is known.
 	// BindRoute/Unassign (or genuine failed completion) registers it once.
 	PrepareTCP(TrafficOrigin, net.Destination, net.Destination, func() error) Exchange
@@ -185,29 +115,23 @@ type AdmissionStore interface {
 // facts still update the bound aggregate without changing that snapshot.
 type Exchange interface {
 	Ref() FlowRef
-	// ExcludeCarrier suppresses an unregistered physical carrier's facts. False
-	// means it was already registered;
-	// an existing logical flow is never erased or claimed by this operation.
+	// ExcludeCarrier suppresses an unregistered physical carrier's facts.
+	// False means it was already registered and cannot be erased.
 	ExcludeCarrier() bool
-	// Rebind validates a retained endpoint's new carrier before enqueue. A
-	// conflicting runtime/origin freezes later byte and destination attribution.
+	// Rebind fences later attribution if a retained endpoint changes runtime or origin.
 	Rebind(RuntimeID, TrafficOrigin)
-	// NewLeg reserves one native UDP ray or one TCP request attempt under this
-	// root. Its receipts keep their own consuming route, but share the root
-	// reference and byte facts. Finish it after pending attribution is known.
-	// Returns nil after stop. Do not mix root receipts with child legs.
+	// NewLeg reserves one native UDP ray or TCP attempt under this root.
+	// Legs share the root reference and byte facts, but own their route and Finish.
+	// Returns nil after stop.
 	NewLeg() Exchange
-	Route(RouteStep)
-	// BindRoute is called by the consuming owner, after forwarding selections.
+	Route(OutboundRef)
+	// BindRoute is called after the consuming owner is selected.
 	BindRoute()
-	// Unassign preserves known bytes when no consuming owner is proven.
 	Unassign()
 	Effective(net.Destination)
-	// SetSource fills a source unavailable at admission once its native
-	// association identifies the peer. It never changes an existing source.
+	// SetSource fills a previously unknown source once.
 	SetSource(net.Destination)
-	// PacketDestination replaces the latest observed requested destination,
-	// independently of delayed route attribution. It does not record history.
+	// PacketDestination records the latest requested packet destination.
 	PacketDestination(net.Destination)
 	AddUplink(uint64)
 	AddDownlink(uint64)
