@@ -252,7 +252,7 @@ func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin fe
 	if cell := s.buckets[key]; cell != nil {
 		return cell
 	}
-	if s.closed.Load() || s.buckets == nil {
+	if s.closed.Load() {
 		return s.unassigned[int(origin)]
 	}
 	if uint32(len(s.buckets)) >= s.limits.MaxBuckets {
@@ -330,9 +330,6 @@ type inspectionExchange struct {
 // single-leg endpoint continues to use its authoritative flow cells directly.
 type pendingCredit struct {
 	up, down uint64
-
-	classified bool
-	settled    bool
 }
 
 func (e *inspectionExchange) NewLeg() featurestats.Exchange {
@@ -365,7 +362,7 @@ func (e *inspectionExchange) ExcludeCarrier() bool {
 func (e *inspectionExchange) Route(outbound featurestats.OutboundRef) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || e.published || e.store == nil {
+	if e.excluded || e.published {
 		return
 	}
 	e.commitPendingLocked()
@@ -413,7 +410,6 @@ func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 	}
 	bucket.uplink.Add(up)
 	bucket.downlink.Add(down)
-	e.settlePendingLocked()
 	e.pending = nil
 }
 
@@ -453,7 +449,7 @@ func (e *inspectionExchange) AddUplink(value uint64) {
 	if e.excluded || e.provenanceConflict {
 		return
 	}
-	if e.isLeg && e.pending != nil && !e.pending.classified {
+	if e.isLeg && e.pending != nil && e.routeSeq == 0 {
 		e.pending.up += value
 		return
 	}
@@ -471,7 +467,7 @@ func (e *inspectionExchange) AddDownlink(value uint64) {
 	if e.excluded || e.provenanceConflict {
 		return
 	}
-	if e.isLeg && e.pending != nil && !e.pending.classified {
+	if e.isLeg && e.pending != nil && e.routeSeq == 0 {
 		e.pending.down += value
 		return
 	}
@@ -548,7 +544,7 @@ func (e *inspectionExchange) completeLocked() *featurestats.TerminalRecord {
 		e.stop = nil
 		return nil
 	}
-	if e.isLeg && e.pending != nil && !e.pending.settled {
+	if e.isLeg && e.pending != nil {
 		// DefaultDispatcher selects asynchronously after returning the link. A
 		// native UDP reader may end before Route or BindRoute, so do not guess
 		// that the still-pending selected role is unassigned. Only a marked
@@ -574,18 +570,10 @@ func (e *inspectionExchange) completeLocked() *featurestats.TerminalRecord {
 	return &featurestats.TerminalRecord{Flow: flow, Ended: e.store.elapsed()}
 }
 
-func (e *inspectionExchange) settlePendingLocked() {
-	if e.pending == nil || e.pending.settled {
-		return
-	}
-	e.pending.settled = true
-}
-
 func (e *inspectionExchange) commitPendingLocked() {
-	if e.pending == nil || e.pending.classified {
+	if e.pending == nil || e.routeSeq != 0 {
 		return
 	}
-	e.pending.classified = true
 	e.record.Uplink += e.pending.up
 	e.record.Downlink += e.pending.down
 }

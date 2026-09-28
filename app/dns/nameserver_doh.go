@@ -39,10 +39,7 @@ type DoHNameServer struct {
 	clientIP        net.IP
 	mu              sync.Mutex
 	connections     map[net.Conn]struct{}
-	closed          bool
 	dialing         sync.WaitGroup
-	workCtx         context.Context
-	cancelWork      context.CancelFunc
 	workers         sync.WaitGroup
 }
 
@@ -54,13 +51,11 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 		mode = "DOHL"
 	}
 	errors.LogInfo(context.Background(), "DNS: created ", mode, " client for ", url.String(), ", with h2c ", h2c)
-	workCtx, cancelWork := context.WithCancel(context.Background())
 	s := &DoHNameServer{
 		cacheController: NewCacheController(mode+"//"+url.Host, disableCache, serveStale, serveExpiredTTL),
 		dohURL:          url.String(),
 		clientIP:        clientIP,
 		connections:     make(map[net.Conn]struct{}),
-		workCtx:         workCtx, cancelWork: cancelWork,
 	}
 	s.httpClient = &http.Client{
 		Transport: &http2.Transport{
@@ -143,7 +138,7 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 func (s *DoHNameServer) beginDial() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.cacheController.ctx.Err() != nil {
 		return false
 	}
 	s.dialing.Add(1)
@@ -153,7 +148,7 @@ func (s *DoHNameServer) beginDial() bool {
 func (s *DoHNameServer) beginWork() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.cacheController.ctx.Err() != nil {
 		return false
 	}
 	s.workers.Add(1)
@@ -230,7 +225,7 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 		go func(r *dnsRequest, ctx context.Context) {
 			defer s.workers.Done()
 			workCtx, cancelWork := context.WithCancel(ctx)
-			stop := context.AfterFunc(s.workCtx, cancelWork)
+			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
 			defer func() { stop(); cancelWork() }()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
@@ -284,28 +279,12 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 }
 
-type dohTrackedConn struct {
-	net.Conn
-	state resourceCloseState
-	done  func()
-}
-
-func (c *dohTrackedConn) Close() error {
-	return c.state.close(func() error {
-		err := c.Conn.Close()
-		if go_errors.Is(err, stdnet.ErrClosed) {
-			return nil
-		}
-		return err
-	}, c.done)
-}
-
 func (s *DoHNameServer) trackConnection(conn net.Conn) (net.Conn, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	accepted := !s.closed
-	var tracked *dohTrackedConn
-	tracked = &dohTrackedConn{Conn: conn, done: func() {
+	accepted := s.cacheController.ctx.Err() == nil
+	var tracked *trackedConn
+	tracked = &trackedConn{Conn: conn, done: func() {
 		s.mu.Lock()
 		delete(s.connections, tracked)
 		s.mu.Unlock()
@@ -315,12 +294,10 @@ func (s *DoHNameServer) trackConnection(conn net.Conn) (net.Conn, bool) {
 }
 
 func (s *DoHNameServer) Close() error {
+	s.cacheController.cancel()
+	// Join admissions that observed the owner before cancellation.
 	s.mu.Lock()
-	s.closed = true
 	s.mu.Unlock()
-	if s.cancelWork != nil {
-		s.cancelWork()
-	}
 	s.dialing.Wait()
 	s.mu.Lock()
 	connections := make([]net.Conn, 0, len(s.connections))

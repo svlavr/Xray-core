@@ -29,9 +29,6 @@ type ClassicNameServer struct {
 	requestsCleanup *ownedPeriodic
 	reqID           uint32
 	clientIP        net.IP
-	closed          bool
-	rayCtx          context.Context
-	cancelRay       context.CancelFunc
 }
 
 type udpDnsRequest struct {
@@ -44,11 +41,9 @@ func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher
 	if address.Port == 0 {
 		address.Port = net.Port(53)
 	}
-	rayCtx, cancelRay := context.WithCancel(context.Background())
 	s := &ClassicNameServer{
 		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
 		address:         &address, requests: make(map[uint16]*udpDnsRequest), clientIP: clientIP,
-		rayCtx: rayCtx, cancelRay: cancelRay,
 	}
 	s.requestsCleanup = newOwnedPeriodic(time.Second, s.RequestsCleanup)
 	s.udpServer = udp.NewDispatcher(dispatcher, s.HandleResponse)
@@ -152,7 +147,7 @@ func (s *ClassicNameServer) newReqID() uint16 { return uint16(atomic.AddUint32(&
 
 func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) bool {
 	s.Lock()
-	if s.closed || req.ctx.Err() != nil || s.requests[req.msg.ID] != nil {
+	if s.cacheController.ctx.Err() != nil || req.ctx.Err() != nil || s.requests[req.msg.ID] != nil {
 		s.Unlock()
 		return false
 	}
@@ -169,7 +164,7 @@ func (s *ClassicNameServer) getCacheController() *CacheController { return s.cac
 func (s *ClassicNameServer) dispatchContext(ctx context.Context) context.Context {
 	// The shared ray carries the initial routing metadata but belongs to this
 	// nameserver. Canceling one request must not terminate sibling requests.
-	return toDnsContext(&dnsRequestContext{Context: context.WithoutCancel(ctx), caller: s.rayCtx}, s.address.String())
+	return toDnsContext(&dnsRequestContext{Context: context.WithoutCancel(ctx), caller: s.cacheController.ctx}, s.address.String())
 }
 
 func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
@@ -209,8 +204,8 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 }
 
 func (s *ClassicNameServer) Close() error {
+	s.cacheController.cancel()
 	s.Lock()
-	s.closed = true
 	for id, req := range s.requests {
 		delete(s.requests, id)
 		if req.stop != nil {
@@ -218,7 +213,6 @@ func (s *ClassicNameServer) Close() error {
 		}
 	}
 	s.Unlock()
-	s.cancelRay()
 	_ = s.requestsCleanup.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

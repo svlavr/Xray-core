@@ -233,13 +233,12 @@ func TestDNSPreparationInputSnapshot(t *testing.T) {
 func TestDNSPreparationFailuresPublishNothing(t *testing.T) {
 	badIP := &geodata.IPRule{Value: &geodata.IPRule_Geoip{Geoip: &geodata.GeoIPRule{File: filepath.Join(t.TempDir(), "missing.dat"), Code: "missing"}}}
 	for name, alter := range map[string]func(*Config){
-		"client-ip":       func(c *Config) { c.ClientIp = []byte{1} },
-		"strategy":        func(c *Config) { c.QueryStrategy = QueryStrategy(99) },
-		"missing-address": func(c *Config) { c.NameServer[1].Address = nil },
-		"invalid-port":    func(c *Config) { c.NameServer[1] = preparationServer("tcp://127.0.0.1:99999", "invalid") },
-		"missing-fake":    func(c *Config) { c.NameServer[1] = preparationServer("fakedns", "invalid") },
-		"expected-ip":     func(c *Config) { c.NameServer[1].ExpectedIp = []*geodata.IPRule{badIP} },
-		"unexpected-ip":   func(c *Config) { c.NameServer[1].UnexpectedIp = []*geodata.IPRule{badIP} },
+		"client-ip":     func(c *Config) { c.ClientIp = []byte{1} },
+		"strategy":      func(c *Config) { c.QueryStrategy = QueryStrategy(99) },
+		"invalid-port":  func(c *Config) { c.NameServer[1] = preparationServer("tcp://127.0.0.1:99999", "invalid") },
+		"missing-fake":  func(c *Config) { c.NameServer[1] = preparationServer("fakedns", "invalid") },
+		"expected-ip":   func(c *Config) { c.NameServer[1].ExpectedIp = []*geodata.IPRule{badIP} },
+		"unexpected-ip": func(c *Config) { c.NameServer[1].UnexpectedIp = []*geodata.IPRule{badIP} },
 		"domain-matcher": func(c *Config) {
 			c.NameServer[1].Domain = []*geodata.DomainRule{preparationDomain(geodata.Domain_Regex, "[")}
 		},

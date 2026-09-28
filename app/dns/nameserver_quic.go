@@ -37,9 +37,6 @@ type QUICNameServer struct {
 	clientIP        net.IP
 	transport       *quic.Transport
 	packetConn      stdnet.PacketConn
-	closed          bool
-	workCtx         context.Context
-	cancelWork      context.CancelFunc
 	workers         sync.WaitGroup
 }
 
@@ -55,12 +52,10 @@ func NewQUICNameServer(url *url.URL, disableCache bool, serveStale bool, serveEx
 	}
 	dest := net.UDPDestination(net.ParseAddress(url.Hostname()), port)
 
-	workCtx, cancelWork := context.WithCancel(context.Background())
 	s := &QUICNameServer{
 		cacheController: NewCacheController(url.String(), disableCache, serveStale, serveExpiredTTL),
 		destination:     &dest,
 		clientIP:        clientIP,
-		workCtx:         workCtx, cancelWork: cancelWork,
 	}
 
 	errors.LogInfo(context.Background(), "DNS: created Local DNS-over-QUIC client for ", url.String())
@@ -119,7 +114,7 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 		go func(r *dnsRequest, ctx context.Context) {
 			defer s.workers.Done()
 			workCtx, cancelWork := context.WithCancel(ctx)
-			stop := context.AfterFunc(s.workCtx, cancelWork)
+			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
 			defer func() { stop(); cancelWork() }()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
@@ -253,7 +248,7 @@ func (s *QUICNameServer) QueryIP(ctx context.Context, domain string, option dns_
 func (s *QUICNameServer) beginWork() bool {
 	s.Lock()
 	defer s.Unlock()
-	if s.closed {
+	if s.cacheController.ctx.Err() != nil {
 		return false
 	}
 	s.workers.Add(1)
@@ -272,7 +267,7 @@ func isActive(s *quic.Conn) bool {
 func (s *QUICNameServer) getConnection(ctx context.Context) (*quic.Conn, error) {
 	s.Lock()
 	defer s.Unlock()
-	if s.closed {
+	if s.cacheController.ctx.Err() != nil {
 		return nil, context.Canceled
 	}
 	conn := s.connection
@@ -364,13 +359,10 @@ func (s *QUICNameServer) openStream(ctx context.Context) (*quic.Stream, error) {
 }
 
 func (s *QUICNameServer) Close() error {
+	s.cacheController.cancel()
 	s.Lock()
-	s.closed = true
 	conn, transport, packetConn := s.connection, s.transport, s.packetConn
 	s.Unlock()
-	if s.cancelWork != nil {
-		s.cancelWork()
-	}
 	var errs []error
 	if conn != nil {
 		_ = conn.CloseWithError(0, "DNS resolver closed")

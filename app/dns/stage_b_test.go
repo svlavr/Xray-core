@@ -6,6 +6,7 @@ import (
 	"io"
 	stdnet "net"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -754,66 +755,54 @@ func (c *scriptedCloseConn) Close() error {
 func (c *scriptedCloseConn) callCount() int { c.mu.Lock(); defer c.mu.Unlock(); return c.calls }
 
 func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
-	for _, kind := range []string{"tcp", "doh"} {
-		t.Run(kind+"-join-success", func(t *testing.T) {
-			left, right := stdnet.Pipe()
-			defer left.Close()
-			defer right.Close()
-			lower := &scriptedCloseConn{Conn: left, entered: make(chan struct{}), proceed: make(chan struct{})}
-			var conn interface{ Close() error }
-			if kind == "tcp" {
-				conn = &tcpTrackedConn{Conn: lower}
-			} else {
-				conn = &dohTrackedConn{Conn: lower}
-			}
-			results := make(chan error, 2)
-			go func() { results <- conn.Close() }()
-			<-lower.entered
-			go func() { results <- conn.Close() }()
-			time.Sleep(time.Millisecond)
-			if calls := lower.callCount(); calls != 1 {
-				t.Fatalf("concurrent lower closes=%d", calls)
-			}
-			close(lower.proceed)
-			if err := <-results; err != nil {
-				t.Fatal(err)
-			}
-			if err := <-results; err != nil {
-				t.Fatal(err)
-			}
-			if err := conn.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if calls := lower.callCount(); calls != 1 {
-				t.Fatalf("successful close replay called lower %d times", calls)
-			}
-		})
-		t.Run(kind+"-retry-failure", func(t *testing.T) {
-			failure := go_errors.New("close failed")
-			left, right := stdnet.Pipe()
-			defer left.Close()
-			defer right.Close()
-			lower := &scriptedCloseConn{Conn: left, errs: []error{failure, nil}}
-			var conn interface{ Close() error }
-			if kind == "tcp" {
-				conn = &tcpTrackedConn{Conn: lower}
-			} else {
-				conn = &dohTrackedConn{Conn: lower}
-			}
-			if err := conn.Close(); !go_errors.Is(err, failure) {
-				t.Fatalf("first close: %v", err)
-			}
-			if err := conn.Close(); err != nil {
-				t.Fatalf("retry: %v", err)
-			}
-			if err := conn.Close(); err != nil {
-				t.Fatalf("replay: %v", err)
-			}
-			if calls := lower.callCount(); calls != 2 {
-				t.Fatalf("retry lower closes=%d", calls)
-			}
-		})
-	}
+	t.Run("join-success", func(t *testing.T) {
+		left, right := stdnet.Pipe()
+		defer left.Close()
+		defer right.Close()
+		lower := &scriptedCloseConn{Conn: left, entered: make(chan struct{}), proceed: make(chan struct{})}
+		conn := &trackedConn{Conn: lower}
+		results := make(chan error, 2)
+		go func() { results <- conn.Close() }()
+		<-lower.entered
+		go func() { results <- conn.Close() }()
+		time.Sleep(time.Millisecond)
+		if calls := lower.callCount(); calls != 1 {
+			t.Fatalf("concurrent lower closes=%d", calls)
+		}
+		close(lower.proceed)
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if calls := lower.callCount(); calls != 1 {
+			t.Fatalf("successful close replay called lower %d times", calls)
+		}
+	})
+	t.Run("retry-failure", func(t *testing.T) {
+		failure := go_errors.New("close failed")
+		left, right := stdnet.Pipe()
+		defer left.Close()
+		defer right.Close()
+		lower := &scriptedCloseConn{Conn: left, errs: []error{failure, nil}}
+		conn := &trackedConn{Conn: lower}
+		if err := conn.Close(); !go_errors.Is(err, failure) {
+			t.Fatalf("first close: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("replay: %v", err)
+		}
+		if calls := lower.callCount(); calls != 2 {
+			t.Fatalf("retry lower closes=%d", calls)
+		}
+	})
 }
 
 func TestTCPAndDoHCloseCaptureLateDialPublication(t *testing.T) {
@@ -830,15 +819,7 @@ func TestTCPAndDoHCloseCaptureLateDialPublication(t *testing.T) {
 					t.Fatal("dial rejected before close")
 				}
 				go func() { closeDone <- server.Close() }()
-				for {
-					server.mu.Lock()
-					closed := server.closed
-					server.mu.Unlock()
-					if closed {
-						break
-					}
-					time.Sleep(time.Millisecond)
-				}
+				<-server.cacheController.ctx.Done()
 				if _, accepted := server.trackConnection(lower); accepted {
 					t.Fatal("late TCP connection accepted")
 				}
@@ -849,15 +830,7 @@ func TestTCPAndDoHCloseCaptureLateDialPublication(t *testing.T) {
 					t.Fatal("dial rejected before close")
 				}
 				go func() { closeDone <- server.Close() }()
-				for {
-					server.mu.Lock()
-					closed := server.closed
-					server.mu.Unlock()
-					if closed {
-						break
-					}
-					time.Sleep(time.Millisecond)
-				}
+				<-server.cacheController.ctx.Done()
 				if _, accepted := server.trackConnection(lower); accepted {
 					t.Fatal("late DoH connection accepted")
 				}
@@ -958,4 +931,131 @@ func TestDoHResourceCloseRejectsLateConnectionPublication(t *testing.T) {
 		t.Fatal("late connection published after close")
 	}
 	_ = tracked.Close()
+}
+
+type stageBPausedPreparationContext struct {
+	context.Context
+	paused  atomic.Bool
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (c *stageBPausedPreparationContext) Value(key any) any {
+	if key == core.XrayKey(1) && c.paused.CompareAndSwap(false, true) {
+		close(c.entered)
+		<-c.resume
+	}
+	return c.Context.Value(key)
+}
+
+func TestStageBCloseDuringInertPreparation(t *testing.T) {
+	old := &stageBBlockingServer{started: make(chan struct{})}
+	feature := stageBManualFeature(t, old)
+	paused := &stageBPausedPreparationContext{Context: context.Background(), entered: make(chan struct{}), resume: make(chan struct{})}
+	feature.ctx = paused
+	var resume sync.Once
+	defer resume.Do(func() { close(paused.resume) })
+	result := make(chan ApplyResult, 1)
+	config := stageBConfig(preparationServer("localhost", "new"))
+	go func() { result <- ApplyConfig(context.Background(), feature, config) }()
+	select {
+	case <-paused.entered:
+	case <-time.After(time.Second):
+		t.Fatal("preparation did not pause")
+	}
+	if other := ApplyConfig(context.Background(), feature, config); other.Applied || other.Err == nil {
+		t.Fatalf("concurrent preparation admitted: %+v", other)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- feature.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for resource-free preparation")
+	}
+	resume.Do(func() { close(paused.resume) })
+	select {
+	case applied := <-result:
+		if applied.Applied || !go_errors.Is(applied.Err, context.Canceled) {
+			t.Fatalf("published after close: %+v", applied)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("preparation did not return after close")
+	}
+	if _, _, err := feature.LookupIPContext(context.Background(), "closed.test", featuredns.IPOption{IPv4Enable: true}); !go_errors.Is(err, context.Canceled) {
+		t.Fatalf("lookup after close: %v", err)
+	}
+}
+
+func TestCacheCloseAndRepeatedUnsubscribePreserveSibling(t *testing.T) {
+	cache := NewCacheController("subscriber", false, false, 0)
+	defer cache.Close()
+	first, sibling := cache.subscribe("host4"), cache.subscribe("host4")
+	first.close()
+	first.close()
+	record := &IPRecord{IP: []net.IP{{192, 0, 2, 1}}}
+	cache.publish("host4", record)
+	select {
+	case got := <-sibling.buffer:
+		if got != record {
+			t.Fatal("sibling received another record")
+		}
+	default:
+		t.Fatal("unsubscribing one query removed its sibling")
+	}
+	if err := cache.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sibling.close()
+	sibling.close()
+	server := &silentCachedServer{cache: cache}
+	_, _, err := queryIP(context.Background(), server, "closed.test", featuredns.IPOption{IPv4Enable: true, IPv6Enable: true})
+	if err == nil {
+		t.Fatal("query after cache close reported success")
+	}
+}
+
+func TestStageBQUICCloseDuringHandshake(t *testing.T) {
+	peer, err := stdnet.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	server, err := NewQUICNameServer(&url.URL{Scheme: "quic+local", Host: peer.LocalAddr().String()}, false, false, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := server.QueryIP(context.Background(), "blocked.test", featuredns.IPOption{IPv4Enable: true})
+		result <- err
+	}()
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := peer.ReadFrom(make([]byte, 2048)); err != nil {
+		t.Fatalf("handshake did not start: %v", err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- server.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close could not cancel the in-progress handshake")
+	}
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("unanswered query reported success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("query did not leave after close")
+	}
 }

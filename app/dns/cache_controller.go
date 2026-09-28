@@ -5,7 +5,6 @@ import (
 	go_errors "errors"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -39,41 +38,35 @@ type CacheController struct {
 	requestGroup  singleflight.Group
 	migrations    sync.WaitGroup
 	pulls         sync.WaitGroup
-	pullCtx       context.Context
-	cancelPulls   context.CancelFunc
-	closed        atomic.Bool
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 type cacheSubscriber struct {
 	buffer chan *IPRecord
-	done   chan struct{}
-	once   sync.Once
 	owner  *CacheController
 	key    string
 }
 
 func (s *cacheSubscriber) close() {
-	s.once.Do(func() {
-		s.owner.Lock()
-		group := s.owner.subs[s.key]
-		for i, candidate := range group {
-			if candidate == s {
-				group = append(group[:i], group[i+1:]...)
-				break
-			}
+	s.owner.Lock()
+	defer s.owner.Unlock()
+	group := s.owner.subs[s.key]
+	for i, candidate := range group {
+		if candidate == s {
+			group = append(group[:i], group[i+1:]...)
+			break
 		}
-		if len(group) == 0 {
-			delete(s.owner.subs, s.key)
-		} else {
-			s.owner.subs[s.key] = group
-		}
-		close(s.done)
-		s.owner.Unlock()
-	})
+	}
+	if len(group) == 0 {
+		delete(s.owner.subs, s.key)
+	} else {
+		s.owner.subs[s.key] = group
+	}
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
-	pullCtx, cancelPulls := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	c := &CacheController{
 		name:            name,
 		disableCache:    disableCache,
@@ -81,8 +74,8 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		serveExpiredTTL: -int32(serveExpiredTTL),
 		ips:             make(map[string]*record),
 		subs:            make(map[string][]*cacheSubscriber),
-		pullCtx:         pullCtx,
-		cancelPulls:     cancelPulls,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
 	c.cacheCleanup = newOwnedPeriodic(300*time.Second, c.CacheCleanup)
@@ -104,15 +97,15 @@ func (c *CacheController) CacheCleanup() error {
 
 func (c *CacheController) startPull(ctx context.Context, s CachedNameserver, fqdn string, option dns_feature.IPOption) {
 	c.Lock()
-	if c.closed.Load() {
+	if c.ctx.Err() != nil {
 		c.Unlock()
 		return
 	}
 	c.pulls.Add(1)
 	c.Unlock()
 	// Keep query metadata while the cache owner controls refresh cancellation.
-	pullCtx := &dnsRequestContext{Context: context.WithoutCancel(ctx), caller: c.pullCtx}
-	go func() { defer c.pulls.Done(); pull(pullCtx, s, fqdn, option) }()
+	ctx = &dnsRequestContext{Context: context.WithoutCancel(ctx), caller: c.ctx}
+	go func() { defer c.pulls.Done(); pull(ctx, s, fqdn, option) }()
 }
 
 func (c *CacheController) collectExpiredKeys() ([]string, error) {
@@ -292,7 +285,7 @@ func (c *CacheController) flush(batch []migrationEntry) {
 }
 
 func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
-	if c.closed.Load() {
+	if c.ctx.Err() != nil {
 		return
 	}
 	rtt := time.Since(req.start)
@@ -372,10 +365,9 @@ func (c *CacheController) findRecords(domain string) *record {
 }
 
 func (c *CacheController) subscribe(key string) *cacheSubscriber {
-	sub := &cacheSubscriber{buffer: make(chan *IPRecord, 16), done: make(chan struct{}), owner: c, key: key}
+	sub := &cacheSubscriber{buffer: make(chan *IPRecord, 16), owner: c, key: key}
 	c.Lock()
-	if c.closed.Load() {
-		close(sub.done)
+	if c.ctx.Err() != nil {
 		c.Unlock()
 		return sub
 	}
@@ -416,20 +408,11 @@ func closeSubscribers(sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
 }
 
 func (c *CacheController) Close() error {
-	c.closed.Store(true)
-	c.cancelPulls()
+	c.cancel()
 	_ = c.cacheCleanup.Close()
 	c.Lock()
-	var subscribers []*cacheSubscriber
-	for _, group := range c.subs {
-		for _, sub := range group {
-			subscribers = append(subscribers, sub)
-		}
-	}
+	c.subs = nil
 	c.Unlock()
-	for _, sub := range subscribers {
-		sub.close()
-	}
 	c.migrations.Wait()
 	c.pulls.Wait()
 	return nil

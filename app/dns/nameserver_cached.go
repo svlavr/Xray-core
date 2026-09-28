@@ -92,7 +92,7 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 			return nil, ctx.Err()
 		case err := <-noResponseErrCh:
 			return nil, err
-		case <-sub.done:
+		case <-sub.owner.ctx.Done():
 			return nil, context.Canceled
 		case msg := <-sub.buffer:
 			sub.close()

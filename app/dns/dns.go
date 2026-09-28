@@ -46,15 +46,9 @@ type DomainMatcherInfo struct {
 
 // New creates a new DNS server with given configuration.
 func New(ctx context.Context, config *Config) (*DNS, error) {
-	if config == nil {
-		return nil, errors.New("missing DNS config")
-	}
 	config = proto.Clone(config).(*Config)
 	needsFakeDNS := false
 	for _, ns := range config.NameServer {
-		if ns == nil || ns.Address == nil || ns.Address.Address == nil {
-			return nil, errors.New("missing nameserver address")
-		}
 		needsFakeDNS = needsFakeDNS || strings.EqualFold(ns.Address.Address.GetDomain(), "fakedns")
 	}
 	if len(config.NameServer) == 0 {
@@ -255,18 +249,12 @@ func (s *DNS) Close() error {
 	defer rt.closeMu.Unlock()
 	rt.mu.Lock()
 	rt.closed = true
-	prepDone := rt.prepDone
 	if rt.current != nil {
-		rt.current.stop()
+		rt.current.cancel()
 	}
 	if rt.closing != nil {
-		rt.closing.stop()
+		rt.closing.cancel()
 	}
-	rt.mu.Unlock()
-	if prepDone != nil {
-		<-prepDone
-	}
-	rt.mu.Lock()
 	current, closing := rt.current, rt.closing
 	rt.mu.Unlock()
 	var errs []error
@@ -275,20 +263,16 @@ func (s *DNS) Close() error {
 			errs = append(errs, err)
 		} else {
 			rt.mu.Lock()
-			if rt.current == current {
-				rt.current = nil
-			}
+			rt.current = nil
 			rt.mu.Unlock()
 		}
 	}
-	if closing != nil && closing != current {
+	if closing != nil {
 		if err := closing.closeOwned(); err != nil {
 			errs = append(errs, err)
 		} else {
 			rt.mu.Lock()
-			if rt.closing == closing {
-				rt.closing = nil
-			}
+			rt.closing = nil
 			rt.mu.Unlock()
 		}
 	}
@@ -302,11 +286,6 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 		return false
 	}
 	if s.runtime == nil {
-		for _, client := range s.clients {
-			if inbound.Tag == client.tag {
-				return true
-			}
-		}
 		return false
 	}
 	s.runtime.mu.Lock()
@@ -334,37 +313,34 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
-	if s.runtime == nil {
-		return s.lookupIP(ctx, domain, option)
+	rt := s.runtime
+	rt.mu.Lock()
+	if rt.closed {
+		rt.mu.Unlock()
+		return nil, 0, context.Canceled
 	}
-	owner, err := s.acquireCurrent()
-	if err != nil {
-		return nil, 0, err
-	}
-	defer owner.release()
-	ownerCtx, releaseOwnerCtx := owningDNSContext(s.ctx, ctx)
-	defer releaseOwnerCtx()
-	queryCtx, cancel := context.WithCancel(ownerCtx)
-	stop := context.AfterFunc(owner.ctx, cancel)
-	defer stop()
-	defer cancel()
-	return owner.resolver.lookupIP(queryCtx, domain, option)
-}
+	owner := rt.current
+	owner.queries.Add(1)
+	rt.mu.Unlock()
+	defer owner.queries.Done()
 
-func owningDNSContext(ownerCtx, callCtx context.Context) (context.Context, func()) {
 	base := context.Background()
-	if core.FromContext(ownerCtx) != nil {
-		base = core.ToBackgroundDetachedContext(ownerCtx)
+	if core.FromContext(s.ctx) != nil {
+		base = core.ToBackgroundDetachedContext(s.ctx)
 	}
-	if inbound := session.InboundFromContext(callCtx); inbound != nil {
+	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		base = session.ContextWithInbound(base, inbound)
 	}
-	if content := session.ContentFromContext(callCtx); content != nil {
+	if content := session.ContentFromContext(ctx); content != nil {
 		base = session.ContextWithContent(base, content)
 	}
-	ctx, cancel := context.WithCancel(base)
-	stop := context.AfterFunc(callCtx, cancel)
-	return ctx, func() { stop(); cancel() }
+	queryCtx, cancel := context.WithCancel(base)
+	stopCaller := context.AfterFunc(ctx, cancel)
+	stopOwner := context.AfterFunc(owner.ctx, cancel)
+	defer stopCaller()
+	defer stopOwner()
+	defer cancel()
+	return owner.resolver.lookupIP(queryCtx, domain, option)
 }
 
 func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {

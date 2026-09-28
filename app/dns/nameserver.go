@@ -54,9 +54,6 @@ func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 }
 
 func newServer(ctx context.Context, dest net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP, fake dns.FakeDNSEngine) (Server, error) {
-	if dest.Address == nil {
-		return nil, errors.New("missing nameserver address")
-	}
 	if address := dest.Address; address.Family().IsDomain() {
 		u, err := url.Parse(address.Domain())
 		if err != nil {
@@ -124,9 +121,6 @@ func NewClient(
 	}
 	dispatcher, _ := instance.GetFeature(routing.DispatcherType()).(routing.Dispatcher)
 	fake, _ := instance.GetFeature((*dns.FakeDNSEngine)(nil)).(dns.FakeDNSEngine)
-	if ns == nil {
-		return nil, errors.New("missing nameserver config")
-	}
 	client, err := newClient(ctx, proto.Clone(ns).(*NameServer), append(net.IP(nil), clientIP...), disableCache, serveStale, serveExpiredTTL, tag, ipOption, dispatcher, fake)
 	if err == nil && updateRules != nil {
 		_, local := client.server.(*LocalNameServer)
@@ -145,9 +139,6 @@ func newClient(
 	dispatcher routing.Dispatcher,
 	fake dns.FakeDNSEngine,
 ) (*Client, error) {
-	if ns == nil || ns.Address == nil || ns.Address.Address == nil {
-		return nil, errors.New("missing nameserver address")
-	}
 	client := &Client{}
 	// Create a new server for each client for now
 	server, err := newServer(ctx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP, fake)
