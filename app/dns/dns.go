@@ -303,6 +303,73 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 	return false
 }
 
+// MayUseSystemResolver reports whether any name server configured here could
+// still resolve through the system resolver. That is what happens when no name
+// server is configured at all, and it is also what a name server pointed at
+// "localhost" does. Callers that are about to redirect the system resolver need
+// to know, because a resolution path that reaches it would then loop back to
+// them.
+//
+// Any such server is enough: name servers can be selected per domain, so a
+// single local one makes some query reach the system resolver even when
+// independent upstreams are configured alongside it.
+func (s *DNS) MayUseSystemResolver() bool {
+	if s.runtime == nil {
+		return resolverMayUseSystem(s)
+	}
+	rt := s.runtime
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.closed || rt.current == nil {
+		return true
+	}
+	return resolverMayUseSystem(rt.current.resolver)
+}
+
+func resolverMayUseSystem(s *DNS) bool {
+	if s == nil || len(s.clients) == 0 {
+		return true
+	}
+	for _, client := range s.clients {
+		switch server := client.server.(type) {
+		case *LocalNameServer:
+			return true
+		case *TCPNameServer:
+			if !server.routed && server.destination.Address.Family().IsDomain() {
+				return true
+			}
+		case *DoHNameServer:
+			if server.systemResolver {
+				return true
+			}
+		case *QUICNameServer:
+			if server.destination.Address.Family().IsDomain() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// AcquireSystemDNS keeps a safe published resolver in place while Linux owns
+// per-link system DNS settings. The caller releases it after successful revert.
+func (s *DNS) AcquireSystemDNS() (func(), error) {
+	if s == nil || s.runtime == nil {
+		return nil, fmt.Errorf("DNS resolver unavailable")
+	}
+	rt := s.runtime
+	rt.systemDNSMu.RLock()
+	rt.mu.Lock()
+	unsafe := rt.closed || rt.current == nil || resolverMayUseSystem(rt.current.resolver) ||
+		(rt.closing != nil && resolverMayUseSystem(rt.closing.resolver))
+	rt.mu.Unlock()
+	if unsafe {
+		rt.systemDNSMu.RUnlock()
+		return nil, fmt.Errorf("DNS configuration may resolve through the system resolver, takeover would loop or resolver is unavailable")
+	}
+	return rt.systemDNSMu.RUnlock, nil
+}
+
 // LookupIP implements dns.Client.
 func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	return s.LookupIPContext(s.ctx, domain, option)

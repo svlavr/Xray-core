@@ -8,9 +8,6 @@ import (
 	"testing"
 	"time"
 
-	B "github.com/sagernet/sing/common/buf"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 	appstats "github.com/xtls/xray-core/app/stats"
 	cnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
@@ -45,19 +42,6 @@ func (*rejectedPacketConnProbe) SetDeadline(time.Time) error      { return nil }
 func (*rejectedPacketConnProbe) SetReadDeadline(time.Time) error  { return nil }
 func (*rejectedPacketConnProbe) SetWriteDeadline(time.Time) error { return nil }
 
-type rejectedSingPacketConn struct{ *rejectedPacketConnProbe }
-
-func (c *rejectedSingPacketConn) ReadPacket(*B.Buffer) (M.Socksaddr, error) {
-	c.reads++
-	return M.Socksaddr{}, io.EOF
-}
-
-func (c *rejectedSingPacketConn) WritePacket(buffer *B.Buffer, _ M.Socksaddr) error {
-	c.writes++
-	buffer.Release()
-	return nil
-}
-
 type rejectedNetPacketConn struct{ *rejectedPacketConnProbe }
 
 func (c *rejectedNetPacketConn) ReadFrom([]byte) (int, stdnet.Addr, error) {
@@ -70,10 +54,7 @@ func (c *rejectedNetPacketConn) WriteTo(payload []byte, _ stdnet.Addr) (int, err
 	return len(payload), nil
 }
 
-var (
-	_ N.PacketConn      = (*rejectedSingPacketConn)(nil)
-	_ stdnet.PacketConn = (*rejectedNetPacketConn)(nil)
-)
+var _ stdnet.PacketConn = (*rejectedNetPacketConn)(nil)
 
 type rejectedPacketDialer struct{ calls int }
 
@@ -92,7 +73,6 @@ func TestSS2022RejectsDirectInboundPacketConn(t *testing.T) {
 		name string
 		new  func(*rejectedPacketConnProbe) cnet.Conn
 	}{
-		{"sing", func(probe *rejectedPacketConnProbe) cnet.Conn { return &rejectedSingPacketConn{probe} }},
 		{"net", func(probe *rejectedPacketConnProbe) cnet.Conn { return &rejectedNetPacketConn{probe} }},
 	}
 	for _, constructor := range constructors {

@@ -41,7 +41,7 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 	}
 
 	proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
-	return errors.New("unable to find an available mux client").AtWarning()
+	return errors.New("unable to find an available mux client")
 }
 
 type WorkerPicker interface {

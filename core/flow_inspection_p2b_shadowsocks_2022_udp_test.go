@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
-	N "github.com/sagernet/sing/common/network"
 	cnet "github.com/xtls/xray-core/common/net"
 	fin "github.com/xtls/xray-core/features/inbound"
 	fs "github.com/xtls/xray-core/features/stats"
@@ -47,27 +45,52 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 				return conn
 			}
 			transport := &inspectionRebindConn{Conn: dial()}
-			method, err := shadowaead_2022.NewWithPassword(config.Method, config.Key, nil)
+			method, err := ss.GetCipherMethod(config.Method)
 			if err != nil {
 				t.Fatal(err)
 			}
-			client, sibling := method.DialPacketConn(transport), method.DialPacketConn(transport)
-			first, second := startOutboundStatsUDPServer(t, 0x19), startOutboundStatsUDPServer(t, 0x37)
-			exchange := func(client N.NetPacketConn, destination cnet.Destination, payload []byte, mask byte) {
-				t.Helper()
-				transport.SetDeadline(time.Now().Add(3 * time.Second))
-				addr := &net.UDPAddr{IP: destination.Address.IP(), Port: int(destination.Port)}
-				if _, err := client.WriteTo(payload, addr); err != nil {
+			keys, err := ss.ParsePSKList(config.Key, method.KeySaltLength)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newCodec := func() *ss.UDPPacketCodec {
+				var codec *ss.UDPPacketCodec
+				if len(keys) == 2 {
+					codec, err = ss.NewUDPPacketCodec(method, keys[1], keys[0])
+				} else {
+					codec, err = ss.NewUDPPacketCodec(method, keys[0])
+				}
+				if err != nil {
 					t.Fatal(err)
 				}
+				return codec
+			}
+			client, sibling := newCodec(), newCodec()
+			first, second := startOutboundStatsUDPServer(t, 0x19), startOutboundStatsUDPServer(t, 0x37)
+			exchange := func(codec *ss.UDPPacketCodec, destination cnet.Destination, payload []byte, mask byte) {
+				t.Helper()
+				transport.SetDeadline(time.Now().Add(3 * time.Second))
+				packet, err := codec.EncodeClientPacket(destination, payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := transport.Write(packet.Bytes()); err != nil {
+					packet.Release()
+					t.Fatal(err)
+				}
+				packet.Release()
 				response := make([]byte, 65535)
-				n, from, err := client.ReadFrom(response)
+				n, err := transport.Read(response)
+				if err != nil {
+					t.Fatal(err)
+				}
+				decoded, err := codec.DecodePacket(response[:n])
 				want := append([]byte(nil), payload...)
 				for i := range want {
 					want[i] ^= mask
 				}
-				if err != nil || !bytes.Equal(response[:n], want) || from.String() != addr.String() {
-					t.Fatalf("packet response %d %v %v", n, from, err)
+				if err != nil || !bytes.Equal(decoded.Payload, want) || decoded.Destination != destination {
+					t.Fatalf("packet response %+v %v", decoded, err)
 				}
 			}
 			payload := []byte("first native session")

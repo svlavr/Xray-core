@@ -36,6 +36,7 @@ type DoHNameServer struct {
 	cacheController *CacheController
 	httpClient      *http.Client
 	dohURL          string
+	systemResolver  bool
 	clientIP        net.IP
 	mu              sync.Mutex
 	connections     map[net.Conn]struct{}
@@ -54,6 +55,7 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 	s := &DoHNameServer{
 		cacheController: NewCacheController(mode+"//"+url.Host, disableCache, serveStale, serveExpiredTTL),
 		dohURL:          url.String(),
+		systemResolver:  dispatcher == nil && net.ParseAddress(url.Hostname()).Family().IsDomain(),
 		clientIP:        clientIP,
 		connections:     make(map[net.Conn]struct{}),
 	}

@@ -18,12 +18,15 @@ import (
 // The feature mutex serializes publication and admission. Each resolver joins
 // its admitted queries before its resource references can be forgotten.
 type dnsRuntime struct {
-	mu      sync.Mutex
-	closeMu sync.Mutex
-	current *resolverOwner
-	closing *resolverOwner
-	applyMu sync.Mutex
-	closed  bool
+	mu sync.Mutex
+	// systemDNSMu orders unsafe resolver publication against Linux system DNS takeover.
+	// Takeover holds a read lock until the OS settings are reverted.
+	systemDNSMu sync.RWMutex
+	closeMu     sync.Mutex
+	current     *resolverOwner
+	closing     *resolverOwner
+	applyMu     sync.Mutex
+	closed      bool
 }
 
 type resolverOwner struct {
@@ -195,6 +198,17 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 		return ApplyResult{Err: err}
 	}
 	candidate.strictSelection = true
+	unsafeSystemDNS := resolverMayUseSystem(candidate)
+	if unsafeSystemDNS {
+		if !rt.systemDNSMu.TryLock() {
+			return ApplyResult{Err: fmt.Errorf("system DNS takeover prevents this DNS update")}
+		}
+		defer func() {
+			if unsafeSystemDNS {
+				rt.systemDNSMu.Unlock()
+			}
+		}()
+	}
 	rt.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		rt.mu.Unlock()
@@ -209,6 +223,10 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	rt.closing = old
 	old.cancel()
 	rt.mu.Unlock()
+	if unsafeSystemDNS {
+		rt.systemDNSMu.Unlock()
+		unsafeSystemDNS = false
+	}
 	// Publication is complete. Cancellation, resource close, and query join are
 	// bounded by ctx for the caller; unfinished work remains in rt.closing.
 	done := make(chan error, 1)

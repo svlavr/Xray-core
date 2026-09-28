@@ -3,38 +3,17 @@ package shadowsocks_2022
 import (
 	"bytes"
 	"context"
-	"errors"
+	"crypto/rand"
 	"io"
-	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
-	C "github.com/sagernet/sing/common"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 	appstats "github.com/xtls/xray-core/app/stats"
+	"github.com/xtls/xray-core/common/buf"
 	cnet "github.com/xtls/xray-core/common/net"
 	fs "github.com/xtls/xray-core/features/stats"
 )
-
-type inspectionTestConn struct {
-	net.Conn
-	reader io.Reader
-	write  func([]byte) (int, error)
-	close  func() error
-}
-
-func (c *inspectionTestConn) Read(p []byte) (int, error)  { return c.reader.Read(p) }
-func (c *inspectionTestConn) Write(p []byte) (int, error) { return c.write(p) }
-func (c *inspectionTestConn) Close() error {
-	if c.close != nil {
-		return c.close()
-	}
-	return nil
-}
 
 func inspectionFlow(t *testing.T, close func() error) (fs.Exchange, fs.FlowInspection) {
 	t.Helper()
@@ -59,157 +38,73 @@ func inspectionLive(t *testing.T, view fs.FlowInspection) fs.FlowRecord {
 	return live.Rows[0]
 }
 
-type inspectionCodecHandler struct{ run func(net.Conn) error }
+type inspectionWriteFunc func([]byte) (int, error)
 
-func (h inspectionCodecHandler) NewConnection(_ context.Context, conn net.Conn, _ M.Metadata) error {
-	return h.run(conn)
-}
-
-func (inspectionCodecHandler) NewPacketConnection(context.Context, N.PacketConn, M.Metadata) error {
-	return errors.New("unexpected UDP")
-}
-func (inspectionCodecHandler) NewError(context.Context, error) {}
+func (f inspectionWriteFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestInspectionSS2022NativeCodecResults(t *testing.T) {
-	const methodName = "2022-blake3-aes-128-gcm"
-	const key = "MDEyMzQ1Njc4OWFiY2RlZg=="
-	failure := errors.New("injected lower result")
-	for _, test := range []struct {
-		name           string
-		warm           bool
-		failAt         int
-		fullError      bool
-		payload, known int
-	}{
-		{"first-success", false, 0, false, 7, 7},
-		{"first-partial-error", false, 1, false, 7, 0},
-		{"first-full-wire-error", false, 1, true, 7, 0},
-		{"later-chunk-error", true, 2, false, shadowaead_2022.MaxPacketSize + 1, shadowaead_2022.MaxPacketSize},
-		{"later-full-wire-error", true, 2, true, shadowaead_2022.MaxPacketSize + 1, shadowaead_2022.MaxPacketSize},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			method, err := shadowaead_2022.NewWithPassword(methodName, key, nil)
+	for _, name := range []string{MethodAES128GCM, MethodAES256GCM, MethodChaCha20Poly1305} {
+		t.Run(name, func(t *testing.T) {
+			method, err := GetCipherMethod(name)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var request bytes.Buffer
-			client := method.DialEarlyConn(&inspectionTestConn{write: request.Write}, M.ParseSocksaddr("example.invalid:80"))
-			if _, err := client.Write([]byte("initial")); err != nil {
+			key := make([]byte, method.KeySaltLength)
+			if _, err := rand.Read(key); err != nil {
 				t.Fatal(err)
 			}
-			calls := 0
-			armed := !test.warm
-			transport := &inspectionTestConn{reader: bytes.NewReader(request.Bytes()), write: func(p []byte) (int, error) {
-				if armed {
-					calls++
-					if calls == test.failAt {
-						if test.fullError {
-							return len(p), failure
-						}
-						return 1, failure
-					}
-				}
-				return len(p), nil
-			}}
+			aead, err := method.NewAEAD(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire bytes.Buffer
 			flow, view := inspectionFlow(t, nil)
-			handler := inspectionCodecHandler{run: func(conn net.Conn) error {
-				if test.warm {
-					if _, err := conn.Write([]byte("warm")); err != nil {
-						t.Fatal(err)
-					}
-					armed = true
-				}
-				observed := &inspectionConn{Conn: conn, receipt: flow}
-				input := make([]byte, 32)
-				if n, err := observed.Read(input); n != 7 || err != nil || string(input[:n]) != "initial" {
-					t.Fatalf("retained request: %d %v", n, err)
-				}
-				n, err := observed.Write(bytes.Repeat([]byte("p"), test.payload))
-				if n != test.known || (test.failAt == 0 && err != nil) || (test.failAt != 0 && !errors.Is(err, failure)) {
-					t.Fatalf("native codec n=%d err=%v", n, err)
-				}
-				return nil
-			}}
-			service, err := shadowaead_2022.NewServiceWithPassword(methodName, key, 500, handler, nil)
+			writer := buf.AttachWriterReceipt(NewStreamWriter(&wire, aead), flow)
+			payload := []byte("native decoded payload")
+			if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
+				t.Fatal(err)
+			}
+			reader := NewStreamReader(&wire, aead)
+			decoded, err := reader.ReadMultiBuffer()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := service.NewConnection(context.Background(), transport, M.Metadata{}); err != nil {
-				t.Fatal(err)
+			if got := decoded.String(); got != string(payload) {
+				t.Fatalf("decoded: %q", got)
 			}
-			row := inspectionLive(t, view)
-			if row.Uplink != 7 || row.Downlink != uint64(test.known) {
-				t.Fatalf("decoded receipts: %+v", row)
+			buf.ReleaseMulti(decoded)
+			if got := inspectionLive(t, view).Downlink; got != uint64(len(payload)) {
+				t.Fatalf("receipt: %d", got)
 			}
 		})
 	}
 }
 
-func TestInspectionSS2022ScalarPositiveError(t *testing.T) {
-	for _, accepted := range []int{0, 2, 4} {
-		flow, view := inspectionFlow(t, nil)
-		conn := &inspectionConn{Conn: &inspectionTestConn{write: func([]byte) (int, error) { return accepted, io.ErrUnexpectedEOF }}, receipt: flow}
-		if n, err := conn.Write([]byte("data")); n != accepted || err != io.ErrUnexpectedEOF {
-			t.Fatalf("result: %d %v", n, err)
-		}
-		fact := inspectionLive(t, view).Downlink
-		if fact != uint64(accepted) {
-			t.Fatalf("positive error: %+v", fact)
-		}
-	}
-}
-
-func TestInspectionSS2022CloseAliases(t *testing.T) {
-	for _, firstErr := range []error{nil, io.ErrUnexpectedEOF} {
-		var calls atomic.Int32
-		endpoint := &inspectionEndpoint{Conn: &inspectionTestConn{close: func() error { calls.Add(1); return firstErr }}}
-		var group sync.WaitGroup
-		for range 16 {
-			group.Add(1)
-			go func() {
-				defer group.Done()
-				if err := endpoint.Close(); err != firstErr {
-					t.Errorf("first close result lost: %v", err)
-				}
-			}()
-		}
-		group.Wait()
-		if calls.Load() != 1 {
-			t.Fatalf("physical closes: %d", calls.Load())
-		}
-	}
-}
-
-func TestInspectionSS2022CloseUsesTransportOwner(t *testing.T) {
-	failure := errors.New("physical close failed")
-	endpoint := &inspectionEndpoint{Conn: &inspectionTestConn{close: func() error { return failure }}}
-	observed := &inspectionConn{
-		Conn:     &inspectionTestConn{close: func() error { t.Fatal("close inspected mutable codec aliases"); return nil }},
-		endpoint: endpoint,
-	}
-	if err := observed.Close(); err != failure {
-		t.Fatalf("physical failure hidden: %v", err)
-	}
-}
-
-type inspectionHalfConn struct {
-	net.Conn
-	writes atomic.Int32
-}
-
-func (c *inspectionHalfConn) CloseWrite() error { c.writes.Add(1); return nil }
-
-func TestInspectionSS2022HalfCloseAndReceiptBoundary(t *testing.T) {
-	physical := new(inspectionHalfConn)
-	observed := &inspectionConn{Conn: &inspectionEndpoint{Conn: physical}}
-	if _, ok := C.Cast[N.WriteCloser](observed); !ok {
-		t.Fatal("native half-close capability hidden")
-	}
-	if err := N.CloseWrite(observed); err != nil || physical.writes.Load() != 1 {
-		t.Fatalf("half close: %v", err)
-	}
-	if N.UnwrapReader(observed) != observed || N.UnwrapWriter(observed) != observed {
-		t.Fatal("copy can bypass decoded receipt")
+func TestInspectionSS2022FrameWriteFailures(t *testing.T) {
+	method, _ := GetCipherMethod(MethodAES128GCM)
+	for _, tc := range []struct {
+		name  string
+		write inspectionWriteFunc
+	}{
+		{"zero-error", func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }},
+		{"partial-error", func([]byte) (int, error) { return 1, io.ErrUnexpectedEOF }},
+		{"complete-error", func(p []byte) (int, error) { return len(p), io.ErrUnexpectedEOF }},
+		{"short-nil", func([]byte) (int, error) { return 1, nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flow, view := inspectionFlow(t, nil)
+			aead, err := method.NewAEAD(make([]byte, method.KeySaltLength))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer := buf.AttachWriterReceipt(NewStreamWriter(tc.write, aead), flow)
+			if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("response"))}); err == nil {
+				t.Fatal("missing native write error")
+			}
+			if got := inspectionLive(t, view).Downlink; got != 0 {
+				t.Fatalf("unaccepted frame credited: %d", got)
+			}
+		})
 	}
 }
 
@@ -218,22 +113,24 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 	var once sync.Once
 	t.Cleanup(func() { once.Do(func() { close(release) }) })
 	flow, view := inspectionFlow(t, func() error { return nil })
-	conn := &inspectionConn{Conn: &inspectionTestConn{write: func(p []byte) (int, error) { close(started); <-release; return len(p), nil }}, receipt: flow}
+	method, _ := GetCipherMethod(MethodAES128GCM)
+	aead, _ := method.NewAEAD(make([]byte, method.KeySaltLength))
+	writer := buf.AttachWriterReceipt(NewStreamWriter(inspectionWriteFunc(func(p []byte) (int, error) { close(started); <-release; return len(p), nil }), aead), flow)
 	done := make(chan error, 1)
-	go func() { _, err := conn.Write([]byte("late")); done <- err }()
+	go func() { done <- writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("late"))}) }()
 	select {
 	case <-started:
 	case <-time.After(3 * time.Second):
 		t.Fatal("write did not start")
 	}
 	result, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || result[0].Err != nil {
+	if err != nil || len(result) != 1 || result[0].Err != nil {
 		t.Fatalf("stop: %+v %v", result, err)
 	}
 	flow.Finish()
 	page, _ := view.ReadTerminals()
 	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("owner-end write snapshot: %+v", page)
+		t.Fatalf("owner-end snapshot: %+v", page)
 	}
 	once.Do(func() { close(release) })
 	select {
@@ -242,11 +139,11 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("write did not finish")
+		t.Fatal("write stuck")
 	}
 	page, _ = view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("late receipt: %+v", page)
+	if page.Rows[0].Flow.Downlink != 0 {
+		t.Fatalf("late snapshot: %+v", page)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
@@ -254,6 +151,6 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 		known += total.Downlink
 	}
 	if known != 4 {
-		t.Fatalf("late receipt totals: %+v", totals)
+		t.Fatalf("late totals: %+v", totals)
 	}
 }

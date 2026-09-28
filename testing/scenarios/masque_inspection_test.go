@@ -29,7 +29,7 @@ import (
 
 func inspectionMasqueCore(t *testing.T) (fs.FlowInspection, string, string, xnet.Destination, xnet.Destination) {
 	t.Helper()
-	serverPort, certHash := startMasqueServer(t)
+	serverPort, certHash := startMasqueServer(t, false)
 	return inspectionMasqueCoreAt(t, serverPort, certHash)
 }
 
@@ -414,7 +414,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 }
 
 func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T) {
-	serverPort, certHash := startMasqueServer(t)
+	serverPort, certHash := startMasqueServer(t, false)
 	gate := newMasqueFirstDatagramGate(t, serverPort)
 	defer gate.Close()
 	view, tcpAddress, _, tcpTarget, _ := inspectionMasqueCoreAt(t, xnet.Port(gate.client.LocalAddr().(*stdnet.UDPAddr).Port), certHash)

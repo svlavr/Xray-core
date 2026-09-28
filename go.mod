@@ -18,8 +18,6 @@ require (
 	github.com/pires/go-proxyproto v0.15.0
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af
 	github.com/robfig/cron/v3 v3.0.1
-	github.com/sagernet/sing v0.5.1
-	github.com/sagernet/sing-shadowsocks v0.2.7
 	github.com/stretchr/testify v1.12.1
 	github.com/vishvananda/netlink v1.3.1
 	github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0
@@ -63,5 +61,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-replace github.com/sagernet/sing => ./third_party/sing

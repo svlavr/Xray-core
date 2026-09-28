@@ -144,7 +144,7 @@ func (w *tcpWorker) Start() error {
 		go w.callback(conn)
 	})
 	if err != nil {
-		return errors.New("failed to listen TCP on ", w.port).AtWarning().Base(err)
+		return errors.New("failed to listen TCP on ", w.port).Base(err)
 	}
 	w.hub = hub
 	return nil
@@ -568,7 +568,7 @@ func (w *dsWorker) Start() error {
 		go w.callback(conn)
 	})
 	if err != nil {
-		return errors.New("failed to listen Unix Domain Socket on ", w.address).AtWarning().Base(err)
+		return errors.New("failed to listen Unix Domain Socket on ", w.address).Base(err)
 	}
 	w.hub = hub
 	return nil

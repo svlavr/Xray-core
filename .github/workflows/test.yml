@@ -36,11 +36,10 @@ jobs:
               exit 1
             fi
           done
-      - name: Verify modules and bundled source
+      - name: Verify modules
         if: ${{ !cancelled() }}
         run: |
           go mod verify
-          python third_party/check_sing.py
 
   upstream-tests:
     name: Upstream Tests / ${{ matrix.name }}
@@ -103,7 +102,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >-
           go test -mod=readonly -race -timeout 1h -count=1
-          ./common/buf ./common/crypto ./common/mux ./common/session ./common/singbridge
+          ./common/buf ./common/crypto ./common/mux ./common/session
           ./features/dns/... ./features/routing/... ./app/proxyman/inbound
           ./proxy/shadowsocks_2022 ./transport/pipe ./transport/internet/udp
       - name: Test legacy HTTP2 pool ownership
@@ -142,25 +141,3 @@ jobs:
         run: ./.github/build/prepare-assets.ps1
       - name: Race test
         run: go test -mod=readonly -race -timeout 1h ./...
-
-  dependency-tests:
-    name: Bundled Dependency Tests / ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: Linux, os: ubuntu-latest, flags: '' }
-          - { name: Windows, os: windows-latest, flags: '' }
-          - { name: macOS, os: macos-latest, flags: '' }
-          - { name: Linux race, os: ubuntu-latest, flags: '-race' }
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          check-latest: true
-      - name: Verify source snapshot
-        run: python third_party/check_sing.py
-      - name: Test complete nested module
-        run: go -C third_party/sing test -mod=readonly ${{ matrix.flags }} -timeout 1h ./...

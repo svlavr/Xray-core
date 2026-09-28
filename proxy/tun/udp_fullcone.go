@@ -82,6 +82,7 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	u.Lock()
+	// Close runs twice per flow; a newer conn may already own this src.
 	if u.udpConns[conn.src] == conn {
 		delete(u.udpConns, conn.src)
 		close(conn.egress)

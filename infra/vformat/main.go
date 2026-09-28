@@ -156,12 +156,6 @@ func main() {
 		}
 
 		if info.IsDir() {
-			// Nested Go modules own their formatting policy and language version.
-			if path != pwd {
-				if module, err := os.Stat(filepath.Join(path, "go.mod")); err == nil && !module.IsDir() {
-					return filepath.SkipDir
-				}
-			}
 			return nil
 		}
 

@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"math"
 	"sync"
 
 	"github.com/xtls/xray-core/features/stats"
@@ -26,19 +25,11 @@ const (
 	endpointDecoded
 )
 
-func (r *deferredEndpointReceipt) addPending(value *uint64, n uint64) {
-	if math.MaxUint64-*value < n {
-		*value = math.MaxUint64
-		return
-	}
-	*value += n
-}
-
 func (r *deferredEndpointReceipt) AddUplink(n uint64) {
 	r.mu.Lock()
 	switch r.mode {
 	case endpointPending:
-		r.addPending(&r.uplink, n)
+		r.uplink += n
 	case endpointRaw:
 		r.Exchange.AddUplink(n)
 	}
@@ -49,7 +40,7 @@ func (r *deferredEndpointReceipt) AddDownlink(n uint64) {
 	r.mu.Lock()
 	switch r.mode {
 	case endpointPending:
-		r.addPending(&r.downlink, n)
+		r.downlink += n
 	case endpointRaw:
 		r.Exchange.AddDownlink(n)
 	}

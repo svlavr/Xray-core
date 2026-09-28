@@ -101,7 +101,7 @@ func newServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 		}
 		return NewClassicNameServer(dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP), nil
 	}
-	return nil, errors.New("No available name server could be created from ", dest).AtWarning()
+	return nil, errors.New("No available name server could be created from ", dest)
 }
 
 // NewClient creates a complete DNS client using already registered features.
@@ -143,7 +143,7 @@ func newClient(
 	// Create a new server for each client for now
 	server, err := newServer(ctx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP, fake)
 	if err != nil {
-		return nil, errors.New("failed to create nameserver").Base(err).AtWarning()
+		return nil, errors.New("failed to create nameserver").Base(err)
 	}
 
 	// Establish expected IPs
@@ -151,7 +151,7 @@ func newClient(
 	if len(ns.ExpectedIp) > 0 {
 		expectedMatcher, err = geodata.IPReg.BuildIPMatcher(ns.ExpectedIp)
 		if err != nil {
-			return nil, errors.New("failed to create expected ip matcher").Base(err).AtWarning()
+			return nil, errors.New("failed to create expected ip matcher").Base(err)
 		}
 	}
 
@@ -160,7 +160,7 @@ func newClient(
 	if len(ns.UnexpectedIp) > 0 {
 		unexpectedMatcher, err = geodata.IPReg.BuildIPMatcher(ns.UnexpectedIp)
 		if err != nil {
-			return nil, errors.New("failed to create unexpected ip matcher").Base(err).AtWarning()
+			return nil, errors.New("failed to create unexpected ip matcher").Base(err)
 		}
 	}
 

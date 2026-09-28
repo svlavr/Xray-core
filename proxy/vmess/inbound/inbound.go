@@ -242,7 +242,7 @@ func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSess
 func (h *Handler) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
 	sessionPolicy := h.policyManager.ForLevel(0)
 	if err := connection.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
-		return errors.New("unable to set read deadline").Base(err).AtWarning()
+		return errors.New("unable to set read deadline").Base(err)
 	}
 
 	iConn := stat.TryUnwrapStatsConn(connection)
@@ -262,7 +262,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				Status: log.AccessRejected,
 				Reason: err,
 			})
-			err = errors.New("invalid request from ", connection.RemoteAddr()).Base(err).AtInfo()
+			err = errors.New("invalid request from ", connection.RemoteAddr()).Base(err)
 		}
 		return err
 	}

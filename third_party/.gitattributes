@@ -1,2 +1,0 @@
-# Preserve the reviewed dependency snapshot byte-for-byte on every host.
-sing/** -text
