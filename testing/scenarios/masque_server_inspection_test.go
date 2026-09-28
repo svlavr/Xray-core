@@ -31,12 +31,26 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer tcpServer.Close()
-				udpServer := udp.Server{MsgProcessor: xor}
-				udpDest, err := udpServer.Start()
+				udpConn, err := stdnet.ListenUDP("udp4", &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 1)})
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer udpServer.Close()
+				udpDest := net.DestinationFromAddr(udpConn.LocalAddr())
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					packet := make([]byte, 2048)
+					for {
+						n, peer, err := udpConn.ReadFromUDP(packet)
+						if err != nil {
+							return
+						}
+						if _, err := udpConn.WriteToUDP(xor(packet[:n]), peer); err != nil {
+							return
+						}
+					}
+				}()
+				defer func() { udpConn.Close(); <-done }()
 				ct, hash := cert.MustGenerate(nil, cert.CommonName("localhost"))
 				serverPort := udp.PickPort()
 				if h2 {
