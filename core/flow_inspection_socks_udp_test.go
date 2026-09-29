@@ -108,10 +108,12 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 			})
 			extra := []byte("SOCKS UDP sibling survives")
 			inspectionUDPExchange(t, sibling, address, extra, mask)
-			live, err := view.ReadLive()
-			if err != nil || len(live.Rows) != 1 {
-				t.Fatalf("sibling live facts: %+v %v", live, err)
-			}
+			var live fs.LiveSnapshot
+			inspectionWait(t, func() bool {
+				live, err = view.ReadLive()
+				want := uint64(len(payload) + len(extra))
+				return err == nil && len(live.Rows) == 1 && live.Rows[0].Uplink >= want && live.Rows[0].Downlink >= want
+			})
 			if outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{live.Rows[0].Ref}); err != nil || outcomes[0].Err != nil {
 				t.Fatalf("sibling stop: %+v %v", outcomes, err)
 			}

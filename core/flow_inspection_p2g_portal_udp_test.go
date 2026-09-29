@@ -143,15 +143,19 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	if flow.Uplink != uint64(len(dataPayload)+len(portalPayload)) || flow.Downlink != uint64(len(dataPayload)) || flow.LatestDestination != portalDestination || flow.Outbound.Tag != "portal" {
 		t.Fatalf("mixed association facts: %+v", page.Rows[0])
 	}
-	totals, err := view.ReadTotals()
-	if err != nil {
-		t.Fatal(err)
-	}
 	var up, down uint64
-	for _, total := range totals.Rows {
-		up += total.Uplink
-		down += total.Downlink
-	}
+	inspectionWait(t, func() bool {
+		totals, readErr := view.ReadTotals()
+		if readErr != nil {
+			return false
+		}
+		up, down = 0, 0
+		for _, total := range totals.Rows {
+			up += total.Uplink
+			down += total.Downlink
+		}
+		return up >= uint64(len(dataPayload)+len(portalPayload)) && down >= uint64(len(dataPayload))
+	})
 	if up != uint64(len(dataPayload)+len(portalPayload)) || down != uint64(len(dataPayload)) {
 		t.Fatalf("mixed association totals: %d/%d", up, down)
 	}
