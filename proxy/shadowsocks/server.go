@@ -316,7 +316,7 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 		if observation != nil {
-			cursor := proxy.ObserveDecodedReader(bodyReader, observation.Exchange, func() {})
+			cursor := buf.NewInspectionReader(bodyReader, observation.Exchange, func() {})
 			defer cursor.Interrupt()
 			bodyReader = cursor
 		}

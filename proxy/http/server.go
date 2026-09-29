@@ -258,18 +258,6 @@ func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *buf
 var errWaitAnother = errors.New("keep alive")
 
 func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, writer io.Writer, dest net.Destination, dispatcher routing.Dispatcher) error {
-	requestCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	owner := &plainRequestOwner{cancel: cancel}
-	ctx, observation, cleanup := proxy.BeginExecutionObservation(requestCtx, s.statsManager, owner, dest)
-	if cleanup != nil {
-		defer cleanup()
-	}
-	responseWriter := writer
-	if observation != nil {
-		responseWriter = &responseReceiptWriter{Writer: writer, receipt: observation.Exchange}
-	}
-
 	if !s.config.AllowTransparent && request.URL.Host == "" {
 		// RFC 2068 (HTTP/1.1) requires URL to be absolute URL in HTTP proxy.
 		response := &http.Response{
@@ -285,12 +273,19 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		}
 		response.Header.Set("Proxy-Connection", "close")
 		response.Header.Set("Connection", "close")
-		if observation != nil {
-			observation.Exchange.Unassign()
-			// ReadRequest may have prefetched later keep-alive bytes. The exact
-			// consumed request serialization is unavailable without a second parser.
-		}
-		return response.Write(responseWriter)
+		return response.Write(writer)
+	}
+
+	requestCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	owner := &plainRequestOwner{cancel: cancel}
+	ctx, observation, cleanup := proxy.BeginExecutionObservation(requestCtx, s.statsManager, owner, dest)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	responseWriter := writer
+	if observation != nil {
+		responseWriter = &responseReceiptWriter{Writer: writer, receipt: observation.Exchange}
 	}
 
 	if len(request.URL.Host) > 0 {

@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"sync"
 
-	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
@@ -57,7 +55,7 @@ func (w *ServerWorker) initializeInspection(ctx context.Context) {
 		return
 	}
 	w.runtime = w.store.Runtime()
-	w.link.Writer = newInspectionOutput(w.link.Writer)
+	w.link.Writer = newFrameWriter(w.link.Writer)
 }
 
 func (w *ServerWorker) observeChild(ctx context.Context, dest net.Destination, s *Session) (context.Context, func()) {
@@ -108,51 +106,6 @@ func (w *ServerWorker) observeRetained(ctx context.Context, dest net.Destination
 	observation := &session.LogicalObservation{Exchange: flow}
 	observation.ReturnedLink.Store(true)
 	return session.ContextWithLogicalObservation(ctx, observation), nil
-}
-
-// The optional router serializes each native carrier frame operation while
-// retaining child-local decoded accounting.
-type inspectionOutput struct {
-	sync.Mutex
-	writer buf.Writer
-}
-
-func newInspectionOutput(writer buf.Writer) *inspectionOutput {
-	return &inspectionOutput{writer: writer}
-}
-
-func (o *inspectionOutput) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	o.Lock()
-	defer o.Unlock()
-	return o.writer.WriteMultiBuffer(mb)
-}
-
-func (o *inspectionOutput) Close() error {
-	// Serialize a buffered carrier flush with normal frame writes.
-	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
-		o.Lock()
-		defer o.Unlock()
-	}
-	return common.Close(o.writer)
-}
-
-func (o *inspectionOutput) Interrupt() {
-	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
-		o.Close()
-		return
-	}
-	// Pipe interruption must remain able to unblock a capacity-waiting frame.
-	common.Interrupt(o.writer)
-}
-
-func (o *inspectionOutput) writeFrame(mb buf.MultiBuffer, payload int32, flow stats.Exchange) error {
-	o.Lock()
-	defer o.Unlock()
-	err := o.writer.WriteMultiBuffer(mb)
-	if err == nil && payload > 0 {
-		flow.AddDownlink(uint64(payload))
-	}
-	return err
 }
 
 type childInput struct {

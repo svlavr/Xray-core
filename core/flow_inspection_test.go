@@ -171,7 +171,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				t.Fatal("first source not addressable")
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || out[0].Err != nil {
+			if err != nil || out[0] != nil {
 				t.Fatalf("close %+v %v", out, err)
 			}
 			var terminal fs.TerminalRecord
@@ -192,7 +192,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				t.Fatalf("final receipt: %+v", terminal)
 			}
 			out, err = view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || out[0].Err != nil {
+			if err != nil || out[0] != nil {
 				t.Fatalf("repeat close %+v %v", out, err)
 			}
 			extra := []byte("sibling stays open")

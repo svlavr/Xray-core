@@ -125,16 +125,6 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 	request, tempUDPConn, err := svrSession.Handshake(reader, conn)
 	defer common.CloseIfExists(tempUDPConn)
 	if err != nil {
-		if request != nil {
-			if store := proxy.ObservationStore(s.statsManager); store != nil {
-				destination := request.Destination()
-				flow := store.PrepareTCP(session.TrafficOriginFromContext(ctx), inbound.Source, destination, nil)
-				if flow != nil {
-					flow.Unassign()
-					flow.Finish()
-				}
-			}
-		}
 		if inbound.Source.IsValid() {
 			log.Record(&log.AccessMessage{
 				From:   inbound.Source,

@@ -80,16 +80,21 @@ func (s *ServerSession) handshake4(cmd byte, reader io.Reader, writer io.Writer)
 		address = net.ParseAddress(domain)
 	}
 
-	request := &protocol.RequestHeader{Command: protocol.RequestCommandTCP, Address: address, Port: port, Version: socks4Version}
 	switch cmd {
 	case cmdTCPConnect:
+		request := &protocol.RequestHeader{
+			Command: protocol.RequestCommandTCP,
+			Address: address,
+			Port:    port,
+			Version: socks4Version,
+		}
 		if err := writeSocks4Response(writer, socks4RequestGranted, net.AnyIP, net.Port(0)); err != nil {
 			return nil, err
 		}
 		return request, nil
 	default:
 		writeSocks4Response(writer, socks4RequestRejected, net.AnyIP, net.Port(0))
-		return request, errors.New("unsupported command: ", cmd)
+		return nil, errors.New("unsupported command: ", cmd)
 	}
 }
 

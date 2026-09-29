@@ -149,7 +149,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 			})
 			inspectionTCPTotals(t, view, uint64(2*len(payload)))
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("exact close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {

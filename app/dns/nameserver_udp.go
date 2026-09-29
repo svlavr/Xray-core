@@ -133,8 +133,9 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 			errors.LogErrorInner(ctx, err, "failed to pack DNS retry")
 			return
 		}
-		if !s.addPendingRequest(retry) {
+		if err := s.addPendingRequest(retry); err != nil {
 			b.Release()
+			errors.LogErrorInner(ctx, err, "failed to admit DNS retry")
 			return
 		}
 		s.udpServer.Dispatch(s.dispatchContext(retry.ctx), *s.address, b)
@@ -145,18 +146,26 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 
 func (s *ClassicNameServer) newReqID() uint16 { return uint16(atomic.AddUint32(&s.reqID, 1)) }
 
-func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) bool {
+func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) error {
 	s.Lock()
-	if s.cacheController.ctx.Err() != nil || req.ctx.Err() != nil || s.requests[req.msg.ID] != nil {
+	if err := s.cacheController.ctx.Err(); err != nil {
 		s.Unlock()
-		return false
+		return err
+	}
+	if err := req.ctx.Err(); err != nil {
+		s.Unlock()
+		return err
+	}
+	if s.requests[req.msg.ID] != nil {
+		s.Unlock()
+		return errors.New("DNS request ID already pending: ", req.msg.ID)
 	}
 	req.expire = time.Now().Add(8 * time.Second)
 	s.requests[req.msg.ID] = req
 	req.stop = context.AfterFunc(req.ctx, func() { s.forgetRequest(req) })
 	s.Unlock()
 	common.Must(s.requestsCleanup.Start())
-	return true
+	return nil
 }
 
 func (s *ClassicNameServer) getCacheController() *CacheController { return s.cacheController }
@@ -192,10 +201,10 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 			continue
 		}
 		pending := &udpDnsRequest{dnsRequest: *req, ctx: ctx}
-		if !s.addPendingRequest(pending) {
+		if err := s.addPendingRequest(pending); err != nil {
 			b.Release()
 			if noResponseErrCh != nil {
-				noResponseErrCh <- context.Canceled
+				noResponseErrCh <- err
 			}
 			continue
 		}

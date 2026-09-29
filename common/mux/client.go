@@ -194,7 +194,7 @@ func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, er
 	// Native pipes already enqueue whole batches atomically. Supplied carriers
 	// may transform data before writing, so their whole writer call is shared.
 	if _, nativePipe := stream.Writer.(*pipe.Writer); !nativePipe {
-		stream.Writer = &serializedWriter{writer: stream.Writer}
+		stream.Writer = newFrameWriter(stream.Writer)
 	}
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),

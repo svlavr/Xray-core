@@ -109,7 +109,7 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 				return selected.ID != 0
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
@@ -194,7 +194,7 @@ func TestFlowInspectionHTTPOutboundHandshakeEnding(t *testing.T) {
 			ref := live.Rows[0].Ref
 			if stop {
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-				if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+				if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 					t.Fatalf("handshake stop: %+v %v", outcomes, err)
 				}
 				page, _ := view.ReadTerminals()

@@ -120,7 +120,7 @@ func TestInspectionDokodemoNativeFakeUDP(t *testing.T) {
 		if enabled {
 			ref := session.LogicalObservationFromContext(observed).Exchange.Ref()
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("stop: %+v %v", outcomes, err)
 			}
 			select {

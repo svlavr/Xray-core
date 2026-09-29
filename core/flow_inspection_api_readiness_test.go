@@ -27,7 +27,7 @@ func (s *apiEarlyStopStore) Begin(kind xnet.Network, origin fs.TrafficOrigin, so
 	e := s.AdmissionStore.Begin(kind, origin, source, destination, stop)
 	s.stopped = e.Ref()
 	result, err := s.view.CloseFlows(context.Background(), []fs.FlowRef{e.Ref()})
-	if err != nil || len(result) != 1 || result[0].Err != nil {
+	if err != nil || len(result) != 1 || result[0] != nil {
 		panic("early exact stop failed")
 	}
 	return e

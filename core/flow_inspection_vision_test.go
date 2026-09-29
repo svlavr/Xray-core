@@ -220,7 +220,7 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			burst(sibling, "raw sibling")
 			check(receiving, "direct", 2)
 			outcomes, err := receiving.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("Vision stop: %+v %v", outcomes, err)
 			}
 			if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {

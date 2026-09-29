@@ -94,7 +94,7 @@ func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 		return err == nil && len(live.Rows) == 2
 	})
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("fallback exact stop: %+v %v", outcomes, err)
 	}
 	if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {

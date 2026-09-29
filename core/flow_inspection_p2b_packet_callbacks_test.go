@@ -146,7 +146,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 func inspectionClosePacketCallback(t *testing.T, view fs.FlowInspection, ref fs.FlowRef) {
 	t.Helper()
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(out) != 1 || out[0].Err != nil {
+	if err != nil || len(out) != 1 || out[0] != nil {
 		t.Fatalf("callback exact stop: %+v %v", out, err)
 	}
 }

@@ -77,7 +77,7 @@ func TestFlowInspectionXUDPRetainedRebind(t *testing.T) {
 		}
 		retained = current
 		out, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-		if err != nil || len(out) != 1 || out[0].Err != nil {
+		if err != nil || len(out) != 1 || out[0] != nil {
 			t.Fatalf("client stop: %+v %v", out, err)
 		}
 		inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 0 })

@@ -55,7 +55,7 @@ func newInspectionStore(runtime featurestats.RuntimeID, limits featurestats.Obse
 	}
 	for i := range store.unassigned {
 		origin := featurestats.TrafficOrigin(i)
-		store.unassigned[i] = newAggregateCell(featurestats.OutboundRef{Runtime: runtime}, origin)
+		store.unassigned[i] = newAggregateCell(featurestats.OutboundRef{}, origin)
 	}
 	return store
 }
@@ -189,15 +189,14 @@ func (s *inspectionStore) ReadTerminals() (featurestats.TerminalSnapshot, error)
 	}, nil
 }
 
-func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.FlowRef) ([]featurestats.CloseOutcome, error) {
+func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.FlowRef) ([]error, error) {
 	if s.closed.Load() {
 		return nil, errors.New("inspection closed")
 	}
-	outcomes := make([]featurestats.CloseOutcome, len(refs))
+	outcomes := make([]error, len(refs))
 	for i, ref := range refs {
-		outcomes[i].Ref = ref
 		if err := ctx.Err(); err != nil {
-			outcomes[i].Err = err
+			outcomes[i] = err
 			continue
 		}
 		if ref.Runtime != s.runtime {
@@ -209,7 +208,7 @@ func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.Fl
 		}
 		stop, err := exchange.requestStop()
 		if err != nil {
-			outcomes[i].Err = err
+			outcomes[i] = err
 			continue
 		}
 		if stop == nil {
@@ -217,7 +216,7 @@ func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.Fl
 		}
 		err = stop()
 		exchange.Finish()
-		outcomes[i].Err = err
+		outcomes[i] = err
 	}
 	return outcomes, nil
 }
@@ -351,7 +350,6 @@ func (e *inspectionExchange) Route(outbound featurestats.OutboundRef) {
 		return
 	}
 	e.commitPendingLocked()
-	outbound.Runtime = e.store.runtime
 	e.routeSerial++
 	e.routeSeq = e.routeSerial
 	e.record.Outbound = outbound
@@ -385,7 +383,6 @@ func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 	if !e.isLeg {
 		e.registerLocked()
 	}
-	outbound.Runtime = e.store.runtime
 	bucket := e.store.bucketFor(outbound, e.record.Origin)
 	e.bucket = bucket
 	up, down := e.record.Uplink, e.record.Downlink

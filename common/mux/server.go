@@ -115,7 +115,7 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
-	if _, ok := output.(*inspectionOutput); ok {
+	if _, ok := output.(*frameWriter); ok {
 		writer.receipt = s.inspection
 	}
 	if err := buf.Copy(s.input, writer); err != nil {

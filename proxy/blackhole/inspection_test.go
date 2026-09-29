@@ -49,7 +49,7 @@ func blackholeInspection(t *testing.T, link *transport.Link, network cnet.Networ
 	}
 	ctx, finish := observe(ctx, manager, conn, dest, link)
 	t.Cleanup(finish)
-	session.LogicalObservationFromContext(ctx).Exchange.Route(fs.OutboundRef{Runtime: view.Runtime(), Serial: 1, Tag: "block"})
+	session.LogicalObservationFromContext(ctx).Exchange.Route(fs.OutboundRef{Serial: 1, Tag: "block"})
 	return ctx, view, finish
 }
 

@@ -113,7 +113,7 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 				t.Fatalf("fenced totals: %+v", totals)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{first.Ref})
-			if err != nil || out[0].Err != nil {
+			if err != nil || out[0] != nil {
 				t.Fatalf("retained close: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {

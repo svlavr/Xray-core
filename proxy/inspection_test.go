@@ -95,7 +95,7 @@ func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 				flow.Route(fs.OutboundRef{Tag: "selected", Serial: 1})
 				flow.BindRoute()
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-				if err != nil || len(outcomes) != 1 || (test.wantFailure && !errors.Is(outcomes[0].Err, test.err)) || (!test.wantFailure && outcomes[0].Err != nil) {
+				if err != nil || len(outcomes) != 1 || (test.wantFailure && !errors.Is(outcomes[0], test.err)) || (!test.wantFailure && outcomes[0] != nil) {
 					t.Fatalf("exact stop: %+v %v, want failure=%t", outcomes, err, test.wantFailure)
 				}
 				page, err := view.ReadTerminals()
@@ -312,7 +312,6 @@ func TestObserveTCPRetainedInputAndOwnerEnd(t *testing.T) {
 	t.Cleanup(func() { conn.Close(); peer.Close() })
 	reader := &buf.BufferedReader{Reader: buf.NewReader(strings.NewReader("tail")), Buffer: buf.MultiBuffer{buf.FromBytes([]byte("retained"))}}
 	link := &transport.Link{Reader: reader, Writer: buf.NewWriter(conn)}
-	originalWriter := link.Writer
 	ctx := session.ContextWithTrafficOrigin(context.Background(), session.TrafficOriginInternal)
 	ctx, finish := proxy.ObserveTCP(ctx, manager, conn, cnet.TCPDestination(cnet.LocalHostIP, 80), link)
 	if finish == nil || reader.Buffer != nil {
@@ -329,8 +328,8 @@ func TestObserveTCPRetainedInputAndOwnerEnd(t *testing.T) {
 	}
 	observation := session.LogicalObservationFromContext(ctx)
 	flow := observation.Exchange
-	if link.Writer == originalWriter || buf.WriterReceipt(link.Writer) != flow {
-		t.Fatal("inspection failed to install the enabled receipt writer")
+	if buf.WriterReceipt(link.Writer) != flow {
+		t.Fatal("endpoint receipt was not attached")
 	}
 	finish()
 	page, err := view.ReadTerminals()
@@ -514,7 +513,7 @@ func TestObserveReturnedTCPRoleClaimAfterBoundStop(t *testing.T) {
 	// Statistical owner ending does not replace the native launch/cancel guard.
 	observation.Exchange.BindRoute()
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{observation.Exchange.Ref()})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("pre-dispatch stop: %+v %v", outcomes, err)
 	}
 	if !observation.ReturnedLink.CompareAndSwap(true, false) {

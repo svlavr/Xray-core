@@ -319,7 +319,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			return errors.New("failed to start decoding").Base(err)
 		}
 		if observation != nil {
-			cursor := proxy.ObserveDecodedReader(bodyReader, observation.Exchange, func() {})
+			cursor := buf.NewInspectionReader(bodyReader, observation.Exchange, func() {})
 			if request.Command == protocol.RequestCommandUDP {
 				cursor.PacketDestination = request.Destination()
 			}

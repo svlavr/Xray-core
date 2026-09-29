@@ -42,7 +42,7 @@ func preconnectInspection(t *testing.T, target cnet.Destination, flow string, co
 	}
 	observation := session.LogicalObservationFromContext(ctx)
 	if observation != nil {
-		observation.Exchange.Route(fs.OutboundRef{Runtime: view.Runtime(), Serial: 1, Tag: "vless"})
+		observation.Exchange.Route(fs.OutboundRef{Serial: 1, Tag: "vless"})
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -100,7 +100,7 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 		t.Fatal("ordinary endpoint was not claimed before preconnect wait")
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("exact stop: %+v %v", outcomes, err)
 	}
 	select {

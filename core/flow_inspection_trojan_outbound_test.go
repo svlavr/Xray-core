@@ -139,7 +139,7 @@ func inspectionOutboundTCP(t *testing.T, config func(*testing.T) *core.OutboundH
 				return selected.ID != 0
 			})
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected})
-			if err != nil || len(out) != 1 || out[0].Err != nil {
+			if err != nil || len(out) != 1 || out[0] != nil {
 				t.Fatalf("outbound exact stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
@@ -208,7 +208,7 @@ func inspectionOutboundUDP(t *testing.T, config func(*testing.T) *core.OutboundH
 				t.Fatalf("physical server replaced logical target: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || len(out) != 1 || out[0].Err != nil {
+			if err != nil || len(out) != 1 || out[0] != nil {
 				t.Fatalf("outbound UDP stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {

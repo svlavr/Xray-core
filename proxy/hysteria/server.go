@@ -191,7 +191,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			Writer: bufferedWriter,
 		}
 		if observation != nil {
-			cursor := proxy.ObserveDecodedReader(link.Reader, observation.Exchange, func() {})
+			cursor := buf.NewInspectionReader(link.Reader, observation.Exchange, func() {})
 			link.Reader = cursor
 			link.Writer = buf.AttachWriterReceipt(link.Writer, observation.Exchange)
 			defer cursor.Interrupt()

@@ -88,7 +88,7 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 				return true
 			})
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{first})
-			if err != nil || out[0].Err != nil {
+			if err != nil || out[0] != nil {
 				t.Fatalf("stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {
@@ -195,7 +195,7 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 		return true
 	})
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRef})
-	if err != nil || len(out) != 1 || out[0].Err != nil {
+	if err != nil || len(out) != 1 || out[0] != nil {
 		t.Fatalf("stop first UDP child: %+v %v", out, err)
 	}
 	inspectionWait(t, func() bool {

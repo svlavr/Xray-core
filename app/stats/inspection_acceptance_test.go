@@ -98,7 +98,7 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 		leg.BindRoute()
 		leg.Finish()
 		outcomes, err := store.CloseFlows(context.Background(), []fs.FlowRef{root.Ref()})
-		if err != nil || outcomes[0].Err != nil || stopped.Load() != 1 {
+		if err != nil || outcomes[0] != nil || stopped.Load() != 1 {
 			t.Fatalf("leg ending removed root stop: %+v %v", outcomes, err)
 		}
 	})
@@ -153,7 +153,7 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 		t.Fatalf("fresh bounded view: %+v %v", fresh, err)
 	}
 	outcomes, err := store.CloseFlows(context.Background(), []fs.FlowRef{savedRef, fresh.Rows[0].Flow.Ref})
-	if err != nil || outcomes[0].Err != nil || outcomes[1].Err != nil {
+	if err != nil || outcomes[0] != nil || outcomes[1] != nil {
 		t.Fatalf("retention close outcomes: %+v %v", outcomes, err)
 	}
 }

@@ -161,5 +161,4 @@ func DiscardBufferedWriter(writer *BufferedWriter) {
 	defer writer.Unlock()
 	writer.buffer.Release()
 	writer.buffer = nil
-	writer.flushNext = false
 }

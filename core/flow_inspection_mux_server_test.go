@@ -129,7 +129,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 					return false
 				})
 				out, err := local.CloseFlows(context.Background(), []fs.FlowRef{clientRef})
-				if err != nil || out[0].Err != nil {
+				if err != nil || out[0] != nil {
 					t.Fatalf("client stop: %+v %v", out, err)
 				}
 				inspectionWait(t, func() bool { live, _ := local.ReadLive(); return len(live.Rows) == 0 })
@@ -137,7 +137,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 			}
 			if test.retained {
 				out, err := remote.CloseFlows(context.Background(), []fs.FlowRef{retainedRef})
-				if err != nil || out[0].Err != nil {
+				if err != nil || out[0] != nil {
 					t.Fatalf("retained stop: %+v %v", out, err)
 				}
 			}

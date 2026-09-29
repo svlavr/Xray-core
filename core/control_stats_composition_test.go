@@ -202,8 +202,8 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				if err != nil || len(outcomes) != len(captured) {
 					t.Fatalf("close captured set: %+v %v", outcomes, err)
 				}
-				for i, outcome := range outcomes {
-					if outcome.Ref != captured[i] || outcome.Err != nil {
+				for _, outcome := range outcomes {
+					if outcome != nil {
 						t.Fatalf("captured close outcome: %+v", outcome)
 					}
 				}
@@ -230,7 +230,7 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 				stale := laterRow.Ref
 				stale.Runtime[0] ^= 0xff
 				outcomes, err = view.CloseFlows(context.Background(), append(captured, stale))
-				if err != nil || len(outcomes) != 3 || outcomes[0].Err != nil || outcomes[1].Err != nil || outcomes[2].Err != nil {
+				if err != nil || len(outcomes) != 3 || outcomes[0] != nil || outcomes[1] != nil || outcomes[2] != nil {
 					t.Fatalf("repeat/stale results: %+v %v", outcomes, err)
 				}
 				controlExchange(t, unrelated, network)
@@ -338,7 +338,7 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 	}
 	controlRoute(t, terminals.Rows[0].Flow, "p3-block")
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{oldRow.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("old incarnation exact stop: %+v %v", outcomes, err)
 	}
 	controlExchange(t, newConn, net.Network_TCP)

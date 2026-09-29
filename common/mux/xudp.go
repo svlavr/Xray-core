@@ -29,7 +29,6 @@ type XUDP struct {
 	link       *transport.Link // retained endpoints, not a carrier binding
 	inspection stats.Exchange
 	cancel     context.CancelFunc
-	retired    bool
 }
 
 type xudpBinding struct {
@@ -111,7 +110,6 @@ var XUDPManager struct {
 // Neither a slow endpoint nor a carrier session can block the global map lock.
 func (x *XUDP) Interrupt() {
 	XUDPManager.Lock()
-	x.retired = true
 	if XUDPManager.Map[x.GlobalID] == x {
 		delete(XUDPManager.Map, x.GlobalID)
 	}
@@ -194,7 +192,7 @@ func (w *ServerWorker) handleXUDP(ctx context.Context, meta *FrameMetadata, read
 				x.Status, x.Expire = Expiring, time.Now().Add(time.Minute)
 			}
 		}
-		retired, flow := x.retired, x.inspection
+		retired, flow := XUDPManager.Map[x.GlobalID] != x, x.inspection
 		XUDPManager.Unlock()
 		if finishAdmission != nil {
 			finishAdmission()
@@ -233,7 +231,7 @@ func (w *ServerWorker) handleXUDP(ctx context.Context, meta *FrameMetadata, read
 			link, err = w.dispatcher.Dispatch(session.ContextWithTimeoutOnly(ctx, true), meta.Target)
 			if err != nil {
 				XUDPManager.Lock()
-				stopped := x.retired
+				stopped := XUDPManager.Map[x.GlobalID] != x
 				XUDPManager.Unlock()
 				x.Interrupt()
 				if stopped {
@@ -267,8 +265,7 @@ func (w *ServerWorker) handleXUDP(ctx context.Context, meta *FrameMetadata, read
 			x.link = link
 		}
 		published := current && !m.closed && m.sessions[s.ID] == nil
-		stopped := x.retired
-		published = published && !stopped
+		stopped := !current
 		if published {
 			x.Mux = s
 			m.count++

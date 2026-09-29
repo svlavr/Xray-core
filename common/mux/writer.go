@@ -12,20 +12,50 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 )
 
-type serializedWriter struct {
+// The optional router serializes each native carrier frame operation while
+// retaining child-local decoded accounting.
+type frameWriter struct {
 	sync.Mutex
 	writer buf.Writer
 }
 
-func (w *serializedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	w.Lock()
-	defer w.Unlock()
-	return w.writer.WriteMultiBuffer(mb)
+func newFrameWriter(writer buf.Writer) *frameWriter {
+	return &frameWriter{writer: writer}
 }
 
-// Cancellation must remain able to unblock the current native write.
-func (w *serializedWriter) Close() error { return common.Close(w.writer) }
-func (w *serializedWriter) Interrupt()   { common.Interrupt(w.writer) }
+func (o *frameWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	o.Lock()
+	defer o.Unlock()
+	return o.writer.WriteMultiBuffer(mb)
+}
+
+func (o *frameWriter) Close() error {
+	// Serialize a buffered carrier flush with normal frame writes.
+	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
+		o.Lock()
+		defer o.Unlock()
+	}
+	return common.Close(o.writer)
+}
+
+func (o *frameWriter) Interrupt() {
+	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
+		o.Close()
+		return
+	}
+	// Pipe interruption must remain able to unblock a capacity-waiting frame.
+	common.Interrupt(o.writer)
+}
+
+func (o *frameWriter) writeFrame(mb buf.MultiBuffer, payload int32, flow stats.Exchange) error {
+	o.Lock()
+	defer o.Unlock()
+	err := o.writer.WriteMultiBuffer(mb)
+	if err == nil && payload > 0 {
+		flow.AddDownlink(uint64(payload))
+	}
+	return err
+}
 
 type Writer struct {
 	dest         net.Destination
@@ -102,7 +132,7 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	mb2 := make(buf.MultiBuffer, 0, len(data)+1)
 	mb2 = append(mb2, frame)
 	mb2 = append(mb2, data...)
-	if output, ok := writer.(*inspectionOutput); ok && receipt != nil {
+	if output, ok := writer.(*frameWriter); ok && receipt != nil {
 		return output.writeFrame(mb2, data.Len(), receipt)
 	}
 	return writer.WriteMultiBuffer(mb2)

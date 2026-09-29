@@ -4,13 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	go_errors "errors"
 	"fmt"
 	"io"
-	stdnet "net"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -38,10 +35,7 @@ type DoHNameServer struct {
 	dohURL          string
 	systemResolver  bool
 	clientIP        net.IP
-	mu              sync.Mutex
-	connections     map[net.Conn]struct{}
-	dialing         sync.WaitGroup
-	workers         sync.WaitGroup
+	lifetime        connectionLifetime
 }
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
@@ -57,17 +51,16 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 		dohURL:          url.String(),
 		systemResolver:  dispatcher == nil && net.ParseAddress(url.Hostname()).Family().IsDomain(),
 		clientIP:        clientIP,
-		connections:     make(map[net.Conn]struct{}),
 	}
 	s.httpClient = &http.Client{
 		Transport: &http2.Transport{
 			IdleConnTimeout: net.ConnIdleTimeout,
 			ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-				if !s.beginDial() {
+				if !s.lifetime.beginDial(s.cacheController) {
 					return nil, context.Canceled
 				}
-				defer s.dialing.Done()
+				defer s.lifetime.dialing.Done()
 				dest, err := net.ParseDestination(network + ":" + addr)
 				if err != nil {
 					return nil, err
@@ -117,7 +110,7 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 						return nil, err
 					}
 				}
-				tracked, ok := s.trackConnection(conn)
+				tracked, ok := s.lifetime.trackConnection(s.cacheController, conn)
 				if !ok {
 					_ = tracked.Close()
 					return nil, context.Canceled
@@ -135,26 +128,6 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 		},
 	}
 	return s
-}
-
-func (s *DoHNameServer) beginDial() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cacheController.ctx.Err() != nil {
-		return false
-	}
-	s.dialing.Add(1)
-	return true
-}
-
-func (s *DoHNameServer) beginWork() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cacheController.ctx.Err() != nil {
-		return false
-	}
-	s.workers.Add(1)
-	return true
 }
 
 // Name implements Server.
@@ -218,14 +191,14 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		if !s.beginWork() {
+		if !s.lifetime.beginWork(s.cacheController) {
 			if noResponseErrCh != nil {
 				noResponseErrCh <- context.Canceled
 			}
 			continue
 		}
 		go func(r *dnsRequest, ctx context.Context) {
-			defer s.workers.Done()
+			defer s.lifetime.workers.Done()
 			workCtx, cancelWork := context.WithCancel(ctx)
 			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
 			defer func() { stop(); cancelWork() }()
@@ -276,41 +249,8 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 }
 
-func (s *DoHNameServer) trackConnection(conn net.Conn) (net.Conn, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	accepted := s.cacheController.ctx.Err() == nil
-	var tracked *trackedConn
-	tracked = &trackedConn{Conn: conn, done: func() {
-		s.mu.Lock()
-		delete(s.connections, tracked)
-		s.mu.Unlock()
-	}}
-	s.connections[tracked] = struct{}{}
-	return tracked, accepted
-}
-
 func (s *DoHNameServer) Close() error {
-	s.cacheController.cancel()
-	// Join admissions that observed the owner before cancellation.
-	s.mu.Lock()
-	s.mu.Unlock()
-	s.dialing.Wait()
-	s.mu.Lock()
-	connections := make([]net.Conn, 0, len(s.connections))
-	for conn := range s.connections {
-		connections = append(connections, conn)
-	}
-	s.mu.Unlock()
-	var errs []error
-	for _, conn := range connections {
-		if err := conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
-			errs = append(errs, err)
-		}
-	}
-	s.cacheController.Close()
-	s.workers.Wait()
-	return go_errors.Join(errs...)
+	return s.lifetime.close(s.cacheController)
 }
 
 func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, error) {

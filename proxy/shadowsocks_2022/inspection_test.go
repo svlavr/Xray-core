@@ -124,7 +124,7 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 		t.Fatal("write did not start")
 	}
 	result, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || len(result) != 1 || result[0].Err != nil {
+	if err != nil || len(result) != 1 || result[0] != nil {
 		t.Fatalf("stop: %+v %v", result, err)
 	}
 	flow.Finish()

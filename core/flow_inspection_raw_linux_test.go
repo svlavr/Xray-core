@@ -60,7 +60,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 			inspectionResponse(t, conn, second)
 			check(uint64(len(first) + len(second)))
 			outcome, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-			if err != nil || outcome[0].Err != nil {
+			if err != nil || outcome[0] != nil {
 				t.Fatalf("close: %+v %v", outcome, err)
 			}
 			inspectionWait(t, func() bool {

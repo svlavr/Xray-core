@@ -96,7 +96,7 @@ func TestFlowInspectionBlackholeTCP(t *testing.T) {
 							return false
 						})
 						out, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-						if err != nil || len(out) != 1 || out[0].Err != nil {
+						if err != nil || len(out) != 1 || out[0] != nil {
 							t.Fatalf("local stop: %+v %v", out, err)
 						}
 					}
@@ -207,7 +207,7 @@ func TestFlowInspectionBlackholeUDP(t *testing.T) {
 			selected := readRow(first, uint64(len(payload)))
 			other := readRow(sibling, uint64(len(payload)))
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || len(out) != 1 || out[0].Err != nil {
+			if err != nil || len(out) != 1 || out[0] != nil {
 				t.Fatalf("exact Blackhole UDP stop: %+v %v", out, err)
 			}
 			inspectionWait(t, func() bool {

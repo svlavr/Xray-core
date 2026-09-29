@@ -128,7 +128,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 		FrameMetadata{SessionID: 1, SessionStatus: SessionStatusKeep, Option: OptionData}.WriteTo(header)
 		lower := &muxPrefixWriter{left: int(header.Len()) + 2 + 8192 + 2}
 		header.Release()
-		writer := NewResponseWriter(1, newInspectionOutput(&buf.SequentialWriter{Writer: lower}), protocol.TransferTypeStream)
+		writer := NewResponseWriter(1, newFrameWriter(&buf.SequentialWriter{Writer: lower}), protocol.TransferTypeStream)
 		writer.receipt = flow
 		if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, bytes.Repeat([]byte{1}, 8197))); err == nil {
 			t.Fatal("missing partial error")
@@ -145,7 +145,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 		buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: &wire})
 		buffered.Write([]byte("outer header"))
 		buffered.SetFlushNext()
-		output := newInspectionOutput(buffered)
+		output := newFrameWriter(buffered)
 		writer := NewResponseWriter(1, output, protocol.TransferTypePacket)
 		writer.receipt = flow
 		if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("body"))}); err != nil {
@@ -160,7 +160,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 	})
 	t.Run("unknown-writer", func(t *testing.T) {
 		flow, view := muxInspectionFlow(t)
-		writer := NewResponseWriter(1, newInspectionOutput(buf.Discard), protocol.TransferTypeStream)
+		writer := NewResponseWriter(1, newFrameWriter(buf.Discard), protocol.TransferTypeStream)
 		writer.receipt = flow
 		writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("unknown"))})
 		row := muxServerFact(t, view)
@@ -176,7 +176,7 @@ func TestMuxDecodedOperationIsolation(t *testing.T) {
 	second, b := muxInspectionFlow(t)
 	reader, lower := pipe.New()
 	defer reader.Interrupt()
-	output := newInspectionOutput(lower)
+	output := newFrameWriter(lower)
 	var wg sync.WaitGroup
 	for i, flow := range []fs.Exchange{first, second} {
 		wg.Add(1)
@@ -202,7 +202,7 @@ func TestMuxDeferredBufferDoesNotInventDrop(t *testing.T) {
 	flow, view := muxInspectionFlow(t)
 	var wire bytes.Buffer
 	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: &wire})
-	writer := NewResponseWriter(1, newInspectionOutput(buffered), protocol.TransferTypePacket)
+	writer := NewResponseWriter(1, newFrameWriter(buffered), protocol.TransferTypePacket)
 	writer.receipt = flow
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("later"))}); err != nil {
 		t.Fatal(err)
@@ -328,7 +328,7 @@ func TestMuxStopDuringRetainedDispatchKeepsCarrier(t *testing.T) {
 	muxWait(t, entered)
 	row := muxServerFact(t, view)
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("stop: %+v %v", outcomes, err)
 	}
 	muxWait(t, canceled)
@@ -369,7 +369,7 @@ func TestMuxHeaderCloseKeepsReceiptOwner(t *testing.T) {
 	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: lower})
 	buffered.Write([]byte("header"))
 	buffered.SetFlushNext()
-	output := newInspectionOutput(buffered)
+	output := newFrameWriter(buffered)
 	closed := make(chan struct{})
 	go func() { output.Close(); close(closed) }()
 	muxWait(t, lower.entered)

@@ -15,7 +15,7 @@ const rawSpliceChunk = 1 << 20
 
 // copySpliceProgress copies one eligible raw stream through a private pipe.
 // handled is false only while fallback remains safe because src was untouched.
-func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt) (handled bool, err error) {
+func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt) (bool, error) {
 	if dst == nil || !rawSpliceSource(src) {
 		return false, nil
 	}
@@ -38,7 +38,6 @@ func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt)
 	// A smaller default pipe is still correct; resizing failure is nonfatal.
 	_, _ = unix.FcntlInt(uintptr(pipe[0]), unix.F_SETPIPE_SZ, rawSpliceChunk)
 
-	handled = true
 	consumed := false
 	var buffered int64
 	// RawConn retains its callback through poll waits. Bind the two callbacks

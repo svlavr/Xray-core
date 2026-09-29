@@ -176,7 +176,6 @@ func (w *observedMessageWriter) WriteMessage(b *buf.Buffer) error {
 	err := w.MessageWriter.WriteMessage(b)
 	if err == nil {
 		w.receipt.AddDownlink(size)
-	} else {
 	}
 	return err
 }
@@ -310,9 +309,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 						return err
 					}
 				} else {
-					go func() {
-						h.handleIPQuery(ctx, id, qType, domain, writer, timer)
-					}()
+					go h.handleIPQuery(ctx, id, qType, domain, writer, timer)
 				}
 			case RuleAction_Direct:
 				if err := connWriter.WriteMessage(b); err != nil {

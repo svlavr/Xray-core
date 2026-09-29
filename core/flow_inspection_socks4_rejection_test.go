@@ -10,12 +10,11 @@ import (
 	cnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
-	fs "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy/socks"
 	"github.com/xtls/xray-core/testing/servers/tcp"
 )
 
-func TestFlowInspectionSOCKS4DecodedRejectedCommand(t *testing.T) {
+func TestFlowInspectionSOCKS4RejectedCommandHasNoAdmission(t *testing.T) {
 	_, view, address := inspectionCore(t, true, false)
 	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
 	if err != nil {
@@ -33,19 +32,13 @@ func TestFlowInspectionSOCKS4DecodedRejectedCommand(t *testing.T) {
 	if _, err := io.ReadFull(conn, response); err != nil || response[1] != 91 {
 		t.Fatalf("SOCKS4 rejection %v: %v", response, err)
 	}
-	var terminal fs.TerminalRecord
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 {
-			return false
-		}
-		terminal = page.Rows[0]
-		return true
-	})
-	flow := terminal.Flow
-	destination := cnet.TCPDestination(cnet.LocalHostIP, 80)
-	if flow.Kind != cnet.Network_TCP || flow.Origin != fs.TrafficOriginUser || flow.InitialDestination != destination || flow.Outbound.Serial != 0 || flow.Uplink != 0 || flow.Downlink != 0 {
-		t.Fatalf("decoded SOCKS4 rejection facts: %+v", terminal)
+	if _, err := io.Copy(io.Discard, conn); err != nil {
+		t.Fatal(err)
+	}
+	live, liveErr := view.ReadLive()
+	page, err := view.ReadTerminals()
+	if liveErr != nil || err != nil || len(live.Rows) != 0 || len(page.Rows) != 0 {
+		t.Fatalf("SOCKS4 rejection admitted a flow: live=%+v ended=%+v errors=%v/%v", live.Rows, page.Rows, liveErr, err)
 	}
 
 	incomplete, err := net.DialTimeout("tcp", address, 3*time.Second)
@@ -63,8 +56,8 @@ func TestFlowInspectionSOCKS4DecodedRejectedCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	incomplete.Close()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
+	page, err = view.ReadTerminals()
+	if err != nil || len(page.Rows) != 0 {
 		t.Fatalf("incomplete SOCKS4 header admitted a flow: %+v %v", page.Rows, err)
 	}
 }

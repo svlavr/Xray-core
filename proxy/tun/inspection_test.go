@@ -298,7 +298,7 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 		t.Fatal("packet entry did not reach stop boundary")
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		close(release)
 		t.Fatalf("stop: %+v %v", outcomes, err)
 	}

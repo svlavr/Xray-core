@@ -123,7 +123,7 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 				t.Fatalf("association facts: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || out[0].Err != nil {
+			if err != nil || out[0] != nil {
 				t.Fatalf("exact association stop: %+v %v", out, err)
 			}
 			control.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -178,7 +178,7 @@ func TestFlowInspectionSOCKSUDPInboundPreFirstPayload(t *testing.T) {
 		t.Fatalf("pre-first association: %+v", association)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{association.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("pre-first exact stop: %+v %v", outcomes, err)
 	}
 	control.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -243,7 +243,7 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 		return true
 	})
 	result, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || result[0].Err != nil {
+	if err != nil || result[0] != nil {
 		t.Fatalf("stop after ray rejection: %+v %v", result, err)
 	}
 	inspectionWait(t, func() bool {

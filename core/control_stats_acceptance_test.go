@@ -210,7 +210,7 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 		}
 	}
 	outcomes, err := view.CloseFlows(ctx, []fs.FlowRef{userRef})
-	if err != nil || outcomes[0].Err != nil {
+	if err != nil || outcomes[0] != nil {
 		t.Fatalf("exact API stop: %+v %v", outcomes, err)
 	}
 	remaining, err := view.ReadLive()
@@ -252,7 +252,7 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 		}
 	}
 	stale, err := newView.CloseFlows(ctx, []fs.FlowRef{userRef})
-	if err != nil || stale[0].Err != nil {
+	if err != nil || stale[0] != nil {
 		t.Fatalf("stale ref: %+v %v", stale, err)
 	}
 	_ = fresh

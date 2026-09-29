@@ -125,6 +125,75 @@ func (o *resolverOwner) closeOwned() error {
 	return err
 }
 
+// connectionLifetime owns TCP and DoH dial admission, workers, and open sockets.
+// Each nameserver supplies its existing cache controller for cancellation.
+type connectionLifetime struct {
+	mu          sync.Mutex
+	connections map[net.Conn]struct{}
+	dialing     sync.WaitGroup
+	workers     sync.WaitGroup
+}
+
+func (l *connectionLifetime) beginDial(cache *CacheController) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if cache.ctx.Err() != nil {
+		return false
+	}
+	l.dialing.Add(1)
+	return true
+}
+
+func (l *connectionLifetime) beginWork(cache *CacheController) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if cache.ctx.Err() != nil {
+		return false
+	}
+	l.workers.Add(1)
+	return true
+}
+
+func (l *connectionLifetime) trackConnection(cache *CacheController, conn net.Conn) (net.Conn, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	accepted := cache.ctx.Err() == nil
+	var tracked *trackedConn
+	tracked = &trackedConn{Conn: conn, done: func() {
+		l.mu.Lock()
+		delete(l.connections, tracked)
+		l.mu.Unlock()
+	}}
+	if l.connections == nil {
+		l.connections = make(map[net.Conn]struct{})
+	}
+	l.connections[tracked] = struct{}{}
+	return tracked, accepted
+}
+
+func (l *connectionLifetime) close(cache *CacheController) error {
+	cache.cancel()
+	// Join admissions that observed the owner before cancellation.
+	l.mu.Lock()
+	l.mu.Unlock()
+	l.dialing.Wait()
+	l.mu.Lock()
+	connections := make([]net.Conn, 0, len(l.connections))
+	for conn := range l.connections {
+		connections = append(connections, conn)
+	}
+	l.mu.Unlock()
+	var errs []error
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	cache.Close()
+	l.workers.Wait()
+	return errors.Join(errs...)
+}
+
 func (s *DNS) initRuntime(resolver *DNS) {
 	s.runtime = &dnsRuntime{current: newResolverOwner(resolver)}
 }

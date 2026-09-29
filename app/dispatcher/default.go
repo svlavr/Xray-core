@@ -298,7 +298,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	var cursor *buf.InspectionReader
 	if observation != nil {
 		lower := outbound.Reader
-		cursor = buf.NewInspectionReader(&buf.BufferedReader{Reader: lower}, observation.Exchange, func() { common.Interrupt(lower) })
+		cursor = buf.NewInspectionReader(lower, observation.Exchange, func() { common.Interrupt(lower) })
 		cursor.InputAlreadyObserved = !observation.InputAtExecution
 		if observation.InputAtExecution && destination.Network == net.Network_UDP {
 			cursor.PacketDestination = destination

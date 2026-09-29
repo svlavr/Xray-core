@@ -72,13 +72,6 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	ob.CanSpliceCopy = 3
 	destination := ob.Target
 	network := destination.Network
-	if network == net.Network_UDP {
-		if inbound := session.InboundFromContext(ctx); inbound != nil {
-			if _, ok := inbound.Conn.(net.PacketConn); ok {
-				return errors.New("direct inbound PacketConn is unsupported; use the routed Link packet path")
-			}
-		}
-	}
 	var udpCodec *UDPPacketCodec
 	if network == net.Network_UDP {
 		var err error

@@ -64,7 +64,7 @@ func TestFlowInspectionMuxClientUDP(t *testing.T) {
 				return true
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-			if err != nil || outcomes[0].Err != nil {
+			if err != nil || outcomes[0] != nil {
 				t.Fatalf("close: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {

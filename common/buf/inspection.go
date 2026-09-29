@@ -38,9 +38,14 @@ type inspectionRead struct {
 	err  error
 }
 
-func NewInspectionReader(r *BufferedReader, flow stats.Exchange, unblock func()) *InspectionReader {
-	c := &InspectionReader{reader: r.Reader, initial: r.Buffer, flow: flow, unblock: unblock}
-	r.Buffer = nil
+// NewInspectionReader takes decoded input and any existing buffered residual.
+// The owner must Interrupt it; unblock must affect only its owned endpoint.
+func NewInspectionReader(r Reader, flow stats.Exchange, unblock func()) *InspectionReader {
+	c := &InspectionReader{reader: r, flow: flow, unblock: unblock}
+	if buffered, ok := r.(*BufferedReader); ok {
+		c.reader, c.initial = buffered.Reader, buffered.Buffer
+		buffered.Buffer = nil
+	}
 	return c
 }
 

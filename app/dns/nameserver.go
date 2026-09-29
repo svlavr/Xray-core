@@ -50,10 +50,10 @@ func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 	if instance := core.FromContext(ctx); instance != nil {
 		fake, _ = instance.GetFeature((*dns.FakeDNSEngine)(nil)).(dns.FakeDNSEngine)
 	}
-	return newServer(ctx, dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP, fake)
+	return newServer(dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP, fake)
 }
 
-func newServer(ctx context.Context, dest net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP, fake dns.FakeDNSEngine) (Server, error) {
+func newServer(dest net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP, fake dns.FakeDNSEngine) (Server, error) {
 	if address := dest.Address; address.Family().IsDomain() {
 		u, err := url.Parse(address.Domain())
 		if err != nil {
@@ -141,7 +141,7 @@ func newClient(
 ) (*Client, error) {
 	client := &Client{}
 	// Create a new server for each client for now
-	server, err := newServer(ctx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP, fake)
+	server, err := newServer(ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP, fake)
 	if err != nil {
 		return nil, errors.New("failed to create nameserver").Base(err)
 	}

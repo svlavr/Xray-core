@@ -133,7 +133,7 @@ func TestFlowInspectionAppReverseChildren(t *testing.T) {
 		t.Fatal("reverse control generated logical records")
 	}
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || out[0].Err != nil {
+	if err != nil || out[0] != nil {
 		t.Fatalf("reverse exact stop: %+v %v", out, err)
 	}
 	inspectionWait(t, func() bool {

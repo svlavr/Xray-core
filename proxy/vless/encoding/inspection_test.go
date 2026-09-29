@@ -139,7 +139,7 @@ func TestInspectionVLESSPacketLateWriteAfterStop(t *testing.T) {
 		t.Fatal("write did not start")
 	}
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || out[0].Err != nil {
+	if err != nil || out[0] != nil {
 		t.Fatalf("stop: %+v %v", out, err)
 	}
 	flow.Finish()

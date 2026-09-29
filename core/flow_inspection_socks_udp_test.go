@@ -99,7 +99,7 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 				return selected.Ref.ID != 0
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("SOCKS UDP exact stop: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {
@@ -114,7 +114,7 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 				want := uint64(len(payload) + len(extra))
 				return err == nil && len(live.Rows) == 1 && live.Rows[0].Uplink >= want && live.Rows[0].Downlink >= want
 			})
-			if outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{live.Rows[0].Ref}); err != nil || outcomes[0].Err != nil {
+			if outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{live.Rows[0].Ref}); err != nil || outcomes[0] != nil {
 				t.Fatalf("sibling stop: %+v %v", outcomes, err)
 			}
 			inspectionWait(t, func() bool {

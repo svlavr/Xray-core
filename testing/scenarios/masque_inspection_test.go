@@ -295,7 +295,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 		t.Fatal("two logical MASQUE flows were not observed")
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRef})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("MASQUE exact stop: %+v %v", outcomes, err)
 	}
 	first.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -336,7 +336,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 		t.Fatal("MASQUE UDP association was not observed")
 	}
 	outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{udpRef})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("MASQUE UDP exact stop: %+v %v", outcomes, err)
 	}
 	deadline = time.Now().Add(5 * time.Second)
@@ -481,7 +481,7 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 	}
 
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRef})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Ref != firstRef || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("first MASQUE exact stop: %+v %v", outcomes, err)
 	}
 	if err := first.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {

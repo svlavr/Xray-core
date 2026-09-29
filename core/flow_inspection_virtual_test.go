@@ -191,7 +191,7 @@ func inspectionWireGuardAssertRow(t *testing.T, row fs.FlowRecord, initial cnet.
 func inspectionWireGuardStop(t *testing.T, view fs.FlowInspection, ref fs.FlowRef) {
 	t.Helper()
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("WireGuard exact stop: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {

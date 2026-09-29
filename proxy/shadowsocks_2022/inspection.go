@@ -54,7 +54,7 @@ func observeTCP(ctx context.Context, manager stats.Manager, endpoint net.Conn, d
 	if early > 0 {
 		observation.Exchange.AddUplink(uint64(early))
 	}
-	cursor := proxy.ObserveDecodedReader(reader, observation.Exchange, func() {})
+	cursor := buf.NewInspectionReader(reader, observation.Exchange, func() {})
 	return ctx, cursor, buf.AttachWriterReceipt(writer, observation.Exchange), func() {
 		cursor.Interrupt()
 		finish()

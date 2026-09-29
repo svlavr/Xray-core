@@ -70,7 +70,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 			return err == nil && len(live.Rows) == 2
 		})
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+		if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 			t.Fatalf("supplied TCP exact stop: %+v %v", outcomes, err)
 		}
 		if pendingPeerEOF {
@@ -105,7 +105,7 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 				return siblingRef != firstRow.Ref
 			})
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{siblingRef})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("pending sibling stop: %+v %v", outcomes, err)
 			}
 		}
@@ -146,7 +146,7 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 		t.Fatalf("VLESS response framing credited before payload: %+v", row)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("VLESS early stop: %+v %v", outcomes, err)
 	}
 	if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {

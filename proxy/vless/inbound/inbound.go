@@ -657,7 +657,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	link := &transport.Link{Reader: clientReader, Writer: clientWriter}
 	if observation != nil && (requestAddons.Flow == "" || request.Command == protocol.RequestCommandTCP && requestAddons.Flow == vless.XRV) {
-		cursor := proxy.ObserveDecodedReader(link.Reader, observation.Exchange, func() {})
+		cursor := buf.NewInspectionReader(link.Reader, observation.Exchange, func() {})
 		if request.Command == protocol.RequestCommandUDP {
 			cursor.PacketDestination = request.Destination()
 		}

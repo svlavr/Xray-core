@@ -139,7 +139,7 @@ func startObservedHTTP2Endpoint(t *testing.T, client *Client, manager *appstats.
 		t.Fatal("inspection was not enabled")
 	}
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.OutboundRef{Runtime: view.Runtime(), Serial: serial, Tag: "http-proxy"})
+	observation.Exchange.Route(fs.OutboundRef{Serial: serial, Tag: "http-proxy"})
 	done := make(chan error, 1)
 	go func() {
 		defer finish()
@@ -222,7 +222,7 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 		return selected.ID != 0
 	})
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("exact stream close: %+v %v", outcomes, err)
 	}
 	waitHTTPInspection(t, func() bool {

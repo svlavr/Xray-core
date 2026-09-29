@@ -73,7 +73,7 @@ func TestStageBTCPWithheldReplyCancellation(t *testing.T) {
 				t.Fatal("query did not return on cancellation")
 			}
 			joined := make(chan struct{})
-			go func() { server.workers.Wait(); close(joined) }()
+			go func() { server.lifetime.workers.Wait(); close(joined) }()
 			select {
 			case <-joined:
 			case <-time.After(time.Second):
@@ -84,9 +84,9 @@ func TestStageBTCPWithheldReplyCancellation(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("TCP connection remained open")
 			}
-			server.mu.Lock()
-			remaining := len(server.connections)
-			server.mu.Unlock()
+			server.lifetime.mu.Lock()
+			remaining := len(server.lifetime.connections)
+			server.lifetime.mu.Unlock()
 			if remaining != 0 {
 				t.Fatal("canceled connection remained owned before whole Close")
 			}
@@ -329,9 +329,9 @@ func TestStageBDoHPooledSiblingCancellation(t *testing.T) {
 	if err := server.Close(); err != nil {
 		t.Fatal(err)
 	}
-	server.mu.Lock()
-	remaining := len(server.connections)
-	server.mu.Unlock()
+	server.lifetime.mu.Lock()
+	remaining := len(server.lifetime.connections)
+	server.lifetime.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("whole nameserver close retained %d connections", remaining)
 	}

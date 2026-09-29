@@ -141,14 +141,13 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 		t.Fatalf("local response: %+v %v", badResponse, err)
 	}
 	badResponse.Body.Close()
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 3
-	})
-	page, _ = view.ReadTerminals()
-	local := page.Rows[2]
-	if local.Flow.Outbound.Serial != 0 || local.Flow.Uplink != 0 || local.Flow.Downlink == 0 {
-		t.Fatalf("local HTTP response receipt: %+v", local)
+	if _, err := io.Copy(io.Discard, bad); err != nil {
+		t.Fatal(err)
+	}
+	page, err = view.ReadTerminals()
+	live, liveErr := view.ReadLive()
+	if err != nil || liveErr != nil || len(page.Rows) != 2 || len(live.Rows) != 0 {
+		t.Fatalf("HTTP rejection admitted a flow: live=%+v ended=%+v errors=%v/%v", live.Rows, page.Rows, liveErr, err)
 	}
 }
 
@@ -190,7 +189,7 @@ func TestFlowInspectionP2GHTTPRequestExactStop(t *testing.T) {
 		return true
 	})
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("HTTP request stop: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {

@@ -172,7 +172,7 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 		t.Fatalf("effective target: got %v want %v", selected.EffectiveDestination, destination)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("exact UDP stop: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {
@@ -195,7 +195,7 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 		t.Fatal("same-source datagram reused the stopped association")
 	}
 	outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("stale ref affected replacement: %+v %v", outcomes, err)
 	}
 	siblingExtra := []byte("sibling after exact stop")
@@ -208,7 +208,7 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 	}
 	refs := []fs.FlowRef{live.Rows[0].Ref, live.Rows[1].Ref}
 	outcomes, err = view.CloseFlows(context.Background(), refs)
-	if err != nil || len(outcomes) != 2 || outcomes[0].Err != nil || outcomes[1].Err != nil {
+	if err != nil || len(outcomes) != 2 || outcomes[0] != nil || outcomes[1] != nil {
 		t.Fatalf("cleanup UDP associations: %+v %v", outcomes, err)
 	}
 	inspectionWait(t, func() bool {
@@ -232,7 +232,7 @@ func TestFlowInspectionSuppliedUDPResolvedTarget(t *testing.T) {
 		t.Fatalf("resolved effective target: %+v", row)
 	}
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || len(out) != 1 || out[0].Err != nil {
+	if err != nil || len(out) != 1 || out[0] != nil {
 		t.Fatalf("close resolved association: %+v %v", out, err)
 	}
 }
@@ -336,7 +336,7 @@ func inspectionUDPBatchThrough(t *testing.T, instance *core.Instance, view fs.Fl
 		t.Fatalf("batch totals: %d/%d want %d", up, down, len(got))
 	}
 	results, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-	if err != nil || len(results) != 1 || results[0].Err != nil {
+	if err != nil || len(results) != 1 || results[0] != nil {
 		t.Fatalf("batch close: %+v %v", results, err)
 	}
 	select {

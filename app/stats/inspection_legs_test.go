@@ -29,7 +29,7 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	a.AddDownlink(7)
 	b.AddDownlink(9)
 	out, err := s.CloseFlows(context.Background(), []fs.FlowRef{root.Ref()})
-	if err != nil || out[0].Err != nil || root.NewLeg() != nil {
+	if err != nil || out[0] != nil || root.NewLeg() != nil {
 		t.Fatalf("association stop did not seal future work: %+v %v", out, err)
 	}
 	a.Finish()

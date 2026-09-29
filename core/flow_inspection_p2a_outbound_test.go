@@ -234,6 +234,10 @@ func TestFlowInspectionP2AVMessOutbound(t *testing.T) {
 	t.Setenv("xray.cone.disabled", "true")
 	t.Run("TCP", func(t *testing.T) { inspectionOutboundTCP(t, inspectionVMessConfig) })
 	t.Run("UDP", func(t *testing.T) { inspectionOutboundUDP(t, inspectionVMessConfig) })
+	t.Run("UDP-cone", func(t *testing.T) {
+		t.Setenv("xray.cone.disabled", "false")
+		inspectionOutboundUDP(t, inspectionVMessConfig)
+	})
 	t.Run("dial-failure", func(t *testing.T) {
 		outbound := inspectionVMessConfig(t)
 		message, err := outbound.ProxySettings.GetInstance()
@@ -333,7 +337,7 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 				t.Fatalf("Hysteria TCP facts: %+v", row)
 			}
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-			if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("Hysteria TCP exact stop: %+v %v", outcomes, err)
 			}
 			if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
@@ -382,7 +386,7 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 			return firstRow.Ref.ID != 0 && siblingRow.Ref.ID != 0
 		})
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+		if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 			t.Fatalf("Hysteria UDP exact stop: %+v %v", outcomes, err)
 		}
 		extra := []byte("sibling after exact stop")
@@ -392,7 +396,7 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 			return len(live.Rows) == 1 && live.Rows[0].Ref == siblingRow.Ref && live.Rows[0].Uplink == uint64(len(payload)+len(extra)) && live.Rows[0].Downlink == uint64(len(payload)+len(extra))
 		})
 		outcomes, err = view.CloseFlows(context.Background(), []fs.FlowRef{siblingRow.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+		if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 			t.Fatalf("Hysteria UDP sibling close: %+v %v", outcomes, err)
 		}
 		inspectionOutboundTotals(t, view, outbound.Tag, uint64(2*len(payload)+len(extra)))
@@ -418,7 +422,7 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 			t.Fatalf("fragmented UDP attribution: %+v", row)
 		}
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+		if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 			t.Fatalf("fragmented UDP close: %+v %v", outcomes, err)
 		}
 	})

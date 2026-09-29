@@ -529,14 +529,29 @@ func TestStageBUDPRequestIDCollisionKeepsFirstPending(t *testing.T) {
 	msg := &dnsmessage.Message{Header: dnsmessage.Header{ID: 42}}
 	first := &udpDnsRequest{dnsRequest: dnsRequest{msg: msg}, ctx: context.Background()}
 	second := &udpDnsRequest{dnsRequest: dnsRequest{msg: msg}, ctx: context.Background()}
-	if !server.addPendingRequest(first) || server.addPendingRequest(second) {
-		t.Fatal("request ID collision was admitted")
+	if err := server.addPendingRequest(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.addPendingRequest(second); err == nil || go_errors.Is(err, context.Canceled) {
+		t.Fatalf("request ID collision must be a non-cancellation error: %v", err)
 	}
 	server.RLock()
 	current := server.requests[42]
 	server.RUnlock()
 	if current != first {
 		t.Fatal("collision displaced first pending request")
+	}
+	server.reqID = 41
+	result := make(chan error, 1)
+	server.sendQuery(context.Background(), result, "collision.test.", featuredns.IPOption{IPv4Enable: true})
+	if err := <-result; err == nil || go_errors.Is(err, context.Canceled) {
+		t.Fatalf("sendQuery lost collision error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	second.ctx = ctx
+	if err := server.addPendingRequest(second); err != context.Canceled {
+		t.Fatalf("actual cancellation: %v", err)
 	}
 }
 
@@ -756,8 +771,8 @@ func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
 	t.Run("concurrent-native-close", func(t *testing.T) {
 		left, right := stdnet.Pipe()
 		defer right.Close()
-		server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0), connections: make(map[net.Conn]struct{})}
-		conn, ok := server.trackConnection(left)
+		server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0)}
+		conn, ok := server.lifetime.trackConnection(server.cacheController, left)
 		if !ok {
 			t.Fatal("initial connection rejected")
 		}
@@ -770,9 +785,9 @@ func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		server.mu.Lock()
-		remaining := len(server.connections)
-		server.mu.Unlock()
+		server.lifetime.mu.Lock()
+		remaining := len(server.lifetime.connections)
+		server.lifetime.mu.Unlock()
 		if remaining != 0 {
 			t.Fatal("closed connection retained")
 		}
@@ -812,33 +827,81 @@ func TestTCPAndDoHCloseCaptureLateDialPublication(t *testing.T) {
 			lower := &scriptedCloseConn{Conn: left}
 			closeDone := make(chan error, 1)
 			if kind == "tcp" {
-				server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0), connections: make(map[net.Conn]struct{})}
-				if !server.beginDial() {
+				server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0)}
+				if !server.lifetime.beginDial(server.cacheController) {
 					t.Fatal("dial rejected before close")
 				}
 				go func() { closeDone <- server.Close() }()
 				<-server.cacheController.ctx.Done()
-				if _, accepted := server.trackConnection(lower); accepted {
+				if _, accepted := server.lifetime.trackConnection(server.cacheController, lower); accepted {
 					t.Fatal("late TCP connection accepted")
 				}
-				server.dialing.Done()
+				server.lifetime.dialing.Done()
 			} else {
-				server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0), httpClient: &http.Client{Transport: &http2.Transport{}}, connections: make(map[net.Conn]struct{})}
-				if !server.beginDial() {
+				server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0), httpClient: &http.Client{Transport: &http2.Transport{}}}
+				if !server.lifetime.beginDial(server.cacheController) {
 					t.Fatal("dial rejected before close")
 				}
 				go func() { closeDone <- server.Close() }()
 				<-server.cacheController.ctx.Done()
-				if _, accepted := server.trackConnection(lower); accepted {
+				if _, accepted := server.lifetime.trackConnection(server.cacheController, lower); accepted {
 					t.Fatal("late DoH connection accepted")
 				}
-				server.dialing.Done()
+				server.lifetime.dialing.Done()
 			}
 			if err := <-closeDone; err != nil {
 				t.Fatal(err)
 			}
 			if calls := lower.callCount(); calls != 1 {
 				t.Fatalf("late connection lower closes=%d", calls)
+			}
+		})
+	}
+}
+
+func TestTCPAndDoHRejectedConnectionCloseFailureRetried(t *testing.T) {
+	for _, kind := range []string{"tcp", "doh"} {
+		t.Run(kind, func(t *testing.T) {
+			failure := go_errors.New("lower close failed")
+			left, right := stdnet.Pipe()
+			defer left.Close()
+			defer right.Close()
+			lower := &scriptedCloseConn{Conn: left, errs: []error{failure, failure, nil}}
+			var cache *CacheController
+			var lifetime *connectionLifetime
+			var closeServer func() error
+			if kind == "tcp" {
+				server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0)}
+				cache, lifetime, closeServer = server.cacheController, &server.lifetime, server.Close
+			} else {
+				server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0)}
+				cache, lifetime, closeServer = server.cacheController, &server.lifetime, server.Close
+			}
+			cache.cancel()
+			tracked, accepted := lifetime.trackConnection(cache, lower)
+			if accepted {
+				t.Fatal("connection accepted after cancellation")
+			}
+			if err := tracked.Close(); !go_errors.Is(err, failure) {
+				t.Fatalf("rejected connection close: %v", err)
+			}
+			if err := closeServer(); !go_errors.Is(err, failure) {
+				t.Fatalf("first owner close: %v", err)
+			}
+			lifetime.mu.Lock()
+			remaining := len(lifetime.connections)
+			lifetime.mu.Unlock()
+			if remaining != 1 {
+				t.Fatalf("failed connection lost from retry inventory: %d", remaining)
+			}
+			if err := closeServer(); err != nil {
+				t.Fatalf("retry owner close: %v", err)
+			}
+			lifetime.mu.Lock()
+			remaining = len(lifetime.connections)
+			lifetime.mu.Unlock()
+			if remaining != 0 || lower.callCount() != 3 {
+				t.Fatalf("connection retry: retained=%d closes=%d", remaining, lower.callCount())
 			}
 		})
 	}
@@ -908,10 +971,9 @@ func TestDoHResourceCloseRejectsLateConnectionPublication(t *testing.T) {
 	server := &DoHNameServer{
 		cacheController: NewCacheController("doh", false, false, 0),
 		httpClient:      &http.Client{Transport: &http2.Transport{}},
-		connections:     make(map[net.Conn]struct{}),
 	}
 	client, peer := stdnet.Pipe()
-	tracked, ok := server.trackConnection(client)
+	tracked, ok := server.lifetime.trackConnection(server.cacheController, client)
 	if !ok {
 		t.Fatal("initial connection was rejected")
 	}
@@ -925,7 +987,7 @@ func TestDoHResourceCloseRejectsLateConnectionPublication(t *testing.T) {
 	late, latePeer := stdnet.Pipe()
 	defer late.Close()
 	defer latePeer.Close()
-	if _, ok := server.trackConnection(late); ok {
+	if _, ok := server.lifetime.trackConnection(server.cacheController, late); ok {
 		t.Fatal("late connection published after close")
 	}
 	_ = tracked.Close()

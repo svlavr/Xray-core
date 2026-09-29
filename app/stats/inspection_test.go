@@ -66,9 +66,8 @@ func TestInspectionLifecycleTotalsClonesAndOwnerEnd(t *testing.T) {
 	}
 	exchange.AddUplink(5)
 	exchange.Route(featurestats.OutboundRef{
-		Runtime: store.runtime,
-		Serial:  7,
-		Tag:     strings.Repeat("t", 300),
+		Serial: 7,
+		Tag:    strings.Repeat("t", 300),
 	})
 	exchange.BindRoute()
 	exchange.Effective(xnet.TCPDestination(xnet.DomainAddress("effective.example"), 443))
@@ -133,7 +132,7 @@ func TestInspectionLifecycleTotalsClonesAndOwnerEnd(t *testing.T) {
 func TestInspectionCapacityRejectedAttributionAndBoundedHistory(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{MaxLive: 1, MaxTerminals: 2, MaxBuckets: 1})
 	first := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-	first.Route(featurestats.OutboundRef{Runtime: store.runtime, Serial: 1, Tag: "one"})
+	first.Route(featurestats.OutboundRef{Serial: 1, Tag: "one"})
 	first.BindRoute()
 	first.AddUplink(1)
 
@@ -186,7 +185,7 @@ func TestInspectionCloseOutcomesAndCallbackOutsideLocks(t *testing.T) {
 		return nil
 	})
 	type closeResult struct {
-		outcomes []featurestats.CloseOutcome
+		outcomes []error
 		err      error
 	}
 	done := make(chan closeResult, 1)
@@ -196,38 +195,38 @@ func TestInspectionCloseOutcomesAndCallbackOutsideLocks(t *testing.T) {
 	}()
 	<-entered
 	outcomes, err := store.CloseFlows(context.Background(), []featurestats.FlowRef{exchange.Ref()})
-	if err != nil || outcomes[0].Err != nil {
+	if err != nil || outcomes[0] != nil {
 		t.Fatalf("repeated close = %+v, %v", outcomes, err)
 	}
 	close(release)
 	first := <-done
-	if first.err != nil || first.outcomes[0].Err != nil {
+	if first.err != nil || first.outcomes[0] != nil {
 		t.Fatalf("first close = %+v, %v", first.outcomes, first.err)
 	}
 	outcomes, err = store.CloseFlows(context.Background(), []featurestats.FlowRef{exchange.Ref()})
-	if err != nil || outcomes[0].Err != nil {
+	if err != nil || outcomes[0] != nil {
 		t.Fatalf("ended close = %+v, %v", outcomes, err)
 	}
 
 	unsupported := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	outcomes, err = store.CloseFlows(context.Background(), []featurestats.FlowRef{unsupported.Ref()})
-	if err != nil || !errors.Is(outcomes[0].Err, errors.ErrUnsupported) {
+	if err != nil || !errors.Is(outcomes[0], errors.ErrUnsupported) {
 		t.Fatalf("unsupported close = %+v, %v", outcomes, err)
 	}
 	stale := unsupported.Ref()
 	stale.Runtime[1] = 9
 	outcomes, err = store.CloseFlows(context.Background(), []featurestats.FlowRef{stale})
-	if err != nil || outcomes[0].Err != nil {
+	if err != nil || outcomes[0] != nil {
 		t.Fatalf("stale close = %+v, %v", outcomes, err)
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	outcomes, err = store.CloseFlows(canceled, []featurestats.FlowRef{unsupported.Ref()})
-	if err != nil || !errors.Is(outcomes[0].Err, context.Canceled) {
+	if err != nil || !errors.Is(outcomes[0], context.Canceled) {
 		t.Fatalf("canceled close = %+v, %v", outcomes, err)
 	}
 	batch, err := store.CloseFlows(context.Background(), []featurestats.FlowRef{{}, {}, {}})
-	if err != nil || len(batch) != 3 || batch[0].Err != nil || batch[1].Err != nil || batch[2].Err != nil {
+	if err != nil || len(batch) != 3 || batch[0] != nil || batch[1] != nil || batch[2] != nil {
 		t.Fatalf("idempotent batch close: %+v %v", batch, err)
 	}
 	unsupported.Finish()
@@ -236,7 +235,7 @@ func TestInspectionCloseOutcomesAndCallbackOutsideLocks(t *testing.T) {
 func TestInspectionConcurrentSnapshotAndLateTotals(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{MaxLive: 1, MaxTerminals: 1, MaxBuckets: 1})
 	exchange := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-	exchange.Route(featurestats.OutboundRef{Runtime: store.runtime, Serial: 1})
+	exchange.Route(featurestats.OutboundRef{Serial: 1})
 	exchange.BindRoute()
 
 	const workers = 8
@@ -298,7 +297,7 @@ func TestInspectionStopPublishesAndPreservesLateTotals(t *testing.T) {
 	exchange := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { return nil })
 
 	out, err := store.CloseFlows(context.Background(), []featurestats.FlowRef{exchange.Ref()})
-	if err != nil || out[0].Err != nil {
+	if err != nil || out[0] != nil {
 		t.Fatalf("close: %+v %v", out, err)
 	}
 
@@ -326,7 +325,7 @@ func TestInspectionCloseFailureAndCanceledSuffix(t *testing.T) {
 	var secondCalled bool
 	second := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { secondCalled = true; return nil })
 	out, err := store.CloseFlows(ctx, []featurestats.FlowRef{first.Ref(), second.Ref()})
-	if err != nil || len(out) != 2 || !errors.Is(out[0].Err, nativeFailure) || !errors.Is(out[1].Err, context.Canceled) || secondCalled {
+	if err != nil || len(out) != 2 || !errors.Is(out[0], nativeFailure) || !errors.Is(out[1], context.Canceled) || secondCalled {
 		t.Fatalf("partial close: %+v %v", out, err)
 	}
 	first.Finish()

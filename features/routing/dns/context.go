@@ -33,8 +33,10 @@ func (ctx *ResolvableContext) GetTargetIPs() []net.IP {
 
 	if domain := ctx.GetTargetDomain(); len(domain) != 0 {
 		lookupCtx := context.Background()
-		if origin, ok := ctx.Context.(originatingContext); ok && origin.OriginatingContext() != nil {
-			lookupCtx = origin.OriginatingContext()
+		if origin, ok := ctx.Context.(originatingContext); ok {
+			if original := origin.OriginatingContext(); original != nil {
+				lookupCtx = original
+			}
 		}
 		ips, _, err := dns.LookupIPContext(lookupCtx, ctx.dnsClient, domain, dns.IPOption{
 			IPv4Enable: true,

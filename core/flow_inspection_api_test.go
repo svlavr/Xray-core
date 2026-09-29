@@ -222,7 +222,7 @@ func TestFlowInspectionAPILocalStop(t *testing.T) {
 		return true
 	})
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("close API root: %+v %v", outcomes, err)
 	}
 	terminal := inspectionAPITerminal(t, view)

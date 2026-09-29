@@ -89,7 +89,7 @@ func TestInspectionXtlsReadWriterCauseAndLocalStop(t *testing.T) {
 	t.Run("local-stop", func(t *testing.T) {
 		flow, view := inspectionPacketFlow(t)
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-		if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+		if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 			t.Fatalf("stop: %+v %v", outcomes, err)
 		}
 		if err := XtlsRead(&inspectionEndReader{err: io.ErrUnexpectedEOF}, buf.NewWriter(io.Discard), inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background()); err == nil {
@@ -117,7 +117,7 @@ func TestInspectionXtlsReadRawFallbackResults(t *testing.T) {
 			flow, view := inspectionPacketFlow(t)
 			if test.localStop {
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-				if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+				if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 					t.Fatalf("stop: %+v %v", outcomes, err)
 				}
 			}

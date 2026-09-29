@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	go_errors "errors"
-	stdnet "net"
 	"net/url"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,10 +29,7 @@ type TCPNameServer struct {
 	dial            func(context.Context) (net.Conn, error)
 	routed          bool
 	clientIP        net.IP
-	mu              sync.Mutex
-	connections     map[net.Conn]struct{}
-	dialing         sync.WaitGroup
-	workers         sync.WaitGroup
+	lifetime        connectionLifetime
 }
 
 // NewTCPNameServer creates DNS over TCP server object for remote resolving.
@@ -113,7 +108,6 @@ func baseTCPNameServer(url *url.URL, prefix string, disableCache bool, serveStal
 		cacheController: NewCacheController(prefix+"//"+dest.NetAddr(), disableCache, serveStale, serveExpiredTTL),
 		destination:     &dest,
 		clientIP:        clientIP,
-		connections:     make(map[net.Conn]struct{}),
 	}
 
 	return s, nil
@@ -164,14 +158,14 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		if !s.beginWork() {
+		if !s.lifetime.beginWork(s.cacheController) {
 			if noResponseErrCh != nil {
 				noResponseErrCh <- context.Canceled
 			}
 			continue
 		}
 		go func(r *dnsRequest, ctx context.Context) {
-			defer s.workers.Done()
+			defer s.lifetime.workers.Done()
 			workCtx, cancelWork := context.WithCancel(ctx)
 			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
 			defer func() { stop(); cancelWork() }()
@@ -200,7 +194,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				dnsCtx = toDnsContext(dnsCtx, dnsCtx, s.destination.String())
 			}
 
-			if !s.beginDial() {
+			if !s.lifetime.beginDial(s.cacheController) {
 				if noResponseErrCh != nil {
 					noResponseErrCh <- context.Canceled
 				}
@@ -208,15 +202,15 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			}
 			conn, err := s.dial(dnsCtx)
 			if err != nil {
-				s.dialing.Done()
+				s.lifetime.dialing.Done()
 				errors.LogErrorInner(ctx, err, "failed to dial namesever")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
 				}
 				return
 			}
-			tracked, ok := s.trackConnection(conn)
-			s.dialing.Done()
+			tracked, ok := s.lifetime.trackConnection(s.cacheController, conn)
+			s.lifetime.dialing.Done()
 			if !ok {
 				_ = tracked.Close()
 				if noResponseErrCh != nil {
@@ -310,61 +304,8 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 }
 
-func (s *TCPNameServer) beginDial() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cacheController.ctx.Err() != nil {
-		return false
-	}
-	s.dialing.Add(1)
-	return true
-}
-
-func (s *TCPNameServer) beginWork() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cacheController.ctx.Err() != nil {
-		return false
-	}
-	s.workers.Add(1)
-	return true
-}
-
-func (s *TCPNameServer) trackConnection(conn net.Conn) (net.Conn, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	accepted := s.cacheController.ctx.Err() == nil
-	var tracked *trackedConn
-	tracked = &trackedConn{Conn: conn, done: func() {
-		s.mu.Lock()
-		delete(s.connections, tracked)
-		s.mu.Unlock()
-	}}
-	s.connections[tracked] = struct{}{}
-	return tracked, accepted
-}
-
 func (s *TCPNameServer) Close() error {
-	s.cacheController.cancel()
-	// Join admissions that observed the owner before cancellation.
-	s.mu.Lock()
-	s.mu.Unlock()
-	s.dialing.Wait()
-	s.mu.Lock()
-	connections := make([]net.Conn, 0, len(s.connections))
-	for conn := range s.connections {
-		connections = append(connections, conn)
-	}
-	s.mu.Unlock()
-	var errs []error
-	for _, conn := range connections {
-		if err := conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
-			errs = append(errs, err)
-		}
-	}
-	s.cacheController.Close()
-	s.workers.Wait()
-	return go_errors.Join(errs...)
+	return s.lifetime.close(s.cacheController)
 }
 
 // QueryIP implements Server.

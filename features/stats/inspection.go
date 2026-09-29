@@ -25,10 +25,10 @@ type FlowRef struct {
 	ID      uint64
 }
 
+// OutboundRef identifies a handler within its owning FlowInspection view.
 type OutboundRef struct {
-	Runtime RuntimeID
-	Serial  uint64
-	Tag     string
+	Serial uint64
+	Tag    string
 }
 
 type ObservationOptions struct {
@@ -78,11 +78,6 @@ type TerminalSnapshot struct {
 	Rows []TerminalRecord
 }
 
-type CloseOutcome struct {
-	Ref FlowRef
-	Err error
-}
-
 // FlowInspection is the optional direct-Go observation and local-control
 // capability implemented by the native statistics manager.
 type FlowInspection interface {
@@ -90,7 +85,10 @@ type FlowInspection interface {
 	ReadLive() (LiveSnapshot, error)
 	ReadTerminals() (TerminalSnapshot, error)
 	ReadTotals() (TotalsSnapshot, error)
-	CloseFlows(context.Context, []FlowRef) ([]CloseOutcome, error)
+	// CloseFlows returns one error per input ref, in the same order.
+	// Nil includes an already absent or stopped flow; a closed store returns
+	// a top-level error without per-flow results.
+	CloseFlows(context.Context, []FlowRef) ([]error, error)
 }
 
 // ObservationProvider is an optional Manager capability. Observation returns

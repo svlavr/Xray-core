@@ -63,7 +63,7 @@ func ObserveFallback(ctx context.Context, manager stats.Manager, conn io.Closer,
 	}
 	flow.Route(stats.OutboundRef{})
 	flow.BindRoute()
-	cursor := ObserveDecodedReader(reader, flow, func() { cancel(); conn.Close() })
+	cursor := buf.NewInspectionReader(reader, flow, func() { cancel(); conn.Close() })
 	return observedCtx, cursor, flow, func() {
 		cursor.Interrupt()
 		flow.Finish()
@@ -86,7 +86,7 @@ func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, 
 		return ctx, nil
 	}
 	flow := observation.Exchange
-	cursor := ObserveDecodedReader(link.Reader, flow, func() { cancel(); conn.Close() })
+	cursor := buf.NewInspectionReader(link.Reader, flow, func() { cancel(); conn.Close() })
 	if kind == net.Network_UDP {
 		cursor.PacketDestination = dest
 	}
@@ -202,18 +202,6 @@ func beginOwnedObservation(ctx context.Context, manager stats.Manager, conn io.C
 
 func isMuxCarrier(dest net.Destination) bool {
 	return dest.Address != nil && dest.Address.Family().IsDomain() && dest.Address.Domain() == "v1.mux.cool"
-}
-
-// ObserveDecodedReader wraps only decoded payload and retains existing buffered
-// input once. Its owning task must Interrupt it during native cleanup.
-// Use a no-op unblock for a task-local cursor when endpoint close belongs to the
-// enclosing admission; ending one direction must not close its active sibling.
-func ObserveDecodedReader(reader buf.Reader, flow stats.Exchange, unblock func()) *buf.InspectionReader {
-	buffered, ok := reader.(*buf.BufferedReader)
-	if !ok {
-		buffered = &buf.BufferedReader{Reader: reader}
-	}
-	return buf.NewInspectionReader(buffered, flow, unblock)
 }
 
 // ObservationStore resolves optional collection once at the native owner entry.

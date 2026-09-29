@@ -167,8 +167,8 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, outcome := range outcomes {
-					if outcome.Err != nil {
-						t.Fatal(outcome.Err)
+					if outcome != nil {
+						t.Fatal(outcome)
 					}
 				}
 				first.SetReadDeadline(time.Now().Add(3 * time.Second))

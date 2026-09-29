@@ -369,3 +369,47 @@ func TestInspectionCursorCounterBinding(t *testing.T) {
 		t.Fatal("counter binding lost or duplicated consumption")
 	}
 }
+
+// BenchmarkInspectionWriter measures adapter/allocation cost with an in-memory
+// sink. It does not measure kernel writev or network throughput.
+func BenchmarkInspectionWriter(b *testing.B) {
+	for _, kind := range []string{"vector", "sequential"} {
+		for _, mode := range []string{"off", "on"} {
+			for _, operation := range []string{"scalar", "batch"} {
+				b.Run(kind+"/"+mode+"/"+operation, func(b *testing.B) {
+					payload := make([]byte, 1024)
+					receipt := new(inspectionReceipt)
+					batchSize := 1
+					if operation == "batch" {
+						batchSize = 4
+					}
+					b.SetBytes(int64(batchSize * len(payload)))
+					b.ReportAllocs()
+					for b.Loop() {
+						var writer buf.Writer
+						if kind == "vector" {
+							writer = &buf.BufferToBytesWriter{Writer: io.Discard}
+						} else {
+							writer = &buf.SequentialWriter{Writer: io.Discard}
+						}
+						if mode == "on" {
+							writer = buf.AttachWriterReceipt(writer, receipt)
+						}
+						if operation == "scalar" {
+							if n, err := writer.(io.Writer).Write(payload); err != nil || n != len(payload) {
+								b.Fatalf("scalar: %d %v", n, err)
+							}
+						} else if err := writer.WriteMultiBuffer(buf.MultiBuffer{
+							buf.FromBytes(payload), buf.FromBytes(payload), buf.FromBytes(payload), buf.FromBytes(payload),
+						}); err != nil {
+							b.Fatal(err)
+						}
+					}
+					if mode == "on" && receipt.down.Load() != uint64(b.N*batchSize*len(payload)) {
+						b.Fatal("writer lost or duplicated byte credit")
+					}
+				})
+			}
+		}
+	}
+}

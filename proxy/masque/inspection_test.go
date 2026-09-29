@@ -173,7 +173,7 @@ func TestInspectionMasqueFirstRequestStopDuringEstablishment(t *testing.T) {
 		t.Fatal("first tunnel retained the logical request identity")
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{observation.Exchange.Ref()})
-	if err != nil || len(outcomes) != 1 || outcomes[0].Err != nil {
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("first request exact stop: %+v %v", outcomes, err)
 	}
 	finish()
