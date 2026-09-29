@@ -39,8 +39,6 @@ func (s *LocalNameServer) IsDisableCache() bool {
 	return true
 }
 
-func (*LocalNameServer) Close() error { return nil }
-
 // NewLocalNameServer creates localdns server object for directly lookup in system DNS.
 func NewLocalNameServer() *LocalNameServer {
 	errors.LogInfo(context.Background(), "DNS: created localhost client")

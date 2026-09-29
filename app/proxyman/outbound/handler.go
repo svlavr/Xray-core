@@ -174,13 +174,11 @@ func (h *Handler) Tag() string {
 	return h.tag
 }
 
-// InspectionClaimSettledOnReturn marks the native handler boundary where every
-// path has synchronously claimed the selected logical endpoint or has returned
-// without launching an owner that can claim it later.
-func (*Handler) InspectionClaimSettledOnReturn() {}
-
 // Dispatch implements proxy.Outbound.Dispatch.
 func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
+	if reader, ok := link.Reader.(*buf.InspectionReader); ok {
+		defer reader.FinishSelectedLeg()
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	content := session.ContentFromContext(ctx)

@@ -681,10 +681,6 @@ func (r *Reverse) Tag() string {
 	return r.tag
 }
 
-// InspectionClaimSettledOnReturn marks ClientManager.Dispatch's synchronous
-// child claim or definitive pre-launch failure boundary.
-func (*Reverse) InspectionClaimSettledOnReturn() {}
-
 func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer features.Feature) error {
 	muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
 	if err != nil {
@@ -706,6 +702,9 @@ func (r *Reverse) NewMux(ctx context.Context, link *transport.Link, observer fea
 }
 
 func (r *Reverse) Dispatch(ctx context.Context, link *transport.Link) {
+	if reader, ok := link.Reader.(*buf.InspectionReader); ok {
+		defer reader.FinishSelectedLeg()
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	if ob != nil {

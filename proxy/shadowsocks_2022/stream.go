@@ -77,8 +77,6 @@ func (w *StreamWriter) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
 	return w
 }
 
-func (w *StreamWriter) WriterReceipt() stats.Exchange { return w.receipt }
-
 func NewStreamWriter(w io.Writer, c cipher.AEAD) *StreamWriter {
 	return &StreamWriter{
 		writer: w,

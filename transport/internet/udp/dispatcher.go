@@ -220,9 +220,7 @@ func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, cal
 			}
 			conn.observation.Exchange.Finish()
 		}
-		if conn.done != nil {
-			close(conn.done)
-		}
+		close(conn.done)
 	}()
 
 	input := conn.link.Reader
@@ -263,7 +261,6 @@ type dispatcherConn struct {
 	observation stats.Exchange
 	mu          sync.Mutex
 	closed      bool
-	finish      sync.Once
 }
 
 type dispatcherPacket struct {
@@ -391,7 +388,7 @@ func (c *dispatcherConn) endRay() error {
 
 func (c *dispatcherConn) finishRoot() {
 	if c.observation != nil {
-		c.finish.Do(c.observation.Finish)
+		c.observation.Finish()
 	}
 }
 

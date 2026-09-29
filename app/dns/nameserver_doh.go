@@ -302,9 +302,6 @@ func (s *DoHNameServer) Close() error {
 		connections = append(connections, conn)
 	}
 	s.mu.Unlock()
-	if transport, ok := s.httpClient.Transport.(*http2.Transport); ok {
-		transport.CloseIdleConnections()
-	}
 	var errs []error
 	for _, conn := range connections {
 		if err := conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {

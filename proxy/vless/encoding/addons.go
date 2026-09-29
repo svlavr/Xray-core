@@ -145,14 +145,9 @@ func (w *inspectionLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) erro
 	return w.MultiLengthPacketWriter.writeMultiBuffer(mb, w.receipt)
 }
 
-func (w *inspectionLengthPacketWriter) WriterReceipt() stats.Exchange { return w.receipt }
-
 // WithWriterReceipt binds the decoded packet operation. The native encoder and
 // lower writer keep their batching and buffering behavior.
 func (w *MultiLengthPacketWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
-	if flow == nil {
-		return w
-	}
 	return &inspectionLengthPacketWriter{MultiLengthPacketWriter: w, receipt: flow}
 }
 

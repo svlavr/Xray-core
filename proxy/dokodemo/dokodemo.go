@@ -230,13 +230,12 @@ func NewPacketWriter(conn net.PacketConn, d *net.Destination, mark int, back *ne
 }
 
 type PacketWriter struct {
-	mu        sync.Mutex
-	closed    bool
-	closeOnce sync.Once
-	conn      net.PacketConn
-	conns     map[net.Destination]net.PacketConn
-	mark      int
-	back      *net.UDPAddr
+	mu     sync.Mutex
+	closed bool
+	conn   net.PacketConn
+	conns  map[net.Destination]net.PacketConn
+	mark   int
+	back   *net.UDPAddr
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -295,18 +294,18 @@ func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchan
 }
 
 func (w *PacketWriter) Close() error {
-	w.closeOnce.Do(func() {
-		w.mu.Lock()
-		w.closed = true
-		conns := w.conns
-		w.conns = nil
+	w.mu.Lock()
+	if w.closed {
 		w.mu.Unlock()
-		for _, conn := range conns {
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	})
+		return nil
+	}
+	w.closed = true
+	conns := w.conns
+	w.conns = nil
+	w.mu.Unlock()
+	for _, conn := range conns {
+		conn.Close()
+	}
 	return nil
 }
 
@@ -365,7 +364,6 @@ type inspectionPacketWriter struct {
 	receipt stats.Exchange
 }
 
-func (w *inspectionPacketWriter) WriterReceipt() stats.Exchange { return w.receipt }
 func (w *inspectionPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.PacketWriter.writeMultiBuffer(mb, w.receipt)
 }

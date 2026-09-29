@@ -53,7 +53,7 @@ func ContextWithTrafficOrigin(ctx context.Context, origin TrafficOrigin) context
 // was recorded by an admission owner.
 func TrafficOriginFromContext(ctx context.Context) TrafficOrigin {
 	origin, _ := ctx.Value(trafficOriginKey).(TrafficOrigin)
-	return normalizeTrafficOrigin(origin)
+	return origin
 }
 
 func normalizeTrafficOrigin(origin TrafficOrigin) TrafficOrigin {

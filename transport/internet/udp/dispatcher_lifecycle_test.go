@@ -105,6 +105,7 @@ func TestUDPDispatcherDeliversPacketsBeforeReadError(t *testing.T) {
 					mb: buf.MultiBuffer{first, second}, err: terminal,
 				}},
 				cancel: cancel,
+				done:   make(chan struct{}),
 			}
 			entry.timer = signal.CancelAfterInactivity(ctx, entry.terminate, time.Minute)
 			defer entry.Close()

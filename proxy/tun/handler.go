@@ -62,7 +62,6 @@ func (w *tunUDPStatsWriter) WithWriterReceipt(receipt stats.Exchange) buf.Writer
 	w.writer = buf.AttachWriterReceipt(w.writer, receipt)
 	return w
 }
-func (w *tunUDPStatsWriter) WriterReceipt() stats.Exchange { return buf.WriterReceipt(w.writer) }
 
 // ConnectionHandler interface with the only method that stack is going to push new connections to
 type ConnectionHandler interface {

@@ -264,9 +264,6 @@ func (w *inspectionUDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (w *UDPWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
-	if flow == nil {
-		return w
-	}
 	return &inspectionUDPWriter{UDPWriter: w, receipt: flow}
 }
 

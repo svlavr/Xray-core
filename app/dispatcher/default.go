@@ -411,14 +411,6 @@ type inspectionCarrierHandler interface {
 	IsInspectionCarrier(context.Context) bool
 }
 
-type inspectionSelectedLegFinisher interface {
-	FinishSelectedLeg()
-}
-
-type inspectionSynchronousClaimHandler interface {
-	InspectionClaimSettledOnReturn()
-}
-
 func sniffer(ctx context.Context, cReader sniffCursor, metadataOnly bool, network net.Network) (SniffResult, error) {
 	payload := buf.NewWithSize(32767)
 	defer payload.Release()
@@ -586,12 +578,4 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 
 	handler.Dispatch(ctx, link)
-	if observation != nil {
-		if _, synchronous := handler.(inspectionSynchronousClaimHandler); !synchronous {
-			return
-		}
-		if finisher, ok := observation.Exchange.(inspectionSelectedLegFinisher); ok {
-			finisher.FinishSelectedLeg()
-		}
-	}
 }

@@ -337,7 +337,7 @@ func (e *inspectionExchange) Ref() featurestats.FlowRef {
 func (e *inspectionExchange) ExcludeCarrier() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.isLeg || (e.registered && e.record.Ref != (featurestats.FlowRef{})) {
+	if e.isLeg || e.record.Ref.ID != 0 {
 		return false
 	}
 	e.excluded = true
@@ -386,7 +386,6 @@ func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 		e.registerLocked()
 	}
 	outbound.Runtime = e.store.runtime
-	e.route = outbound
 	bucket := e.store.bucketFor(outbound, e.record.Origin)
 	e.bucket = bucket
 	up, down := e.record.Uplink, e.record.Downlink
@@ -471,7 +470,7 @@ func (e *inspectionExchange) Rebind(runtime featurestats.RuntimeID, origin featu
 		return
 	}
 	if runtime != e.store.runtime ||
-		normalizeOrigin(origin) == featurestats.TrafficOriginUnknown || origin != e.record.Origin {
+		origin == featurestats.TrafficOriginUnknown || origin != e.record.Origin {
 		e.provenanceConflict = true
 	}
 }
@@ -502,11 +501,8 @@ func (e *inspectionExchange) FinishSelectedLeg() {
 	if e.pending != nil {
 		e.bindLocked(featurestats.OutboundRef{})
 	}
-	terminal := e.completeLocked()
+	e.completeLocked()
 	e.mu.Unlock()
-	if terminal != nil {
-		e.store.publish(e, *terminal)
-	}
 }
 
 func (e *inspectionExchange) requestStop() (func() error, error) {

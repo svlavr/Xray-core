@@ -51,6 +51,14 @@ func (r *InspectionReader) SetCounter(c stats.Counter) {
 	r.mu.Unlock()
 }
 
+// FinishSelectedLeg settles unclaimed ray credit when a native selected handler
+// returns. It does not finish a MUX child still owned by asynchronous execution.
+func (r *InspectionReader) FinishSelectedLeg() {
+	if flow, ok := r.flow.(interface{ FinishSelectedLeg() }); ok {
+		flow.FinishSelectedLeg()
+	}
+}
+
 func (r *InspectionReader) credit(mb MultiBuffer) {
 	if !r.InputAlreadyObserved && r.PacketDestination.IsValid() {
 		for _, b := range mb {

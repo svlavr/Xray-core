@@ -191,7 +191,6 @@ type inspectionUDPWriter struct {
 	receipt stats.Exchange
 }
 
-func (w *inspectionUDPWriter) WriterReceipt() stats.Exchange { return w.receipt }
 func (w *inspectionUDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.udpConn.writeMultiBuffer(mb, w.receipt)
 }

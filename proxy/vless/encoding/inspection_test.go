@@ -91,16 +91,8 @@ func TestInspectionVLESSPacketDropsAndAttachment(t *testing.T) {
 	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: output})
 	buffered.Write([]byte{0, 0})
 	native := NewMultiLengthPacketWriter(buffered)
-	if native.WithWriterReceipt(nil) != native {
-		t.Fatal("disabled writer identity changed")
-	}
-	attached := native.WithWriterReceipt(flow)
-	if attached == native || buf.WriterReceipt(attached) != flow || inspectionPacketFact(t, view) != 0 {
-		t.Fatal("decoded packet owner was not attached")
-	}
-	other, otherView := inspectionPacketFlow(t)
 	buffered.SetFlushNext()
-	writer := native.WithWriterReceipt(other)
+	writer := buf.AttachWriterReceipt(native, flow)
 	oversized := buf.New()
 	oversized.Extend(buf.Size)
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{oversized}); err != nil {
@@ -112,7 +104,7 @@ func TestInspectionVLESSPacketDropsAndAttachment(t *testing.T) {
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("ok"))}); err != nil {
 		t.Fatal(err)
 	}
-	if fact := inspectionPacketFact(t, otherView); fact != 2 {
+	if fact := inspectionPacketFact(t, view); fact != 2 {
 		t.Fatalf("drop/next packet: %+v", fact)
 	}
 	if output.Len() != 6 {

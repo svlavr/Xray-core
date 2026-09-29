@@ -156,9 +156,6 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 				}
 				return len(p), nil
 			})}
-			if writer.WithWriterReceipt(nil) != writer {
-				t.Fatal("disabled packet writer changed")
-			}
 			observed := buf.AttachWriterReceipt(writer, flow)
 			payload := buf.New()
 			payload.Write(bytes.Repeat([]byte("p"), 512))
