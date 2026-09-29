@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apernet/quic-go"
 	mdns "github.com/miekg/dns"
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
@@ -928,18 +929,18 @@ func (c *retryPacketConn) Close() error {
 func TestQUICResourceCloseRetainsFailedSocketForRetry(t *testing.T) {
 	closeFailure := go_errors.New("packet close failed")
 	packet := &retryPacketConn{closeErr: []error{closeFailure, nil}}
-	server := &QUICNameServer{cacheController: NewCacheController("quic", false, false, 0), packetConn: packet}
+	server := &QUICNameServer{cacheController: NewCacheController("quic", false, false, 0), transport: &quic.Transport{Conn: packet}}
 	if err := server.Close(); !go_errors.Is(err, closeFailure) {
 		t.Fatalf("first socket close failure lost: %v", err)
 	}
-	if server.packetConn == nil {
+	if server.transport == nil || server.transport.Conn != packet {
 		t.Fatal("failed socket was removed from retry inventory")
 	}
 	if err := server.Close(); err != nil {
 		t.Fatalf("socket retry: %v", err)
 	}
-	if server.packetConn != nil || packet.closed != 2 {
-		t.Fatalf("socket retry inventory not cleared exactly once: retained=%v closes=%d", server.packetConn != nil, packet.closed)
+	if server.transport != nil || packet.closed != 2 {
+		t.Fatalf("socket retry inventory not cleared exactly once: retained=%v closes=%d", server.transport != nil, packet.closed)
 	}
 }
 
@@ -951,7 +952,7 @@ func TestQUICCanceledResolutionAllocatesNoSocket(t *testing.T) {
 	if _, err := server.openConnection(ctx); err == nil {
 		t.Fatal("canceled resolution succeeded")
 	}
-	if server.packetConn != nil || server.transport != nil {
+	if server.transport != nil {
 		t.Fatal("canceled resolution allocated a QUIC socket")
 	}
 }

@@ -36,7 +36,6 @@ type QUICNameServer struct {
 	connection      *quic.Conn
 	clientIP        net.IP
 	transport       *quic.Transport
-	packetConn      stdnet.PacketConn
 	workers         sync.WaitGroup
 }
 
@@ -314,7 +313,6 @@ func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error)
 		if err != nil {
 			return nil, err
 		}
-		s.packetConn = packetConn
 		s.transport = &quic.Transport{Conn: packetConn}
 	}
 	conn, err := s.transport.Dial(ctx, remote, tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
@@ -356,9 +354,9 @@ func (s *QUICNameServer) openStream(ctx context.Context) (*quic.Stream, error) {
 func (s *QUICNameServer) Close() error {
 	s.cacheController.cancel()
 	s.Lock()
-	conn, transport, packetConn := s.connection, s.transport, s.packetConn
+	conn, transport := s.connection, s.transport
 	s.Unlock()
-	var errs []error
+	var closeErr error
 	if conn != nil {
 		_ = conn.CloseWithError(0, "DNS resolver closed")
 		s.Lock()
@@ -369,24 +367,17 @@ func (s *QUICNameServer) Close() error {
 	}
 	if transport != nil {
 		_ = transport.Close()
-		s.Lock()
-		if s.transport == transport {
-			s.transport = nil
-		}
-		s.Unlock()
-	}
-	if packetConn != nil {
-		if err := packetConn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
-			errs = append(errs, err)
+		if err := transport.Conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
+			closeErr = err
 		} else {
 			s.Lock()
-			if s.packetConn == packetConn {
-				s.packetConn = nil
+			if s.transport == transport {
+				s.transport = nil
 			}
 			s.Unlock()
 		}
 	}
 	s.cacheController.Close()
 	s.workers.Wait()
-	return go_errors.Join(errs...)
+	return closeErr
 }
