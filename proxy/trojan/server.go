@@ -584,9 +584,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 		return nil
 	}
 
-	requestDone := task.OnSuccess(postRequest, task.Close(serverWriter))
-	responseDone := task.OnSuccess(getResponse, task.Close(writer))
-	if err := task.Run(ctx, requestDone, responseDone); err != nil {
+	if err := task.Run(ctx, task.OnSuccess(postRequest, task.Close(serverWriter)), task.OnSuccess(getResponse, task.Close(writer))); err != nil {
 		common.Must(common.Interrupt(serverReader))
 		common.Must(common.Interrupt(serverWriter))
 		return errors.New("fallback ends").Base(err)

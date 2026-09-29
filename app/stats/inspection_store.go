@@ -60,10 +60,6 @@ func newInspectionStore(runtime featurestats.RuntimeID, limits featurestats.Obse
 	return store
 }
 
-func (s *inspectionStore) isClosed() bool {
-	return s.closed.Load()
-}
-
 func (s *inspectionStore) elapsed() time.Duration {
 	return time.Since(s.epoch)
 }
@@ -159,23 +155,16 @@ func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
 		return featurestats.TotalsSnapshot{}, errors.New("inspection closed")
 	}
 	s.mu.RLock()
-	cells := make([]*aggregateCell, 0, len(s.buckets)+len(s.unassigned))
+	defer s.mu.RUnlock()
+	rows := make([]featurestats.TotalRecord, 0, len(s.buckets)+len(s.unassigned))
+	appendCell := func(cell *aggregateCell) {
+		rows = append(rows, featurestats.TotalRecord{Outbound: cell.outbound, Origin: cell.origin, Uplink: cell.uplink.Load(), Downlink: cell.downlink.Load()})
+	}
 	for _, cell := range s.unassigned {
-		cells = append(cells, cell)
+		appendCell(cell)
 	}
 	for _, cell := range s.buckets {
-		cells = append(cells, cell)
-	}
-	s.mu.RUnlock()
-
-	rows := make([]featurestats.TotalRecord, 0, len(cells))
-	for _, cell := range cells {
-		rows = append(rows, featurestats.TotalRecord{
-			Outbound: cell.outbound,
-			Origin:   cell.origin,
-			Uplink:   cell.uplink.Load(),
-			Downlink: cell.downlink.Load(),
-		})
+		appendCell(cell)
 	}
 	return featurestats.TotalsSnapshot{
 		At:   s.elapsed(),
@@ -236,10 +225,7 @@ func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.Fl
 func (s *inspectionStore) lookup(id uint64) *inspectionExchange {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if exchange := s.live[id]; exchange != nil {
-		return exchange
-	}
-	return nil
+	return s.live[id]
 }
 
 func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) *aggregateCell {
@@ -314,16 +300,15 @@ type inspectionFlow struct {
 
 type inspectionExchange struct {
 	*inspectionFlow
-	isLeg            bool
-	hasLegs          bool
-	route            featurestats.OutboundRef
-	routeSeq         uint64
-	pending          *pendingCredit
-	bucket           *aggregateCell
-	published        bool
-	excluded         bool
-	finishRequested  bool
-	selectedReturned bool
+	isLeg           bool
+	hasLegs         bool
+	route           featurestats.OutboundRef
+	routeSeq        uint64
+	pending         *pendingCredit
+	bucket          *aggregateCell
+	published       bool
+	excluded        bool
+	finishRequested bool
 }
 
 // Only a ray with unbound receipts needs numeric pending credit. The ordinary
@@ -449,7 +434,7 @@ func (e *inspectionExchange) AddUplink(value uint64) {
 	if e.excluded || e.provenanceConflict {
 		return
 	}
-	if e.isLeg && e.pending != nil && e.routeSeq == 0 {
+	if e.pending != nil && e.routeSeq == 0 {
 		e.pending.up += value
 		return
 	}
@@ -467,7 +452,7 @@ func (e *inspectionExchange) AddDownlink(value uint64) {
 	if e.excluded || e.provenanceConflict {
 		return
 	}
-	if e.isLeg && e.pending != nil && e.routeSeq == 0 {
+	if e.pending != nil && e.routeSeq == 0 {
 		e.pending.down += value
 		return
 	}
@@ -514,7 +499,9 @@ func (e *inspectionExchange) FinishSelectedLeg() {
 		e.mu.Unlock()
 		return
 	}
-	e.selectedReturned = true
+	if e.pending != nil {
+		e.bindLocked(featurestats.OutboundRef{})
+	}
 	terminal := e.completeLocked()
 	e.mu.Unlock()
 	if terminal != nil {
@@ -544,15 +531,8 @@ func (e *inspectionExchange) completeLocked() *featurestats.TerminalRecord {
 		e.stop = nil
 		return nil
 	}
-	if e.isLeg && e.pending != nil {
-		// DefaultDispatcher selects asynchronously after returning the link. A
-		// native UDP reader may end before Route or BindRoute, so do not guess
-		// that the still-pending selected role is unassigned. Only a marked
-		// synchronous handler return may settle a selected no-claim leg.
-		if !e.selectedReturned {
-			return nil
-		}
-		e.bindLocked(featurestats.OutboundRef{})
+	if e.pending != nil {
+		return nil // Only the selected handler can settle an unclaimed leg.
 	}
 	if e.bucket == nil && !e.hasLegs {
 		e.bindLocked(featurestats.OutboundRef{})

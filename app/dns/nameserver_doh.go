@@ -74,7 +74,7 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
 				}
 				var conn net.Conn
 				if dispatcher != nil {
-					dnsCtx := toDnsContext(ctx, s.dohURL)
+					dnsCtx := toDnsContext(ctx, ctx, s.dohURL)
 					if h2c {
 						dnsCtx = session.ContextWithMitmAlpn11(dnsCtx, false) // for insurance
 						dnsCtx = session.ContextWithMitmServerName(dnsCtx, url.Hostname())
@@ -233,11 +233,6 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			// may cause reqs all aborted if any one encounter an error
 			dnsCtx := workCtx
 
-			// reserve internal dns server requested Inbound
-			if inbound := session.InboundFromContext(ctx); inbound != nil {
-				dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
-			}
-
 			dnsCtx = session.ContextWithContent(dnsCtx, &session.Content{
 				Protocol:       "https",
 				SkipDNSResolve: true,
@@ -316,7 +311,7 @@ func (s *DoHNameServer) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	errs = append(errs, s.cacheController.Close())
+	s.cacheController.Close()
 	s.workers.Wait()
 	return go_errors.Join(errs...)
 }

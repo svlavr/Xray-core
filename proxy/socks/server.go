@@ -125,10 +125,9 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 	request, tempUDPConn, err := svrSession.Handshake(reader, conn)
 	defer common.CloseIfExists(tempUDPConn)
 	if err != nil {
-		var rejected *decodedSocks4Rejection
-		if goerrors.As(err, &rejected) {
+		if request != nil {
 			if store := proxy.ObservationStore(s.statsManager); store != nil {
-				destination := rejected.destination
+				destination := request.Destination()
 				flow := store.PrepareTCP(session.TrafficOriginFromContext(ctx), inbound.Source, destination, nil)
 				if flow != nil {
 					flow.Unassign()
@@ -260,9 +259,7 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 		writeUDPResponse(ctx, conn, packet)
 	})
 	udpServer.Observation = flow
-	defer func() {
-		udpServer.RemoveRay()
-	}()
+	defer udpServer.RemoveRay()
 
 	inbound := session.InboundFromContext(ctx)
 

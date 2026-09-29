@@ -191,28 +191,14 @@ type UDPWriter struct {
 }
 
 func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
-	_, err := w.sendMessage(msg)
-	return err
-}
-
-func (w *UDPWriter) sendMessage(msg *UDPMessage) (int, error) {
 	size := msg.Size()
 	message := w.buf[:]
 	if size > len(message) {
 		message = make([]byte, size)
 	}
-	msgN := msg.Serialize(message)
-	if msgN != size {
-		return 0, errors.New("failed to serialize UDP message")
-	}
-	n, err := w.writer.Write(message[:msgN])
-	if err != nil {
-		return n, err
-	}
-	if n != msgN {
-		return n, io.ErrShortWrite
-	}
-	return n, nil
+	msg.Serialize(message)
+	_, err := w.writer.Write(message[:size])
+	return err
 }
 
 func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -231,9 +217,8 @@ func (w *UDPWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange)
 }
 
 func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err error) {
-	complete := false
 	if receipt != nil {
-		defer func() { proxy.RecordPacketOutcome(receipt, uint64(b.Len()), complete) }()
+		defer func() { proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil) }()
 	}
 	addr := w.addr
 	if b.UDP != nil {
@@ -249,8 +234,7 @@ func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err erro
 		Data:      b.Bytes(),
 	}
 
-	n, err := w.sendMessage(msg)
-	complete = n == msg.Size()
+	err = w.SendMessage(msg)
 	var errTooLarge *quic.DatagramTooLargeError
 	if go_errors.As(err, &errTooLarge) {
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
@@ -258,18 +242,12 @@ func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err erro
 		if len(fMsgs) == 0 {
 			return errors.New("failed to fragment UDP message")
 		}
-		all := true
-		for i, fMsg := range fMsgs {
-			n, sendErr := w.sendMessage(&fMsg)
-			all = all && n == fMsg.Size()
-			if i == len(fMsgs)-1 {
-				complete = complete || all
-			}
-			err := sendErr
-			if err != nil {
+		for _, fMsg := range fMsgs {
+			if err := w.SendMessage(&fMsg); err != nil {
 				return err
 			}
 		}
+
 	} else if err != nil {
 		return err
 	}

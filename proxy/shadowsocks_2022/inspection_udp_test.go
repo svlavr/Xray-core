@@ -1,8 +1,12 @@
 package shadowsocks_2022
 
 import (
+	"context"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/xtls/xray-core/common/signal"
 
 	"github.com/xtls/xray-core/common/utils"
 )
@@ -36,5 +40,36 @@ func TestInspectionSS2022RetiredSessionKeepsReplacement(t *testing.T) {
 	}
 	if _, ok := sessions.Load(id); ok {
 		t.Fatal("replacement remains in active map")
+	}
+}
+
+func TestInspectionSS2022TimerCloseReentry(t *testing.T) {
+	for _, when := range []string{"before-timer", "timer-callback", "after-timer"} {
+		t.Run(when, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			entry := &udpConnEntry{cancel: cancel}
+			done := make(chan struct{})
+			go func() {
+				if when == "before-timer" {
+					entry.Close()
+				}
+				timeout := time.Hour
+				if when == "timer-callback" {
+					timeout = 0
+				}
+				entry.setTimer(signal.CancelAfterInactivity(ctx, func() { entry.Close() }, timeout))
+				entry.Close()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("recursive timer close blocked")
+			}
+			if ctx.Err() == nil || !entry.isClosed() {
+				t.Fatal("association not closed")
+			}
+		})
 	}
 }

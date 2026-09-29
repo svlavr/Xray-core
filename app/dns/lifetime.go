@@ -25,7 +25,6 @@ type dnsRuntime struct {
 	closeMu     sync.Mutex
 	current     *resolverOwner
 	closing     *resolverOwner
-	applyMu     sync.Mutex
 	closed      bool
 }
 
@@ -35,29 +34,6 @@ type resolverOwner struct {
 	cancel   context.CancelFunc
 	closeMu  sync.Mutex
 	queries  sync.WaitGroup
-}
-
-// resourceCloseState is local to a concrete native connection owner. Failed
-// closes retain that connection so the owner can reach it on the next Close.
-type resourceCloseState struct {
-	mu     sync.Mutex
-	closed bool
-}
-
-func (s *resourceCloseState) close(run func() error, onSuccess func()) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil
-	}
-	err := run()
-	if err == nil {
-		s.closed = true
-		if onSuccess != nil {
-			onSuccess()
-		}
-	}
-	return err
 }
 
 // ownedPeriodic preserves the cache and UDP cleanup worker join already needed
@@ -85,40 +61,32 @@ func (p *ownedPeriodic) Start() error {
 	p.running = true
 	p.wg.Add(1)
 	p.mu.Unlock()
+	return p.run()
+}
+
+func (p *ownedPeriodic) run() error {
 	defer p.wg.Done()
 	err := p.execute()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err != nil || p.closed || !p.running {
+	if err != nil || p.closed {
 		p.running = false
 		return err
 	}
-	p.scheduleLocked()
-	return nil
-}
-
-func (p *ownedPeriodic) scheduleLocked() {
 	p.timer = time.AfterFunc(p.interval, func() {
 		p.mu.Lock()
-		if p.closed || !p.running {
+		if p.closed {
 			p.mu.Unlock()
 			return
 		}
 		p.wg.Add(1)
 		p.mu.Unlock()
-		defer p.wg.Done()
-		err := p.execute()
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if err != nil || p.closed || !p.running {
-			p.running = false
-			return
-		}
-		p.scheduleLocked()
+		p.run()
 	})
+	return nil
 }
 
-func (p *ownedPeriodic) Close() error {
+func (p *ownedPeriodic) Close() {
 	p.mu.Lock()
 	p.closed, p.running = true, false
 	if p.timer != nil {
@@ -127,7 +95,6 @@ func (p *ownedPeriodic) Close() error {
 	}
 	p.mu.Unlock()
 	p.wg.Wait()
-	return nil
 }
 
 func newResolverOwner(resolver *DNS) *resolverOwner {
@@ -164,22 +131,6 @@ func (s *DNS) initRuntime(resolver *DNS) {
 
 func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	rt := s.runtime
-	rt.mu.Lock()
-	if rt.closed {
-		rt.mu.Unlock()
-		return ApplyResult{Err: context.Canceled}
-	}
-	if !rt.applyMu.TryLock() {
-		rt.mu.Unlock()
-		return ApplyResult{Err: fmt.Errorf("DNS update already in progress")}
-	}
-	defer rt.applyMu.Unlock()
-	if rt.closing != nil {
-		rt.mu.Unlock()
-		return ApplyResult{Err: fmt.Errorf("previous DNS resolver cleanup incomplete")}
-	}
-	rt.mu.Unlock()
-
 	clone := proto.Clone(config).(*Config)
 	if len(clone.NameServer) == 0 {
 		return ApplyResult{Err: fmt.Errorf("explicit DNS update requires a nameserver")}
@@ -218,6 +169,10 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 		rt.mu.Unlock()
 		return ApplyResult{Err: context.Canceled}
 	}
+	if rt.closing != nil {
+		rt.mu.Unlock()
+		return ApplyResult{Err: fmt.Errorf("previous DNS resolver cleanup incomplete")}
+	}
 	old := rt.current
 	rt.current = newResolverOwner(candidate)
 	rt.closing = old
@@ -250,16 +205,14 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 // trackedConn removes a successfully closed connection from its native owner.
 type trackedConn struct {
 	net.Conn
-	state resourceCloseState
-	done  func()
+	done func()
 }
 
 func (c *trackedConn) Close() error {
-	return c.state.close(func() error {
-		err := c.Conn.Close()
-		if errors.Is(err, net.ErrClosed) {
-			return nil
-		}
+	err := c.Conn.Close()
+	if err != nil && !errors.Is(err, net.ErrClosed) {
 		return err
-	}, c.done)
+	}
+	c.done()
+	return nil
 }

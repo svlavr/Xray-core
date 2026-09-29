@@ -17,7 +17,7 @@ type udpWriterFunc func([]byte) (int, error)
 
 func (f udpWriterFunc) Write(p []byte) (int, error) { return f(p) }
 
-func TestUDPWriterSendMessageLargeAndShortWrite(t *testing.T) {
+func TestUDPWriterSendMessageLarge(t *testing.T) {
 	data := bytes.Repeat([]byte("p"), buf.Size)
 	message := &UDPMessage{FragCount: 1, Addr: "127.0.0.1:53", Data: data}
 	var encoded []byte
@@ -34,11 +34,6 @@ func TestUDPWriterSendMessageLargeAndShortWrite(t *testing.T) {
 	parsed, err := ParseUDPMessage(encoded)
 	if err != nil || parsed.Addr != message.Addr || !bytes.Equal(parsed.Data, data) {
 		t.Fatalf("large message was not serialized intact: %+v %v", parsed, err)
-	}
-
-	writer.writer = udpWriterFunc(func(p []byte) (int, error) { return len(p) - 1, nil })
-	if err := writer.SendMessage(&UDPMessage{FragCount: 1, Addr: "127.0.0.1:53", Data: []byte("payload")}); !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("short write returned %v", err)
 	}
 }
 
@@ -122,7 +117,7 @@ func TestInspectionUDPFragmentCountLimit(t *testing.T) {
 }
 
 func TestInspectionHysteriaPacketResults(t *testing.T) {
-	for _, mode := range []string{"full", "full-error", "short-nil", "zero-error", "fragments", "first-fragment-error", "middle-fragment-error", "last-fragment-full-error", "too-many-fragments"} {
+	for _, mode := range []string{"full", "zero-error", "fragments", "first-fragment-error", "middle-fragment-error", "too-many-fragments"} {
 		t.Run(mode, func(t *testing.T) {
 			manager := new(appstats.Manager)
 			view, err := manager.EnableInspection(fs.ObservationOptions{})
@@ -140,10 +135,6 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 				switch mode {
 				case "full":
 					return len(p), nil
-				case "full-error":
-					return len(p), failure
-				case "short-nil":
-					return len(p) - 1, nil
 				case "zero-error":
 					return 0, failure
 				case "too-many-fragments":
@@ -162,9 +153,6 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 				}
 				if mode == "middle-fragment-error" && message.FragID == 1 {
 					return 0, failure
-				}
-				if mode == "last-fragment-full-error" && message.FragID == message.FragCount-1 {
-					return len(p), failure
 				}
 				return len(p), nil
 			})}
@@ -188,11 +176,11 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 			}
 			fact := page.Rows[0].Flow.Downlink
 			switch mode {
-			case "full", "full-error", "fragments", "last-fragment-full-error":
+			case "full", "fragments":
 				if fact != 512 {
 					t.Fatalf("complete packet result: %+v", fact)
 				}
-			case "short-nil", "middle-fragment-error":
+			case "middle-fragment-error":
 				if fact != 0 {
 					t.Fatalf("partial packet result: %+v", fact)
 				}

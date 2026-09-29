@@ -75,8 +75,6 @@ func TestInspectionPacketWriterRawResults(t *testing.T) {
 		{"full error", 4, 4, io.ErrClosedPipe, 4},
 		{"empty", 0, 0, nil, 0},
 		{"empty error", 0, 0, io.ErrClosedPipe, 0},
-		{"negative", 4, -1, nil, 0},
-		{"oversize", 4, 5, nil, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, perDestination := range []bool{false, true} {

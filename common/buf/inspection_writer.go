@@ -81,20 +81,12 @@ func recordBufferOperation(receipt stats.Exchange, size uint64, err error) {
 }
 
 func writeBytesInspection(writer io.Writer, payload []byte, receipt stats.Exchange) (int, error) {
-	n, err := writeScalarInspection(writer, payload, receipt)
-	if err == nil && n != len(payload) {
-		err = io.ErrShortWrite
-	}
-	if err != nil {
-		discardFailedPrefix(receipt)
-	}
-	return n, err
-}
-
-func writeScalarInspection(writer io.Writer, payload []byte, receipt stats.Exchange) (int, error) {
 	n, err := writer.Write(payload)
 	if n > 0 {
 		receipt.AddDownlink(uint64(n))
+	}
+	if err != nil {
+		discardFailedPrefix(receipt)
 	}
 	return n, err
 }

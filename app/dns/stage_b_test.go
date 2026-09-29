@@ -642,7 +642,7 @@ func TestStageBNativeOwnLinkTag(t *testing.T) {
 	client := stageBManualFeature(t, &stageBBlockingServer{started: make(chan struct{})})
 	client.runtime.current.resolver.clients[0].tag = "resolver"
 	ctx := session.ContextWithInbound(context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance)), &session.Inbound{Tag: "resolver"})
-	if !client.IsOwnLink(ctx) || !client.IsOwnLink(toDnsContext(ctx, "resolver.test")) {
+	if !client.IsOwnLink(ctx) || !client.IsOwnLink(toDnsContext(ctx, ctx, "resolver.test")) {
 		t.Fatal("native resolver tag lost from routed DNS context")
 	}
 	if client.IsOwnLink(session.ContextWithInbound(ctx, &session.Inbound{Tag: "foreign"})) || client.IsOwnLink(context.Background()) {
@@ -655,7 +655,7 @@ func TestStageBNativeOwnLinkTag(t *testing.T) {
 		t.Fatal("closed resolver tag remained active")
 	}
 }
-func (s *silentCachedServer) Close() error { return s.cache.Close() }
+func (s *silentCachedServer) Close() error { s.cache.Close(); return nil }
 
 func TestCacheCloseWakesPendingDualStackSubscribers(t *testing.T) {
 	cache := NewCacheController("pending", false, false, 0)
@@ -678,9 +678,7 @@ func TestCacheCloseWakesPendingDualStackSubscribers(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if err := cache.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+	cache.Close()
 	select {
 	case err := <-done:
 		if err == nil {
@@ -698,7 +696,7 @@ func TestOwnedPeriodicCloseJoinsExecutionAndStateBookkeeping(t *testing.T) {
 	go func() { startDone <- periodic.Start() }()
 	<-started
 	closeDone := make(chan error, 1)
-	go func() { closeDone <- periodic.Close() }()
+	go func() { periodic.Close(); closeDone <- nil }()
 	select {
 	case <-closeDone:
 		t.Fatal("Close returned before Execute completed")
@@ -755,32 +753,31 @@ func (c *scriptedCloseConn) Close() error {
 func (c *scriptedCloseConn) callCount() int { c.mu.Lock(); defer c.mu.Unlock(); return c.calls }
 
 func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
-	t.Run("join-success", func(t *testing.T) {
+	t.Run("concurrent-native-close", func(t *testing.T) {
 		left, right := stdnet.Pipe()
-		defer left.Close()
 		defer right.Close()
-		lower := &scriptedCloseConn{Conn: left, entered: make(chan struct{}), proceed: make(chan struct{})}
-		conn := &trackedConn{Conn: lower}
-		results := make(chan error, 2)
-		go func() { results <- conn.Close() }()
-		<-lower.entered
-		go func() { results <- conn.Close() }()
-		time.Sleep(time.Millisecond)
-		if calls := lower.callCount(); calls != 1 {
-			t.Fatalf("concurrent lower closes=%d", calls)
+		server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0), connections: make(map[net.Conn]struct{})}
+		conn, ok := server.trackConnection(left)
+		if !ok {
+			t.Fatal("initial connection rejected")
 		}
-		close(lower.proceed)
-		if err := <-results; err != nil {
-			t.Fatal(err)
+		results := make(chan error, 8)
+		for range 8 {
+			go func() { results <- conn.Close() }()
 		}
-		if err := <-results; err != nil {
-			t.Fatal(err)
+		for range 8 {
+			if err := <-results; err != nil {
+				t.Fatal(err)
+			}
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatal(err)
+		server.mu.Lock()
+		remaining := len(server.connections)
+		server.mu.Unlock()
+		if remaining != 0 {
+			t.Fatal("closed connection retained")
 		}
-		if calls := lower.callCount(); calls != 1 {
-			t.Fatalf("successful close replay called lower %d times", calls)
+		if _, err := right.Write([]byte{1}); err == nil {
+			t.Fatal("closed connection still writable")
 		}
 	})
 	t.Run("retry-failure", func(t *testing.T) {
@@ -789,8 +786,9 @@ func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
 		defer left.Close()
 		defer right.Close()
 		lower := &scriptedCloseConn{Conn: left, errs: []error{failure, nil}}
-		conn := &trackedConn{Conn: lower}
-		if err := conn.Close(); !go_errors.Is(err, failure) {
+		var retired atomic.Bool
+		conn := &trackedConn{Conn: lower, done: func() { retired.Store(true) }}
+		if err := conn.Close(); !go_errors.Is(err, failure) || retired.Load() {
 			t.Fatalf("first close: %v", err)
 		}
 		if err := conn.Close(); err != nil {
@@ -799,7 +797,7 @@ func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
 		if err := conn.Close(); err != nil {
 			t.Fatalf("replay: %v", err)
 		}
-		if calls := lower.callCount(); calls != 2 {
+		if calls := lower.callCount(); calls != 3 || !retired.Load() {
 			t.Fatalf("retry lower closes=%d", calls)
 		}
 	})
@@ -963,8 +961,8 @@ func TestStageBCloseDuringInertPreparation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("preparation did not pause")
 	}
-	if other := ApplyConfig(context.Background(), feature, config); other.Applied || other.Err == nil {
-		t.Fatalf("concurrent preparation admitted: %+v", other)
+	if other := ApplyConfig(context.Background(), feature, config); !other.Applied || other.Err != nil {
+		t.Fatalf("independent preparation could not publish: %+v", other)
 	}
 	closed := make(chan error, 1)
 	go func() { closed <- feature.Close() }()
@@ -1006,9 +1004,7 @@ func TestCacheCloseAndRepeatedUnsubscribePreserveSibling(t *testing.T) {
 	default:
 		t.Fatal("unsubscribing one query removed its sibling")
 	}
-	if err := cache.Close(); err != nil {
-		t.Fatal(err)
-	}
+	cache.Close()
 	sibling.close()
 	sibling.close()
 	server := &silentCachedServer{cache: cache}

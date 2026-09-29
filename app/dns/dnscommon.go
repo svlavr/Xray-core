@@ -257,9 +257,9 @@ L:
 }
 
 // toDnsContext create a new background context with parent inbound, session and dns log
-func toDnsContext(ctx context.Context, addr string) context.Context {
+func toDnsContext(ctx, caller context.Context, addr string) context.Context {
 	dnsCtx := core.ToBackgroundDetachedContext(ctx)
-	dnsCtx = &dnsRequestContext{Context: dnsCtx, caller: ctx}
+	dnsCtx = &dnsRequestContext{Context: dnsCtx, caller: caller}
 	dnsCtx = session.ContextWithTrafficOrigin(dnsCtx, session.TrafficOriginInternal)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		dnsCtx = session.ContextWithInbound(dnsCtx, inbound)

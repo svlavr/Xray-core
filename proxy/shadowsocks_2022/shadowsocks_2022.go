@@ -38,7 +38,7 @@ func (e *udpConnEntry) setTimer(timer *signal.ActivityTimer) {
 	closed := e.closed
 	e.Unlock()
 	if closed {
-		go timer.SetTimeout(0)
+		timer.SetTimeout(0)
 	}
 }
 
@@ -109,9 +109,7 @@ func (e *udpConnEntry) Close() error {
 		finish()
 	}
 	if timer != nil {
-		// ActivityTimer invokes its callback under its own lock. Stop it only
-		// after returning from that callback, including timer-driven Close.
-		go timer.SetTimeout(0)
+		timer.SetTimeout(0)
 	}
 	return nil
 }

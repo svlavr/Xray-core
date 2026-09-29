@@ -2,7 +2,6 @@ package outbound
 
 import (
 	"context"
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -127,10 +126,8 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 		m.untaggedHandlers = append(m.untaggedHandlers, entry)
 	}
 
-	if m.nextSerial < math.MaxUint64 {
-		m.nextSerial++
-		entry.serial = m.nextSerial
-	}
+	m.nextSerial++
+	entry.serial = m.nextSerial
 
 	if m.running {
 		return handler.Start()
@@ -200,7 +197,7 @@ func (m *Manager) Select(selectors []string) []string {
 	return tags
 }
 
-// ResolveHandler returns the selected entry and its non-reused insertion serial
+// ResolveHandler returns the selected entry and its insertion serial
 // under the same native manager lock. The empty tag selects the default entry.
 func (m *Manager) ResolveHandler(tag string, useDefault bool) (outbound.Handler, uint64) {
 	m.access.RLock()

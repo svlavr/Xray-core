@@ -12,9 +12,6 @@ type rawCopyReceipt struct {
 }
 
 func (r *rawCopyReceipt) add(n int64) {
-	if r == nil || n <= 0 {
-		return
-	}
 	if r.exchange != nil {
 		r.exchange.AddDownlink(uint64(n))
 	}

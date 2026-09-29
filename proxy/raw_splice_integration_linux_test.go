@@ -189,12 +189,12 @@ func TestRawSplicePipeSetupFallback(t *testing.T) {
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &unix.Rlimit{Cur: 0, Max: old.Max}); err != nil {
 		t.Fatal(err)
 	}
-	n, handled, err := copySpliceProgress(destinationWriter, sourceReader, &rawCopyReceipt{})
+	handled, err := copySpliceProgress(destinationWriter, sourceReader, &rawCopyReceipt{})
 	if restoreErr := unix.Setrlimit(unix.RLIMIT_NOFILE, &old); restoreErr != nil {
 		t.Fatal(restoreErr)
 	}
-	if n != 0 || handled || !errors.Is(err, unix.EMFILE) {
-		t.Fatalf("setup fallback n=%d handled=%v err=%v", n, handled, err)
+	if handled || !errors.Is(err, unix.EMFILE) {
+		t.Fatalf("setup fallback handled=%v err=%v", handled, err)
 	}
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(sourceReader, got); err != nil {
@@ -253,12 +253,13 @@ func BenchmarkRawCopyProgress(b *testing.B) {
 						flow.Route(stats.OutboundRef{Serial: 1})
 						flow.BindRoute()
 					}
+					before := readCounter.Value()
 					b.StartTimer()
 					var n int64
 					var err error
 					if observed {
 						var handled bool
-						n, handled, err = copySpliceProgress(dw, sr, &rawCopyReceipt{exchange: flow, readCounter: readCounter, writeCounter: writeCounter, userCounter: userCounter})
+						handled, err = copySpliceProgress(dw, sr, &rawCopyReceipt{exchange: flow, readCounter: readCounter, writeCounter: writeCounter, userCounter: userCounter})
 						if !handled {
 							b.Fatal("benchmark missed native splice")
 						}
@@ -269,6 +270,9 @@ func BenchmarkRawCopyProgress(b *testing.B) {
 						userCounter.Add(n)
 					}
 					b.StopTimer()
+					if observed {
+						n = readCounter.Value() - before
+					}
 					if err != nil || n != int64(size) {
 						b.Fatalf("copy n=%d err=%v", n, err)
 					}

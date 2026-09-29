@@ -33,10 +33,9 @@ type InspectionReader struct {
 	unblock           func()
 }
 type inspectionRead struct {
-	done  chan struct{}
-	mb    MultiBuffer
-	err   error
-	ready bool
+	done chan struct{}
+	mb   MultiBuffer
+	err  error
 }
 
 func NewInspectionReader(r *BufferedReader, flow stats.Exchange, unblock func()) *InspectionReader {
@@ -112,7 +111,7 @@ func (r *InspectionReader) next(timeout time.Duration, timed bool) (MultiBuffer,
 				ReleaseMulti(mb)
 				r.pending = nil
 			} else {
-				p.mb, p.err, p.ready = mb, err, true
+				p.mb, p.err = mb, err
 			}
 			close(p.done)
 			r.mu.Unlock()
@@ -205,7 +204,7 @@ func (r *InspectionReader) Interrupt() {
 	r.initial = ReleaseMulti(r.initial)
 	r.replay = ReleaseMulti(r.replay)
 	r.replayErr = nil
-	if p := r.pending; p != nil && p.ready {
+	if p := r.pending; p != nil {
 		p.mb = ReleaseMulti(p.mb)
 		r.pending = nil
 	}

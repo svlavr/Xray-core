@@ -45,7 +45,7 @@ func (m *Manager) Observation() featurestats.AdmissionStore {
 	m.access.RLock()
 	store := m.inspection
 	m.access.RUnlock()
-	if store == nil || store.isClosed() {
+	if store == nil || store.closed.Load() {
 		return nil
 	}
 	return store

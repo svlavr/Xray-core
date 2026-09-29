@@ -164,7 +164,7 @@ func (s *ClassicNameServer) getCacheController() *CacheController { return s.cac
 func (s *ClassicNameServer) dispatchContext(ctx context.Context) context.Context {
 	// The shared ray carries the initial routing metadata but belongs to this
 	// nameserver. Canceling one request must not terminate sibling requests.
-	return toDnsContext(&dnsRequestContext{Context: context.WithoutCancel(ctx), caller: s.cacheController.ctx}, s.address.String())
+	return toDnsContext(ctx, s.cacheController.ctx, s.address.String())
 }
 
 func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
@@ -213,10 +213,12 @@ func (s *ClassicNameServer) Close() error {
 		}
 	}
 	s.Unlock()
-	_ = s.requestsCleanup.Close()
+	s.requestsCleanup.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return go_errors.Join(s.udpServer.CloseAndWait(ctx), s.cacheController.Close())
+	err := s.udpServer.CloseAndWait(ctx)
+	s.cacheController.Close()
+	return err
 }
 
 func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {

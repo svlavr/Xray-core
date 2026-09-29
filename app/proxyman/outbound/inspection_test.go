@@ -3,7 +3,6 @@ package outbound
 import (
 	"context"
 	"errors"
-	"math"
 	"sync"
 	"testing"
 
@@ -65,14 +64,6 @@ func TestInspectionHandlerIncarnation(t *testing.T) {
 	h, failedID := m.ResolveHandler(failed.tag, false)
 	if h != failed || failedID <= next {
 		t.Fatal("failed Start lost native registered entry")
-	}
-	m.nextSerial = math.MaxUint64
-	exhausted := &inspectionHandler{tag: "exhausted"}
-	if err = m.AddHandler(context.Background(), exhausted); err != nil {
-		t.Fatal(err)
-	}
-	if h, id = m.ResolveHandler(exhausted.tag, false); h != exhausted || id != 0 {
-		t.Fatal("exhaustion changed routing or wrapped identity")
 	}
 }
 

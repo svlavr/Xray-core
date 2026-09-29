@@ -803,7 +803,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				if statWriter != nil {
 					rawReceipt.userCounter = statWriter.Counter
 				}
-				_, handled, err := copySpliceProgress(tc, readerConn, &rawReceipt)
+				handled, err := copySpliceProgress(tc, readerConn, &rawReceipt)
 				if !handled {
 					return readV(ctx, reader, writer, timer, readCounter)
 				}

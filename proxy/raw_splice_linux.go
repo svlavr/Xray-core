@@ -15,26 +15,22 @@ const rawSpliceChunk = 1 << 20
 
 // copySpliceProgress copies one eligible raw stream through a private pipe.
 // handled is false only while fallback remains safe because src was untouched.
-func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt) (written int64, handled bool, err error) {
-	if dst == nil || src == nil || !rawSpliceSource(src) {
-		return 0, false, nil
+func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt) (handled bool, err error) {
+	if dst == nil || !rawSpliceSource(src) {
+		return false, nil
 	}
-	srcConn, ok := src.(syscall.Conn)
-	if !ok {
-		return 0, false, nil
-	}
-	srcRaw, err := srcConn.SyscallConn()
+	srcRaw, err := src.(syscall.Conn).SyscallConn()
 	if err != nil {
-		return 0, false, err
+		return false, err
 	}
 	dstRaw, err := dst.SyscallConn()
 	if err != nil {
-		return 0, false, err
+		return false, err
 	}
 
 	pipe := []int{-1, -1}
 	if err := unix.Pipe2(pipe, unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
-		return 0, false, err
+		return false, err
 	}
 	defer unix.Close(pipe[0])
 	defer unix.Close(pipe[1])
@@ -85,7 +81,7 @@ func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt)
 			buffered += moved
 		}
 		if readErr != nil && !consumed && unsupportedSpliceError(readErr) {
-			return 0, false, nil
+			return false, nil
 		}
 
 		for buffered > 0 {
@@ -95,23 +91,22 @@ func copySpliceProgress(dst *net.TCPConn, src net.Conn, receipt *rawCopyReceipt)
 			}
 			if pumped > 0 {
 				buffered -= pumped
-				written += pumped
 				receipt.add(pumped)
 			}
 			if writeErr != nil {
-				return written, true, writeErr
+				return true, writeErr
 			}
 			if pumped == 0 {
 				err := io.ErrShortWrite
-				return written, true, err
+				return true, err
 			}
 		}
 
 		if readErr != nil {
-			return written, true, readErr
+			return true, readErr
 		}
 		if moved == 0 {
-			return written, true, nil
+			return true, nil
 		}
 	}
 }

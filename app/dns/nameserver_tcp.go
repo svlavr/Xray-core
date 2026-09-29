@@ -177,10 +177,6 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			defer func() { stop(); cancelWork() }()
 			dnsCtx := workCtx
 
-			if inbound := session.InboundFromContext(ctx); inbound != nil {
-				dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
-			}
-
 			dnsCtx = session.ContextWithContent(dnsCtx, &session.Content{
 				Protocol:       "dns",
 				SkipDNSResolve: true,
@@ -201,7 +197,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			defer b.Release()
 
 			if s.routed {
-				dnsCtx = toDnsContext(dnsCtx, s.destination.String())
+				dnsCtx = toDnsContext(dnsCtx, dnsCtx, s.destination.String())
 			}
 
 			if !s.beginDial() {
@@ -366,7 +362,7 @@ func (s *TCPNameServer) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	errs = append(errs, s.cacheController.Close())
+	s.cacheController.Close()
 	s.workers.Wait()
 	return go_errors.Join(errs...)
 }

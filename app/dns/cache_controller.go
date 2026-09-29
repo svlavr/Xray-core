@@ -407,13 +407,12 @@ func closeSubscribers(sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
 	}
 }
 
-func (c *CacheController) Close() error {
+func (c *CacheController) Close() {
 	c.cancel()
-	_ = c.cacheCleanup.Close()
+	c.cacheCleanup.Close()
 	c.Lock()
 	c.subs = nil
 	c.Unlock()
 	c.migrations.Wait()
 	c.pulls.Wait()
-	return nil
 }

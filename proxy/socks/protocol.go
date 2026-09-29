@@ -36,18 +36,6 @@ const (
 	statusCmdNotSupport = 0x07
 )
 
-// decodedSocks4Rejection carries only a fully parsed request target back to
-// the native admission owner. A handshake or authentication failure before
-// target decoding must not create a logical exchange.
-type decodedSocks4Rejection struct {
-	destination net.Destination
-	responseErr error
-	cause       error
-}
-
-func (e *decodedSocks4Rejection) Error() string { return e.cause.Error() }
-func (e *decodedSocks4Rejection) Unwrap() error { return e.cause }
-
 var addrParser = protocol.NewAddressParser(
 	protocol.AddressFamilyByte(0x01, net.AddressFamilyIPv4),
 	protocol.AddressFamilyByte(0x04, net.AddressFamilyIPv6),
@@ -92,25 +80,16 @@ func (s *ServerSession) handshake4(cmd byte, reader io.Reader, writer io.Writer)
 		address = net.ParseAddress(domain)
 	}
 
+	request := &protocol.RequestHeader{Command: protocol.RequestCommandTCP, Address: address, Port: port, Version: socks4Version}
 	switch cmd {
 	case cmdTCPConnect:
-		request := &protocol.RequestHeader{
-			Command: protocol.RequestCommandTCP,
-			Address: address,
-			Port:    port,
-			Version: socks4Version,
-		}
 		if err := writeSocks4Response(writer, socks4RequestGranted, net.AnyIP, net.Port(0)); err != nil {
 			return nil, err
 		}
 		return request, nil
 	default:
-		responseErr := writeSocks4Response(writer, socks4RequestRejected, net.AnyIP, net.Port(0))
-		return nil, &decodedSocks4Rejection{
-			destination: net.TCPDestination(address, port),
-			responseErr: responseErr,
-			cause:       errors.New("unsupported command: ", cmd),
-		}
+		writeSocks4Response(writer, socks4RequestRejected, net.AnyIP, net.Port(0))
+		return request, errors.New("unsupported command: ", cmd)
 	}
 }
 

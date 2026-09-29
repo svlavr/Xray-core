@@ -77,8 +77,8 @@ func TestRawSpliceTCPProgressAndCounters(t *testing.T) {
 	}
 	result := make(chan rawSpliceResult, 1)
 	go func() {
-		written, handled, err := copySpliceProgress(destinationWriter, sourceReader, receipt)
-		result <- rawSpliceResult{written: written, handled: handled, err: err}
+		handled, err := copySpliceProgress(destinationWriter, sourceReader, receipt)
+		result <- rawSpliceResult{handled: handled, err: err}
 	}()
 
 	first := []byte("progress-before-source-eof")
@@ -125,7 +125,7 @@ func TestRawSpliceTCPProgressAndCounters(t *testing.T) {
 	}
 	completed := waitRawSpliceResult(t, result)
 	want := int64(len(first) + len(second))
-	if !completed.handled || completed.err != nil || completed.written != want {
+	if !completed.handled || completed.err != nil {
 		t.Fatalf("copy result = %+v, want handled bytes=%d", completed, want)
 	}
 	assertRawSpliceReceipts(t, want, exchange, readCounter, writeCounter, userCounter)
@@ -149,10 +149,10 @@ func TestRawSpliceUnixAndPipeCleanup(t *testing.T) {
 	counter := new(rawSpliceTestCounter)
 	result := make(chan rawSpliceResult, 1)
 	go func() {
-		written, handled, err := copySpliceProgress(destinationWriter, sourceReader, &rawCopyReceipt{
+		handled, err := copySpliceProgress(destinationWriter, sourceReader, &rawCopyReceipt{
 			exchange: exchange, readCounter: counter, writeCounter: counter, userCounter: counter,
 		})
-		result <- rawSpliceResult{written: written, handled: handled, err: err}
+		result <- rawSpliceResult{handled: handled, err: err}
 	}()
 	if err := destinationReader.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -165,7 +165,7 @@ func TestRawSpliceUnixAndPipeCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	completed := waitRawSpliceResult(t, result)
-	if !completed.handled || completed.err != nil || completed.written != int64(len(payload)) || !bytes.Equal(got, payload) {
+	if !completed.handled || completed.err != nil || exchange.downlink.Load() != uint64(len(payload)) || !bytes.Equal(got, payload) {
 		t.Fatalf("unix copy result=%+v equal=%v", completed, bytes.Equal(got, payload))
 	}
 	if after := rawSpliceFDCount(t); after != before {
@@ -185,9 +185,9 @@ func TestRawSpliceUnsupportedDoesNotConsume(t *testing.T) {
 		writeDone <- err
 	}()
 
-	written, handled, err := copySpliceProgress(destinationWriter, source, &rawCopyReceipt{})
-	if written != 0 || handled || err != nil {
-		t.Fatalf("unsupported result = written=%d handled=%v err=%v", written, handled, err)
+	handled, err := copySpliceProgress(destinationWriter, source, &rawCopyReceipt{})
+	if handled || err != nil {
+		t.Fatalf("unsupported result = handled=%v err=%v", handled, err)
 	}
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(source, got); err != nil {
@@ -227,7 +227,8 @@ func TestRawSpliceDeadlinePreservesPositivePrefix(t *testing.T) {
 		exchange: exchange, readCounter: readCounter, writeCounter: writeCounter, userCounter: userCounter,
 	}
 	before := rawSpliceFDCount(t)
-	written, handled, err := copySpliceProgress(destinationWriter, sourceReader, receipt)
+	handled, err := copySpliceProgress(destinationWriter, sourceReader, receipt)
+	written := int64(exchange.downlink.Load())
 	if after := rawSpliceFDCount(t); after != before {
 		t.Fatalf("failed splice leaked pipe descriptors: before=%d after=%d", before, after)
 	}

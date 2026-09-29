@@ -148,22 +148,9 @@ func (o *inspectionOutput) Interrupt() {
 func (o *inspectionOutput) writeFrame(mb buf.MultiBuffer, payload int32, flow stats.Exchange) error {
 	o.Lock()
 	defer o.Unlock()
-	accepted := true
-	var err error
-	if writer, ok := o.writer.(interface {
-		WriteMultiBufferResult(buf.MultiBuffer) (bool, error)
-	}); ok {
-		accepted, err = writer.WriteMultiBufferResult(mb)
-	} else {
-		err = o.writer.WriteMultiBuffer(mb)
-	}
-	if err == nil {
-		if accepted {
-			if payload > 0 {
-				flow.AddDownlink(uint64(payload))
-			}
-		}
-	} else {
+	err := o.writer.WriteMultiBuffer(mb)
+	if err == nil && payload > 0 {
+		flow.AddDownlink(uint64(payload))
 	}
 	return err
 }

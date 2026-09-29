@@ -275,15 +275,6 @@ func RecordPacketWrite(receipt stats.Exchange, payload uint64, encoded, written 
 	RecordPacketOutcome(receipt, payload, encoded > 0 && written == encoded)
 }
 
-// RecordUnframedPacketWrite retains the actual payload prefix from a raw
-// WriteTo. Unlike encoded frames, each returned byte is a logical payload byte.
-func RecordUnframedPacketWrite(receipt stats.Exchange, offered, written int) {
-	if receipt == nil || written < 0 || written > offered {
-		return
-	}
-	receipt.AddDownlink(uint64(written))
-}
-
 // RecordPacketOutcome also accepts a native fragment group's combined result:
 // one complete logical packet wins over any partial retry of that same packet.
 func RecordPacketOutcome(receipt stats.Exchange, payload uint64, complete bool) {

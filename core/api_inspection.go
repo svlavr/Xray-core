@@ -86,18 +86,14 @@ func (o *apiObservation) Close() error {
 	o.closed = true
 	closer := o.closer
 	exchange := o.exchange
-	finish := o.finishOnClose
-	cancel := o.cancel
 	o.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
-	}
+	o.cancel()
 	var err error
 	if closer != nil {
 		err = closer.Close()
 	}
-	if exchange != nil && (finish || closer == nil) {
+	if exchange != nil && (o.finishOnClose || closer == nil) {
 		exchange.Finish()
 	}
 	return err

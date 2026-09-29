@@ -81,9 +81,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		timer := signal.CancelAfterInactivity(ctx, func() {
 			cancel()
 		}, time.Duration(30+dice.Roll(61))*time.Second)
-		go func() {
-			buf.Copy(link.Reader, buf.Discard, buf.UpdateActivity(timer))
-		}()
+		go buf.Copy(link.Reader, buf.Discard, buf.UpdateActivity(timer))
 		<-ctx.Done()
 	}
 	return nil

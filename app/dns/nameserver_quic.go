@@ -120,11 +120,6 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 			// may cause reqs all aborted if any one encounter an error
 			dnsCtx := workCtx
 
-			// reserve internal dns server requested Inbound
-			if inbound := session.InboundFromContext(ctx); inbound != nil {
-				dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
-			}
-
 			dnsCtx = session.ContextWithContent(dnsCtx, &session.Content{
 				Protocol:       "quic",
 				SkipDNSResolve: true,
@@ -391,7 +386,7 @@ func (s *QUICNameServer) Close() error {
 			s.Unlock()
 		}
 	}
-	errs = append(errs, s.cacheController.Close())
+	s.cacheController.Close()
 	s.workers.Wait()
 	return go_errors.Join(errs...)
 }

@@ -13,7 +13,7 @@ func TestToDNSContextOverridesTrafficOrigin(t *testing.T) {
 	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUser)
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: "user-inbound"})
 
-	dnsCtx := toDnsContext(ctx, "dns.example:53")
+	dnsCtx := toDnsContext(ctx, ctx, "dns.example:53")
 	if got := session.TrafficOriginFromContext(dnsCtx); got != session.TrafficOriginInternal {
 		t.Fatalf("DNS traffic origin: got %v want INTERNAL", got)
 	}

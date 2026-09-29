@@ -364,13 +364,8 @@ func (w *AuthenticationWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stat
 
 func (w *AuthenticationWriter) writeBatch(mb buf.MultiBuffer, receipt stats.Exchange, payload uint64) error {
 	err := w.writer.WriteMultiBuffer(mb)
-	if receipt != nil {
-		if err == nil {
-			if payload != 0 {
-				receipt.AddDownlink(payload)
-			}
-		} else {
-		}
+	if receipt != nil && err == nil && payload != 0 {
+		receipt.AddDownlink(payload)
 	}
 	return err
 }

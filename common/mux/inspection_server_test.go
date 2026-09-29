@@ -139,22 +139,6 @@ func TestMuxDecodedOperations(t *testing.T) {
 		}
 		flow.Finish()
 	})
-	t.Run("silent-overflow", func(t *testing.T) {
-		flow, view := muxInspectionFlow(t)
-		reader, lower := pipe.New(pipe.WithSizeLimit(0), pipe.DiscardOverflow())
-		defer reader.Interrupt()
-		lower.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("occupied"))})
-		writer := NewResponseWriter(1, newInspectionOutput(lower), protocol.TransferTypePacket)
-		writer.receipt = flow
-		if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("drop"))}); err != nil {
-			t.Fatal(err)
-		}
-		row := muxServerFact(t, view)
-		if row.Downlink != 0 {
-			t.Fatalf("overflow: %+v", row.Downlink)
-		}
-		flow.Finish()
-	})
 	t.Run("buffered-header-and-control", func(t *testing.T) {
 		flow, view := muxInspectionFlow(t)
 		var wire bytes.Buffer

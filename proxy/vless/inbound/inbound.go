@@ -514,9 +514,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				return nil
 			}
 
-			requestDone := task.OnSuccess(postRequest, task.Close(serverWriter))
-			responseDone := task.OnSuccess(getResponse, task.Close(writer))
-			if err := task.Run(ctx, requestDone, responseDone); err != nil {
+			if err := task.Run(ctx, task.OnSuccess(postRequest, task.Close(serverWriter)), task.OnSuccess(getResponse, task.Close(writer))); err != nil {
 				common.Interrupt(serverReader)
 				common.Interrupt(serverWriter)
 				return errors.New("fallback ends").Base(err)
@@ -561,9 +559,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		}
 		ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, h.stats, connection, request.Destination(), kind)
 		if observationCleanup != nil {
-			defer func() {
-				observationCleanup()
-			}()
+			defer observationCleanup()
 		}
 	}
 

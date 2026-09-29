@@ -111,15 +111,14 @@ func (o *plainRequestOwner) Close() error {
 	}
 	o.closed = true
 	link := o.link
-	cancel := o.cancel
 	o.mu.Unlock()
 	if link != nil {
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
-	} else if cancel != nil {
+	} else {
 		// Before Dispatch returns its request-local pipes, cancellation is the
 		// only exact way to prevent that request from starting execution.
-		cancel()
+		o.cancel()
 	}
 	return nil
 }
@@ -131,9 +130,6 @@ type responseReceiptWriter struct {
 
 func (w *responseReceiptWriter) Write(p []byte) (int, error) {
 	n, err := w.Writer.Write(p)
-	if n < 0 || n > len(p) {
-		return n, err
-	}
 	w.receipt.AddDownlink(uint64(n))
 	return n, err
 }
@@ -294,8 +290,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			// ReadRequest may have prefetched later keep-alive bytes. The exact
 			// consumed request serialization is unavailable without a second parser.
 		}
-		err := response.Write(responseWriter)
-		return err
+		return response.Write(responseWriter)
 	}
 
 	if len(request.URL.Host) > 0 {

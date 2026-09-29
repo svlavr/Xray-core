@@ -19,7 +19,6 @@ type UDPCodec struct {
 	method           *CipherMethod
 	psk              []byte
 	blockCipher      cipher.Block
-	masterBlock      cipher.Block
 	identityBlocks   []cipher.Block
 	identityHashes   [][AESBlockSize]byte
 	chachaCipher     cipher.AEAD
@@ -77,7 +76,6 @@ func NewUDPPacketCodec(method *CipherMethod, psk []byte, masterPSK ...[]byte) (*
 			}
 			c.identityHashes = append(c.identityHashes, DeriveUserPSKHash(nextPSK))
 		}
-		c.masterBlock = c.identityBlocks[0]
 	}
 
 	if !method.IsChaCha {
@@ -166,8 +164,8 @@ func (c *UDPCodec) EncodeClientPacket(dest net.Destination, payload []byte) (*bu
 
 	var encryptedHeader [16]byte
 	headerBlock := c.blockCipher
-	if c.masterBlock != nil {
-		headerBlock = c.masterBlock
+	if len(c.identityBlocks) > 0 {
+		headerBlock = c.identityBlocks[0]
 	}
 	headerBlock.Encrypt(encryptedHeader[:], rawHeader[:])
 	outBuf.Write(encryptedHeader[:])

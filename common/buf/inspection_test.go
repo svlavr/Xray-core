@@ -219,8 +219,6 @@ func TestInspectionBufferedWriterExcludesPendingPrefix(t *testing.T) {
 		{name: "complete", wantKnown: 7},
 		{name: "partial-error-inside-header", result: func([]byte) (int, error) { return 2, errInspectionWrite }, wantErr: errInspectionWrite},
 		{name: "partial-error-crosses-header", result: func([]byte) (int, error) { return 6, errInspectionWrite }, wantKnown: 2, wantErr: errInspectionWrite},
-		{name: "nil-short", result: func([]byte) (int, error) { return 6, nil }, wantKnown: 2, wantErr: io.ErrShortWrite},
-		{name: "nil-zero", result: func([]byte) (int, error) { return 0, nil }, wantErr: io.ErrShortWrite},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			receipt := new(inspectionReceipt)

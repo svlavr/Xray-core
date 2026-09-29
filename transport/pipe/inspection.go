@@ -5,12 +5,6 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 )
 
-// WriteMultiBufferResult exposes the native queue admission result to the MUX
-// frame owner without attaching a lower logical receipt.
-func (w *Writer) WriteMultiBufferResult(mb buf.MultiBuffer) (bool, error) {
-	return w.pipe.writeMultiBufferResult(mb, nil)
-}
-
 // WithWriterReceipt reports the pipe's native accepted/drop decision.
 func (w *Writer) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
 	return &inspectionWriter{Writer: w, receipt: receipt}
