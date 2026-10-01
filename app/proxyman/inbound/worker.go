@@ -14,7 +14,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
@@ -180,7 +179,6 @@ type udpConn struct {
 	packetCtx        context.Context
 	remote           net.Addr
 	local            net.Addr
-	done             *done.Instance
 	uplink           stats.Counter
 	downlink         stats.Counter
 	ctx              context.Context
@@ -241,10 +239,7 @@ func (c *udpConn) writeResult(n int, err error) (int, error) {
 }
 
 func (c *udpConn) Close() error {
-	if c.cancel != nil {
-		c.cancel()
-	}
-	common.Must(c.done.Close())
+	c.cancel()
 	common.Must(common.Close(c.writer))
 	return nil
 }
@@ -305,7 +300,7 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		return nil, false
 	}
 
-	if conn, found := w.activeConn[id]; found && !conn.done.Done() {
+	if conn, found := w.activeConn[id]; found && conn.ctx.Err() == nil {
 		conn.updateActivity()
 		return conn, true
 	}
@@ -329,7 +324,6 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 			IP:   w.address.IP(),
 			Port: int(w.port),
 		},
-		done:     done.New(),
 		uplink:   w.uplinkCounter,
 		downlink: w.downlinkCounter,
 	}
