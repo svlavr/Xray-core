@@ -77,14 +77,14 @@ func TestInspectionBlackholePartialResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Native Blackhole still ignores the write error; the error-only batch
-	// result is incomplete without changing that return.
+	// Native Blackhole still ignores the write error; its native writer records
+	// the three accepted bytes without changing that return.
 	if err := handler.Process(ctx, link, nil); err != nil {
 		t.Fatal(err)
 	}
 	finish()
 	terminal := blackholeTerminal(t, view)
-	if terminal.Flow.Downlink != 0 || terminal.Flow.Uplink != 0 || terminal.Flow.Origin != fs.TrafficOriginInternal {
+	if terminal.Flow.Downlink != 3 || terminal.Flow.Uplink != 0 || terminal.Flow.Origin != fs.TrafficOriginInternal {
 		t.Fatalf("prefix/error receipt: %+v", terminal)
 	}
 }

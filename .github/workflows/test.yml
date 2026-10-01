@@ -96,8 +96,8 @@ jobs:
       - name: Repeat control, statistics and DNS ownership regressions
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
-          -run '^(TestInspection|TestFlowInspection|TestControlStats|TestCleanControlStats|TestStageB|TestDNSPreparation|TestOwnedPeriodic|TestCacheClose|TestTrackedTCPAndDoH|TestTCPAndDoH|TestQUICResource|TestQUICCanceled|TestQUICResolution|TestDoHResource|TestToDNSContext)'
-          ./app/stats ./app/dns ./core ./proxy/dns ./testing/scenarios
+          -run '^(TestInspection|TestObserve|TestVision|TestFlowInspection|TestControlStats|TestCleanControlStats|TestStageB|TestDNSPreparation|TestOwnedPeriodic|TestCacheClose|TestTrackedTCPAndDoH|TestTCPAndDoH|TestQUICResource|TestQUICCanceled|TestQUICResolution|TestDoHResource|TestToDNSContext)'
+          ./app/stats ./app/dns ./core ./proxy ./proxy/blackhole ./proxy/dns ./testing/scenarios
       - name: Test shared transport and endpoint mechanisms
         if: ${{ !cancelled() }}
         run: >-

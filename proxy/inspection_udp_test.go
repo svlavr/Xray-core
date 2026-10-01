@@ -107,9 +107,12 @@ func TestObserveUDPPacketReceiptsOriginsAndTerminalGate(t *testing.T) {
 				t.Fatal("UDP endpoint receipts were not bound")
 			}
 			flow := observation.Exchange
+			// The native sequential writer accepted the first payload and two
+			// bytes from the second operation before returning its error.
+			wantDownlink := uint64(len("packet-one") + 2)
 			finish()
 			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
+			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != wantDownlink {
 				t.Fatalf("owner-end UDP snapshot: %+v %v", page, err)
 			}
 			flow.AddDownlink(1)
@@ -118,7 +121,7 @@ func TestObserveUDPPacketReceiptsOriginsAndTerminalGate(t *testing.T) {
 				t.Fatalf("UDP terminal: %+v %v", page, err)
 			}
 			row := page.Rows[0]
-			if row.Flow.Origin != fs.TrafficOrigin(test.origin) || row.Flow.Uplink != uint64(len("firstsecond")) || row.Flow.Downlink != 0 || row.Flow.LatestDestination != destinations[1] {
+			if row.Flow.Origin != fs.TrafficOrigin(test.origin) || row.Flow.Uplink != uint64(len("firstsecond")) || row.Flow.Downlink != wantDownlink || row.Flow.LatestDestination != destinations[1] {
 				t.Fatalf("UDP terminal receipts: %+v", row)
 			}
 			totals, _ := view.ReadTotals()
@@ -126,7 +129,7 @@ func TestObserveUDPPacketReceiptsOriginsAndTerminalGate(t *testing.T) {
 			for _, total := range totals.Rows {
 				down += total.Downlink
 			}
-			if down != 1 {
+			if down != wantDownlink+1 {
 				t.Fatalf("late UDP total: %+v", totals)
 			}
 		})
