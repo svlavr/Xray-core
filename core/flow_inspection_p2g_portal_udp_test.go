@@ -126,7 +126,7 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	portalRay.Dispatch(context.Background(), portalDestination, buf.FromBytes([]byte(portalPayload)))
 	inspectionWait(t, func() bool {
 		live, readErr := view.ReadLive()
-		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink == uint64(len(dataPayload)+len(portalPayload))
+		return readErr == nil && len(live.Rows) == 1 && live.Rows[0].Uplink == uint64(len(dataPayload)+len(portalPayload)) && live.Rows[0].Outbound.Tag == "portal"
 	})
 	portalRay.RemoveRay()
 	root.Finish()

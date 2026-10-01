@@ -100,10 +100,9 @@ func (s *inspectionStore) prepare(kind xnet.Network, origin featurestats.Traffic
 // Native endpoint owners retain unregistered receipts themselves. There is no
 // pending index; the existing live map only owns classified logical exchanges.
 func (e *inspectionExchange) registerLocked() {
-	if e.registered || e.excluded {
+	if e.record.Ref.ID != 0 || e.excluded {
 		return
 	}
-	e.registered = true
 	s := e.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -282,7 +281,6 @@ func (s *inspectionStore) close() {
 // their attribution and completion state; no historical ray list is kept.
 type inspectionFlow struct {
 	store              *inspectionStore
-	registered         bool
 	stop               func() error
 	stopRequested      bool
 	mu                 sync.Mutex

@@ -83,6 +83,35 @@ func TestInspectionPreparedLogicalBindingAndFailure(t *testing.T) {
 	}
 }
 
+func TestInspectionRefusedRegistrationCanUseFreedCapacity(t *testing.T) {
+	for _, exclude := range []bool{false, true} {
+		s := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1})
+		first := s.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+		waiting := s.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+		waiting.AddUplink(7)
+		if waiting.Ref().ID != 0 {
+			t.Fatal("capacity refusal assigned a live identity")
+		}
+		if exclude && !waiting.ExcludeCarrier() {
+			t.Fatal("unaddressable carrier was not excluded")
+		}
+		first.Finish()
+		var bindings sync.WaitGroup
+		for range 8 {
+			bindings.Go(waiting.BindRoute)
+		}
+		bindings.Wait()
+		live, _ := s.ReadLive()
+		if exclude {
+			if waiting.Ref().ID != 0 || len(live.Rows) != 0 {
+				t.Fatal("excluded carrier acquired the freed capacity")
+			}
+		} else if waiting.Ref().ID != 2 || len(live.Rows) != 1 || live.Rows[0].Uplink != 7 {
+			t.Fatalf("freed capacity lost identity or observed bytes: %+v", live)
+		}
+	}
+}
+
 func TestInspectionPreparedCapacityIsCheckedAtBinding(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1})
 	a := s.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
