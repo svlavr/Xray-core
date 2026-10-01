@@ -28,10 +28,11 @@ type dnsRuntime struct {
 }
 
 type resolverOwner struct {
-	resolver *DNS
-	ctx      context.Context
-	cancel   context.CancelFunc
-	closeMu  sync.Mutex
+	resolver  *DNS
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func newResolverOwner(resolver *DNS) *resolverOwner {
@@ -51,13 +52,14 @@ func (o *resolverOwner) closeResources() error {
 	return errors.Join(errs...)
 }
 
-// closeOwned joins a resolver already retired and canceled under dnsRuntime.mu.
+// closeOwned shares one terminal close and query join between retirement callers.
+// The resolver is already retired and canceled under dnsRuntime.mu.
 func (o *resolverOwner) closeOwned() error {
-	o.closeMu.Lock()
-	defer o.closeMu.Unlock()
-	err := o.closeResources()
-	o.resolver.queries.Wait()
-	return err
+	o.closeOnce.Do(func() {
+		o.closeErr = o.closeResources()
+		o.resolver.queries.Wait()
+	})
+	return o.closeErr
 }
 
 // connectionLifetime owns TCP and DoH dial admission, workers, and open sockets.

@@ -261,12 +261,13 @@ func TestStageBSameCoreReplacementKeepsUnrelatedConnection(t *testing.T) {
 }
 
 type stageBBlockingServer struct {
-	started    chan struct{}
-	once       sync.Once
-	closeBlock chan struct{}
-	mu         sync.Mutex
-	closeErrs  []error
-	closes     int
+	started      chan struct{}
+	once         sync.Once
+	closeBlock   chan struct{}
+	closeEntered chan struct{}
+	mu           sync.Mutex
+	closeErrs    []error
+	closes       int
 }
 
 func (s *stageBBlockingServer) Name() string       { return "stage-b-old" }
@@ -278,6 +279,12 @@ func (s *stageBBlockingServer) QueryIP(ctx context.Context, _ string, _ featured
 }
 
 func (s *stageBBlockingServer) Close() error {
+	if s.closeEntered != nil {
+		select {
+		case s.closeEntered <- struct{}{}:
+		default:
+		}
+	}
 	if s.closeBlock != nil {
 		<-s.closeBlock
 	}
@@ -388,6 +395,67 @@ func TestStageBTimedCleanupKeepsBoundedOwner(t *testing.T) {
 	}
 	if feature.IsOwnLink(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "old"})) {
 		t.Fatal("closed resolver tag remained active")
+	}
+}
+
+func TestStageBReplacementAndFeatureCloseShareRetirement(t *testing.T) {
+	release := make(chan struct{})
+	closeFailure := go_errors.New("terminal resolver close failed")
+	old := &stageBBlockingServer{closeBlock: release, closeEntered: make(chan struct{}, 1), closeErrs: []error{closeFailure}}
+	feature := stageBManualFeature(t, old)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		_ = feature.Close()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := ApplyConfig(ctx, feature, stageBConfig(stageBServer("127.0.0.1:1", "replacement")))
+	if !result.Applied || !go_errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("unfinished retirement: %+v", result)
+	}
+	select {
+	case <-old.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not enter old resource Close")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- feature.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		feature.runtime.mu.Lock()
+		captured := feature.runtime.closed
+		feature.runtime.mu.Unlock()
+		if captured {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("feature Close did not capture the retiring owner")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("feature Close passed unfinished retirement: %v", err)
+	default:
+	}
+	close(release)
+	select {
+	case err := <-closed:
+		if !go_errors.Is(err, closeFailure) {
+			t.Fatalf("feature Close lost terminal error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("feature Close did not join retirement")
+	}
+	old.mu.Lock()
+	closes := old.closes
+	old.mu.Unlock()
+	if closes != 1 {
+		t.Fatalf("retired resolver Close calls=%d, want 1", closes)
 	}
 }
 

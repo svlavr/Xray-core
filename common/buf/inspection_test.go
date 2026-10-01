@@ -108,7 +108,7 @@ func (w *prefixWriter) Write(p []byte) (int, error) {
 	return min(2, len(p)), errInspectionWrite
 }
 
-func TestInspectionWriterBatchErrorIsCoarse(t *testing.T) {
+func TestInspectionWriterBatchCountsPartialProgress(t *testing.T) {
 	for _, vector := range []bool{false, true} {
 		t.Run(map[bool]string{false: "sequential", true: "vector"}[vector], func(t *testing.T) {
 			receipt := new(inspectionReceipt)
@@ -121,7 +121,7 @@ func TestInspectionWriterBatchErrorIsCoarse(t *testing.T) {
 			}
 			writer = buf.AttachWriterReceipt(writer, receipt)
 			err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("abc")), buf.FromBytes([]byte("defgh"))})
-			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 {
+			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 5 {
 				t.Fatalf("prefix %d err %v", receipt.down.Load(), err)
 			}
 		})
@@ -132,7 +132,7 @@ type inspectionWriteFunc func([]byte) (int, error)
 
 func (f inspectionWriteFunc) Write(p []byte) (int, error) { return f(p) }
 
-func TestInspectionWriterBatchErrorsAreCoarse(t *testing.T) {
+func TestInspectionWriterBatchCountsPositiveError(t *testing.T) {
 	for _, kind := range []string{"scalar", "vector", "sequential"} {
 		t.Run(kind, func(t *testing.T) {
 			receipt := new(inspectionReceipt)
@@ -149,7 +149,7 @@ func TestInspectionWriterBatchErrorsAreCoarse(t *testing.T) {
 				mb = append(mb, buf.FromBytes([]byte("second")))
 			}
 			err := writer.WriteMultiBuffer(mb)
-			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 {
+			if !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 2 {
 				t.Fatalf("known=%d err=%v", receipt.down.Load(), err)
 			}
 		})
@@ -167,7 +167,7 @@ func TestInspectionWriterReadFromUsesReceiptPath(t *testing.T) {
 		t.Fatal("observed vector writer lost ReaderFrom")
 	}
 	n, err := readerFrom.ReadFrom(strings.NewReader("payload"))
-	if n != 7 || !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 0 {
+	if n != 7 || !errors.Is(err, errInspectionWrite) || receipt.down.Load() != 2 {
 		t.Fatalf("read-from n=%d known=%d err=%v", n, receipt.down.Load(), err)
 	}
 }

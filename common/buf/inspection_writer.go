@@ -6,33 +6,6 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 )
 
-type inspectionBufferToBytesWriter struct {
-	*BufferToBytesWriter
-	receipt stats.Exchange
-}
-
-func (w *inspectionBufferToBytesWriter) Write(payload []byte) (int, error) {
-	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
-}
-
-func (w *inspectionBufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
-	size := uint64(mb.Len())
-	err := w.BufferToBytesWriter.WriteMultiBuffer(mb)
-	RecordBufferOperation(w.receipt, size, err)
-	return err
-}
-
-func (w *inspectionBufferToBytesWriter) ReadFrom(reader io.Reader) (int64, error) {
-	var size SizeCounter
-	err := Copy(NewReader(reader), w, CountSize(&size))
-	return size.Size, err
-}
-
-type inspectionSequentialWriter struct {
-	*SequentialWriter
-	receipt stats.Exchange
-}
-
 // inspectionPrefixReceipt removes framing that was already buffered before an
 // endpoint receipt was attached. BufferedWriter serializes this state with its
 // existing mutex. Only bytes reported by a native result consume it.
@@ -57,17 +30,6 @@ func discardFailedPrefix(receipt stats.Exchange) {
 		// tail cannot be subtracted from the next independent payload write.
 		prefixed.remaining = 0
 	}
-}
-
-func (w *inspectionSequentialWriter) Write(payload []byte) (int, error) {
-	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
-}
-
-func (w *inspectionSequentialWriter) WriteMultiBuffer(mb MultiBuffer) error {
-	size := uint64(mb.Len())
-	err := w.SequentialWriter.WriteMultiBuffer(mb)
-	RecordBufferOperation(w.receipt, size, err)
-	return err
 }
 
 // RecordBufferOperation credits only a completed decoded batch and clears a
@@ -95,9 +57,10 @@ func WriteBytesWithReceipt(writer io.Writer, payload []byte, receipt stats.Excha
 	return n, err
 }
 
-// AttachWriterReceipt wraps a known native endpoint writer with opt-in receipt
-// accounting. Unsupported writers keep their identity and add no byte facts. For BufferedWriter, pre-binding buffered bytes must be framing,
-// and every later successful operation must be decoded payload.
+// AttachWriterReceipt binds opt-in accounting before an exclusively owned
+// endpoint writer is used. Unsupported writers keep their identity and add no
+// byte facts. For BufferedWriter, pre-binding buffered bytes must be framing,
+// and every later operation must be decoded payload.
 func AttachWriterReceipt(writer Writer, receipt stats.Exchange) Writer {
 	bound, _ := AttachWriterReceiptWithStatus(writer, receipt)
 	return bound
@@ -128,9 +91,11 @@ func attachBufferedWriterReceipt(buffered *BufferedWriter, receipt stats.Exchang
 func attachWriterReceipt(writer Writer, receipt stats.Exchange) (Writer, bool) {
 	switch w := writer.(type) {
 	case *BufferToBytesWriter:
-		return &inspectionBufferToBytesWriter{BufferToBytesWriter: w, receipt: receipt}, true
+		w.receipt = receipt
+		return w, true
 	case *SequentialWriter:
-		return &inspectionSequentialWriter{SequentialWriter: w, receipt: receipt}, true
+		w.receipt = receipt
+		return w, true
 	case interface{ WithWriterReceipt(stats.Exchange) Writer }:
 		return w.WithWriterReceipt(receipt), true
 	default:
@@ -142,9 +107,9 @@ func attachWriterReceipt(writer Writer, receipt stats.Exchange) (Writer, bool) {
 // It must not be inferred from an inherited execution context.
 func WriterReceipt(writer Writer) stats.Exchange {
 	switch w := writer.(type) {
-	case *inspectionBufferToBytesWriter:
+	case *BufferToBytesWriter:
 		return OriginalWriterReceipt(w.receipt)
-	case *inspectionSequentialWriter:
+	case *SequentialWriter:
 		return OriginalWriterReceipt(w.receipt)
 	case *BufferedWriter:
 		w.Lock()

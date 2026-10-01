@@ -218,6 +218,13 @@ func SplitMulti(mb MultiBuffer, i int) (MultiBuffer, MultiBuffer) {
 
 // WriteMultiBuffer writes all buffers from the MultiBuffer to the Writer one by one, and return error if any, with leftover MultiBuffer.
 func WriteMultiBuffer(writer io.Writer, mb MultiBuffer) (MultiBuffer, error) {
+	mb, _, err := writeMultiBuffer(writer, mb)
+	return mb, err
+}
+
+// writeMultiBuffer retains the native per-buffer results for its owning writer.
+func writeMultiBuffer(writer io.Writer, mb MultiBuffer) (MultiBuffer, int64, error) {
+	var written int64
 	for {
 		mb2, b := SplitFirst(mb)
 		mb = mb2
@@ -225,14 +232,15 @@ func WriteMultiBuffer(writer io.Writer, mb MultiBuffer) (MultiBuffer, error) {
 			break
 		}
 
-		_, err := writer.Write(b.Bytes())
+		n, err := writer.Write(b.Bytes())
+		written += int64(n)
 		b.Release()
 		if err != nil {
-			return mb, err
+			return mb, written, err
 		}
 	}
 
-	return nil, nil
+	return nil, written, nil
 }
 
 // Len returns the total number of bytes in the MultiBuffer.
