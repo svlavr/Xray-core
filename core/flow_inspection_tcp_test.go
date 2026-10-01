@@ -138,7 +138,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Kind != cnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" || row.InitialDestination != destination {
+					if row.Kind != cnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" || row.Destination != destination {
 						t.Fatalf("admission/route: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {

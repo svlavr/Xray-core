@@ -130,12 +130,10 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			Reader: reader,
 			Writer: writer,
 		}
-		if !addr.Address.Family().IsDomain() || addr.Address.Domain() != "v1.mux.cool" {
-			var cleanup func()
-			ctx, cleanup = proxy.ObserveUDP(ctx, s.stats, conn, *addr, link)
-			if cleanup != nil {
-				defer cleanup()
-			}
+		var cleanup func()
+		ctx, cleanup = proxy.ObserveUDP(ctx, s.stats, conn, *addr, link)
+		if cleanup != nil {
+			defer cleanup()
 		}
 		return dispatcher.DispatchLink(ctx, *addr, link)
 	} else {
@@ -168,13 +166,9 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		errors.LogInfo(ctx, "tunnelling request to ", dest)
 		var observation *session.LogicalObservation
 		var observationCleanup func()
-		if !dest.Address.Family().IsDomain() || dest.Address.Domain() != "v1.mux.cool" {
-			ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, s.stats, conn, dest, net.Network_TCP)
-			if observationCleanup != nil {
-				defer func() {
-					observationCleanup()
-				}()
-			}
+		ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, s.stats, conn, dest, net.Network_TCP)
+		if observationCleanup != nil {
+			defer observationCleanup()
 		}
 
 		bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))

@@ -65,10 +65,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
 		ordinaryTarget = false
 	}
-	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget)
-	if observation != nil {
-		observation.Exchange.Effective(target)
-	}
+	proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget)
 
 	conn, err := dialer.Dial(hysteria.ContextWithDatagram(ctx, target.Network == net.Network_UDP), c.server.Destination)
 	if err != nil {

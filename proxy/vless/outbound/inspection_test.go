@@ -90,7 +90,7 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(live.Rows) == 1 && live.Rows[0].Outbound.Tag == "vless" && live.Rows[0].EffectiveDestination == target {
+		if len(live.Rows) == 1 && live.Rows[0].Outbound.Tag == "vless" && live.Rows[0].Destination == target {
 			ref = live.Rows[0].Ref
 			break
 		}

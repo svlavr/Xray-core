@@ -309,7 +309,7 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 	if newRow.Outbound.Serial == oldRow.Outbound.Serial {
 		t.Fatal("tag reuse reused the old incarnation")
 	}
-	if newRow.InitialDestination != original || newRow.EffectiveDestination != redirected || redirectedBytes.Load() == 0 {
+	if newRow.Destination != original || redirectedBytes.Load() == 0 {
 		t.Fatalf("redirect facts: %+v", newRow)
 	}
 	if err := core.AddOutboundHandler(instance, &core.OutboundHandlerConfig{Tag: "p3-block", ProxySettings: serial.ToTypedMessage(&blackhole.Config{})}); err != nil {

@@ -57,10 +57,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	destination := ob.Target
 	network := destination.Network
 
-	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, network == net.Network_TCP || network == net.Network_UDP)
-	if observation != nil {
-		observation.Exchange.Effective(destination)
-	}
+	proxy.ClaimObservedEndpoint(ctx, link.Reader, network == net.Network_TCP || network == net.Network_UDP)
 
 	server := c.server
 	var conn stat.Connection

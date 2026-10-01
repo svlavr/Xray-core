@@ -153,10 +153,10 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 					}
 					if row.Kind == net.Network_UDP {
 						packetRef = row.Ref
-						if row.EffectiveDestination != udpDest {
+						if row.Destination != net.UDPDestination(net.ParseAddress("192.0.2.1"), masqueEchoPort) {
 							t.Fatalf("UDP destination: %+v", row)
 						}
-					} else if row.EffectiveDestination != tcpDest {
+					} else if row.Destination != net.TCPDestination(net.ParseAddress("192.0.2.1"), masqueEchoPort) {
 						t.Fatalf("TCP destination: %+v", row)
 					}
 				}

@@ -110,7 +110,7 @@ func TestFlowInspectionAPIDialUDPStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) || flow.LatestDestination != destination {
+	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) || flow.Destination != destination {
 		t.Fatalf("API UDP stream facts: %+v", flow)
 	}
 }
@@ -138,7 +138,7 @@ func TestFlowInspectionAPIDialUDPPacketConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.LatestDestination != destination || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 {
+	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.Destination != destination || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 {
 		t.Fatalf("API PacketConn facts: %+v", flow)
 	}
 }

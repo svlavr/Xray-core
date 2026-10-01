@@ -125,7 +125,7 @@ func TestFlowInspectionAppReverseChildren(t *testing.T) {
 		row = live.Rows[0]
 		return row.Uplink == uint64(len(payload)) && row.Downlink == uint64(len(payload))
 	})
-	if row.Origin != fs.TrafficOriginUnknown || row.InitialDestination != destination || row.Outbound.Tag != "direct" {
+	if row.Origin != fs.TrafficOriginUnknown || row.Destination != destination || row.Outbound.Tag != "direct" {
 		t.Fatalf("reverse child: %+v", row)
 	}
 	page, _ := view.ReadTerminals()

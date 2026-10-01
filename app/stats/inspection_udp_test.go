@@ -23,29 +23,29 @@ func TestInspectionLatestPacketDestinationPreservedAndCopied(t *testing.T) {
 		t.Fatalf("live packet destinations: %+v %v", live, err)
 	}
 	row := live.Rows[0]
-	if row.LatestDestination != second {
+	if row.Destination != second {
 		t.Fatalf("latest packet destination was rewritten: %+v", row)
 	}
-	live.Rows[0].LatestDestination = third
+	live.Rows[0].Destination = third
 	again, err := store.ReadLive()
-	if err != nil || again.Rows[0].LatestDestination.Port != second.Port {
+	if err != nil || again.Rows[0].Destination.Port != second.Port {
 		t.Fatalf("live snapshot retained caller destination: %+v %v", again, err)
 	}
 
 	flow.Finish()
 	flow.PacketDestination(third)
 	page, err := store.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.LatestDestination.Port != second.Port {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Destination.Port != second.Port {
 		t.Fatalf("terminal packet destinations: %+v %v", page, err)
 	}
-	page.Rows[0].Flow.LatestDestination = third
+	page.Rows[0].Flow.Destination = third
 	pageAgain, err := store.ReadTerminals()
-	if err != nil || pageAgain.Rows[0].Flow.LatestDestination.Port != second.Port {
+	if err != nil || pageAgain.Rows[0].Flow.Destination.Port != second.Port {
 		t.Fatalf("terminal snapshot retained caller destination: %+v %v", pageAgain, err)
 	}
 }
 
-func TestInspectionLatestDestinationFollowsPacketsNotRouteCompletion(t *testing.T) {
+func TestInspectionDestinationFollowsPacketsNotRouteCompletion(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	root := store.Begin(xnet.Network_UDP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	older, newer := root.NewLeg(), root.NewLeg()
@@ -60,7 +60,7 @@ func TestInspectionLatestDestinationFollowsPacketsNotRouteCompletion(t *testing.
 	older.Route(featurestats.OutboundRef{Serial: 1, Tag: "older"})
 	older.BindRoute()
 	live, err := store.ReadLive()
-	if err != nil || len(live.Rows) != 1 || live.Rows[0].LatestDestination != last || live.Rows[0].Uplink != 8 {
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Destination != last || live.Rows[0].Uplink != 8 {
 		t.Fatalf("packet order changed by delayed route: %+v %v", live, err)
 	}
 	totals, _ := store.ReadTotals()

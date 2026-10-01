@@ -117,7 +117,7 @@ func TestFlowInspectionBlackholeTCP(t *testing.T) {
 							t.Fatal("stopped reference changed")
 						}
 					}
-					if flow.Origin != fs.TrafficOriginUser || flow.Outbound.Serial == 0 || flow.EffectiveDestination != destination {
+					if flow.Origin != fs.TrafficOriginUser || flow.Outbound.Serial == 0 || flow.Destination != destination {
 						t.Fatalf("ending/route/origin: %+v", terminal)
 					}
 					if flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(response)) {
@@ -199,7 +199,7 @@ func TestFlowInspectionBlackholeUDP(t *testing.T) {
 					}
 					return false
 				})
-				if found.Kind != cnet.Network_UDP || found.Origin != fs.TrafficOriginUser || found.Outbound.Tag != "block" || found.Outbound.Serial == 0 || found.EffectiveDestination != destination {
+				if found.Kind != cnet.Network_UDP || found.Origin != fs.TrafficOriginUser || found.Outbound.Tag != "block" || found.Outbound.Serial == 0 || found.Destination != destination {
 					t.Fatalf("Blackhole UDP facts: %+v", found)
 				}
 				return found

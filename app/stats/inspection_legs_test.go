@@ -22,10 +22,9 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	b.AddUplink(5)
 	b.BindRoute()
 	newDest := xnet.UDPDestination(xnet.LocalHostIP, 53)
-	b.Effective(newDest)
+	b.PacketDestination(newDest)
 	a.BindRoute() // Late old binding must not roll back the latest route.
 	a.BindRoute()
-	a.Effective(xnet.UDPDestination(xnet.LocalHostIP, 54))
 	a.AddDownlink(7)
 	b.AddDownlink(9)
 	out, err := s.CloseFlows(context.Background(), []fs.FlowRef{root.Ref()})
@@ -43,7 +42,7 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	root.Finish()
 	page, _ = s.ReadTerminals()
 	f := page.Rows[0].Flow
-	if f.Ref != root.Ref() || f.Uplink != 8 || f.Downlink != 18 || f.Outbound.Serial != 12 || f.EffectiveDestination != newDest {
+	if f.Ref != root.Ref() || f.Uplink != 8 || f.Downlink != 18 || f.Outbound.Serial != 12 || f.Destination != newDest {
 		t.Fatalf("association facts: %+v", f)
 	}
 	totals, _ := s.ReadTotals()
@@ -163,7 +162,7 @@ func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
 	root.Finish()
 
 	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 || page.Rows[0].Flow.Downlink != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 11 || page.Rows[0].Flow.Downlink != 13 || page.Rows[0].Flow.Destination != destination {
 		t.Fatalf("pre-classification terminal: %+v", page)
 	}
 	leg.Route(fs.OutboundRef{Serial: 31, Tag: "ordinary"})
@@ -171,7 +170,7 @@ func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
 	leg.AddUplink(17)
 
 	again, _ := s.ReadTerminals()
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink != 0 {
+	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink != 11 || again.Rows[0].Flow.Downlink != 13 {
 		t.Fatalf("late route changed immutable terminal: %+v", again)
 	}
 	totals, _ := s.ReadTotals()
@@ -198,7 +197,7 @@ func TestInspectionRouteThenOwnerEndBeforeBind(t *testing.T) {
 	root.Finish()
 
 	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 23 || page.Rows[0].Flow.LatestDestination != destination || page.Rows[0].Flow.Outbound.Serial != 35 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 23 || page.Rows[0].Flow.Destination != destination || page.Rows[0].Flow.Outbound.Serial != 35 {
 		t.Fatalf("route-before-bind lower bound: %+v", page)
 	}
 	leg.BindRoute()

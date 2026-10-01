@@ -66,6 +66,17 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return err
 }
 
+// WithWriterReceipt binds decoded writes before this connection's exclusive
+// body use. The native compact-then-scalar path retains each actual result.
+func (c *Conn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
+	c.receipt = receipt
+	return c
+}
+
+func (c *Conn) WriterReceipt() stats.Exchange {
+	return buf.OriginalWriterReceipt(c.receipt)
+}
+
 func (c *Conn) HandshakeContextServerName(ctx context.Context) string {
 	if err := c.HandshakeContext(ctx); err != nil {
 		return ""

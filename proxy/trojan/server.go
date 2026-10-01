@@ -247,12 +247,10 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 	errors.LogInfo(ctx, "received request for ", destination)
 	endpoint := transport.Link{Reader: clientReader, Writer: buf.NewWriter(conn)}
-	if !destination.Address.Family().IsDomain() || destination.Address.Domain() != "v1.mux.cool" {
-		var cleanup func()
-		ctx, cleanup = proxy.ObserveReturnedTCP(ctx, s.statsManager, conn, destination, &endpoint)
-		if cleanup != nil {
-			defer cleanup()
-		}
+	var cleanup func()
+	ctx, cleanup = proxy.ObserveReturnedTCP(ctx, s.statsManager, conn, destination, &endpoint)
+	if cleanup != nil {
+		defer cleanup()
 	}
 	return s.handleConnection(ctx, sessionPolicy, destination, endpoint.Reader, endpoint.Writer, dispatcher)
 }
@@ -502,9 +500,6 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 		return errors.New("failed to dial to " + fb.Dest).Base(err)
 	}
 	defer conn.Close()
-	if observation != nil {
-		observation.Effective(net.DestinationFromAddr(conn.RemoteAddr()))
-	}
 
 	serverReader := buf.NewReader(conn)
 	serverWriter := buf.NewWriter(conn)

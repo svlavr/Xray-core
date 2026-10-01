@@ -287,7 +287,7 @@ func TestFlowInspectionP2GVLESSDecodedRejectionBeforeResponse(t *testing.T) {
 	})
 	page, _ := view.ReadTerminals()
 	row := page.Rows[0]
-	if row.Flow.InitialDestination != request.Destination() || row.Flow.Outbound.Serial != 0 || row.Flow.Uplink != 0 || row.Flow.Downlink != 0 {
+	if row.Flow.Destination != request.Destination() || row.Flow.Outbound.Serial != 0 || row.Flow.Uplink != 0 || row.Flow.Downlink != 0 {
 		t.Fatalf("VLESS pre-response rejection: %+v", row)
 	}
 }

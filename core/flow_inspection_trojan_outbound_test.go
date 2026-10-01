@@ -129,7 +129,7 @@ func inspectionOutboundTCP(t *testing.T, config func(*testing.T) *core.OutboundH
 					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
+					if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Destination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("outbound TCP live facts: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -197,15 +197,8 @@ func inspectionOutboundUDP(t *testing.T, config func(*testing.T) *core.OutboundH
 				selected = live.Rows[0]
 				return true
 			})
-			if selected.Kind != cnet.Network_UDP || selected.InitialDestination != destination || selected.Outbound.Tag != outbound.Tag || selected.Outbound.Serial == 0 || selected.LatestDestination != destination {
+			if selected.Kind != cnet.Network_UDP || selected.Destination != destination || selected.Outbound.Tag != outbound.Tag || selected.Outbound.Serial == 0 {
 				t.Fatalf("outbound UDP live facts: %+v", selected)
-			}
-			if variant == "resolved" {
-				if !selected.EffectiveDestination.Address.Family().IsIP() || selected.EffectiveDestination.Port != destination.Port {
-					t.Fatalf("resolved target: %+v", selected)
-				}
-			} else if selected.EffectiveDestination != destination {
-				t.Fatalf("physical server replaced logical target: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
 			if err != nil || len(out) != 1 || out[0] != nil {

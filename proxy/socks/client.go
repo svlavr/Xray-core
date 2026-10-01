@@ -58,10 +58,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	// Destination of the inner request.
 	destination := ob.Target
 
-	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, destination.Network == net.Network_TCP || destination.Network == net.Network_UDP)
-	if observation != nil {
-		observation.Exchange.Effective(destination)
-	}
+	proxy.ClaimObservedEndpoint(ctx, link.Reader, destination.Network == net.Network_TCP || destination.Network == net.Network_UDP)
 
 	// Outbound server.
 	server := c.server

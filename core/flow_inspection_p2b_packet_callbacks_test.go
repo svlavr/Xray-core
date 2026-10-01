@@ -103,7 +103,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 							t.Fatalf("callback facts: %+v", row)
 						}
 					}
-					if first.InitialDestination != firstDest {
+					if first.Destination != secondDest || other.Destination != firstDest {
 						t.Fatalf("packet destinations: %+v", first)
 					}
 					inspectionClosePacketCallback(t, view, first.Ref)

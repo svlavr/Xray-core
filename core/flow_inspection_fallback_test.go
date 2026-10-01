@@ -55,7 +55,7 @@ func TestFlowInspectionFallback(t *testing.T) {
 
 func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 	t.Helper()
-	target, configuredAddress := inspectionFallbackTarget(t, xver)
+	_, configuredAddress := inspectionFallbackTarget(t, xver)
 	_, view, address := inspectionFallbackCore(t, protocol, true, xver, configuredAddress)
 	payload := append([]byte("GET /fallback HTTP/1.1\r\nHost: retained.invalid\r\n\r\n"), bytes.Repeat([]byte("p"), 4096)...)
 	first := inspectionFallbackClient(t, address, payload)
@@ -64,7 +64,6 @@ func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual := cnet.DestinationFromAddr(target.Addr())
 	var firstRow fs.FlowRecord
 	inspectionWait(t, func() bool {
 		live, err := view.ReadLive()
@@ -74,7 +73,7 @@ func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 		firstRow = live.Rows[0]
 		return true
 	})
-	assertFallbackFacts(t, firstRow, configured, actual, uint64(len(payload)))
+	assertFallbackFacts(t, firstRow, configured, uint64(len(payload)))
 	assertFallbackTotals(t, view, uint64(len(payload)))
 
 	if xver != 0 {
@@ -256,9 +255,9 @@ func inspectionFallbackResponse(t *testing.T, conn net.Conn, want []byte) {
 	}
 }
 
-func assertFallbackFacts(t *testing.T, row fs.FlowRecord, configured, effective cnet.Destination, payload uint64) {
+func assertFallbackFacts(t *testing.T, row fs.FlowRecord, configured cnet.Destination, payload uint64) {
 	t.Helper()
-	if row.Kind != cnet.Network_TCP || row.InitialDestination != configured || row.Outbound.Serial != 0 || row.Outbound.Tag != "" || row.EffectiveDestination != effective || row.Uplink != payload || row.Downlink != payload {
+	if row.Kind != cnet.Network_TCP || row.Destination != configured || row.Outbound.Serial != 0 || row.Outbound.Tag != "" || row.Uplink != payload || row.Downlink != payload {
 		t.Fatalf("fallback facts: %+v", row)
 	}
 }

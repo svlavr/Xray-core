@@ -50,15 +50,13 @@ func TestObserveFallbackRetainsInputAndUnknownRoute(t *testing.T) {
 			t.Fatalf("fallback input %q, want %q: %v", got, want, err)
 		}
 	}
-	effective := cnet.TCPDestination(cnet.LocalHostIP, 8443)
-	flow.Effective(effective)
 	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 {
 		t.Fatalf("live fallback: %+v %v", live, err)
 	}
 	configured := cnet.TCPDestination(cnet.DomainAddress("configured.invalid"), 8443)
 	row := live.Rows[0]
-	if row.InitialDestination != configured || row.Outbound.Serial != 0 || row.EffectiveDestination != effective || row.Uplink != 9 {
+	if row.Destination != configured || row.Outbound.Serial != 0 || row.Uplink != 9 {
 		t.Fatalf("fallback facts: %+v", row)
 	}
 }
@@ -82,7 +80,7 @@ func TestObserveFallbackMalformedTargetIsUnknown(t *testing.T) {
 		t.Fatalf("live fallback: %+v %v", live, err)
 	}
 	row := live.Rows[0]
-	if row.InitialDestination.IsValid() || row.EffectiveDestination.IsValid() {
+	if row.Destination.IsValid() {
 		t.Fatalf("malformed fallback fabricated a target: %+v", row)
 	}
 }

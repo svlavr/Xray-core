@@ -212,7 +212,7 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 			if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 				return false
 			}
-			if row.Outbound.Tag != "http-proxy" || row.Outbound.Serial == 0 || row.EffectiveDestination != target {
+			if row.Outbound.Tag != "http-proxy" || row.Outbound.Serial == 0 || row.Destination != target {
 				t.Fatalf("live HTTP/2 receipt: %+v", row)
 			}
 			if row.Outbound.Serial == 1 {

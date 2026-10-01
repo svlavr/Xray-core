@@ -21,10 +21,8 @@ type dnsRuntime struct {
 	// systemDNSMu orders unsafe resolver publication against Linux system DNS takeover.
 	// Takeover holds a read lock until the OS settings are reverted.
 	systemDNSMu sync.RWMutex
-	closeMu     sync.Mutex
 	current     *resolverOwner
 	closing     *resolverOwner
-	closed      bool
 }
 
 type resolverOwner struct {
@@ -171,7 +169,7 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 		rt.mu.Unlock()
 		return ApplyResult{Err: err}
 	}
-	if rt.closed {
+	if rt.current == nil || rt.current.ctx.Err() != nil {
 		rt.mu.Unlock()
 		return ApplyResult{Err: context.Canceled}
 	}

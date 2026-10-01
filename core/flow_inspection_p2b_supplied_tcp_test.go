@@ -174,7 +174,7 @@ func TestFlowInspectionP2BSpecialCarriersNotAdmitted(t *testing.T) {
 			destination := startOutboundStatsTCPServer(t)
 			inspectionSOCKS(t, address, destination, []byte("excluded shared carrier"))
 			live, err := view.ReadLive()
-			if err != nil || len(live.Rows) != 1 || live.Rows[0].InitialDestination != destination {
+			if err != nil || len(live.Rows) != 1 || live.Rows[0].Destination != destination {
 				t.Fatalf("shared carrier admitted as a logical exchange: %+v %v", live, err)
 			}
 			page, err := view.ReadTerminals()
@@ -203,7 +203,7 @@ func inspectionEnableOutboundMux(t *testing.T, outbound *core.OutboundHandlerCon
 
 func assertDecodedTCPReceiverFacts(t *testing.T, row fs.FlowRecord, destination cnet.Destination, payload uint64) {
 	t.Helper()
-	if row.Kind != cnet.Network_TCP || row.InitialDestination != destination || row.Outbound.Tag != "direct" || row.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser || row.Uplink != payload || row.Downlink != payload {
+	if row.Kind != cnet.Network_TCP || row.Destination != destination || row.Outbound.Tag != "direct" || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser || row.Uplink != payload || row.Downlink != payload {
 		t.Fatalf("supplied TCP facts: %+v", row)
 	}
 }

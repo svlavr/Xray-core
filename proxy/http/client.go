@@ -82,10 +82,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		return errors.New("UDP is not supported by HTTP outbound")
 	}
 
-	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
-	if observation != nil {
-		observation.Exchange.Effective(target)
-	}
+	proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 
 	server := c.server
 	dest := server.Destination

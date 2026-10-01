@@ -248,6 +248,27 @@ func NewAuthenticationWriter(auth Authenticator, sizeParser ChunkSizeEncoder, wr
 	return w
 }
 
+// ObserveAuthenticationWriter binds decoded operation results after the native
+// header/IV was prepared and before any body write. The returned cleanup must
+// run after the response owner's last native write/flush. It discards buffered
+// output without emitting it.
+// Nil observation preserves the native writer identity and allocates nothing.
+func ObserveAuthenticationWriter(writer buf.Writer, flow stats.Exchange) (buf.Writer, func()) {
+	if flow == nil {
+		return writer, nil
+	}
+	w, ok := writer.(*AuthenticationWriter)
+	if !ok {
+		return writer, nil
+	}
+	w.receipt = flow
+	return w, func() {
+		if buffered, ok := w.writer.(*buf.BufferedWriter); ok {
+			buf.DiscardBufferedWriter(buffered)
+		}
+	}
+}
+
 func (w *AuthenticationWriter) seal(b []byte) (*buf.Buffer, error) {
 	encryptedSize := int32(len(b) + w.auth.Overhead())
 	var paddingSize int32

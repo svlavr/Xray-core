@@ -99,7 +99,7 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Outbound.Tag != "http-proxy" || row.Outbound.Serial == 0 || row.EffectiveDestination != destination || row.Origin != fs.TrafficOriginUser {
+					if row.Outbound.Tag != "http-proxy" || row.Outbound.Serial == 0 || row.Destination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("live proxy receipt: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {

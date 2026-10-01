@@ -38,16 +38,16 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 			flow.Rebind(store.runtime, fs.TrafficOriginUser) // conflict cannot be repaired by a later matching carrier
 			row := flow.record
 			if test.conflict {
-				if row.LatestDestination != first {
-					t.Fatalf("conflict changed packet attribution: %+v", row.LatestDestination)
+				if row.Destination != first {
+					t.Fatalf("conflict changed packet attribution: %+v", row.Destination)
 				}
 				if row.Uplink != 7 || row.Downlink != 11 || row.Origin != fs.TrafficOriginUser {
 					t.Fatalf("conflict facts: %+v", row)
 				}
 			} else if row.Uplink != 107 || row.Downlink != 211 || flow.provenanceConflict {
 				t.Fatalf("matching facts: %+v", row)
-			} else if row.LatestDestination != second {
-				t.Fatalf("matching carrier lost packet attribution: %+v", row.LatestDestination)
+			} else if row.Destination != second {
+				t.Fatalf("matching carrier lost packet attribution: %+v", row.Destination)
 			}
 			flow.Finish()
 			page, _ := store.ReadTerminals()

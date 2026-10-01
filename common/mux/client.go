@@ -323,8 +323,6 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	}
 	if observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, true); observation != nil {
 		s.inspection = observation.Exchange
-		outbounds := session.OutboundsFromContext(ctx)
-		s.inspection.Effective(outbounds[len(outbounds)-1].Target)
 	}
 	if m.sessionManager.allocate(&m.strategy, s) == nil {
 		return false

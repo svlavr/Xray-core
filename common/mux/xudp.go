@@ -176,7 +176,7 @@ func (w *ServerWorker) handleXUDP(ctx context.Context, meta *FrameMetadata, read
 	x.Status = Initializing
 	old, link, flow := x.Mux, x.link, x.inspection
 	XUDPManager.Unlock()
-	var finishAdmission func()
+	var endOwner *Session
 	if flow != nil {
 		flow.Rebind(w.runtime, session.TrafficOriginFromContext(ctx))
 	}
@@ -194,9 +194,7 @@ func (w *ServerWorker) handleXUDP(ctx context.Context, meta *FrameMetadata, read
 		}
 		retired, flow := XUDPManager.Map[x.GlobalID] != x, x.inspection
 		XUDPManager.Unlock()
-		if finishAdmission != nil {
-			finishAdmission()
-		} else if retired && flow != nil {
+		if endOwner == nil && retired && flow != nil {
 			flow.Finish()
 		}
 	}()
@@ -205,11 +203,11 @@ func (w *ServerWorker) handleXUDP(ctx context.Context, meta *FrameMetadata, read
 		old.xudp.detach()
 	}
 	cancelAdmission := func() {
-		s := &Session{parent: w.sessionManager, ID: meta.SessionID, server: true, initializing: true, inspection: x.inspection}
+		s := &Session{parent: w.sessionManager, ID: meta.SessionID, server: true, inspection: x.inspection}
 		if x.inspection != nil {
 			s.cleanup = x.inspection.Finish
 		}
-		finishAdmission = s.finishAdmission
+		endOwner = s
 		s.cancelAdmission(ctx, w.link.Writer)
 	}
 

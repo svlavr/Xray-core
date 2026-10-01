@@ -427,7 +427,7 @@ func TestStageBReplacementAndFeatureCloseShareRetirement(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		feature.runtime.mu.Lock()
-		captured := feature.runtime.closed
+		captured := feature.runtime.current.ctx.Err() != nil
 		feature.runtime.mu.Unlock()
 		if captured {
 			break
@@ -442,6 +442,10 @@ func TestStageBReplacementAndFeatureCloseShareRetirement(t *testing.T) {
 		t.Fatalf("feature Close passed unfinished retirement: %v", err)
 	default:
 	}
+	concurrent := make(chan error, 3)
+	for range 3 {
+		go func() { concurrent <- feature.Close() }()
+	}
 	close(release)
 	select {
 	case err := <-closed:
@@ -450,6 +454,16 @@ func TestStageBReplacementAndFeatureCloseShareRetirement(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("feature Close did not join retirement")
+	}
+	for range 3 {
+		select {
+		case err := <-concurrent:
+			if err != nil && !go_errors.Is(err, closeFailure) {
+				t.Fatalf("overlapping Close returned an unrelated error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("overlapping Close did not share resource retirement")
+		}
 	}
 	old.mu.Lock()
 	closes := old.closes

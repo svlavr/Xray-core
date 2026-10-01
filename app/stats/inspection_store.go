@@ -86,11 +86,11 @@ func (s *inspectionStore) prepare(kind xnet.Network, origin featurestats.Traffic
 			store: s,
 			stop:  stop,
 			record: featurestats.FlowRecord{
-				Kind:               kind,
-				Origin:             origin,
-				Source:             source,
-				InitialDestination: destination,
-				Opened:             s.elapsed(),
+				Kind:        kind,
+				Origin:      origin,
+				Source:      source,
+				Destination: destination,
+				Opened:      s.elapsed(),
 			},
 		},
 	}
@@ -287,7 +287,6 @@ type inspectionFlow struct {
 	stopRequested      bool
 	mu                 sync.Mutex
 	record             featurestats.FlowRecord
-	routeSerial        uint64
 	provenanceConflict bool
 }
 
@@ -296,7 +295,6 @@ type inspectionExchange struct {
 	isLeg           bool
 	hasLegs         bool
 	route           featurestats.OutboundRef
-	routeSeq        uint64
 	pending         *pendingCredit
 	bucket          *aggregateCell
 	published       bool
@@ -343,11 +341,7 @@ func (e *inspectionExchange) Route(outbound featurestats.OutboundRef) {
 	if e.excluded || e.published {
 		return
 	}
-	e.commitPendingLocked()
-	e.routeSerial++
-	e.routeSeq = e.routeSerial
 	e.record.Outbound = outbound
-	e.record.EffectiveDestination = xnet.Destination{}
 	if e.bucket == nil {
 		e.route = outbound
 	}
@@ -373,7 +367,6 @@ func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 	if e.excluded || e.bucket != nil {
 		return
 	}
-	e.commitPendingLocked()
 	if !e.isLeg {
 		e.registerLocked()
 	}
@@ -386,15 +379,6 @@ func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 	bucket.uplink.Add(up)
 	bucket.downlink.Add(down)
 	e.pending = nil
-}
-
-func (e *inspectionExchange) Effective(destination xnet.Destination) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.excluded || e.published || e.routeSeq == 0 || e.routeSeq != e.routeSerial {
-		return
-	}
-	e.record.EffectiveDestination = destination
 }
 
 func (e *inspectionExchange) SetSource(source xnet.Destination) {
@@ -415,17 +399,13 @@ func (e *inspectionExchange) PacketDestination(destination xnet.Destination) {
 	if e.excluded || e.published || e.provenanceConflict || !destination.IsValid() {
 		return
 	}
-	e.record.LatestDestination = destination
+	e.record.Destination = destination
 }
 
 func (e *inspectionExchange) AddUplink(value uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.excluded || e.provenanceConflict {
-		return
-	}
-	if e.pending != nil && e.routeSeq == 0 {
-		e.pending.up += value
 		return
 	}
 	e.record.Uplink += value
@@ -440,10 +420,6 @@ func (e *inspectionExchange) AddDownlink(value uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.excluded || e.provenanceConflict {
-		return
-	}
-	if e.pending != nil && e.routeSeq == 0 {
-		e.pending.down += value
 		return
 	}
 	e.record.Downlink += value
@@ -535,14 +511,6 @@ func (e *inspectionExchange) completeLocked() *featurestats.TerminalRecord {
 	e.stop = nil
 	flow := e.record
 	return &featurestats.TerminalRecord{Flow: flow, Ended: e.store.elapsed()}
-}
-
-func (e *inspectionExchange) commitPendingLocked() {
-	if e.pending == nil || e.routeSeq != 0 {
-		return
-	}
-	e.record.Uplink += e.pending.up
-	e.record.Downlink += e.pending.down
 }
 
 func normalizeOrigin(origin featurestats.TrafficOrigin) featurestats.TrafficOrigin {

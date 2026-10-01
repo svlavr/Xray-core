@@ -131,7 +131,6 @@ func TestInspectionLifecycleTotalsClonesAndOwnerEnd(t *testing.T) {
 		Tag:    strings.Repeat("t", 300),
 	})
 	exchange.BindRoute()
-	exchange.Effective(xnet.TCPDestination(xnet.DomainAddress("effective.example"), 443))
 	exchange.AddUplink(2)
 	exchange.AddDownlink(3)
 

@@ -212,8 +212,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return w.handleXUDP(ctx, meta, reader)
 	}
 
-	s := &Session{parent: w.sessionManager, ID: meta.SessionID, transferType: protocol.TransferTypeStream, server: true, initializing: true}
-	defer s.finishAdmission()
+	s := &Session{parent: w.sessionManager, ID: meta.SessionID, transferType: protocol.TransferTypeStream, server: true}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
 	}

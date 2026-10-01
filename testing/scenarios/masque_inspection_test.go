@@ -221,7 +221,7 @@ func (g *masqueFirstDatagramGate) Snapshot() (sources int, forwarded uint64, err
 
 func inspectionMasqueTCPRow(t *testing.T, row fs.FlowRecord, target xnet.Destination, known uint64) {
 	t.Helper()
-	if row.Ref.ID == 0 || row.Kind != xnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != target || row.Uplink != known || row.Downlink != known || row.Outbound.Tag != "masque-inspected" || row.Outbound.Serial == 0 || row.EffectiveDestination != target {
+	if row.Ref.ID == 0 || row.Kind != xnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Destination != target || row.Uplink != known || row.Downlink != known || row.Outbound.Tag != "masque-inspected" || row.Outbound.Serial == 0 {
 		t.Fatalf("logical MASQUE TCP flow: %+v", row)
 	}
 }
@@ -321,7 +321,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 		}
 		for _, row := range live.Rows {
 			if row.Kind == xnet.Network_UDP && row.Uplink == uint64(len(udpPayload)) && row.Downlink == uint64(len(udpPayload)) {
-				if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "masque-inspected" || row.EffectiveDestination != udpTarget || row.Downlink != row.Uplink {
+				if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "masque-inspected" || row.Destination != udpTarget || row.Downlink != row.Uplink {
 					t.Fatalf("logical MASQUE UDP flow: %+v", row)
 				}
 				udpRef = row.Ref

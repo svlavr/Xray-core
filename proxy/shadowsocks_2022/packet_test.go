@@ -80,7 +80,7 @@ func TestInspectionSS2022PacketCodecResults(t *testing.T) {
 				if outcome == "complete" {
 					want = 8
 				}
-				if row.Uplink != 7 || row.Downlink != want || row.LatestDestination != destination {
+				if row.Uplink != 7 || row.Downlink != want || row.Destination != destination {
 					t.Fatalf("packet result: %+v", row)
 				}
 			})

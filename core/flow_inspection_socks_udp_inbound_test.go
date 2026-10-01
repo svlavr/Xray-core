@@ -110,16 +110,15 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 					return false
 				}
 				for _, row := range live.Rows {
-					if row.LatestDestination == secondDest {
+					if row.Destination == secondDest {
 						selected = row
 					}
 				}
 				return selected.Uplink == uint64(len(payload)+len(extra)) && selected.Downlink == selected.Uplink
 			})
 			// The association begins before the first datagram with unavailable
-			// peer and target. The first accepted packet fills the native peer;
-			// destinations and the consuming route arrive with actual rays.
-			if selected.Kind != cnet.Network_UDP || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.InitialDestination.IsValid() || selected.Outbound.Tag != "direct" || selected.Outbound.Serial == 0 {
+			// peer and target. Accepted packets fill the peer and latest requested target.
+			if selected.Kind != cnet.Network_UDP || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.Destination != secondDest || selected.Outbound.Tag != "direct" || selected.Outbound.Serial == 0 {
 				t.Fatalf("association facts: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
@@ -174,7 +173,7 @@ func TestFlowInspectionSOCKSUDPInboundPreFirstPayload(t *testing.T) {
 		association = live.Rows[0]
 		return association.Ref.ID != 0
 	})
-	if association.Kind != cnet.Network_UDP || association.Origin != fs.TrafficOriginUser || association.Source.IsValid() || association.InitialDestination.IsValid() || association.Uplink != 0 || association.Downlink != 0 {
+	if association.Kind != cnet.Network_UDP || association.Origin != fs.TrafficOriginUser || association.Source.IsValid() || association.Destination.IsValid() || association.Uplink != 0 || association.Downlink != 0 {
 		t.Fatalf("pre-first association: %+v", association)
 	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{association.Ref})

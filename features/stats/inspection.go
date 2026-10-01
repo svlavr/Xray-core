@@ -38,17 +38,15 @@ type ObservationOptions struct {
 }
 
 type FlowRecord struct {
-	Ref                  FlowRef
-	Kind                 net.Network
-	Origin               TrafficOrigin
-	Source               net.Destination
-	InitialDestination   net.Destination
-	Opened               time.Duration
-	Outbound             OutboundRef
-	EffectiveDestination net.Destination
-	LatestDestination    net.Destination
-	Uplink               uint64
-	Downlink             uint64
+	Ref         FlowRef
+	Kind        net.Network
+	Origin      TrafficOrigin
+	Source      net.Destination
+	Destination net.Destination
+	Opened      time.Duration
+	Outbound    OutboundRef
+	Uplink      uint64
+	Downlink    uint64
 }
 
 type TerminalRecord struct {
@@ -126,7 +124,6 @@ type Exchange interface {
 	// BindRoute is called after the consuming owner is selected.
 	BindRoute()
 	Unassign()
-	Effective(net.Destination)
 	// SetSource fills a previously unknown source once.
 	SetSource(net.Destination)
 	// PacketDestination records the latest requested packet destination.

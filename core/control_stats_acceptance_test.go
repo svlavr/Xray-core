@@ -152,7 +152,7 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 	var userRef fs.FlowRef
 	seen := make(map[fs.TrafficOrigin]bool)
 	for _, row := range live.Rows {
-		if row.Kind != xnet.Network_TCP || row.InitialDestination != destination || row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) || row.Outbound.Tag != "direct" {
+		if row.Kind != xnet.Network_TCP || row.Destination != destination || row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) || row.Outbound.Tag != "direct" {
 			t.Fatalf("live facts: %+v", row)
 		}
 		seen[row.Origin] = true

@@ -48,7 +48,7 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 				first = live.Rows[0]
 				return true
 			})
-			if first.Kind != cnet.Network_UDP || first.Origin != fs.TrafficOriginUser || first.Outbound.Tag != "direct" || first.Outbound.Serial == 0 || first.InitialDestination != destination {
+			if first.Kind != cnet.Network_UDP || first.Origin != fs.TrafficOriginUser || first.Outbound.Tag != "direct" || first.Outbound.Serial == 0 || first.Destination != destination {
 				t.Fatalf("supplied packet facts: %+v", first)
 			}
 			inspectionUDPExchange(t, sibling, address, payload, 0x19)
@@ -92,7 +92,7 @@ func TestFlowInspectionP2BHysteriaPacketDestinations(t *testing.T) {
 			return false
 		}
 		row := live.Rows[0]
-		if row.InitialDestination != first || row.Uplink != row.Downlink {
+		if row.Destination != second || row.Uplink != row.Downlink {
 			t.Fatalf("Hysteria packet destinations: %+v", row)
 		}
 		ref = row.Ref

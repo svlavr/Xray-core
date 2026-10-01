@@ -74,10 +74,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
 		command = protocol.RequestCommandMux
 	}
-	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, command == protocol.RequestCommandTCP || command == protocol.RequestCommandUDP)
-	if observation != nil {
-		observation.Exchange.Effective(target)
-	}
+	proxy.ClaimObservedEndpoint(ctx, link.Reader, command == protocol.RequestCommandTCP || command == protocol.RequestCommandUDP)
 	useXUDP := command == protocol.RequestCommandUDP && h.cone && target.Port != 53 && target.Port != 443
 	if useXUDP {
 		command = protocol.RequestCommandMux

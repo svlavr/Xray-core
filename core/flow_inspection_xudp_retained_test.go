@@ -62,7 +62,7 @@ func TestFlowInspectionXUDPRetainedRebind(t *testing.T) {
 			row = live.Rows[0]
 			return row.Uplink == uint64(len(payload)) && row.Downlink == uint64(len(payload))
 		})
-		if row.Source.Port != cnet.Port(source.Port) || row.Outbound.Tag != "vmess-proxy" || row.EffectiveDestination != destination {
+		if row.Source.Port != cnet.Port(source.Port) || row.Outbound.Tag != "vmess-proxy" || row.Destination != destination {
 			t.Fatalf("client binding: %+v", row)
 		}
 		if row.Ref == prior {

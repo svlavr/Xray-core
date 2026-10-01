@@ -164,10 +164,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		ordinaryTarget = ordinaryTarget && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
 	}
 	vision := account.Flow == vless.XRV || account.Flow == vless.XRV+"-udp443"
-	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget && (account.Flow == "" || vision))
-	if observation != nil {
-		observation.Exchange.Effective(target)
-	}
+	proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget && (account.Flow == "" || vision))
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {

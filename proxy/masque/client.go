@@ -108,10 +108,6 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		eligible = eligible && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
 	}
 	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, eligible)
-	if observation != nil {
-		observation.Exchange.Effective(ob.Target)
-	}
-
 	t, err := c.getTunnel(ctx, ob.Gateway, dialer)
 	if err != nil {
 		return errors.New("failed to establish CONNECT-IP tunnel").Base(err)

@@ -80,7 +80,7 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 					return false
 				}
 				for _, r := range live.Rows {
-					if r.InitialDestination != dest || r.Origin != fs.TrafficOriginUser || r.Outbound.Tag != "portal" || r.Uplink != uint64(len(payload)) || r.Downlink != uint64(len(payload)) {
+					if r.Destination != dest || r.Origin != fs.TrafficOriginUser || r.Outbound.Tag != "portal" || r.Uplink != uint64(len(payload)) || r.Downlink != uint64(len(payload)) {
 						return false
 					}
 					first = r.Ref
@@ -188,7 +188,7 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 			return false
 		}
 		row := live.Rows[0]
-		if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != logicalDestination || row.Outbound.Tag != "portal" || row.Uplink != uint64(len(firstPayload)) || row.Downlink != uint64(len(firstPayload)) {
+		if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Destination != logicalDestination || row.Outbound.Tag != "portal" || row.Uplink != uint64(len(firstPayload)) || row.Downlink != uint64(len(firstPayload)) {
 			return false
 		}
 		firstRef = row.Ref
@@ -277,7 +277,7 @@ func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
 			return false
 		}
 		r := live.Rows[0]
-		return r.InitialDestination == target && r.Outbound.Tag == "same-domain" && r.EffectiveDestination == dest && r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload))
+		return r.Destination == target && r.Outbound.Tag == "same-domain" && r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload))
 	})
 	conn.Close()
 	inspectionWait(t, func() bool {

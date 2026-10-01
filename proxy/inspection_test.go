@@ -149,13 +149,22 @@ func TestBeginReturnedObservationExcludesReservedCarrier(t *testing.T) {
 		if observed != ctx || observation != nil || cleanup != nil {
 			t.Fatal("reserved carrier was admitted")
 		}
+		observed, observation, cleanup = proxy.BeginSuppliedObservation(ctx, manager, conn, destination, cnet.Network_TCP)
+		if observed != ctx || observation != nil || cleanup != nil {
+			t.Fatal("supplied carrier was admitted")
+		}
 		link := &transport.Link{Reader: buf.NewReader(conn), Writer: buf.NewWriter(conn)}
+		original := *link
+		observed, cleanup = proxy.ObserveReturnedTCP(ctx, manager, conn, destination, link)
+		if observed != ctx || cleanup != nil || *link != original {
+			t.Fatal("returned TCP carrier changed the endpoint")
+		}
 		observed, cleanup = proxy.ObserveTCP(ctx, manager, conn, destination, link)
-		if observed != ctx || cleanup != nil {
+		if observed != ctx || cleanup != nil || *link != original {
 			t.Fatal("supplied TCP carrier was admitted")
 		}
 		observed, cleanup = proxy.ObserveUDP(ctx, manager, conn, destination, link)
-		if observed != ctx || cleanup != nil {
+		if observed != ctx || cleanup != nil || *link != original {
 			t.Fatal("supplied UDP carrier was admitted")
 		}
 	}

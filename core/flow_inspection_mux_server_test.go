@@ -32,7 +32,7 @@ func inspectionOnlyMuxFlow(t *testing.T, view fs.FlowInspection, conn net.Conn, 
 			return false
 		}
 		r := live.Rows[0]
-		if r.InitialDestination != destination || r.Outbound.Tag != tag || r.Outbound.Serial == 0 || r.EffectiveDestination != destination || r.Origin != fs.TrafficOriginUser {
+		if r.Destination != destination || r.Outbound.Tag != tag || r.Outbound.Serial == 0 || r.Origin != fs.TrafficOriginUser {
 			t.Fatalf("MUX logical owner: %+v", r)
 		}
 		ref = r.Ref
@@ -110,7 +110,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 					row = live.Rows[0]
 					return row.Uplink == total && row.Downlink == total
 				})
-				if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "direct" || row.EffectiveDestination != destination {
+				if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "direct" || row.Destination != destination {
 					t.Fatalf("server facts: %+v", row)
 				}
 				if i > 0 && row.Ref != retainedRef {

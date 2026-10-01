@@ -197,8 +197,6 @@ type Session struct {
 	server       bool           // retain wire ID until the server response worker returns
 	inspection   stats.Exchange // existing client admission; never the carrier
 	cleanup      func()         // ordinary server admission, after response return
-	initializing bool
-	responseDone bool
 }
 
 // Close closes all resources associated with this session.
@@ -257,29 +255,10 @@ func (s *Session) finishServer() {
 	if s.parent.sessions[s.ID] == s {
 		delete(s.parent.sessions, s.ID)
 	}
-	s.responseDone = true
-	cleanup := s.takeCleanupLocked()
-	s.parent.Unlock()
-	if cleanup != nil {
-		cleanup()
-	}
-}
-
-func (s *Session) finishAdmission() {
-	s.parent.Lock()
-	s.initializing = false
-	cleanup := s.takeCleanupLocked()
-	s.parent.Unlock()
-	if cleanup != nil {
-		cleanup()
-	}
-}
-
-func (s *Session) takeCleanupLocked() func() {
-	if s.initializing || !s.responseDone {
-		return nil
-	}
 	cleanup := s.cleanup
 	s.cleanup = nil
-	return cleanup
+	s.parent.Unlock()
+	if cleanup != nil {
+		cleanup()
+	}
 }

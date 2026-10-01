@@ -182,7 +182,6 @@ func acceptanceFillMetadata(store *inspectionStore, serial uint64, index int) *i
 	e := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, domain("source"), domain("initial"), nil).(*inspectionExchange)
 	for i := 0; i < 4; i++ {
 		e.Route(fs.OutboundRef{Serial: serial, Tag: strings.Repeat("t", 300)})
-		e.Effective(domain("effective"))
 	}
 	e.BindRoute()
 	for i := 0; i < 8; i++ {
@@ -202,7 +201,7 @@ func TestInspectionAcceptanceDefaultCapRetainedHeap(t *testing.T) {
 	}
 	for i := 0; i < int(store.limits.MaxTerminals); i++ {
 		e := acceptanceFillMetadata(store, uint64(i+1), i)
-		if len(e.record.Outbound.Tag) != 300 || !e.record.LatestDestination.IsValid() {
+		if len(e.record.Outbound.Tag) != 300 || !e.record.Destination.IsValid() {
 			t.Fatalf("latest bounded metadata missing: %+v", e.record)
 		}
 		e.Finish()

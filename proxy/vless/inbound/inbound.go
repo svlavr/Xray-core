@@ -432,9 +432,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				return errors.New("failed to dial to " + fb.Dest).Base(err)
 			}
 			defer conn.Close()
-			if observation != nil {
-				observation.Effective(net.DestinationFromAddr(conn.RemoteAddr()))
-			}
 
 			serverReader := buf.NewReader(conn)
 			serverWriter := buf.NewWriter(conn)
@@ -549,10 +546,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	account := request.User.Account.(*vless.MemoryAccount)
 	ordinary := request.Command == protocol.RequestCommandTCP || request.Command == protocol.RequestCommandUDP
-	carrier := request.Address.Family().IsDomain() && request.Address.Domain() == "v1.mux.cool"
 	var observation *session.LogicalObservation
 	var observationCleanup func()
-	if ordinary && !carrier {
+	if ordinary {
 		kind := net.Network_TCP
 		if request.Command == protocol.RequestCommandUDP {
 			kind = net.Network_UDP

@@ -142,7 +142,7 @@ func inspectionUDPRow(t *testing.T, view fs.FlowInspection, source cnet.Port, de
 			if row.Uplink != uplink || row.Downlink != downlink {
 				return false
 			}
-			if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.InitialDestination != destination || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" || row.LatestDestination != destination {
+			if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Destination != destination || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" {
 				t.Fatalf("UDP logical facts: %+v", row)
 			}
 			found = row
@@ -168,9 +168,6 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 	siblingPort := cnet.Port(sibling.LocalAddr().(*net.UDPAddr).Port)
 	selected := inspectionUDPRow(t, view, firstPort, destination, uint64(len(firstPayload)), uint64(len(firstPayload)))
 	_ = inspectionUDPRow(t, view, siblingPort, destination, uint64(len(siblingPayload)), uint64(len(siblingPayload)))
-	if selected.EffectiveDestination != destination {
-		t.Fatalf("effective target: got %v want %v", selected.EffectiveDestination, destination)
-	}
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
 	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("exact UDP stop: %+v %v", outcomes, err)
@@ -228,9 +225,6 @@ func TestFlowInspectionSuppliedUDPResolvedTarget(t *testing.T) {
 	payload := []byte("resolved supplied UDP target")
 	inspectionUDPExchange(t, client, inbound, payload, mask)
 	row := inspectionUDPRow(t, view, cnet.Port(client.LocalAddr().(*net.UDPAddr).Port), requested, uint64(len(payload)), uint64(len(payload)))
-	if !row.EffectiveDestination.Address.Family().IsIP() || row.EffectiveDestination.Port != requested.Port {
-		t.Fatalf("resolved effective target: %+v", row)
-	}
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
 	if err != nil || len(out) != 1 || out[0] != nil {
 		t.Fatalf("close resolved association: %+v %v", out, err)
@@ -315,7 +309,7 @@ func inspectionUDPBatchThrough(t *testing.T, instance *core.Instance, view fs.Fl
 		row = live.Rows[0]
 		return row.Uplink == uint64(len(got)) && row.Downlink == uint64(len(got))
 	})
-	if row.Kind != cnet.Network_UDP || row.InitialDestination != destinations[0] || row.LatestDestination != destinations[1] || row.Outbound.Tag != outboundTag {
+	if row.Kind != cnet.Network_UDP || row.Destination != destinations[1] || row.Outbound.Tag != outboundTag {
 		t.Fatalf("batch association facts: %+v", row)
 	}
 	totals, err := view.ReadTotals()

@@ -245,10 +245,7 @@ func (s *DNS) Close() error {
 		return nil
 	}
 	rt := s.runtime
-	rt.closeMu.Lock()
-	defer rt.closeMu.Unlock()
 	rt.mu.Lock()
-	rt.closed = true
 	if rt.current != nil {
 		rt.current.cancel()
 	}
@@ -311,7 +308,7 @@ func (s *DNS) MayUseSystemResolver() bool {
 	rt := s.runtime
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if rt.closed || rt.current == nil {
+	if rt.current == nil || rt.current.ctx.Err() != nil {
 		return true
 	}
 	return resolverMayUseSystem(rt.current.resolver)
@@ -351,7 +348,7 @@ func (s *DNS) AcquireSystemDNS() (func(), error) {
 	rt := s.runtime
 	rt.systemDNSMu.RLock()
 	rt.mu.Lock()
-	unsafe := rt.closed || rt.current == nil || resolverMayUseSystem(rt.current.resolver) ||
+	unsafe := rt.current == nil || rt.current.ctx.Err() != nil || resolverMayUseSystem(rt.current.resolver) ||
 		(rt.closing != nil && resolverMayUseSystem(rt.closing.resolver))
 	rt.mu.Unlock()
 	if unsafe {
@@ -373,7 +370,7 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 	}
 	rt := s.runtime
 	rt.mu.Lock()
-	if rt.closed {
+	if rt.current == nil || rt.current.ctx.Err() != nil {
 		rt.mu.Unlock()
 		return nil, 0, context.Canceled
 	}

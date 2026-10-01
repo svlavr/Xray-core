@@ -127,7 +127,7 @@ func TestInspectionMasqueTCPClaimBeforeTunnelFailure(t *testing.T) {
 	if err != nil || len(page.Rows) != 1 {
 		t.Fatalf("terminal: %+v %v", page, err)
 	}
-	if page.Rows[0].Flow.Outbound.Tag != "masque-test" || page.Rows[0].Flow.EffectiveDestination != target {
+	if page.Rows[0].Flow.Outbound.Tag != "masque-test" || page.Rows[0].Flow.Destination != target {
 		t.Fatalf("logical MASQUE route: %+v", page.Rows[0].Flow)
 	}
 }

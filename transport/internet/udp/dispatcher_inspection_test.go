@@ -85,13 +85,13 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	lifecycleWait(t, legFinished)
 	root.Finish()
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len("pending input")) {
 		t.Fatalf("owner-end pending snapshot: %+v", page)
 	}
 	close(roleSelected)
 	lifecycleWait(t, selectedDone)
 	again, _ := view.ReadTerminals()
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink != 0 {
+	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink != uint64(len("pending input")) {
 		t.Fatalf("selected role changed immutable terminal: %+v", again)
 	}
 	totals, _ := view.ReadTotals()
@@ -306,7 +306,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.LatestDestination != destination || flow.Outbound.Serial != 17 {
+			if flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.Destination != destination || flow.Outbound.Serial != 17 {
 				t.Fatalf("API dispatcher facts: %+v", flow)
 			}
 			return

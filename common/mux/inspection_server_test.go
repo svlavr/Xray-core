@@ -112,6 +112,65 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 	t.Fatal("stopped admission did not release its owners")
 }
 
+func TestMuxEndRetiresBeforeLateInitialFrame(t *testing.T) {
+	manager := new(appstats.Manager)
+	view, err := manager.EnableInspection(fs.ObservationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.Close() })
+	link, _, response, _ := retainedLink(t, 1024)
+	response.Close()
+	d := &retainedDispatcher{dispatch: func(ctx context.Context) (*transport.Link, error) {
+		observation := session.LogicalObservationFromContext(ctx)
+		observation.Exchange.Route(fs.OutboundRef{Serial: 1})
+		observation.Exchange.BindRoute()
+		return link, nil
+	}}
+	carrier := &blockedCarrier{entered: make(chan struct{}), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(carrier.release) })
+	t.Cleanup(release)
+	w := retainedWorker(t, d, carrier)
+	w.stats, w.store = manager, manager.Observation()
+	sibling := &Session{ID: 9, parent: w.sessionManager, output: buf.Discard}
+	w.sessionManager.Add(sibling)
+	input, payload := io.Pipe()
+	t.Cleanup(func() { input.Close(); payload.Close() })
+	returned := make(chan error, 1)
+	ctx := session.ContextWithTrafficOrigin(context.Background(), session.TrafficOriginUser)
+	meta := &FrameMetadata{SessionID: 1, Option: OptionData, Target: net.TCPDestination(net.LocalHostIP, 80)}
+	go func() {
+		returned <- w.handleStatusNew(ctx, meta, &buf.BufferedReader{Reader: buf.NewReader(input)})
+	}()
+	muxWait(t, carrier.entered)
+	muxCheckTerminal(t, view, 0)
+	release()
+	waitMuxTerminal(t, view)
+	if got, _ := w.sessionManager.Get(9); got != sibling {
+		t.Fatal("END retirement closed a sibling")
+	}
+	if _, err := payload.Write([]byte{0, 3, 'l', 'a', 't'}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-returned:
+		if err != nil {
+			t.Fatalf("late initial frame did not drain: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late initial frame blocked the carrier")
+	}
+	page, _ := view.ReadTerminals()
+	totals, _ := view.ReadTotals()
+	var uplink uint64
+	for _, row := range totals.Rows {
+		uplink += row.Uplink
+	}
+	if page.Rows[0].Flow.Uplink != 0 || uplink != 3 {
+		t.Fatalf("late frame changed snapshot or lost totals: %+v %+v", page, totals)
+	}
+}
+
 func muxServerFact(t *testing.T, view fs.FlowInspection) fs.FlowRecord {
 	t.Helper()
 	live, err := view.ReadLive()

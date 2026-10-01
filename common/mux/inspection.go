@@ -18,7 +18,7 @@ type childCloser struct{ session *Session }
 func (c childCloser) Close() error { return c.session.Close(false) }
 
 // A stop during preparation still has a native child END owner. The admission
-// keeps its base lifetime until both the initial frame drain and END return.
+// finishes at response END; carrier-frame drain retains its own native reader.
 func (s *Session) cancelAdmission(ctx context.Context, output buf.Writer) {
 	s.Close(false)
 	s.parent.Lock()

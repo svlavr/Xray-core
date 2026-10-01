@@ -82,15 +82,8 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 						return false
 					}
 					if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "socks-proxy" || row.Outbound.Serial == 0 ||
-						row.InitialDestination != destination || row.LatestDestination != destination {
+						row.Destination != destination {
 						t.Fatalf("SOCKS UDP logical facts: %+v", row)
-					}
-					if variant == "resolved" {
-						if !row.EffectiveDestination.Address.Family().IsIP() || row.EffectiveDestination.Port != destination.Port {
-							t.Fatalf("resolved logical target: %+v", row)
-						}
-					} else if row.EffectiveDestination != destination {
-						t.Fatalf("physical server became logical target: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.UDPAddr).Port) {
 						selected = row

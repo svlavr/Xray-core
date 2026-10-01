@@ -57,7 +57,7 @@ func TestFlowInspectionMuxClientUDP(t *testing.T) {
 				if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 					return false
 				}
-				if row.Outbound.Tag != outbound.Tag || row.EffectiveDestination != destination || row.LatestDestination != destination {
+				if row.Outbound.Tag != outbound.Tag || row.Destination != destination {
 					t.Fatalf("UDP child facts: %+v", row)
 				}
 				ref = row.Ref

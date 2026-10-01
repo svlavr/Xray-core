@@ -163,10 +163,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		eligible = eligible && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
 	}
 	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, eligible)
-	if observation != nil {
-		observation.Exchange.Effective(ob.Target)
-	}
-
 	if err := h.init(ob.Gateway); err != nil {
 		return err
 	}

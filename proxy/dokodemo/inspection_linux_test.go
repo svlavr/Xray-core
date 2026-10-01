@@ -142,7 +142,7 @@ func TestInspectionDokodemoNativeFakeUDP(t *testing.T) {
 				t.Fatalf("terminal: %+v %v", page, err)
 			}
 			f := page.Rows[0].Flow
-			if f.Uplink != 7 || f.Downlink != 16 || f.InitialDestination != target {
+			if f.Uplink != 7 || f.Downlink != 16 || f.Destination != target {
 				t.Fatalf("native facts: %+v", f)
 			}
 		}
