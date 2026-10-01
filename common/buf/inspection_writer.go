@@ -99,35 +99,42 @@ func WriteBytesWithReceipt(writer io.Writer, payload []byte, receipt stats.Excha
 // accounting. Unsupported writers keep their identity and add no byte facts. For BufferedWriter, pre-binding buffered bytes must be framing,
 // and every later successful operation must be decoded payload.
 func AttachWriterReceipt(writer Writer, receipt stats.Exchange) Writer {
+	bound, _ := AttachWriterReceiptWithStatus(writer, receipt)
+	return bound
+}
+
+// AttachWriterReceiptWithStatus reports whether the endpoint writer accepted
+// the receipt. A selected consumer may account for an unsupported writer itself.
+func AttachWriterReceiptWithStatus(writer Writer, receipt stats.Exchange) (Writer, bool) {
 	if buffered, ok := writer.(*BufferedWriter); ok {
 		buffered.Lock()
 		defer buffered.Unlock()
 
-		attachBufferedWriterReceipt(buffered, receipt)
-		return writer
+		return writer, attachBufferedWriterReceipt(buffered, receipt)
 	}
 	return attachWriterReceipt(writer, receipt)
 }
 
 // The caller holds the existing buffered-writer mutex.
-func attachBufferedWriterReceipt(buffered *BufferedWriter, receipt stats.Exchange) {
+func attachBufferedWriterReceipt(buffered *BufferedWriter, receipt stats.Exchange) bool {
 	if buffered.buffer != nil && !buffered.buffer.IsEmpty() {
 		receipt = &inspectionPrefixReceipt{Exchange: receipt, remaining: uint64(buffered.buffer.Len())}
 	}
-	buffered.writer = attachWriterReceipt(buffered.writer, receipt)
+	var attached bool
+	buffered.writer, attached = attachWriterReceipt(buffered.writer, receipt)
+	return attached
 }
 
-func attachWriterReceipt(writer Writer, receipt stats.Exchange) Writer {
+func attachWriterReceipt(writer Writer, receipt stats.Exchange) (Writer, bool) {
 	switch w := writer.(type) {
 	case *BufferToBytesWriter:
-		return &inspectionBufferToBytesWriter{BufferToBytesWriter: w, receipt: receipt}
+		return &inspectionBufferToBytesWriter{BufferToBytesWriter: w, receipt: receipt}, true
 	case *SequentialWriter:
-		return &inspectionSequentialWriter{SequentialWriter: w, receipt: receipt}
+		return &inspectionSequentialWriter{SequentialWriter: w, receipt: receipt}, true
 	case interface{ WithWriterReceipt(stats.Exchange) Writer }:
-		return w.WithWriterReceipt(receipt)
+		return w.WithWriterReceipt(receipt), true
 	default:
-
-		return writer
+		return writer, false
 	}
 }
 

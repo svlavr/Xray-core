@@ -251,6 +251,10 @@ type LogicalObservation struct {
 	// InputAtExecution leaves caller-root uplink credit at the native consumer.
 	// Callback admissions that already credited decoded input keep this false.
 	InputAtExecution bool
+	// SuppliedEndpoint identifies the observed source link before DispatchLink.
+	// WriterReceiptAttached records whether its endpoint writer credits output.
+	SuppliedEndpoint      bool
+	WriterReceiptAttached bool
 }
 
 func ContextWithLogicalObservation(ctx context.Context, observation *LogicalObservation) context.Context {

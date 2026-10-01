@@ -153,30 +153,15 @@ func (h *Handler) applyRules(qType dnsmessage.Type, domain string) (RuleAction, 
 	return RuleAction_Return, dnsmessage.RCodeSuccess
 }
 
-type observedMessageReader struct {
-	dns_proto.MessageReader
+type endpointReceiptWriter struct {
+	buf.Writer
 	receipt stats.Exchange
 }
 
-func (r *observedMessageReader) ReadMessage() (*buf.Buffer, error) {
-	b, err := r.MessageReader.ReadMessage()
-	if b != nil {
-		r.receipt.AddUplink(uint64(b.Len()))
-	}
-	return b, err
-}
-
-type observedMessageWriter struct {
-	dns_proto.MessageWriter
-	receipt stats.Exchange
-}
-
-func (w *observedMessageWriter) WriteMessage(b *buf.Buffer) error {
-	size := uint64(b.Len())
-	err := w.MessageWriter.WriteMessage(b)
-	if err == nil {
-		w.receipt.AddDownlink(size)
-	}
+func (w *endpointReceiptWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	size := uint64(mb.Len())
+	err := w.Writer.WriteMultiBuffer(mb)
+	buf.RecordBufferOperation(w.receipt, size, err)
 	return err
 }
 
@@ -210,26 +195,27 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		},
 		connReady: make(chan struct{}, 1),
 	}
-	receipt := proxy.ClaimDecodedEndpoint(ctx, link.Reader)
+	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
+	supplied := observation != nil && observation.SuppliedEndpoint
+	output := link.Writer
+	if supplied && !observation.WriterReceiptAttached {
+		output = &endpointReceiptWriter{Writer: output, receipt: observation.Exchange}
+	}
 
 	var reader dns_proto.MessageReader
 	var writer dns_proto.MessageWriter
 	if srcNetwork == net.Network_TCP {
 		reader = dns_proto.NewTCPReader(link.Reader)
 		writer = &dns_proto.TCPWriter{
-			Writer: link.Writer,
+			Writer: output,
 		}
 	} else {
 		reader = &dns_proto.UDPReader{
 			Reader: link.Reader,
 		}
 		writer = &dns_proto.UDPWriter{
-			Writer: link.Writer,
+			Writer: output,
 		}
-	}
-	if receipt != nil {
-		reader = &observedMessageReader{MessageReader: reader, receipt: receipt}
-		writer = &observedMessageWriter{MessageWriter: writer, receipt: receipt}
 	}
 
 	var connReader dns_proto.MessageReader
@@ -248,7 +234,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		}
 	}
 
-	if session.TimeoutOnlyFromContext(ctx) && receipt == nil {
+	if session.TimeoutOnlyFromContext(ctx) && !supplied {
 		detached := context.Background()
 		if inbound := session.InboundFromContext(ctx); inbound != nil {
 			detached = session.ContextWithInbound(detached, &session.Inbound{Tag: inbound.Tag})

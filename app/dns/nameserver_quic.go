@@ -369,13 +369,12 @@ func (s *QUICNameServer) Close() error {
 		_ = transport.Close()
 		if err := transport.Conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
 			closeErr = err
-		} else {
-			s.Lock()
-			if s.transport == transport {
-				s.transport = nil
-			}
-			s.Unlock()
 		}
+		s.Lock()
+		if s.transport == transport {
+			s.transport = nil
+		}
+		s.Unlock()
 	}
 	s.cacheController.Close()
 	s.workers.Wait()

@@ -305,9 +305,9 @@ func stageBManualFeature(t *testing.T, server Server) *DNS {
 	return feature
 }
 
-func TestStageBReplacementCancelsOldWorkAndRetainsFailedClose(t *testing.T) {
+func TestStageBReplacementReportsFailedCloseAndAllowsNextUpdate(t *testing.T) {
 	closeFailure := go_errors.New("old resource close failed")
-	old := &stageBBlockingServer{started: make(chan struct{}), closeErrs: []error{closeFailure, nil}}
+	old := &stageBBlockingServer{started: make(chan struct{}), closeErrs: []error{closeFailure}}
 	feature := stageBManualFeature(t, old)
 	t.Cleanup(func() { _ = feature.Close() })
 	lookupDone := make(chan error, 1)
@@ -326,16 +326,16 @@ func TestStageBReplacementCancelsOldWorkAndRetainsFailedClose(t *testing.T) {
 		t.Fatalf("old query was not canceled: %v", err)
 	}
 	stageBLookup(t, feature, "new.test", net.IP{192, 0, 2, 70})
-	if next := ApplyConfig(context.Background(), feature, cfg); next.Applied || next.Err == nil {
-		t.Fatalf("overwrote unfinished close: %+v", next)
+	if next := ApplyConfig(context.Background(), feature, cfg); !next.Applied || next.Err != nil {
+		t.Fatalf("completed close error blocked next update: %+v", next)
 	}
 	if err := feature.Close(); err != nil {
-		t.Fatalf("feature Close did not retry old owner: %v", err)
+		t.Fatalf("feature Close: %v", err)
 	}
 	old.mu.Lock()
 	closes := old.closes
 	old.mu.Unlock()
-	if closes != 2 {
+	if closes != 1 {
 		t.Fatalf("old resource close calls=%d", closes)
 	}
 	if _, _, err := feature.LookupIPContext(context.Background(), "new.test", featuredns.IPOption{IPv4Enable: true}); err == nil {
@@ -924,12 +924,16 @@ func (c *scriptedCloseConn) Close() error {
 	if c.proceed != nil {
 		<-c.proceed
 	}
-	return err
+	closeErr := c.Conn.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
 
 func (c *scriptedCloseConn) callCount() int { c.mu.Lock(); defer c.mu.Unlock(); return c.calls }
 
-func TestTrackedDoHCloseJoinAndRetry(t *testing.T) {
+func TestTrackedDoHCloseJoinAndRetirement(t *testing.T) {
 	t.Run("concurrent-native-close", func(t *testing.T) {
 		left, right := stdnet.Pipe()
 		defer right.Close()
@@ -957,25 +961,19 @@ func TestTrackedDoHCloseJoinAndRetry(t *testing.T) {
 			t.Fatal("closed connection still writable")
 		}
 	})
-	t.Run("retry-failure", func(t *testing.T) {
+	t.Run("close-error-retires", func(t *testing.T) {
 		failure := go_errors.New("close failed")
 		left, right := stdnet.Pipe()
 		defer left.Close()
 		defer right.Close()
-		lower := &scriptedCloseConn{Conn: left, errs: []error{failure, nil}}
+		lower := &scriptedCloseConn{Conn: left, errs: []error{failure}}
 		var retired atomic.Bool
 		conn := &trackedConn{Conn: lower, done: func() { retired.Store(true) }}
-		if err := conn.Close(); !go_errors.Is(err, failure) || retired.Load() {
+		if err := conn.Close(); !go_errors.Is(err, failure) || !retired.Load() {
 			t.Fatalf("first close: %v", err)
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("retry: %v", err)
-		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("replay: %v", err)
-		}
-		if calls := lower.callCount(); calls != 3 || !retired.Load() {
-			t.Fatalf("retry lower closes=%d", calls)
+		if calls := lower.callCount(); calls != 1 {
+			t.Fatalf("terminal lower closes=%d", calls)
 		}
 	})
 }
@@ -1083,12 +1081,12 @@ func TestTCPCloseWaitsLateDialWorkerAndRejectsNewQuery(t *testing.T) {
 	}
 }
 
-func TestDoHRejectedConnectionCloseFailureRetried(t *testing.T) {
+func TestDoHRejectedConnectionCloseFailureRetires(t *testing.T) {
 	failure := go_errors.New("lower close failed")
 	left, right := stdnet.Pipe()
 	defer left.Close()
 	defer right.Close()
-	lower := &scriptedCloseConn{Conn: left, errs: []error{failure, failure, nil}}
+	lower := &scriptedCloseConn{Conn: left, errs: []error{failure}}
 	server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0)}
 	cache, lifetime, closeServer := server.cacheController, &server.lifetime, server.Close
 	cache.cancel()
@@ -1099,23 +1097,14 @@ func TestDoHRejectedConnectionCloseFailureRetried(t *testing.T) {
 	if err := tracked.Close(); !go_errors.Is(err, failure) {
 		t.Fatalf("rejected connection close: %v", err)
 	}
-	if err := closeServer(); !go_errors.Is(err, failure) {
-		t.Fatalf("first owner close: %v", err)
+	if err := closeServer(); err != nil {
+		t.Fatalf("owner close retried terminal connection: %v", err)
 	}
 	lifetime.mu.Lock()
 	remaining := len(lifetime.connections)
 	lifetime.mu.Unlock()
-	if remaining != 1 {
-		t.Fatalf("failed connection lost from retry inventory: %d", remaining)
-	}
-	if err := closeServer(); err != nil {
-		t.Fatalf("retry owner close: %v", err)
-	}
-	lifetime.mu.Lock()
-	remaining = len(lifetime.connections)
-	lifetime.mu.Unlock()
-	if remaining != 0 || lower.callCount() != 3 {
-		t.Fatalf("connection retry: retained=%d closes=%d", remaining, lower.callCount())
+	if remaining != 0 || lower.callCount() != 1 {
+		t.Fatalf("terminal connection retained=%d closes=%d", remaining, lower.callCount())
 	}
 }
 
@@ -1137,21 +1126,21 @@ func (c *retryPacketConn) Close() error {
 	return err
 }
 
-func TestQUICResourceCloseRetainsFailedSocketForRetry(t *testing.T) {
+func TestQUICResourceCloseReportsFailureAndRetiresSocket(t *testing.T) {
 	closeFailure := go_errors.New("packet close failed")
 	packet := &retryPacketConn{closeErr: []error{closeFailure, nil}}
 	server := &QUICNameServer{cacheController: NewCacheController("quic", false, false, 0), transport: &quic.Transport{Conn: packet}}
 	if err := server.Close(); !go_errors.Is(err, closeFailure) {
 		t.Fatalf("first socket close failure lost: %v", err)
 	}
-	if server.transport == nil || server.transport.Conn != packet {
-		t.Fatal("failed socket was removed from retry inventory")
+	if server.transport != nil {
+		t.Fatal("terminal socket remained in transport inventory")
 	}
 	if err := server.Close(); err != nil {
-		t.Fatalf("socket retry: %v", err)
+		t.Fatalf("repeated owner close: %v", err)
 	}
-	if server.transport != nil || packet.closed != 2 {
-		t.Fatalf("socket retry inventory not cleared exactly once: retained=%v closes=%d", server.transport != nil, packet.closed)
+	if packet.closed != 1 {
+		t.Fatalf("terminal socket close calls=%d", packet.closed)
 	}
 }
 

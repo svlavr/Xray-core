@@ -74,64 +74,22 @@ func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, 
 	if isMuxCarrier(dest) {
 		return ctx, nil
 	}
-	var observedCtx context.Context
-	var observation *session.LogicalObservation
-	var cancel context.CancelFunc
-	if returned {
-		observedCtx, observation, cancel = beginObservation(ctx, manager, conn, dest, kind, true)
-	} else {
-		observedCtx, observation, cancel = beginDeferredObservation(ctx, manager, conn, dest, kind)
-	}
+	observedCtx, observation, cancel := beginObservation(ctx, manager, conn, dest, kind, returned)
 	if observation == nil {
 		return ctx, nil
 	}
+	observation.SuppliedEndpoint = !returned
 	flow := observation.Exchange
 	cursor := buf.NewInspectionReader(link.Reader, flow, func() { cancel(); conn.Close() })
 	if kind == net.Network_UDP {
 		cursor.PacketDestination = dest
 	}
 	link.Reader = cursor
-	link.Writer = buf.AttachWriterReceipt(link.Writer, flow)
+	link.Writer, observation.WriterReceiptAttached = buf.AttachWriterReceiptWithStatus(link.Writer, flow)
 	return observedCtx, func() {
 		cursor.Interrupt()
 		flow.Finish()
 	}
-}
-
-func beginDeferredObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, *session.LogicalObservation, context.CancelFunc) {
-	store := ObservationStore(manager)
-	if store == nil {
-		return ctx, nil, nil
-	}
-	observedCtx, cancel := context.WithCancel(ctx)
-	var source net.Destination
-	if inbound := session.InboundFromContext(ctx); inbound != nil {
-		source = inbound.Source
-	}
-	gate := new(deferredEndpointReceipt)
-	// A UDP Begin publishes the exchange immediately. Its stop may run before
-	// Begin returns, so keep the gate locked until the underlying receipt exists.
-	gate.mu.Lock()
-	stop := func() error {
-		gate.settleBeforeStop()
-		cancel()
-		return closeObservedEndpoint(conn)
-	}
-	var flow stats.Exchange
-	if kind == net.Network_TCP {
-		flow = store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, dest, stop)
-	} else {
-		flow = store.Begin(kind, session.TrafficOriginFromContext(ctx), source, dest, stop)
-	}
-	if flow == nil {
-		gate.mu.Unlock()
-		cancel()
-		return ctx, nil, nil
-	}
-	gate.Exchange = flow
-	gate.mu.Unlock()
-	observation := &session.LogicalObservation{Exchange: gate}
-	return session.ContextWithLogicalObservation(observedCtx, observation), observation, cancel
 }
 
 func beginObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network, returned bool) (context.Context, *session.LogicalObservation, context.CancelFunc) {
@@ -290,25 +248,4 @@ func ClaimObservedEndpoint(ctx context.Context, reader buf.Reader, eligible bool
 	}
 	observation.Exchange.BindRoute()
 	return observation
-}
-
-// ClaimDecodedEndpoint transfers one supplied endpoint's pre-route raw receipt
-// to a decoded message owner. The same flow keeps its selected handler and
-// exact local stop; an ordinary raw claim or owner ending makes transfer fail.
-func ClaimDecodedEndpoint(ctx context.Context, reader buf.Reader) stats.Exchange {
-	if override, ok := reader.(*buf.EndpointOverrideReader); ok {
-		reader = override.Reader
-	}
-	if _, ok := reader.(*buf.InspectionReader); !ok {
-		return nil
-	}
-	observation := session.LogicalObservationFromContext(ctx)
-	if observation == nil {
-		return nil
-	}
-	deferred, ok := observation.Exchange.(*deferredEndpointReceipt)
-	if !ok {
-		return nil
-	}
-	return deferred.selectDecoded()
 }

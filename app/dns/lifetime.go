@@ -32,7 +32,6 @@ type resolverOwner struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	closeMu  sync.Mutex
-	queries  sync.WaitGroup
 }
 
 func newResolverOwner(resolver *DNS) *resolverOwner {
@@ -53,13 +52,11 @@ func (o *resolverOwner) closeResources() error {
 }
 
 // closeOwned joins a resolver already retired and canceled under dnsRuntime.mu.
-// A failed resource is retained in the same owner for a later feature Close.
 func (o *resolverOwner) closeOwned() error {
 	o.closeMu.Lock()
 	defer o.closeMu.Unlock()
 	err := o.closeResources()
-	o.queries.Wait()
-	o.resolver.queryWorkers.Wait()
+	o.resolver.queries.Wait()
 	return err
 }
 
@@ -194,11 +191,9 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	done := make(chan error, 1)
 	go func() {
 		err := old.closeOwned()
-		if err == nil {
-			rt.mu.Lock()
-			rt.closing = nil
-			rt.mu.Unlock()
-		}
+		rt.mu.Lock()
+		rt.closing = nil
+		rt.mu.Unlock()
 		done <- err
 	}()
 	select {
@@ -209,7 +204,7 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	}
 }
 
-// trackedConn removes a successfully closed connection from its native owner.
+// trackedConn removes a connection after its terminal Close attempt.
 type trackedConn struct {
 	net.Conn
 	done func()
@@ -217,9 +212,9 @@ type trackedConn struct {
 
 func (c *trackedConn) Close() error {
 	err := c.Conn.Close()
+	c.done()
 	if err != nil && !errors.Is(err, net.ErrClosed) {
 		return err
 	}
-	c.done()
 	return nil
 }

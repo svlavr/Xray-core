@@ -17,56 +17,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 )
 
-func TestInspectionDeferredEndpointRawAndDecoded(t *testing.T) {
-	for _, decoded := range []bool{false, true} {
-		t.Run(map[bool]string{false: "raw", true: "decoded"}[decoded], func(t *testing.T) {
-			manager := new(appstats.Manager)
-			view, err := manager.EnableInspection(fs.ObservationOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer manager.Close()
-			root := manager.Observation().PrepareTCP(fs.TrafficOriginUser, cnet.Destination{}, cnet.TCPDestination(cnet.LocalHostIP, 53), nil)
-			root.Route(fs.OutboundRef{Tag: "dns", Serial: 1})
-			gate := &deferredEndpointReceipt{Exchange: root}
-			gate.AddUplink(7)
-			gate.AddDownlink(5)
-
-			if decoded {
-				if gate.selectDecoded() != root || gate.selectDecoded() != nil {
-					t.Fatal("decoded claim was not one-shot")
-				}
-				gate.AddUplink(100)
-				gate.AddDownlink(100)
-
-				root.AddUplink(11)
-				root.AddDownlink(13)
-			} else {
-				gate.BindRoute()
-				gate.AddUplink(11)
-				gate.AddDownlink(13)
-				if gate.selectDecoded() != nil {
-					t.Fatal("raw receipt was transferred after settlement")
-				}
-			}
-			gate.Finish()
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 {
-				t.Fatalf("terminal: %+v %v", page, err)
-			}
-			flow := page.Rows[0].Flow
-			wantUp, wantDown := uint64(18), uint64(18)
-			if decoded {
-				wantUp, wantDown = 11, 13
-			}
-			if flow.Uplink != wantUp || flow.Downlink != wantDown {
-				t.Fatalf("deferred facts: %+v", page.Rows[0])
-			}
-		})
-	}
-}
-
-func TestInspectionDecodedClaimAfterSniffReplay(t *testing.T) {
+func TestInspectionSourceClaimAfterSniffReplay(t *testing.T) {
 	manager := new(appstats.Manager)
 	view, err := manager.EnableInspection(fs.ObservationOptions{})
 	if err != nil {
@@ -92,24 +43,23 @@ func TestInspectionDecodedClaimAfterSniffReplay(t *testing.T) {
 	if err := cursor.Cache(sniff, time.Second); err != nil || !strings.Contains(string(sniff.Bytes()), string(payload)) {
 		t.Fatalf("sniff replay: %q %v", sniff.Bytes(), err)
 	}
-	decoded := ClaimDecodedEndpoint(ctx, link.Reader)
-	if decoded == nil || decoded.Ref() != root.Ref() {
+	claimed := ClaimObservedEndpoint(ctx, link.Reader, true)
+	if claimed == nil || claimed.Exchange.Ref() != root.Ref() {
 		t.Fatal("DNS did not claim the supplied endpoint")
 	}
 	message, err := dnsproto.NewTCPReader(link.Reader).ReadMessage()
 	if err != nil || string(message.Bytes()) != string(payload) {
 		t.Fatalf("decoded message: %v %v", message, err)
 	}
-	decoded.AddUplink(uint64(message.Len()))
 	message.Release()
 	root.Finish()
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(payload)) {
-		t.Fatalf("sniffed DNS payload included framing: %+v %v", page.Rows, err)
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(frame)) {
+		t.Fatalf("sniffed source bytes were lost or replayed: %+v %v", page.Rows, err)
 	}
 }
 
-func TestInspectionDeferredUDPStopBeforeClaim(t *testing.T) {
+func TestInspectionUDPStopBeforeRouteClaim(t *testing.T) {
 	manager := new(appstats.Manager)
 	view, err := manager.EnableInspection(fs.ObservationOptions{})
 	if err != nil {

@@ -25,7 +25,7 @@ import (
 	"github.com/xtls/xray-core/testing/servers/udp"
 )
 
-func TestInspectionDNSDecodedTCPReturn(t *testing.T) {
+func TestInspectionDNSEndpointTCPReturn(t *testing.T) {
 	port := tcp.PickPort()
 	instance, err := core.New(&core.Config{
 		App: []*serial.TypedMessage{
@@ -90,8 +90,8 @@ func TestInspectionDNSDecodedTCPReturn(t *testing.T) {
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.Outbound.Tag != "dns-local" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(requestBytes)) || flow.Downlink != uint64(len(responseBytes)) {
-				t.Fatalf("decoded DNS facts: %+v; sizes %d/%d", flow, len(requestBytes), len(responseBytes))
+			if flow.Outbound.Tag != "dns-local" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(requestBytes)+2) || flow.Downlink != uint64(len(responseBytes)+2) {
+				t.Fatalf("source endpoint DNS facts: %+v; message sizes %d/%d", flow, len(requestBytes), len(responseBytes))
 			}
 			return
 		}
@@ -150,7 +150,7 @@ func inspectionDNSUDP(t *testing.T, action dnsproxy.RuleAction, rewrite *cnet.En
 	return view, "127.0.0.1:" + port.String()
 }
 
-func TestInspectionDNSDecodedUDPBranches(t *testing.T) {
+func TestInspectionDNSEndpointUDPBranches(t *testing.T) {
 	for _, action := range []dnsproxy.RuleAction{
 		dnsproxy.RuleAction_Return, dnsproxy.RuleAction_Drop,
 		dnsproxy.RuleAction_Hijack, dnsproxy.RuleAction_Direct,
@@ -239,7 +239,7 @@ func TestInspectionDNSDecodedUDPBranches(t *testing.T) {
 				if len(page.Rows) == 1 {
 					flow := page.Rows[0].Flow
 					if flow.Outbound.Tag != "dns-out" || flow.Uplink != uint64(len(wire)) || flow.Downlink != uint64(n) {
-						t.Fatalf("decoded UDP facts: %+v; sizes %d/%d", flow, len(wire), n)
+						t.Fatalf("source endpoint UDP facts: %+v; sizes %d/%d", flow, len(wire), n)
 					}
 					return
 				}

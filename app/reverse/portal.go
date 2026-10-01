@@ -72,13 +72,6 @@ func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) err
 	}
 
 	if isPortalCarrier(ob.Target, p.domain) {
-		// This exact selected owner knows that the prepared TCP endpoint is a
-		// carrier. Keep its native receipt lifetime, but publish no logical row.
-		if _, ok := link.Reader.(*buf.InspectionReader); ok {
-			if observation := session.LogicalObservationFromContext(ctx); observation != nil {
-				observation.Exchange.ExcludeCarrier()
-			}
-		}
 		muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
 		if err != nil {
 			return errors.New("failed to create mux client worker").Base(err)

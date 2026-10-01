@@ -34,7 +34,7 @@ type DNS struct {
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
 	strictSelection        bool
-	queryWorkers           sync.WaitGroup
+	queries                sync.WaitGroup
 	runtime                *dnsRuntime
 }
 
@@ -259,23 +259,14 @@ func (s *DNS) Close() error {
 	rt.mu.Unlock()
 	var errs []error
 	if current != nil {
-		if err := current.closeOwned(); err != nil {
-			errs = append(errs, err)
-		} else {
-			rt.mu.Lock()
-			rt.current = nil
-			rt.mu.Unlock()
-		}
+		errs = append(errs, current.closeOwned())
 	}
 	if closing != nil {
-		if err := closing.closeOwned(); err != nil {
-			errs = append(errs, err)
-		} else {
-			rt.mu.Lock()
-			rt.closing = nil
-			rt.mu.Unlock()
-		}
+		errs = append(errs, closing.closeOwned())
 	}
+	rt.mu.Lock()
+	rt.current, rt.closing = nil, nil
+	rt.mu.Unlock()
 	return go_errors.Join(errs...)
 }
 
@@ -387,9 +378,9 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 		return nil, 0, context.Canceled
 	}
 	owner := rt.current
-	owner.queries.Add(1)
+	owner.resolver.queries.Add(1)
 	rt.mu.Unlock()
-	defer owner.queries.Done()
+	defer owner.resolver.queries.Done()
 
 	base := context.Background()
 	if core.FromContext(s.ctx) != nil {
@@ -656,9 +647,9 @@ func (s *DNS) asyncQueryAll(domain string, option dns.IPOption, clients []*Clien
 			continue
 		}
 
-		s.queryWorkers.Add(1)
+		s.queries.Add(1)
 		go func(i int, c *Client, qctx context.Context) {
-			defer s.queryWorkers.Done()
+			defer s.queries.Done()
 			if !c.server.IsDisableCache() {
 				nctx, cancel := context.WithTimeout(qctx, c.timeoutMs*2)
 				qctx = nctx
