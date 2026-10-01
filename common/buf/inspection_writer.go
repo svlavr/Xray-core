@@ -12,13 +12,13 @@ type inspectionBufferToBytesWriter struct {
 }
 
 func (w *inspectionBufferToBytesWriter) Write(payload []byte) (int, error) {
-	return writeBytesInspection(w.Writer, payload, w.receipt)
+	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
 }
 
 func (w *inspectionBufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	size := uint64(mb.Len())
 	err := w.BufferToBytesWriter.WriteMultiBuffer(mb)
-	recordBufferOperation(w.receipt, size, err)
+	RecordBufferOperation(w.receipt, size, err)
 	return err
 }
 
@@ -60,17 +60,19 @@ func discardFailedPrefix(receipt stats.Exchange) {
 }
 
 func (w *inspectionSequentialWriter) Write(payload []byte) (int, error) {
-	return writeBytesInspection(w.Writer, payload, w.receipt)
+	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
 }
 
 func (w *inspectionSequentialWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	size := uint64(mb.Len())
 	err := w.SequentialWriter.WriteMultiBuffer(mb)
-	recordBufferOperation(w.receipt, size, err)
+	RecordBufferOperation(w.receipt, size, err)
 	return err
 }
 
-func recordBufferOperation(receipt stats.Exchange, size uint64, err error) {
+// RecordBufferOperation credits only a completed decoded batch and clears a
+// discarded framing prefix after a failed native write.
+func RecordBufferOperation(receipt stats.Exchange, size uint64, err error) {
 	if err == nil {
 		if size != 0 {
 			receipt.AddDownlink(size)
@@ -80,7 +82,9 @@ func recordBufferOperation(receipt stats.Exchange, size uint64, err error) {
 	discardFailedPrefix(receipt)
 }
 
-func writeBytesInspection(writer io.Writer, payload []byte, receipt stats.Exchange) (int, error) {
+// WriteBytesWithReceipt records the actual scalar result, including positive
+// progress returned with an error, and clears a failed framing prefix.
+func WriteBytesWithReceipt(writer io.Writer, payload []byte, receipt stats.Exchange) (int, error) {
 	n, err := writer.Write(payload)
 	if n > 0 {
 		receipt.AddDownlink(uint64(n))
@@ -132,9 +136,9 @@ func attachWriterReceipt(writer Writer, receipt stats.Exchange) Writer {
 func WriterReceipt(writer Writer) stats.Exchange {
 	switch w := writer.(type) {
 	case *inspectionBufferToBytesWriter:
-		return originalWriterReceipt(w.receipt)
+		return OriginalWriterReceipt(w.receipt)
 	case *inspectionSequentialWriter:
-		return originalWriterReceipt(w.receipt)
+		return OriginalWriterReceipt(w.receipt)
 	case *BufferedWriter:
 		w.Lock()
 		defer w.Unlock()
@@ -146,7 +150,8 @@ func WriterReceipt(writer Writer) stats.Exchange {
 	}
 }
 
-func originalWriterReceipt(receipt stats.Exchange) stats.Exchange {
+// OriginalWriterReceipt removes only the local buffered-framing prefix layer.
+func OriginalWriterReceipt(receipt stats.Exchange) stats.Exchange {
 	if prefixed, ok := receipt.(*inspectionPrefixReceipt); ok {
 		return prefixed.Exchange
 	}

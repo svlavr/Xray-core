@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
@@ -34,67 +33,6 @@ type resolverOwner struct {
 	cancel   context.CancelFunc
 	closeMu  sync.Mutex
 	queries  sync.WaitGroup
-}
-
-// ownedPeriodic preserves the cache and UDP cleanup worker join already needed
-// by their native owners; it carries no resolver identity or query capability.
-type ownedPeriodic struct {
-	mu       sync.Mutex
-	interval time.Duration
-	execute  func() error
-	timer    *time.Timer
-	running  bool
-	closed   bool
-	wg       sync.WaitGroup
-}
-
-func newOwnedPeriodic(interval time.Duration, execute func() error) *ownedPeriodic {
-	return &ownedPeriodic{interval: interval, execute: execute}
-}
-
-func (p *ownedPeriodic) Start() error {
-	p.mu.Lock()
-	if p.closed || p.running {
-		p.mu.Unlock()
-		return nil
-	}
-	p.running = true
-	p.wg.Add(1)
-	p.mu.Unlock()
-	return p.run()
-}
-
-func (p *ownedPeriodic) run() error {
-	defer p.wg.Done()
-	err := p.execute()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err != nil || p.closed {
-		p.running = false
-		return err
-	}
-	p.timer = time.AfterFunc(p.interval, func() {
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return
-		}
-		p.wg.Add(1)
-		p.mu.Unlock()
-		p.run()
-	})
-	return nil
-}
-
-func (p *ownedPeriodic) Close() {
-	p.mu.Lock()
-	p.closed, p.running = true, false
-	if p.timer != nil {
-		p.timer.Stop()
-		p.timer = nil
-	}
-	p.mu.Unlock()
-	p.wg.Wait()
 }
 
 func newResolverOwner(resolver *DNS) *resolverOwner {

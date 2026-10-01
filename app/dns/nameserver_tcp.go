@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	go_errors "errors"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,7 +30,7 @@ type TCPNameServer struct {
 	dial            func(context.Context) (net.Conn, error)
 	routed          bool
 	clientIP        net.IP
-	lifetime        connectionLifetime
+	workers         sync.WaitGroup // admission is guarded by cacheController's lock
 }
 
 // NewTCPNameServer creates DNS over TCP server object for remote resolving.
@@ -158,14 +159,18 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		if !s.lifetime.beginWork(s.cacheController) {
+		s.cacheController.Lock()
+		if s.cacheController.ctx.Err() != nil {
+			s.cacheController.Unlock()
 			if noResponseErrCh != nil {
 				noResponseErrCh <- context.Canceled
 			}
 			continue
 		}
+		s.workers.Add(1)
+		s.cacheController.Unlock()
 		go func(r *dnsRequest, ctx context.Context) {
-			defer s.lifetime.workers.Done()
+			defer s.workers.Done()
 			workCtx, cancelWork := context.WithCancel(ctx)
 			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
 			defer func() { stop(); cancelWork() }()
@@ -194,43 +199,48 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				dnsCtx = toDnsContext(dnsCtx, dnsCtx, s.destination.String())
 			}
 
-			if !s.lifetime.beginDial(s.cacheController) {
+			if err := s.cacheController.ctx.Err(); err != nil {
 				if noResponseErrCh != nil {
-					noResponseErrCh <- context.Canceled
+					noResponseErrCh <- err
 				}
 				return
 			}
 			conn, err := s.dial(dnsCtx)
 			if err != nil {
-				s.lifetime.dialing.Done()
+				if conn != nil {
+					_ = conn.Close()
+				}
 				errors.LogErrorInner(ctx, err, "failed to dial namesever")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
 				}
 				return
 			}
-			tracked, ok := s.lifetime.trackConnection(s.cacheController, conn)
-			s.lifetime.dialing.Done()
-			if !ok {
-				_ = tracked.Close()
-				if noResponseErrCh != nil {
-					noResponseErrCh <- context.Canceled
-				}
-				return
-			}
-			conn = tracked
-			defer conn.Close()
-			_ = conn.SetDeadline(deadline)
 			ioCanceled := make(chan struct{})
 			stopIO := context.AfterFunc(dnsCtx, func() {
 				_ = conn.Close()
 				close(ioCanceled)
 			})
 			defer func() {
-				if !stopIO() {
+				if stopIO() {
+					_ = conn.Close()
+				} else {
 					<-ioCanceled
 				}
 			}()
+			if err := dnsCtx.Err(); err != nil {
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			if err := s.cacheController.ctx.Err(); err != nil {
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			_ = conn.SetDeadline(deadline)
 			dnsReqBuf := buf.New()
 			defer dnsReqBuf.Release()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
@@ -305,7 +315,12 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 }
 
 func (s *TCPNameServer) Close() error {
-	return s.lifetime.close(s.cacheController)
+	s.cacheController.cancel()
+	// Cache Close takes the admission lock before this Wait, so no worker can
+	// be added after the barrier. Each admitted worker closes its own connection.
+	s.cacheController.Close()
+	s.workers.Wait()
+	return nil
 }
 
 // QueryIP implements Server.

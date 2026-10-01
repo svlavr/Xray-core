@@ -256,6 +256,10 @@ func (c *Config) getCustomCA() *certificateAuthoritySet {
 			continue
 		}
 		entry := cloneCertificateConfig(source)
+		if entry.OneTimeLoading || entry.CertificatePath == "" || entry.KeyPath == "" {
+			set.append(entry)
+			continue
+		}
 		index := set.append(cloneCertificateConfig(entry))
 		setupOcspTicker(entry, func(isReloaded, _ bool) {
 			if isReloaded {

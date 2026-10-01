@@ -17,17 +17,9 @@ type aggregateKey struct {
 }
 
 type aggregateCell struct {
-	outbound featurestats.OutboundRef
-	origin   featurestats.TrafficOrigin
+	tag      string
 	uplink   atomic.Uint64
 	downlink atomic.Uint64
-}
-
-func newAggregateCell(outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) *aggregateCell {
-	return &aggregateCell{
-		outbound: outbound,
-		origin:   origin,
-	}
 }
 
 type inspectionStore struct {
@@ -39,7 +31,7 @@ type inspectionStore struct {
 	mu           sync.RWMutex
 	live         map[uint64]*inspectionExchange
 	buckets      map[aggregateKey]*aggregateCell
-	unassigned   [4]*aggregateCell
+	unassigned   [4]aggregateCell
 	terminals    []featurestats.TerminalRecord
 	terminalHead uint32
 	nextID       uint64
@@ -52,10 +44,6 @@ func newInspectionStore(runtime featurestats.RuntimeID, limits featurestats.Obse
 		epoch:   time.Now(),
 		live:    make(map[uint64]*inspectionExchange),
 		buckets: make(map[aggregateKey]*aggregateCell),
-	}
-	for i := range store.unassigned {
-		origin := featurestats.TrafficOrigin(i)
-		store.unassigned[i] = newAggregateCell(featurestats.OutboundRef{}, origin)
 	}
 	return store
 }
@@ -157,14 +145,14 @@ func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows := make([]featurestats.TotalRecord, 0, len(s.buckets)+len(s.unassigned))
-	appendCell := func(cell *aggregateCell) {
-		rows = append(rows, featurestats.TotalRecord{Outbound: cell.outbound, Origin: cell.origin, Uplink: cell.uplink.Load(), Downlink: cell.downlink.Load()})
+	appendCell := func(cell *aggregateCell, outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) {
+		rows = append(rows, featurestats.TotalRecord{Outbound: outbound, Origin: origin, Uplink: cell.uplink.Load(), Downlink: cell.downlink.Load()})
 	}
-	for _, cell := range s.unassigned {
-		appendCell(cell)
+	for i := range s.unassigned {
+		appendCell(&s.unassigned[i], featurestats.OutboundRef{}, featurestats.TrafficOrigin(i))
 	}
-	for _, cell := range s.buckets {
-		appendCell(cell)
+	for key, cell := range s.buckets {
+		appendCell(cell, featurestats.OutboundRef{Serial: key.serial, Tag: cell.tag}, key.origin)
 	}
 	return featurestats.TotalsSnapshot{
 		At:   s.elapsed(),
@@ -229,7 +217,7 @@ func (s *inspectionStore) lookup(id uint64) *inspectionExchange {
 
 func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) *aggregateCell {
 	if outbound.Serial == 0 {
-		return s.unassigned[int(origin)]
+		return &s.unassigned[int(origin)]
 	}
 	key := aggregateKey{serial: outbound.Serial, origin: origin}
 	s.mu.Lock()
@@ -238,12 +226,12 @@ func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin fe
 		return cell
 	}
 	if s.closed.Load() {
-		return s.unassigned[int(origin)]
+		return &s.unassigned[int(origin)]
 	}
 	if uint32(len(s.buckets)) >= s.limits.MaxBuckets {
-		return s.unassigned[int(origin)]
+		return &s.unassigned[int(origin)]
 	}
-	cell := newAggregateCell(outbound, origin)
+	cell := &aggregateCell{tag: outbound.Tag}
 	s.buckets[key] = cell
 	return cell
 }

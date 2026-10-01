@@ -20,8 +20,10 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
+	udp_proto "github.com/xtls/xray-core/common/protocol/udp"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
@@ -29,6 +31,7 @@ import (
 	"github.com/xtls/xray-core/proxy/freedom"
 	"github.com/xtls/xray-core/transport"
 	_ "github.com/xtls/xray-core/transport/internet/tcp"
+	udptransport "github.com/xtls/xray-core/transport/internet/udp"
 	"github.com/xtls/xray-core/transport/pipe"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http2"
@@ -610,6 +613,76 @@ func TestStageBUDPCloseCancelsBlockedDispatch(t *testing.T) {
 	}
 }
 
+func TestStageBUDPLateOldCallbackCannotUpdateReplacement(t *testing.T) {
+	dispatcher := &stageBUDPDispatcher{}
+	old := NewClassicNameServer(net.UDPDestination(net.LocalHostIP, 53), dispatcher, false, false, 0, nil)
+	old.udpServer.RemoveRay() // No ray has started on the replaced test callback.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	callbackReturned := make(chan struct{})
+	old.udpServer = udptransport.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
+		close(entered)
+		<-release
+		old.HandleResponse(ctx, packet)
+		close(callbackReturned)
+	})
+	feature := stageBManualFeature(t, old)
+	t.Cleanup(func() { _ = feature.Close() })
+	queryDone := make(chan error, 1)
+	base := context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance))
+	feature.ctx = base
+	go func() {
+		_, _, err := feature.LookupIPContext(base, "valid.test", featuredns.IPOption{IPv4Enable: true})
+		queryDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("old UDP callback did not capture the response")
+	}
+	address, _ := stageBTCPResolver(t, "192.0.2.91", map[string]bool{"valid.test.": true})
+	config := stageBConfig(stageBServer(address, "new"))
+	applied := make(chan ApplyResult, 1)
+	go func() { applied <- ApplyConfig(context.Background(), feature, config) }()
+	select {
+	case result := <-applied:
+		if !result.Applied || result.Err != nil {
+			t.Fatalf("replacement: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement waited for the old UDP callback")
+	}
+	stageBLookup(t, feature, "valid.test", net.IP{192, 0, 2, 91})
+	close(release)
+	select {
+	case <-callbackReturned:
+	case <-time.After(time.Second):
+		t.Fatal("old callback did not return after release")
+	}
+	select {
+	case err := <-queryDone:
+		if err == nil {
+			t.Fatal("retired UDP query reported success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retired UDP query did not terminate")
+	}
+	old.cacheController.RLock()
+	oldRecords := len(old.cacheController.ips)
+	old.cacheController.RUnlock()
+	if oldRecords != 0 {
+		t.Fatal("late callback updated the retired cache")
+	}
+	stageBLookup(t, feature, "valid.test", net.IP{192, 0, 2, 91})
+}
+
 func TestStageBDNSNoInternalRowsOffOn(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		t.Run(map[bool]string{false: "off", true: "on"}[enabled], func(t *testing.T) {
@@ -705,31 +778,119 @@ func TestCacheCloseWakesPendingDualStackSubscribers(t *testing.T) {
 	}
 }
 
-func TestOwnedPeriodicCloseJoinsExecutionAndStateBookkeeping(t *testing.T) {
-	started, proceed := make(chan struct{}), make(chan struct{})
-	periodic := newOwnedPeriodic(time.Hour, func() error { close(started); <-proceed; return nil })
-	startDone := make(chan error, 1)
-	go func() { startDone <- periodic.Start() }()
-	<-started
-	closeDone := make(chan error, 1)
-	go func() { periodic.Close(); closeDone <- nil }()
+func TestStageBPeriodicSynchronousStartClosesThroughGate(t *testing.T) {
+	cache := NewCacheController("synchronous-start", false, false, 0)
+	started, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	cache.cacheCleanup = &task.Periodic{Interval: time.Hour, Execute: func() error {
+		close(started)
+		<-release
+		return nil
+	}}
+	startDone := make(chan struct{})
+	go func() { cache.startCleanup(cache.cacheCleanup); close(startDone) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("synchronous cleanup did not start")
+	}
+	closeDone := make(chan struct{})
+	go func() { cache.Close(); close(closeDone) }()
+	<-cache.ctx.Done()
 	select {
 	case <-closeDone:
-		t.Fatal("Close returned before Execute completed")
-	default:
+		t.Fatal("Close passed a synchronous Start still inside Execute")
+	case <-time.After(20 * time.Millisecond):
 	}
-	close(proceed)
-	if err := <-startDone; err != nil {
+	close(release)
+	for _, done := range []<-chan struct{}{startDone, closeDone} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("periodic Start or Close did not finish")
+		}
+	}
+}
+
+func TestStageBPeriodicLateCallbackCannotMigrateOrRearm(t *testing.T) {
+	cache := NewCacheController("late-callback", false, false, 0)
+	cache.ips["kept"] = new(record)
+	cache.highWatermark = 20000
+	entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	var executions atomic.Int32
+	cache.cacheCleanup = &task.Periodic{Interval: 10 * time.Millisecond, Execute: func() error {
+		switch executions.Add(1) {
+		case 1:
+			return nil
+		case 2:
+			close(entered)
+			<-release
+			cache.writeAndShrink(nil)
+			close(returned)
+		}
+		return nil
+	}}
+	cache.startCleanup(cache.cacheCleanup)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("timer callback did not enter")
+	}
+	closeDone := make(chan struct{})
+	go func() { cache.Close(); close(closeDone) }()
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for an already entered timer callback")
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("old callback did not finish")
+	}
+	time.Sleep(50 * time.Millisecond)
+	cache.RLock()
+	retained, peak, migrating := len(cache.ips), cache.highWatermark, cache.dirtyips != nil
+	cache.RUnlock()
+	if executions.Load() != 2 || retained != 1 || peak != 20000 || migrating {
+		t.Fatalf("late callback migrated or rearmed: runs=%d records=%d peak=%d migrating=%v", executions.Load(), retained, peak, migrating)
+	}
+}
+
+func TestStageBPeriodicPostCancelStartDoesNotExecute(t *testing.T) {
+	cache := NewCacheController("post-cancel", false, false, 0)
+	var cacheRuns atomic.Int32
+	cache.cacheCleanup.Execute = func() error { cacheRuns.Add(1); return nil }
+	cache.cancel()
+	cache.startCleanup(cache.cacheCleanup)
+	cache.Close()
+	if cacheRuns.Load() != 0 {
+		t.Fatal("cache cleanup started after cancellation")
+	}
+	server := NewClassicNameServer(net.UDPDestination(net.LocalHostIP, 53), nil, true, false, 0, nil)
+	var requestRuns atomic.Int32
+	server.requestsCleanup.Execute = func() error { requestRuns.Add(1); return nil }
+	server.cacheController.cancel()
+	server.cacheController.startCleanup(server.requestsCleanup)
+	if err := server.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-closeDone; err != nil {
-		t.Fatal(err)
-	}
-	periodic.mu.Lock()
-	closed, running, timer := periodic.closed, periodic.running, periodic.timer
-	periodic.mu.Unlock()
-	if !closed || running || timer != nil {
-		t.Fatalf("periodic state after join: closed=%v running=%v timer=%v", closed, running, timer)
+	if requestRuns.Load() != 0 {
+		t.Fatal("UDP request cleanup started after cancellation")
 	}
 }
 
@@ -768,11 +929,11 @@ func (c *scriptedCloseConn) Close() error {
 
 func (c *scriptedCloseConn) callCount() int { c.mu.Lock(); defer c.mu.Unlock(); return c.calls }
 
-func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
+func TestTrackedDoHCloseJoinAndRetry(t *testing.T) {
 	t.Run("concurrent-native-close", func(t *testing.T) {
 		left, right := stdnet.Pipe()
 		defer right.Close()
-		server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0)}
+		server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0)}
 		conn, ok := server.lifetime.trackConnection(server.cacheController, left)
 		if !ok {
 			t.Fatal("initial connection rejected")
@@ -819,92 +980,142 @@ func TestTrackedTCPAndDoHCloseJoinAndRetry(t *testing.T) {
 	})
 }
 
-func TestTCPAndDoHCloseCaptureLateDialPublication(t *testing.T) {
-	for _, kind := range []string{"tcp", "doh"} {
-		t.Run(kind, func(t *testing.T) {
-			left, right := stdnet.Pipe()
-			defer left.Close()
-			defer right.Close()
-			lower := &scriptedCloseConn{Conn: left}
-			closeDone := make(chan error, 1)
-			if kind == "tcp" {
-				server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0)}
-				if !server.lifetime.beginDial(server.cacheController) {
-					t.Fatal("dial rejected before close")
-				}
-				go func() { closeDone <- server.Close() }()
-				<-server.cacheController.ctx.Done()
-				if _, accepted := server.lifetime.trackConnection(server.cacheController, lower); accepted {
-					t.Fatal("late TCP connection accepted")
-				}
-				server.lifetime.dialing.Done()
-			} else {
-				server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0), httpClient: &http.Client{Transport: &http2.Transport{}}}
-				if !server.lifetime.beginDial(server.cacheController) {
-					t.Fatal("dial rejected before close")
-				}
-				go func() { closeDone <- server.Close() }()
-				<-server.cacheController.ctx.Done()
-				if _, accepted := server.lifetime.trackConnection(server.cacheController, lower); accepted {
-					t.Fatal("late DoH connection accepted")
-				}
-				server.lifetime.dialing.Done()
-			}
-			if err := <-closeDone; err != nil {
-				t.Fatal(err)
-			}
-			if calls := lower.callCount(); calls != 1 {
-				t.Fatalf("late connection lower closes=%d", calls)
-			}
-		})
+func TestDoHCloseCaptureLateDialPublication(t *testing.T) {
+	left, right := stdnet.Pipe()
+	defer left.Close()
+	defer right.Close()
+	lower := &scriptedCloseConn{Conn: left}
+	server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0), httpClient: &http.Client{Transport: &http2.Transport{}}}
+	if !server.lifetime.beginDial(server.cacheController) {
+		t.Fatal("dial rejected before close")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- server.Close() }()
+	<-server.cacheController.ctx.Done()
+	if _, accepted := server.lifetime.trackConnection(server.cacheController, lower); accepted {
+		t.Fatal("late DoH connection accepted")
+	}
+	server.lifetime.dialing.Done()
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if calls := lower.callCount(); calls != 1 {
+		t.Fatalf("late connection lower closes=%d", calls)
 	}
 }
 
-func TestTCPAndDoHRejectedConnectionCloseFailureRetried(t *testing.T) {
-	for _, kind := range []string{"tcp", "doh"} {
-		t.Run(kind, func(t *testing.T) {
-			failure := go_errors.New("lower close failed")
-			left, right := stdnet.Pipe()
-			defer left.Close()
-			defer right.Close()
-			lower := &scriptedCloseConn{Conn: left, errs: []error{failure, failure, nil}}
-			var cache *CacheController
-			var lifetime *connectionLifetime
-			var closeServer func() error
-			if kind == "tcp" {
-				server := &TCPNameServer{cacheController: NewCacheController("tcp", false, false, 0)}
-				cache, lifetime, closeServer = server.cacheController, &server.lifetime, server.Close
-			} else {
-				server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0)}
-				cache, lifetime, closeServer = server.cacheController, &server.lifetime, server.Close
-			}
-			cache.cancel()
-			tracked, accepted := lifetime.trackConnection(cache, lower)
-			if accepted {
-				t.Fatal("connection accepted after cancellation")
-			}
-			if err := tracked.Close(); !go_errors.Is(err, failure) {
-				t.Fatalf("rejected connection close: %v", err)
-			}
-			if err := closeServer(); !go_errors.Is(err, failure) {
-				t.Fatalf("first owner close: %v", err)
-			}
-			lifetime.mu.Lock()
-			remaining := len(lifetime.connections)
-			lifetime.mu.Unlock()
-			if remaining != 1 {
-				t.Fatalf("failed connection lost from retry inventory: %d", remaining)
-			}
-			if err := closeServer(); err != nil {
-				t.Fatalf("retry owner close: %v", err)
-			}
-			lifetime.mu.Lock()
-			remaining = len(lifetime.connections)
-			lifetime.mu.Unlock()
-			if remaining != 0 || lower.callCount() != 3 {
-				t.Fatalf("connection retry: retained=%d closes=%d", remaining, lower.callCount())
-			}
-		})
+func TestTCPCloseWaitsLateDialWorkerAndRejectsNewQuery(t *testing.T) {
+	endpoint, _ := url.Parse("tcp+local://127.0.0.1:53")
+	server, err := NewTCPLocalNameServer(endpoint, true, false, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	t.Cleanup(func() { _ = server.Close() })
+	peers := make(chan stdnet.Conn, 1)
+	var dials atomic.Int32
+	server.dial = func(context.Context) (stdnet.Conn, error) {
+		dials.Add(1)
+		close(entered)
+		<-release // This dial deliberately ignores cancellation until released.
+		client, peer := stdnet.Pipe()
+		peers <- peer
+		return client, nil
+	}
+	queryDone := make(chan error, 1)
+	go func() {
+		_, _, err := server.QueryIP(context.Background(), "late.test", featuredns.IPOption{IPv4Enable: true})
+		queryDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("TCP dial did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- server.Close() }()
+	<-server.cacheController.ctx.Done()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the admitted dial worker: %v", err)
+	default:
+	}
+	close(release)
+	var peer stdnet.Conn
+	select {
+	case peer = <-peers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("late dial did not return a connection")
+	}
+	defer peer.Close()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not wait for the late dial worker")
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); !go_errors.Is(err, io.EOF) && !go_errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("late returned connection was not closed: %v", err)
+	}
+	select {
+	case err := <-queryDone:
+		if err == nil {
+			t.Fatal("retired TCP query reported success")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("retired TCP query did not finish")
+	}
+	if _, _, err := server.QueryIP(context.Background(), "after.test", featuredns.IPOption{IPv4Enable: true}); err == nil {
+		t.Fatal("post-close TCP query reported success")
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("post-close query started another dial: %d", got)
+	}
+}
+
+func TestDoHRejectedConnectionCloseFailureRetried(t *testing.T) {
+	failure := go_errors.New("lower close failed")
+	left, right := stdnet.Pipe()
+	defer left.Close()
+	defer right.Close()
+	lower := &scriptedCloseConn{Conn: left, errs: []error{failure, failure, nil}}
+	server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0)}
+	cache, lifetime, closeServer := server.cacheController, &server.lifetime, server.Close
+	cache.cancel()
+	tracked, accepted := lifetime.trackConnection(cache, lower)
+	if accepted {
+		t.Fatal("connection accepted after cancellation")
+	}
+	if err := tracked.Close(); !go_errors.Is(err, failure) {
+		t.Fatalf("rejected connection close: %v", err)
+	}
+	if err := closeServer(); !go_errors.Is(err, failure) {
+		t.Fatalf("first owner close: %v", err)
+	}
+	lifetime.mu.Lock()
+	remaining := len(lifetime.connections)
+	lifetime.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("failed connection lost from retry inventory: %d", remaining)
+	}
+	if err := closeServer(); err != nil {
+		t.Fatalf("retry owner close: %v", err)
+	}
+	lifetime.mu.Lock()
+	remaining = len(lifetime.connections)
+	lifetime.mu.Unlock()
+	if remaining != 0 || lower.callCount() != 3 {
+		t.Fatalf("connection retry: retained=%d closes=%d", remaining, lower.callCount())
 	}
 }
 

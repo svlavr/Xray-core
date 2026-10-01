@@ -307,6 +307,62 @@ func TestInspectionBufferedWriterFailedFlushDiscardsHeaderTail(t *testing.T) {
 	}
 }
 
+type inspectionReceiptBindingProbe struct{ bound fs.Exchange }
+
+func (w *inspectionReceiptBindingProbe) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	buf.ReleaseMulti(mb)
+	return nil
+}
+
+func (w *inspectionReceiptBindingProbe) WithWriterReceipt(receipt fs.Exchange) buf.Writer {
+	w.bound = receipt
+	return w
+}
+
+func TestInspectionReceiptHelpersClearFailedPrefix(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		batch      bool
+		written    int
+		firstKnown uint64
+	}{
+		{name: "scalar-inside-header", written: 2},
+		{name: "scalar-past-header", written: 6, firstKnown: 2},
+		{name: "failed-batch", batch: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			receipt := new(inspectionReceipt)
+			lower := new(inspectionReceiptBindingProbe)
+			buffered := buf.NewBufferedWriter(lower)
+			defer buf.DiscardBufferedWriter(buffered)
+			if _, err := buffered.Write([]byte("head")); err != nil {
+				t.Fatal(err)
+			}
+			buf.AttachWriterReceipt(buffered, receipt)
+			if buf.OriginalWriterReceipt(lower.bound) != receipt {
+				t.Fatal("framing prefix hid the original receipt")
+			}
+			if test.batch {
+				buf.RecordBufferOperation(lower.bound, uint64(len("headpayload")), errInspectionWrite)
+			} else {
+				writer := inspectionWriteFunc(func([]byte) (int, error) {
+					return test.written, errInspectionWrite
+				})
+				if n, err := buf.WriteBytesWithReceipt(writer, []byte("headpayload"), lower.bound); n != test.written || !errors.Is(err, errInspectionWrite) {
+					t.Fatalf("failed scalar result: %d %v", n, err)
+				}
+			}
+			if got := receipt.down.Load(); got != test.firstKnown {
+				t.Fatalf("failed result credited %d, want %d", got, test.firstKnown)
+			}
+			buf.RecordBufferOperation(lower.bound, uint64(len("next")), nil)
+			if got, want := receipt.down.Load(), test.firstKnown+uint64(len("next")); got != want {
+				t.Fatalf("later batch credited %d, want %d", got, want)
+			}
+		})
+	}
+}
+
 type unsupportedBufferedWriter struct{ got string }
 
 func (w *unsupportedBufferedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {

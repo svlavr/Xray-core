@@ -362,7 +362,7 @@ func TestInspectionRouteCaptureRequiresOwnerBinding(t *testing.T) {
 
 func TestInspectionIndependentSample(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
-	cell := store.unassigned[int(featurestats.TrafficOriginUser)]
+	cell := &store.unassigned[int(featurestats.TrafficOriginUser)]
 	cell.uplink.Add(1)
 	snapshot, err := store.ReadTotals()
 	if err != nil {

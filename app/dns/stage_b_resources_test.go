@@ -73,7 +73,7 @@ func TestStageBTCPWithheldReplyCancellation(t *testing.T) {
 				t.Fatal("query did not return on cancellation")
 			}
 			joined := make(chan struct{})
-			go func() { server.lifetime.workers.Wait(); close(joined) }()
+			go func() { server.workers.Wait(); close(joined) }()
 			select {
 			case <-joined:
 			case <-time.After(time.Second):
@@ -83,12 +83,6 @@ func TestStageBTCPWithheldReplyCancellation(t *testing.T) {
 			case <-peerDone:
 			case <-time.After(time.Second):
 				t.Fatal("TCP connection remained open")
-			}
-			server.lifetime.mu.Lock()
-			remaining := len(server.lifetime.connections)
-			server.lifetime.mu.Unlock()
-			if remaining != 0 {
-				t.Fatal("canceled connection remained owned before whole Close")
 			}
 		})
 	}

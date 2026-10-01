@@ -30,7 +30,6 @@ type connEntry struct {
 	cancel      context.CancelFunc
 	closed      atomic.Bool
 	observation *session.LogicalObservation
-	done        chan struct{}
 }
 
 func (c *connEntry) Close() error {
@@ -81,29 +80,6 @@ func (v *Dispatcher) RemoveRay() {
 		}
 		v.conn.Close()
 		v.conn = nil
-	}
-}
-
-// CloseAndWait terminates the owned ray and joins its input callback.
-func (v *Dispatcher) CloseAndWait(ctx context.Context) error {
-	v.Lock()
-	v.closed = true
-	conn := v.conn
-	v.Unlock()
-	if conn == nil {
-		return nil
-	}
-	conn.Close()
-	select {
-	case <-conn.done:
-		v.Lock()
-		if v.conn == conn {
-			v.conn = nil
-		}
-		v.Unlock()
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 }
 
@@ -168,7 +144,6 @@ func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*
 		link:        link,
 		cancel:      cancel,
 		observation: observation,
-		done:        make(chan struct{}),
 	}
 
 	entry.timer = signal.CancelAfterInactivity(ctx, entry.terminate, time.Minute)
@@ -220,7 +195,6 @@ func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, cal
 			}
 			conn.observation.Exchange.Finish()
 		}
-		close(conn.done)
 	}()
 
 	input := conn.link.Reader

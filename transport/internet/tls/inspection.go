@@ -1,8 +1,6 @@
 package tls
 
 import (
-	"io"
-
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/features/stats"
 )
@@ -10,20 +8,25 @@ import (
 // WithWriterReceipt preserves this TLS writer's compact-then-scalar path and
 // connection ownership while retaining each actual plaintext Write result.
 func (c *Conn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
-	return &inspectionWriter{Conn: c, writer: buf.AttachWriterReceipt(&buf.SequentialWriter{Writer: c}, receipt)}
+	return &inspectionWriter{Conn: c, receipt: receipt}
 }
 
 type inspectionWriter struct {
 	*Conn
-	writer buf.Writer
+	receipt stats.Exchange
 }
 
 func (w *inspectionWriter) Write(p []byte) (int, error) {
-	return w.writer.(io.Writer).Write(p)
+	return buf.WriteBytesWithReceipt(w.Conn, p, w.receipt)
 }
 
 func (w *inspectionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.writer.WriteMultiBuffer(buf.Compact(mb))
+	size := uint64(mb.Len())
+	err := w.Conn.WriteMultiBuffer(mb)
+	buf.RecordBufferOperation(w.receipt, size, err)
+	return err
 }
 
-func (w *inspectionWriter) WriterReceipt() stats.Exchange { return buf.WriterReceipt(w.writer) }
+func (w *inspectionWriter) WriterReceipt() stats.Exchange {
+	return buf.OriginalWriterReceipt(w.receipt)
+}

@@ -86,8 +86,8 @@ func (r *InspectionReader) credit(mb MultiBuffer) {
 	}
 }
 
-func (r *InspectionReader) next(timeout time.Duration, timed bool) (MultiBuffer, error) {
-	r.mu.Lock()
+// nextLocked consumes the mutex on every return path.
+func (r *InspectionReader) nextLocked(timeout time.Duration, timed bool) (MultiBuffer, error) {
 	if r.closed {
 		r.mu.Unlock()
 		return nil, io.ErrClosedPipe
@@ -164,29 +164,24 @@ func (r *InspectionReader) ReadMultiBufferTimeout(timeout time.Duration) (MultiB
 
 func (r *InspectionReader) read(timeout time.Duration, timed bool) (MultiBuffer, error) {
 	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil, io.ErrClosedPipe
-	}
 	if !r.replay.IsEmpty() || r.replayErr != nil {
 		mb, err := r.replay, r.replayErr
 		r.replay, r.replayErr = nil, nil
 		r.mu.Unlock()
 		return mb, err
 	}
-	r.mu.Unlock()
-	return r.next(timeout, timed)
+	return r.nextLocked(timeout, timed)
 }
 
 // Cache keeps every returned byte and its terminal error for one replay.
 func (r *InspectionReader) Cache(b *Buffer, timeout time.Duration) error {
 	r.mu.Lock()
 	err := r.replayErr
-	r.mu.Unlock()
 	if err != nil {
+		r.mu.Unlock()
 		return err
 	}
-	mb, err := r.next(timeout, true)
+	mb, err := r.nextLocked(timeout, true)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {

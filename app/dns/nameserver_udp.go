@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol/dns"
 	udp_proto "github.com/xtls/xray-core/common/protocol/udp"
+	"github.com/xtls/xray-core/common/task"
 	dns_feature "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport/internet/udp"
@@ -26,7 +27,7 @@ type ClassicNameServer struct {
 	address         *net.Destination
 	requests        map[uint16]*udpDnsRequest
 	udpServer       *udp.Dispatcher
-	requestsCleanup *ownedPeriodic
+	requestsCleanup *task.Periodic
 	reqID           uint32
 	clientIP        net.IP
 }
@@ -45,7 +46,7 @@ func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher
 		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
 		address:         &address, requests: make(map[uint16]*udpDnsRequest), clientIP: clientIP,
 	}
-	s.requestsCleanup = newOwnedPeriodic(time.Second, s.RequestsCleanup)
+	s.requestsCleanup = &task.Periodic{Interval: time.Second, Execute: s.RequestsCleanup}
 	s.udpServer = udp.NewDispatcher(dispatcher, s.HandleResponse)
 	errors.LogInfo(context.Background(), "DNS: created UDP client initialized for ", address.NetAddr())
 	return s
@@ -164,7 +165,7 @@ func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) error {
 	s.requests[req.msg.ID] = req
 	req.stop = context.AfterFunc(req.ctx, func() { s.forgetRequest(req) })
 	s.Unlock()
-	common.Must(s.requestsCleanup.Start())
+	s.cacheController.startCleanup(s.requestsCleanup)
 	return nil
 }
 
@@ -222,12 +223,10 @@ func (s *ClassicNameServer) Close() error {
 		}
 	}
 	s.Unlock()
-	s.requestsCleanup.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err := s.udpServer.CloseAndWait(ctx)
+	s.cacheController.stopCleanup(s.requestsCleanup)
+	s.udpServer.RemoveRay()
 	s.cacheController.Close()
-	return err
+	return nil
 }
 
 func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {

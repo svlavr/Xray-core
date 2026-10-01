@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/task"
 	dns_feature "github.com/xtls/xray-core/features/dns"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -33,7 +33,8 @@ type CacheController struct {
 
 	sync.RWMutex
 	subs          map[string][]*cacheSubscriber
-	cacheCleanup  *ownedPeriodic
+	cleanupMu     sync.Mutex // serializes synchronous periodic Start with Close
+	cacheCleanup  *task.Periodic
 	highWatermark int
 	requestGroup  singleflight.Group
 	migrations    sync.WaitGroup
@@ -78,8 +79,23 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		cancel:          cancel,
 	}
 
-	c.cacheCleanup = newOwnedPeriodic(300*time.Second, c.CacheCleanup)
+	c.cacheCleanup = &task.Periodic{Interval: 300 * time.Second, Execute: c.CacheCleanup}
 	return c
+}
+
+func (c *CacheController) startCleanup(periodic *task.Periodic) {
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+	if c.ctx.Err() == nil {
+		// Both cleanup callbacks return an error only when there is no work.
+		_ = periodic.Start()
+	}
+}
+
+func (c *CacheController) stopCleanup(periodic *task.Periodic) {
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+	_ = periodic.Close()
 }
 
 // CacheCleanup clears expired items from cache
@@ -141,6 +157,9 @@ func (c *CacheController) collectExpiredKeys() ([]string, error) {
 func (c *CacheController) writeAndShrink(expiredKeys []string) {
 	c.Lock()
 	defer c.Unlock()
+	if c.ctx.Err() != nil {
+		return
+	}
 
 	// double check to prevent upper call multiple cleanup tasks
 	if c.dirtyips != nil {
@@ -349,7 +368,7 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt, ", lock: ", lockWait)
 
 	if !c.serveStale || c.serveExpiredTTL != 0 {
-		common.Must(c.cacheCleanup.Start())
+		c.startCleanup(c.cacheCleanup)
 	}
 }
 
@@ -409,7 +428,7 @@ func closeSubscribers(sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
 
 func (c *CacheController) Close() {
 	c.cancel()
-	c.cacheCleanup.Close()
+	c.stopCleanup(c.cacheCleanup)
 	c.Lock()
 	c.subs = nil
 	c.Unlock()
