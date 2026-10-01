@@ -17,6 +17,67 @@ func testInspectionStore(t *testing.T, options featurestats.ObservationOptions) 
 	return newInspectionStore(featurestats.RuntimeID{1}, normalizeObservationOptions(options))
 }
 
+func TestInspectionConcurrentRetirementRejectsNewFacts(t *testing.T) {
+	manager := new(Manager)
+	view, err := manager.EnableInspection(featurestats.ObservationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := manager.Observation()
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	var admitted sync.WaitGroup
+	admitted.Add(4)
+	for i := 0; i < 4; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			flow := store.Begin(xnet.Network_UDP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { return nil })
+			admitted.Done()
+			<-start
+			for j := 0; j < 32; j++ {
+				if j != 0 {
+					flow = store.Begin(xnet.Network_UDP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { return nil })
+				}
+				if flow != nil {
+					flow.Route(featurestats.OutboundRef{Serial: 1})
+					flow.BindRoute()
+					flow.AddUplink(1)
+					flow.Finish()
+				}
+				_, _ = view.ReadLive()
+				_, _ = view.ReadTotals()
+				_, _ = view.ReadTerminals()
+			}
+		}()
+	}
+	admitted.Wait()
+	close(start)
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	workers.Wait()
+	_ = manager.Close()
+	if manager.Observation() != nil || store.Begin(xnet.Network_UDP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil) != nil {
+		t.Fatal("closed manager or captured store admitted new facts")
+	}
+	if _, err := view.ReadLive(); err == nil {
+		t.Fatal("closed live view accepted")
+	}
+	if _, err := view.ReadTotals(); err == nil {
+		t.Fatal("closed totals accepted")
+	}
+	if _, err := view.ReadTerminals(); err == nil {
+		t.Fatal("closed ended view accepted")
+	}
+	if _, err := view.CloseFlows(context.Background(), nil); err == nil {
+		t.Fatal("closed control accepted")
+	}
+	if _, err := manager.EnableInspection(featurestats.ObservationOptions{}); err == nil {
+		t.Fatal("closed manager accepted a second enablement")
+	}
+}
+
 func TestInspectionEnablement(t *testing.T) {
 	manager, err := NewManager(context.Background(), &Config{})
 	if err != nil {

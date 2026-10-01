@@ -96,9 +96,10 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 type udpConn struct {
 	handler *udpConnectionHandler
 
-	egress chan *packet
-	src    net.Destination
-	dst    net.Destination
+	egress  chan *packet
+	src     net.Destination
+	dst     net.Destination
+	receipt stats.Exchange
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -139,10 +140,6 @@ func (c *udpConn) Read(p []byte) (int, error) {
 }
 
 func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return c.writeMultiBuffer(mb, nil)
-}
-
-func (c *udpConn) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for i, b := range mb {
 		dst := c.dst
 		if b.UDP != nil {
@@ -153,8 +150,8 @@ func (c *udpConn) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) e
 			}
 		}
 		err := c.handler.writePacket(b.Bytes(), dst, c.src)
-		if receipt != nil {
-			proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil)
+		if c.receipt != nil {
+			proxy.RecordPacketOutcome(c.receipt, uint64(b.Len()), err == nil)
 		}
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
@@ -183,16 +180,8 @@ func (c *udpConn) Close() error {
 }
 
 func (c *udpConn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
-	return &inspectionUDPWriter{udpConn: c, receipt: receipt}
-}
-
-type inspectionUDPWriter struct {
-	*udpConn
-	receipt stats.Exchange
-}
-
-func (w *inspectionUDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.udpConn.writeMultiBuffer(mb, w.receipt)
+	c.receipt = receipt
+	return c
 }
 
 func (c *udpConn) LocalAddr() net.Addr {

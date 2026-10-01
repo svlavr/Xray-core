@@ -232,6 +232,7 @@ type AuthenticationWriter struct {
 	sizeParser   ChunkSizeEncoder
 	transferType protocol.TransferType
 	padding      PaddingLengthGenerator
+	receipt      stats.Exchange
 }
 
 func NewAuthenticationWriter(auth Authenticator, sizeParser ChunkSizeEncoder, writer io.Writer, transferType protocol.TransferType, padding PaddingLengthGenerator) *AuthenticationWriter {
@@ -276,10 +277,10 @@ func (w *AuthenticationWriter) seal(b []byte) (*buf.Buffer, error) {
 	return eb, nil
 }
 
-func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer, receipt stats.Exchange) error {
+func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 	var payload uint64
-	if receipt != nil {
+	if w.receipt != nil {
 		payload = uint64(mb.Len())
 	}
 
@@ -311,10 +312,10 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer, receipt stats.Exc
 		}
 	}
 
-	return w.writeBatch(mb2Write, receipt, payload)
+	return w.writeBatch(mb2Write, payload)
 }
 
-func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer, receipt stats.Exchange) error {
+func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 
 	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
@@ -331,7 +332,7 @@ func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer, receipt stats.Exc
 		}
 
 		mb2Write = append(mb2Write, eb)
-		if receipt != nil {
+		if w.receipt != nil {
 			payload += uint64(b.Len())
 		}
 	}
@@ -340,32 +341,28 @@ func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer, receipt stats.Exc
 		return nil
 	}
 
-	return w.writeBatch(mb2Write, receipt, payload)
+	return w.writeBatch(mb2Write, payload)
 }
 
 // WriteMultiBuffer implements buf.Writer.
 func (w *AuthenticationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.writeMultiBuffer(mb, nil)
-}
-
-func (w *AuthenticationWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	if mb.IsEmpty() {
 		eb, err := w.seal([]byte{})
 		common.Must(err)
-		return w.writeBatch(buf.MultiBuffer{eb}, receipt, 0)
+		return w.writeBatch(buf.MultiBuffer{eb}, 0)
 	}
 
 	if w.transferType == protocol.TransferTypeStream {
-		return w.writeStream(mb, receipt)
+		return w.writeStream(mb)
 	}
 
-	return w.writePacket(mb, receipt)
+	return w.writePacket(mb)
 }
 
-func (w *AuthenticationWriter) writeBatch(mb buf.MultiBuffer, receipt stats.Exchange, payload uint64) error {
+func (w *AuthenticationWriter) writeBatch(mb buf.MultiBuffer, payload uint64) error {
 	err := w.writer.WriteMultiBuffer(mb)
-	if receipt != nil && err == nil && payload != 0 {
-		receipt.AddDownlink(payload)
+	if w.receipt != nil && err == nil && payload != 0 {
+		w.receipt.AddDownlink(payload)
 	}
 	return err
 }

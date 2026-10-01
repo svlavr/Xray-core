@@ -93,13 +93,10 @@ func NewMultiLengthPacketWriter(writer buf.Writer) *MultiLengthPacketWriter {
 
 type MultiLengthPacketWriter struct {
 	buf.Writer
+	receipt stats.Exchange
 }
 
 func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.writeMultiBuffer(mb, nil)
-}
-
-func (w *MultiLengthPacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	defer buf.ReleaseMulti(mb)
 	var payload uint64
 	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
@@ -122,7 +119,7 @@ func (w *MultiLengthPacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt s
 			continue
 		}
 		mb2Write = append(mb2Write, eb)
-		if receipt != nil {
+		if w.receipt != nil {
 			payload += uint64(length)
 		}
 	}
@@ -130,25 +127,17 @@ func (w *MultiLengthPacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt s
 		return nil
 	}
 	err := w.Writer.WriteMultiBuffer(mb2Write)
-	if receipt != nil && err == nil && payload != 0 {
-		receipt.AddDownlink(payload)
+	if w.receipt != nil && err == nil && payload != 0 {
+		w.receipt.AddDownlink(payload)
 	}
 	return err
-}
-
-type inspectionLengthPacketWriter struct {
-	*MultiLengthPacketWriter
-	receipt stats.Exchange
-}
-
-func (w *inspectionLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.MultiLengthPacketWriter.writeMultiBuffer(mb, w.receipt)
 }
 
 // WithWriterReceipt binds the decoded packet operation. The native encoder and
 // lower writer keep their batching and buffering behavior.
 func (w *MultiLengthPacketWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
-	return &inspectionLengthPacketWriter{MultiLengthPacketWriter: w, receipt: flow}
+	w.receipt = flow
+	return w
 }
 
 func NewLengthPacketWriter(writer io.Writer) *LengthPacketWriter {

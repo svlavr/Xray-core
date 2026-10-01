@@ -118,7 +118,7 @@ type Exchange interface {
 	ExcludeCarrier() bool
 	// Rebind fences later attribution if a retained endpoint changes runtime or origin.
 	Rebind(RuntimeID, TrafficOrigin)
-	// NewLeg reserves one native UDP ray or TCP attempt under this root.
+	// NewLeg reserves one native UDP ray under this association root.
 	// Legs share the root reference and byte facts, but own their route and Finish.
 	// Returns nil after stop.
 	NewLeg() Exchange

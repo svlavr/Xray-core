@@ -160,13 +160,8 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (p *pipe) writeMultiBuffer(mb buf.MultiBuffer, ctx context.Context) error {
-	_, err := p.writeMultiBufferResult(mb, ctx)
-	return err
-}
-
-func (p *pipe) writeMultiBufferResult(mb buf.MultiBuffer, ctx context.Context) (bool, error) {
 	if mb.IsEmpty() {
-		return true, nil
+		return nil
 	}
 	var canceled <-chan struct{}
 	if ctx != nil {
@@ -177,29 +172,29 @@ func (p *pipe) writeMultiBufferResult(mb buf.MultiBuffer, ctx context.Context) (
 		err := p.writeMultiBufferInternal(mb, ctx)
 		if err == nil {
 			p.readSignal.Signal()
-			return true, nil
+			return nil
 		}
 
 		if err == errBufferFull {
 			if p.option.discardOverflow {
 				buf.ReleaseMulti(mb)
-				return false, nil
+				return nil
 			}
 			select {
 			case <-p.writeSignal.Wait():
 				continue
 			case <-p.done.Wait():
 				buf.ReleaseMulti(mb)
-				return false, io.ErrClosedPipe
+				return io.ErrClosedPipe
 			case <-canceled:
 				buf.ReleaseMulti(mb)
-				return false, ctx.Err()
+				return ctx.Err()
 			}
 		}
 
 		buf.ReleaseMulti(mb)
 		p.readSignal.Signal()
-		return false, err
+		return err
 	}
 }
 

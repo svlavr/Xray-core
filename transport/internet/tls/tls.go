@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
+	"github.com/xtls/xray-core/features/stats"
 )
 
 type Interface interface {
@@ -31,6 +32,7 @@ var (
 type Conn struct {
 	*tls.Conn
 	suppressCloseNotify atomic.Bool
+	receipt             stats.Exchange
 }
 
 const tlsCloseTimeout = 250 * time.Millisecond
@@ -48,6 +50,13 @@ func (c *Conn) Close() error {
 	})
 	defer timer.Stop()
 	return c.Conn.Close()
+}
+
+func (c *Conn) Write(p []byte) (int, error) {
+	if c.receipt == nil {
+		return c.Conn.Write(p)
+	}
+	return buf.WriteBytesWithReceipt(c.Conn, p, c.receipt)
 }
 
 func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {

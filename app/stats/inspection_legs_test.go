@@ -244,36 +244,18 @@ func TestInspectionEarlyFinishedSelectedLegWithoutClaimIsUnassigned(t *testing.T
 	t.Fatalf("selected no-claim unassigned total missing: %+v", totals)
 }
 
-func TestInspectionTCPAttemptLegsKeepPerRouteTotals(t *testing.T) {
+func TestInspectionTCPDoesNotCreatePacketLeg(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(xnet.Network_TCP, fs.TrafficOriginInternal, xnet.Destination{}, xnet.TCPDestination(xnet.LocalHostIP, 443), nil)
-	first, second := root.NewLeg(), root.NewLeg()
-	if first == nil || second == nil || first.NewLeg() != nil {
-		t.Fatal("TCP root did not admit exactly one level of attempt legs")
+	if root.NewLeg() != nil {
+		t.Fatal("TCP exchange acquired a UDP packet leg")
 	}
-	for i, leg := range []fs.Exchange{first, second} {
-		leg.AddUplink(uint64(11 + i))
-		leg.AddDownlink(uint64(21 + i))
-		leg.Route(fs.OutboundRef{Serial: uint64(41 + i)})
-		leg.BindRoute()
-		leg.Finish()
-	}
+	root.AddUplink(23)
+	root.AddDownlink(43)
 	root.Finish()
 
 	page, _ := s.ReadTerminals()
 	if len(page.Rows) != 1 || page.Rows[0].Flow.Kind != xnet.Network_TCP || page.Rows[0].Flow.Uplink != 23 || page.Rows[0].Flow.Downlink != 43 {
-		t.Fatalf("TCP attempt root: %+v", page)
-	}
-	totals, _ := s.ReadTotals()
-	for _, serial := range []uint64{41, 42} {
-		var found bool
-		for _, total := range totals.Rows {
-			if total.Outbound.Serial == serial {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("TCP attempt total %d missing: %+v", serial, totals)
-		}
+		t.Fatalf("TCP root: %+v", page)
 	}
 }

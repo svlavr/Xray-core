@@ -52,7 +52,7 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 	if dest.Network == net.Network_UDP {
 		kind = net.Network_UDP
 	}
-	ctx, observation := beginAPIObservation(ctx, v, dest, kind, true)
+	ctx, observation := beginAPIObservation(ctx, v, dest, kind)
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {
@@ -91,7 +91,7 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 // xray:api:beta
 func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
 	ctx = toContext(ctx, v)
-	ctx, observation := beginAPIObservation(ctx, v, net.Destination{}, net.Network_UDP, false)
+	ctx, observation := beginAPIObservation(ctx, v, net.Destination{}, net.Network_UDP)
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {

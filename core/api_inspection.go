@@ -15,15 +15,14 @@ import (
 // remains the execution owner; this guard only joins exact local Close with
 // the inspection root created for the API call.
 type apiObservation struct {
-	mu            sync.Mutex
-	closer        io.Closer
-	exchange      stats.Exchange
-	closed        bool
-	finishOnClose bool
-	cancel        context.CancelFunc
+	mu       sync.Mutex
+	closer   io.Closer
+	exchange stats.Exchange
+	closed   bool
+	cancel   context.CancelFunc
 }
 
-func beginAPIObservation(ctx context.Context, instance *Instance, destination net.Destination, kind net.Network, finishOnClose bool) (context.Context, *apiObservation) {
+func beginAPIObservation(ctx context.Context, instance *Instance, destination net.Destination, kind net.Network) (context.Context, *apiObservation) {
 	if current := session.LogicalObservationFromContext(ctx); current != nil && current.Exchange != nil {
 		continuation := &session.LogicalObservation{Exchange: current.Exchange}
 		continuation.ReturnedLink.Store(true)
@@ -40,7 +39,7 @@ func beginAPIObservation(ctx context.Context, instance *Instance, destination ne
 	}
 
 	ownedCtx, cancel := context.WithCancel(ctx)
-	owner := &apiObservation{finishOnClose: finishOnClose, cancel: cancel}
+	owner := &apiObservation{cancel: cancel}
 	var source net.Destination
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		source = inbound.Source
@@ -93,7 +92,7 @@ func (o *apiObservation) Close() error {
 	if closer != nil {
 		err = closer.Close()
 	}
-	if exchange != nil && (o.finishOnClose || closer == nil) {
+	if exchange != nil {
 		exchange.Finish()
 	}
 	return err

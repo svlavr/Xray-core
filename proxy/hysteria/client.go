@@ -185,9 +185,10 @@ func init() {
 }
 
 type UDPWriter struct {
-	writer io.Writer
-	addr   string
-	buf    [buf.Size]byte
+	writer  io.Writer
+	addr    string
+	buf     [buf.Size]byte
+	receipt stats.Exchange
 }
 
 func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
@@ -202,12 +203,8 @@ func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
 }
 
 func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.writeMultiBuffer(mb, nil)
-}
-
-func (w *UDPWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for i, b := range mb {
-		if err := w.writePacket(b, receipt); err != nil {
+		if err := w.writePacket(b); err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
 		}
@@ -216,8 +213,8 @@ func (w *UDPWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange)
 	return nil
 }
 
-func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err error) {
-	if receipt != nil {
+func (w *UDPWriter) writePacket(b *buf.Buffer) (err error) {
+	if receipt := w.receipt; receipt != nil {
 		defer func() { proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil) }()
 	}
 	addr := w.addr
@@ -254,17 +251,9 @@ func (w *UDPWriter) writePacket(b *buf.Buffer, receipt stats.Exchange) (err erro
 	return nil
 }
 
-type inspectionUDPWriter struct {
-	*UDPWriter
-	receipt stats.Exchange
-}
-
-func (w *inspectionUDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.UDPWriter.writeMultiBuffer(mb, w.receipt)
-}
-
 func (w *UDPWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
-	return &inspectionUDPWriter{UDPWriter: w, receipt: flow}
+	w.receipt = flow
+	return w
 }
 
 type UDPReader struct {

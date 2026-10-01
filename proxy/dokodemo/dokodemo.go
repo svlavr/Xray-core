@@ -230,19 +230,16 @@ func NewPacketWriter(conn net.PacketConn, d *net.Destination, mark int, back *ne
 }
 
 type PacketWriter struct {
-	mu     sync.Mutex
-	closed bool
-	conn   net.PacketConn
-	conns  map[net.Destination]net.PacketConn
-	mark   int
-	back   *net.UDPAddr
+	mu      sync.Mutex
+	closed  bool
+	conn    net.PacketConn
+	conns   map[net.Destination]net.PacketConn
+	mark    int
+	back    *net.UDPAddr
+	receipt stats.Exchange
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.writeMultiBuffer(mb, nil)
-}
-
-func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchange) error {
 	for {
 		mb2, b := buf.SplitFirst(mb)
 		mb = mb2
@@ -263,8 +260,8 @@ func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchan
 			}
 			n, writeErr := conn.WriteTo(b.Bytes(), w.back)
 			err = writeErr
-			if receipt != nil {
-				receipt.AddDownlink(uint64(n))
+			if w.receipt != nil {
+				w.receipt.AddDownlink(uint64(n))
 			}
 			if err != nil {
 				errors.LogInfo(context.Background(), err.Error())
@@ -280,8 +277,8 @@ func (w *PacketWriter) writeMultiBuffer(mb buf.MultiBuffer, receipt stats.Exchan
 			}
 			n, writeErr := conn.WriteTo(b.Bytes(), w.back)
 			err = writeErr
-			if receipt != nil {
-				receipt.AddDownlink(uint64(n))
+			if w.receipt != nil {
+				w.receipt.AddDownlink(uint64(n))
 			}
 			b.Release()
 			if err != nil {
@@ -356,14 +353,6 @@ func (w *PacketWriter) retire(destination net.Destination, conn net.PacketConn) 
 }
 
 func (w *PacketWriter) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
-	return &inspectionPacketWriter{PacketWriter: w, receipt: receipt}
-}
-
-type inspectionPacketWriter struct {
-	*PacketWriter
-	receipt stats.Exchange
-}
-
-func (w *inspectionPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	return w.PacketWriter.writeMultiBuffer(mb, w.receipt)
+	w.receipt = receipt
+	return w
 }

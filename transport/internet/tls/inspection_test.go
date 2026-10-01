@@ -62,6 +62,9 @@ func TestInspectionTLSWriterUsesNativeResults(t *testing.T) {
 	server, client := inspectionTLSPair(t)
 	receipt := new(inspectionTLSReceipt)
 	writer := server.WithWriterReceipt(receipt)
+	if writer != server {
+		t.Fatal("observed TLS writer lost its native identity")
+	}
 	if got := buf.WriterReceipt(writer); got != receipt {
 		t.Fatal("observed TLS writer lost its original receipt")
 	}

@@ -26,7 +26,6 @@ type inspectionStore struct {
 	runtime featurestats.RuntimeID
 	limits  featurestats.ObservationOptions
 	epoch   time.Time
-	closed  atomic.Bool
 
 	mu           sync.RWMutex
 	live         map[uint64]*inspectionExchange
@@ -56,6 +55,12 @@ func (s *inspectionStore) Runtime() featurestats.RuntimeID {
 	return s.runtime
 }
 
+func (s *inspectionStore) isClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.live == nil
+}
+
 func (s *inspectionStore) Begin(kind xnet.Network, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
 	flow := s.prepare(kind, origin, source, destination, stop)
 	if flow != nil {
@@ -72,7 +77,7 @@ func (s *inspectionStore) PrepareTCP(origin featurestats.TrafficOrigin, source, 
 }
 
 func (s *inspectionStore) prepare(kind xnet.Network, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
-	if s.closed.Load() {
+	if s.isClosed() {
 		return nil
 	}
 	origin = normalizeOrigin(origin)
@@ -102,7 +107,7 @@ func (e *inspectionExchange) registerLocked() {
 	s := e.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed.Load() {
+	if s.live == nil {
 		return
 	}
 	if uint32(len(s.live)) >= s.limits.MaxLive {
@@ -114,10 +119,11 @@ func (e *inspectionExchange) registerLocked() {
 }
 
 func (s *inspectionStore) ReadLive() (featurestats.LiveSnapshot, error) {
-	if s.closed.Load() {
+	s.mu.RLock()
+	if s.live == nil {
+		s.mu.RUnlock()
 		return featurestats.LiveSnapshot{}, errors.New("inspection closed")
 	}
-	s.mu.RLock()
 	rows := make([]*inspectionExchange, 0, len(s.live))
 	for _, exchange := range s.live {
 		rows = append(rows, exchange)
@@ -139,11 +145,11 @@ func (s *inspectionStore) ReadLive() (featurestats.LiveSnapshot, error) {
 }
 
 func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
-	if s.closed.Load() {
-		return featurestats.TotalsSnapshot{}, errors.New("inspection closed")
-	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.live == nil {
+		return featurestats.TotalsSnapshot{}, errors.New("inspection closed")
+	}
 	rows := make([]featurestats.TotalRecord, 0, len(s.buckets)+len(s.unassigned))
 	appendCell := func(cell *aggregateCell, outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) {
 		rows = append(rows, featurestats.TotalRecord{Outbound: outbound, Origin: origin, Uplink: cell.uplink.Load(), Downlink: cell.downlink.Load()})
@@ -161,11 +167,11 @@ func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
 }
 
 func (s *inspectionStore) ReadTerminals() (featurestats.TerminalSnapshot, error) {
-	if s.closed.Load() {
+	s.mu.RLock()
+	if s.live == nil {
+		s.mu.RUnlock()
 		return featurestats.TerminalSnapshot{}, errors.New("inspection closed")
 	}
-
-	s.mu.RLock()
 	rows := make([]featurestats.TerminalRecord, 0, len(s.terminals))
 	for i := 0; i < len(s.terminals); i++ {
 		rows = append(rows, s.terminals[(int(s.terminalHead)+i)%len(s.terminals)])
@@ -178,7 +184,7 @@ func (s *inspectionStore) ReadTerminals() (featurestats.TerminalSnapshot, error)
 }
 
 func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.FlowRef) ([]error, error) {
-	if s.closed.Load() {
+	if s.isClosed() {
 		return nil, errors.New("inspection closed")
 	}
 	outcomes := make([]error, len(refs))
@@ -225,7 +231,7 @@ func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin fe
 	if cell := s.buckets[key]; cell != nil {
 		return cell
 	}
-	if s.closed.Load() {
+	if s.live == nil {
 		return &s.unassigned[int(origin)]
 	}
 	if uint32(len(s.buckets)) >= s.limits.MaxBuckets {
@@ -237,7 +243,7 @@ func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin fe
 }
 
 func (s *inspectionStore) publish(exchange *inspectionExchange, terminal featurestats.TerminalRecord) {
-	if terminal.Flow.Ref.ID == 0 || s.closed.Load() {
+	if terminal.Flow.Ref.ID == 0 {
 		return
 	}
 	s.mu.Lock()
@@ -261,15 +267,15 @@ func (s *inspectionStore) publish(exchange *inspectionExchange, terminal feature
 }
 
 func (s *inspectionStore) close() {
-	if !s.closed.CompareAndSwap(false, true) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live == nil {
 		return
 	}
-	s.mu.Lock()
 	s.live = nil
 	s.buckets = nil
 	s.terminals = nil
 	s.terminalHead = 0
-	s.mu.Unlock()
 }
 
 // One association owns the visible values and lock. Native rays retain only
@@ -307,7 +313,7 @@ type pendingCredit struct {
 func (e *inspectionExchange) NewLeg() featurestats.Exchange {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || e.isLeg || (e.record.Kind != xnet.Network_UDP && e.record.Kind != xnet.Network_TCP) || e.stopRequested || e.published {
+	if e.excluded || e.isLeg || e.record.Kind != xnet.Network_UDP || e.stopRequested || e.published {
 		return nil
 	}
 	e.hasLegs = true

@@ -303,8 +303,8 @@ func TestInspectionAuthenticationUnavailableAndZeroProgress(t *testing.T) {
 	flow, view := authenticationFlow(t)
 	native := crypto.NewAuthenticationWriter(authenticationAuth(), crypto.PlainChunkSizeParser{}, opaqueAuthenticationOutput{Writer: io.Discard}, protocol.TransferTypeStream, nil)
 	writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
-	if writer == native || finish == nil {
-		t.Fatal("decoded codec owner was not observed")
+	if writer != native || finish == nil {
+		t.Fatal("decoded codec owner identity or cleanup was lost")
 	}
 	if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("accepted"))); err != nil {
 		t.Fatal(err)
