@@ -183,9 +183,12 @@ type UDPWriter struct {
 func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
 	msgN := msg.Serialize(w.buf[:])
 	if msgN < 0 {
-		return nil
+		return io.ErrShortBuffer
 	}
-	_, err := w.writer.Write(w.buf[:msgN])
+	n, err := w.writer.Write(w.buf[:msgN])
+	if err == nil && n != msgN {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -210,6 +213,10 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if go_errors.As(err, &errTooLarge) {
 			msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
 			fMsgs := FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
+			if len(fMsgs) == 0 {
+				buf.ReleaseMulti(mb[i:])
+				return err
+			}
 			for _, fMsg := range fMsgs {
 				err := w.SendMessage(&fMsg)
 				if err != nil {

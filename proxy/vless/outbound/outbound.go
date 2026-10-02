@@ -310,7 +310,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	clientReader := link.Reader // .(*pipe.Reader)
 	clientWriter := link.Writer // .(*pipe.Writer)
 	trafficState := proxy.NewTrafficState(account.ID.Bytes())
-	if request.Command == protocol.RequestCommandUDP && (requestAddons.Flow == vless.XRV || (h.cone && request.Port != 53 && request.Port != 443)) {
+	// Controlled UDP operations need response addresses even when cone is disabled
+	// or the destination is 53/443. Reuse native XUDP framing on this invocation;
+	// this does not enable the sender's shared mux manager or change ordinary UDP.
+	requirePacketSource := session.TrafficOriginFromContext(ctx) == session.OriginMeasurement && session.UDPPacketSourceRequired(ctx)
+	if request.Command == protocol.RequestCommandUDP && (requestAddons.Flow == vless.XRV || (h.cone && request.Port != 53 && request.Port != 443) || requirePacketSource) {
 		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")
 		request.Port = net.Port(666)
