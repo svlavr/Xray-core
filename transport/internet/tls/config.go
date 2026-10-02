@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/platform/filesystem"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	"github.com/xtls/xray-core/transport/internet"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -100,7 +102,7 @@ func withOCSPStaple(cert *tls.Certificate, staple []byte) *tls.Certificate {
 	return &cloned
 }
 
-func (c *Config) buildCertificateSet(watch bool) *certificateSet {
+func (c *Config) buildCertificateSet(watch bool, owner *configOwner) *certificateSet {
 	set := new(certificateSet)
 	for _, source := range c.Certificate {
 		entry := cloneCertificateConfig(source)
@@ -115,7 +117,7 @@ func (c *Config) buildCertificateSet(watch bool) *certificateSet {
 		if !watch {
 			continue
 		}
-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
+		setupOcspTicker(owner, entry, func(isReloaded, isOcspstapling bool) {
 			current := set.load(index)
 			next := current
 			if isReloaded {
@@ -126,7 +128,7 @@ func (c *Config) buildCertificateSet(watch bool) *certificateSet {
 				}
 			}
 			if isOcspstapling {
-				if newOCSPData, err := ocsp.GetOCSPForCert(next.Certificate); err != nil {
+				if newOCSPData, err := ocsp.GetOCSPForCertContext(owner.ctx, next.Certificate); err != nil {
 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
 				} else if !slices.Equal(newOCSPData, next.OCSPStaple) {
 					next = withOCSPStaple(next, newOCSPData)
@@ -143,15 +145,49 @@ func (c *Config) buildCertificateSet(watch bool) *certificateSet {
 // BuildCertificates returns an immutable point-in-time snapshot. GetTLSConfig
 // owns the live reload selector used by server handshakes.
 func (c *Config) BuildCertificates() []*tls.Certificate {
-	return c.buildCertificateSet(false).snapshot()
+	return c.buildCertificateSet(false, nil).snapshot()
 }
 
-func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
-	hasReloadPaths := entry.CertificatePath != "" && entry.KeyPath != ""
-	if entry.OneTimeLoading || !hasReloadPaths && entry.OcspStapling == 0 {
+type configOwner struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	workers sync.WaitGroup
+}
+
+func newConfigOwner() *configOwner {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &configOwner{ctx: ctx, cancel: cancel}
+}
+
+func (o *configOwner) close() {
+	if o == nil {
 		return
 	}
+	o.cancel()
+	o.workers.Wait()
+}
+
+// CloseConfig retires workers attached to the config's RandCarrier. Clones
+// share that carrier, so the listener owning the original config closes it.
+// Call before replacing Rand on a returned server config: replacement drops
+// the owner handle.
+func CloseConfig(config *tls.Config) {
+	if config == nil {
+		return
+	}
+	if carrier, ok := config.Rand.(*RandCarrier); ok {
+		carrier.owner.close()
+	}
+}
+
+func setupOcspTicker(owner *configOwner, entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
+	hasReloadPaths := entry.CertificatePath != "" && entry.KeyPath != ""
+	if owner == nil || entry.OneTimeLoading || !hasReloadPaths && entry.OcspStapling == 0 {
+		return
+	}
+	owner.workers.Add(1)
 	go func() {
+		defer owner.workers.Done()
 		var isOcspstapling bool
 		hotReloadCertInterval := uint64(3600)
 		if entry.OcspStapling != 0 {
@@ -161,6 +197,9 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 		t := time.NewTicker(time.Duration(hotReloadCertInterval) * time.Second)
 		defer t.Stop()
 		for {
+			if owner.ctx.Err() != nil {
+				return
+			}
 			var isReloaded bool
 			if hasReloadPaths {
 				newCert, err := filesystem.ReadCert(entry.CertificatePath)
@@ -179,8 +218,15 @@ func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstaplin
 					isReloaded = true
 				}
 			}
+			if owner.ctx.Err() != nil {
+				return
+			}
 			callback(isReloaded, isOcspstapling)
-			<-t.C
+			select {
+			case <-owner.ctx.Done():
+				return
+			case <-t.C:
+			}
 		}
 	}()
 }
@@ -249,7 +295,7 @@ func (s *certificateAuthoritySet) len() int {
 	return len(s.certs)
 }
 
-func (c *Config) getCustomCA() *certificateAuthoritySet {
+func (c *Config) getCustomCA(owner *configOwner) *certificateAuthoritySet {
 	set := new(certificateAuthoritySet)
 	for _, source := range c.Certificate {
 		if source.Usage != Certificate_AUTHORITY_ISSUE {
@@ -261,7 +307,7 @@ func (c *Config) getCustomCA() *certificateAuthoritySet {
 			continue
 		}
 		index := set.append(cloneCertificateConfig(entry))
-		setupOcspTicker(entry, func(isReloaded, _ bool) {
+		setupOcspTicker(owner, entry, func(isReloaded, _ bool) {
 			if isReloaded {
 				set.replace(index, cloneCertificateConfig(entry))
 			}
@@ -271,8 +317,9 @@ func (c *Config) getCustomCA() *certificateAuthoritySet {
 }
 
 type issuedCertificateCache struct {
-	access sync.Mutex
-	byName map[string]*tls.Certificate
+	access   sync.Mutex
+	byName   map[string]*tls.Certificate
+	issuance singleflight.Group
 }
 
 func (c *issuedCertificateCache) getOrIssue(domain string, authorities []*Certificate) (*tls.Certificate, error) {
@@ -296,27 +343,43 @@ func (c *issuedCertificateCache) getOrIssue(domain string, authorities []*Certif
 	c.access.Unlock()
 
 	// Key generation must not hold up unrelated cached handshakes.
-	for _, rawCert := range authorities {
-		if rawCert.Usage != Certificate_AUTHORITY_ISSUE {
-			continue
-		}
-		issued, err := issueCertificate(rawCert, domain)
-		if err != nil {
-			errors.LogInfoInner(context.Background(), err, "failed to issue new certificate for ", domain)
-			continue
-		}
-		expTime := issued.Leaf.NotAfter.Format(time.RFC3339)
-		errors.LogInfo(context.Background(), "new certificate for ", domain, " (expire on ", expTime, ") issued")
+	value, err, _ := c.issuance.Do(domain, func() (any, error) {
 		c.access.Lock()
-		if cached := c.byName[domain]; cached != nil && !isCertificateExpired(cached) {
-			c.access.Unlock()
+		cached := c.byName[domain]
+		c.access.Unlock()
+		if cached != nil && !isCertificateExpired(cached) {
 			return cached, nil
 		}
-		c.byName[domain] = issued
-		c.access.Unlock()
-		return issued, nil
+		for _, rawCert := range authorities {
+			if rawCert.Usage != Certificate_AUTHORITY_ISSUE {
+				continue
+			}
+			issued, err := issueCertificate(rawCert, domain)
+			if err != nil {
+				errors.LogInfoInner(context.Background(), err, "failed to issue new certificate for ", domain)
+				continue
+			}
+			expTime := issued.Leaf.NotAfter.Format(time.RFC3339)
+			errors.LogInfo(context.Background(), "new certificate for ", domain, " (expire on ", expTime, ") issued")
+			c.access.Lock()
+			// Like the native TLS session cache, issuance is a bounded cache, not
+			// durable hostname history. Eviction never mutates a published certificate.
+			if len(c.byName) >= 128 {
+				for name := range c.byName {
+					delete(c.byName, name)
+					break
+				}
+			}
+			c.byName[domain] = issued
+			c.access.Unlock()
+			return issued, nil
+		}
+		return nil, errors.New("failed to create a new certificate for ", domain)
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, errors.New("failed to create a new certificate for ", domain)
+	return value.(*tls.Certificate), nil
 }
 
 func getGetCertificateFunc(ca *certificateAuthoritySet) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -442,10 +505,30 @@ type RandCarrier struct {
 	RootCAs              *x509.CertPool
 	VerifyPeerCertByName []string
 	PinnedPeerCertSha256 [][]byte
+	owner                *configOwner
+	client               bool
+	reader               io.Reader
 }
 
 func (r *RandCarrier) Read(p []byte) (n int, err error) {
+	if r.reader != nil {
+		return r.reader.Read(p)
+	}
 	return rand.Read(p)
+}
+
+func (c *Config) needsServerWorker() bool {
+	for _, entry := range c.Certificate {
+		if entry.OneTimeLoading {
+			continue
+		}
+		paths := entry.CertificatePath != "" && entry.KeyPath != ""
+		if entry.Usage == Certificate_AUTHORITY_ISSUE && paths ||
+			entry.Usage == Certificate_ENCIPHERMENT && (paths || entry.OcspStapling != 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetTLSConfig converts this Config into tls.Config.
@@ -490,13 +573,22 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 
 	for _, opt := range opts {
 		opt(config)
+		if config.Rand != randCarrier {
+			randCarrier.reader = config.Rand
+			config.Rand = randCarrier
+		}
 	}
 
-	caCerts := c.getCustomCA()
+	var owner *configOwner
+	if !randCarrier.client && c.needsServerWorker() {
+		owner = newConfigOwner()
+		randCarrier.owner = owner
+	}
+	caCerts := c.getCustomCA(owner)
 	if caCerts.len() > 0 {
 		config.GetCertificate = getGetCertificateFunc(caCerts)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateSet(true), c.RejectUnknownSni)
+		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateSet(owner != nil, owner), c.RejectUnknownSni)
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {
@@ -569,6 +661,16 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 
 // Option for building TLS config.
 type Option func(*tls.Config)
+
+// WithClient marks an actual client use. The client keeps static certificate
+// selection shape, but has no server reload or OCSP workers to retire.
+func WithClient() Option {
+	return func(config *tls.Config) {
+		if carrier, ok := config.Rand.(*RandCarrier); ok {
+			carrier.client = true
+		}
+	}
+}
 
 // WithDestination sets the server name in TLS config.
 // Due to the incorrect structure of GetTLSConfig(), the config.ServerName will always be empty.

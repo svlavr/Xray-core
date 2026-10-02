@@ -3,11 +3,23 @@ package outbound
 import (
 	"context"
 	"errors"
+	"io"
+	stdnet "net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/app/proxyman"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
 	fout "github.com/xtls/xray-core/features/outbound"
+	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/transport/internet"
+	transportgrpc "github.com/xtls/xray-core/transport/internet/grpc"
+	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
+	grpc "google.golang.org/grpc"
 )
 
 type inspectionHandler struct {
@@ -101,5 +113,77 @@ func TestInspectionConcurrentNativeEntries(t *testing.T) {
 		if err = m.RemoveHandler(context.Background(), "same"); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestInspectionNativeHandlerCloseRetiresGRPCOwner(t *testing.T) {
+	listener, err := stdnet.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer(grpc.UnknownServiceHandler(func(_ any, stream grpc.ServerStream) error {
+		for {
+			var hunk encoding.Hunk
+			if err := stream.RecvMsg(&hunk); err != nil {
+				return err
+			}
+			if err := stream.SendMsg(&hunk); err != nil {
+				return err
+			}
+		}
+	}))
+	done := make(chan struct{})
+	go func() { defer close(done); _ = server.Serve(listener) }()
+	t.Cleanup(func() { server.Stop(); <-done })
+
+	instance, err := core.New(&core.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	ctx = context.WithValue(ctx, core.XrayKey(1), instance)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{}})
+	handler, err := NewHandler(ctx, &core.OutboundHandlerConfig{
+		SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{StreamSettings: &internet.StreamConfig{
+			ProtocolName:      "grpc",
+			TransportSettings: []*internet.TransportConfig{{ProtocolName: "grpc", Settings: serial.ToTypedMessage(&transportgrpc.Config{ServiceName: "owner-test"})}},
+		}}),
+		ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handler.(*Handler)
+	t.Cleanup(func() { _ = h.Close() })
+	if h.streamSettings == nil || h.streamSettings.Owner == nil {
+		t.Fatal("native handler has no transport owner")
+	}
+	destination := net.TCPDestination(net.LocalHostIP, net.Port(listener.Addr().(*stdnet.TCPAddr).Port))
+	conn, err := h.Dial(ctx, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := conn.Write([]byte("alive")); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 5)
+	if _, err := io.ReadFull(conn, response); err != nil || string(response) != "alive" {
+		t.Fatalf("echo: %q %v", response, err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if h.streamSettings.Owner.Err() == nil {
+		t.Fatal("native handler close left transport owner active")
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("active gRPC stream survived handler close")
+	}
+	if next, err := h.Dial(ctx, destination); err == nil {
+		_ = next.Close()
+		t.Fatal("closed native handler admitted another gRPC client")
 	}
 }

@@ -315,7 +315,7 @@ func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error)
 		}
 		s.transport = &quic.Transport{Conn: packetConn}
 	}
-	conn, err := s.transport.Dial(ctx, remote, tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	conn, err := s.transport.Dial(ctx, remote, tlsConfig.GetTLSConfig(tls.WithClient(), tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
 	log.Record(&log.AccessMessage{
 		From:   "DNS",
 		To:     s.destination,

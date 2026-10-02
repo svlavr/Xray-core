@@ -48,6 +48,7 @@ func NewListener(ctx context.Context, address net.Address, port net.Port, stream
 
 	hub, err := udp.ListenUDP(ctx, address, port, streamSettings, udp.HubCapacity(1024))
 	if err != nil {
+		tls.CloseConfig(l.tlsConfig)
 		return nil, err
 	}
 	l.Lock()
@@ -130,6 +131,7 @@ func (l *Listener) Remove(id ConnectionID) {
 // Close stops listening on the UDP address. Already Accepted connections are not closed.
 func (l *Listener) Close() error {
 	l.hub.Close()
+	defer tls.CloseConfig(l.tlsConfig)
 
 	l.Lock()
 	defer l.Unlock()

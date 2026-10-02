@@ -2,11 +2,15 @@ package tls
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -122,7 +126,7 @@ func TestBuildCertificatesAndCACloneConfigInput(t *testing.T) {
 	caEntry, _ := testCertificate(t, "ca.example", "ca.example")
 	caEntry.Usage = Certificate_AUTHORITY_ISSUE
 	caConfig := &Config{Certificate: []*Certificate{caEntry}}
-	caSet := caConfig.getCustomCA()
+	caSet := caConfig.getCustomCA(nil)
 	caSnapshot := caSet.snapshot()
 	if len(caSnapshot) != 1 {
 		t.Fatalf("CA certificates=%d", len(caSnapshot))
@@ -130,6 +134,130 @@ func TestBuildCertificatesAndCACloneConfigInput(t *testing.T) {
 	caEntry.Key[0] ^= 0xff
 	if caSnapshot[0].Key[0] == caEntry.Key[0] {
 		t.Fatal("CA snapshot aliases mutable protobuf input")
+	}
+}
+
+func TestTLSConfigOwnerRetiresProactiveReload(t *testing.T) {
+	oldEntry, _ := testCertificate(t, "old-owner.example", "old-owner.example")
+	newEntry, _ := testCertificate(t, "new-owner.example", "new-owner.example")
+	directory := t.TempDir()
+	oldEntry.CertificatePath = filepath.Join(directory, "cert.pem")
+	oldEntry.KeyPath = filepath.Join(directory, "key.pem")
+	if err := os.WriteFile(oldEntry.CertificatePath, newEntry.Certificate, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldEntry.KeyPath, newEntry.Key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := (&Config{Certificate: []*Certificate{oldEntry}}).GetTLSConfig()
+	t.Cleanup(func() { CloseConfig(server) })
+	carrier := server.Rand.(*RandCarrier)
+	if carrier.owner == nil {
+		t.Fatal("server config has no worker owner")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		selected, err := server.GetCertificate(&tls.ClientHelloInfo{ServerName: "new-owner.example"})
+		if err == nil && selected.Leaf.Subject.CommonName == "new-owner.example" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("proactive reload did not publish before a handshake")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	CloseConfig(server)
+	if carrier.owner.ctx.Err() == nil {
+		t.Fatal("server worker owner remains open")
+	}
+	CloseConfig(server)
+}
+
+func TestTLSClientModeHasNoServerWorker(t *testing.T) {
+	entry, _ := testCertificate(t, "client-only.example", "client-only.example")
+	entry.OcspStapling = 1
+	config := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig(WithClient())
+	carrier := config.Rand.(*RandCarrier)
+	if carrier.owner != nil {
+		t.Fatal("client config started a server worker owner")
+	}
+	if config.GetCertificate == nil {
+		t.Fatal("client lost static certificate selector")
+	}
+	CloseConfig(config)
+}
+
+func TestTLSStaticServerHasNoWorkerOwner(t *testing.T) {
+	entry, _ := testCertificate(t, "static-owner.example", "static-owner.example")
+	config := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig()
+	if config.Rand.(*RandCarrier).owner != nil {
+		t.Fatal("static server config allocated a worker owner")
+	}
+	entry.OneTimeLoading = true
+	entry.CertificatePath, entry.KeyPath = "unused-cert.pem", "unused-key.pem"
+	oneTime := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig()
+	if oneTime.Rand.(*RandCarrier).owner != nil {
+		t.Fatal("one-time certificate allocated a worker owner")
+	}
+	CloseConfig(config)
+	CloseConfig(oneTime)
+}
+
+func TestTLSRandOverridePreservesOwnerAndReader(t *testing.T) {
+	entry, _ := testCertificate(t, "rand-override.example", "rand-override.example")
+	entry.OcspStapling = 1
+	config := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig(func(config *tls.Config) {
+		config.Rand = bytes.NewReader([]byte{1, 2, 3})
+	})
+	defer CloseConfig(config)
+	if config.GetCertificate == nil {
+		t.Fatal("Rand override lost server certificate selector")
+	}
+	if config.Rand.(*RandCarrier).owner == nil {
+		t.Fatal("Rand option silently disabled live server refresh")
+	}
+	data := make([]byte, 3)
+	if _, err := io.ReadFull(config.Rand, data); err != nil || !bytes.Equal(data, []byte{1, 2, 3}) {
+		t.Fatalf("custom random reader was lost: %v %v", data, err)
+	}
+	client := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig(func(config *tls.Config) {
+		config.Rand = rand.Reader
+	}, WithClient())
+	defer CloseConfig(client)
+	if client.Rand.(*RandCarrier).owner != nil {
+		t.Fatal("client marker was lost after a custom Rand option")
+	}
+}
+
+func TestTLSConfigCloseCancelsBlockedOCSP(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	responder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	t.Cleanup(responder.Close)
+	issuer, _ := cert.MustGenerate(nil, cert.Authority(true), cert.KeyUsage(x509.KeyUsageCertSign))
+	issued, _ := cert.MustGenerate(issuer, cert.CommonName("ocsp-owner.example"), func(c *x509.Certificate) {
+		c.OCSPServer = []string{responder.URL}
+	})
+	issuedPEM, issuedKey := issued.ToPEM()
+	issuerPEM, _ := issuer.ToPEM()
+	entry := &Certificate{Certificate: bytes.Join([][]byte{issuedPEM, issuerPEM}, nil), Key: issuedKey, OcspStapling: 3600}
+	server := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig()
+	t.Cleanup(func() { CloseConfig(server) })
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OCSP request never reached responder")
+	}
+	closed := make(chan struct{})
+	go func() { CloseConfig(server); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseConfig did not join blocked OCSP worker")
 	}
 }
 
@@ -145,7 +273,9 @@ func TestCertificateSetPathReloadPublishesImmutableReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldEntry.CertificatePath, oldEntry.KeyPath = certPath, keyPath
-	set := (&Config{Certificate: []*Certificate{oldEntry}}).buildCertificateSet(true)
+	owner := newConfigOwner()
+	t.Cleanup(owner.close)
+	set := (&Config{Certificate: []*Certificate{oldEntry}}).buildCertificateSet(true, owner)
 	initial := set.load(0)
 	// The watcher's first reload can finish before this snapshot is captured.
 	initialName := initial.Leaf.Subject.CommonName
@@ -296,7 +426,9 @@ func TestCertificateAuthorityPathReloadPublishesClone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	authorities := (&Config{Certificate: []*Certificate{firstEntry}}).getCustomCA()
+	owner := newConfigOwner()
+	t.Cleanup(owner.close)
+	authorities := (&Config{Certificate: []*Certificate{firstEntry}}).getCustomCA(owner)
 	deadline := time.Now().Add(time.Second)
 	for !bytes.Equal(authorities.snapshot()[0].Certificate, secondEntry.Certificate) {
 		if time.Now().After(deadline) {
@@ -352,5 +484,35 @@ func TestIssuedCertificateCacheReplacesExpiredHostname(t *testing.T) {
 	}
 	if len(cache.byName) != 1 {
 		t.Fatal("expiry sweep retained other expired hostname entries")
+	}
+}
+
+func TestIssuedCertificateCacheBoundsUntrustedNames(t *testing.T) {
+	caCertificate, _ := cert.MustGenerate(nil, cert.Authority(true), cert.KeyUsage(x509.KeyUsageCertSign))
+	caEntry := ParseCertificate(caCertificate)
+	caEntry.Usage = Certificate_AUTHORITY_ISSUE
+	cache := new(issuedCertificateCache)
+	warm := make(map[string]*tls.Certificate)
+	for i := range 129 {
+		name := fmt.Sprintf("host-%d.example", i)
+		issued, err := cache.getOrIssue(name, []*Certificate{caEntry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 128 {
+			warm[name] = issued
+		}
+	}
+	if len(cache.byName) > 128 {
+		t.Fatalf("unbounded hostname retention: %d", len(cache.byName))
+	}
+	retained := 0
+	for name, issued := range warm {
+		if cache.byName[name] == issued {
+			retained++
+		}
+	}
+	if retained != 127 {
+		t.Fatalf("one new hostname evicted %d warm certificates", 128-retained)
 	}
 }

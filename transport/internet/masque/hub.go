@@ -39,6 +39,7 @@ type Listener struct {
 	transport    *quic.Transport
 	pktConn      net.PacketConn
 	tcpListener  net.Listener
+	tlsConfigs   []*gotls.Config
 
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
@@ -135,6 +136,7 @@ func (l *Listener) listenHTTP3(address net.Address, port net.Port, streamSetting
 	l.transport = &quic.Transport{Conn: l.pktConn, DisableGSO: quicParams.DisableGSO, StatelessResetKey: resetKey}
 
 	gotlsConfig := tlsConfig.GetTLSConfig()
+	l.tlsConfigs = append(l.tlsConfigs, gotlsConfig)
 	gotlsConfig.NextProtos = []string{http3.NextProtoH3}
 	l.quicListener, err = l.transport.Listen(gotlsConfig, quicConfig)
 	if err != nil {
@@ -174,6 +176,7 @@ func (l *Listener) listenHTTP2(ctx context.Context, address net.Address, port ne
 		return errors.New("failed to listen TCP on ", address, ":", port).Base(err)
 	}
 	gotlsConfig := tlsConfig.GetTLSConfig()
+	l.tlsConfigs = append(l.tlsConfigs, gotlsConfig)
 	gotlsConfig.NextProtos = []string{http2.NextProtoTLS}
 	go l.acceptHTTP2(gotlsConfig)
 	return nil
@@ -241,6 +244,11 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
+	defer func() {
+		for _, config := range l.tlsConfigs {
+			tls.CloseConfig(config)
+		}
+	}()
 	l.cancel()
 	var errs []error
 	if l.quicServer != nil {
