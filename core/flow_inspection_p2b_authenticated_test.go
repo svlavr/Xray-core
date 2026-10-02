@@ -1,12 +1,10 @@
 package core_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/core"
-	fout "github.com/xtls/xray-core/features/outbound"
 	fs "github.com/xtls/xray-core/features/stats"
 )
 
@@ -21,7 +19,7 @@ func TestFlowInspectionP2BAuthenticatedTCP(t *testing.T) {
 		}},
 		{"Shadowsocks", inspectionShadowsocksReceiver},
 	} {
-		t.Run(test.name, func(t *testing.T) { inspectionDecodedTCPReceiverAcceptance(t, test.receiver) })
+		t.Run(test.name, func(t *testing.T) { inspectionAppClientReceiverAcceptance(t, test.receiver) })
 	}
 }
 
@@ -50,26 +48,6 @@ func TestFlowInspectionP2BAuthenticatedUDP(t *testing.T) {
 
 func TestFlowInspectionP2BAuthenticatedRejection(t *testing.T) {
 	for _, receiver := range []inspectionSuppliedTCPReceiver{inspectionVMessReceiver, inspectionShadowsocksReceiver} {
-		receiving, view, outbound := receiver(t, true, true)
-		if err := receiving.GetFeature(fout.ManagerType()).(fout.Manager).RemoveHandler(context.Background(), "direct"); err != nil {
-			t.Fatal(err)
-		}
-		_, _, address := inspectionTCPOutboundThrough(t, false, outbound)
-		payload := []byte("GET / HTTP/1.1\r\nHost: rejected.invalid\r\n\r\n")
-		client := inspectionSOCKS(t, address, startOutboundStatsTCPServer(t), nil)
-		if _, err := client.Write(payload); err != nil {
-			t.Fatal(err)
-		}
-		inspectionWait(t, func() bool {
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 {
-				return false
-			}
-			row := page.Rows[0]
-			if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Serial != 0 {
-				t.Fatalf("authenticated rejection: %+v", row)
-			}
-			return true
-		})
+		inspectionAppClientRejectedReceiver(t, receiver)
 	}
 }

@@ -13,8 +13,6 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -244,7 +242,6 @@ type udpConn struct {
 	writeFunc func(payload []byte, src net.Destination, dst net.Destination) error
 	closeFunc func()
 	closed    bool
-	receipt   stats.Exchange
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -295,9 +292,6 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 		err := c.writeFunc(b.Bytes(), dst, c.src)
-		if c.receipt != nil {
-			proxy.RecordPacketOutcome(c.receipt, uint64(b.Len()), err == nil)
-		}
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
@@ -305,11 +299,6 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		b.Release()
 	}
 	return nil
-}
-
-func (c *udpConn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
-	c.receipt = receipt
-	return c
 }
 
 func (c *udpConn) Write(p []byte) (int, error) {

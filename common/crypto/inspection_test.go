@@ -3,203 +3,12 @@ package crypto_test
 import (
 	"bytes"
 	"errors"
-	"io"
-	"slices"
-	"strconv"
 	"testing"
 
-	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	crypto "github.com/xtls/xray-core/common/crypto"
-	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
-	fs "github.com/xtls/xray-core/features/stats"
 )
-
-type authenticationOutput struct {
-	bytes.Buffer
-	limit  int
-	fail   error
-	writes []int
-}
-
-func (w *authenticationOutput) Write(p []byte) (int, error) {
-	w.writes = append(w.writes, len(p))
-	n := len(p)
-	if w.limit >= 0 {
-		n = min(n, w.limit-w.Len())
-	}
-	if n < 0 {
-		n = 0
-	}
-	w.Buffer.Write(p[:n])
-	if w.limit >= 0 && w.Len() >= w.limit {
-		return n, w.fail
-	}
-	return n, nil
-}
-
-func authenticationFlow(t *testing.T) (fs.Exchange, fs.FlowInspection) {
-	t.Helper()
-	manager := new(appstats.Manager)
-	view, err := manager.EnableInspection(fs.ObservationOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { manager.Close() })
-	flow := manager.Observation().Begin(net.Network_TCP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
-	return flow, view
-}
-
-func authenticationFact(t *testing.T, view fs.FlowInspection) uint64 {
-	t.Helper()
-	live, err := view.ReadLive()
-	if err != nil || len(live.Rows) != 1 {
-		t.Fatalf("codec live facts: %+v %v", live, err)
-	}
-	return live.Rows[0].Downlink
-}
-
-func authenticationAuth() *crypto.AEADAuthenticator {
-	return &crypto.AEADAuthenticator{AEAD: crypto.NewAesGcm(make([]byte, 16)), NonceGenerator: crypto.GenerateStaticBytes(make([]byte, 12))}
-}
-
-func authenticationWriter(output *authenticationOutput, vector bool, transfer protocol.TransferType) (*crypto.AuthenticationWriter, *buf.BufferedWriter) {
-	var lower buf.Writer = &buf.SequentialWriter{Writer: output}
-	if vector {
-		lower = &buf.BufferToBytesWriter{Writer: output}
-	}
-	buffered := buf.NewBufferedWriter(lower)
-	buffered.Write([]byte("header!"))
-	return crypto.NewAuthenticationWriter(authenticationAuth(), crypto.PlainChunkSizeParser{}, buffered, transfer, nil), buffered
-}
-
-func TestInspectionAuthenticationPartialFrames(t *testing.T) {
-	const header = 7
-	const chunkPayload = buf.Size - 16 - 2
-	payload := bytes.Repeat([]byte("p"), 2*chunkPayload+7)
-	const total = header + 2*buf.Size + 7 + 16 + 2
-	for _, vector := range []bool{false, true} {
-		for _, limit := range []int{0, header - 1, header, header + 1, header + buf.Size, header + buf.Size + 1, total - 1, total} {
-			t.Run(strconv.FormatBool(vector)+"/"+strconv.Itoa(limit), func(t *testing.T) {
-				flow, view := authenticationFlow(t)
-				output := &authenticationOutput{limit: limit, fail: io.ErrUnexpectedEOF}
-				native, buffered := authenticationWriter(output, vector, protocol.TransferTypeStream)
-				writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
-				if finish == nil {
-					t.Fatal("native codec receipt unavailable")
-				}
-				err := writer.WriteMultiBuffer(buf.MergeBytes(nil, payload))
-				if err == nil {
-					err = buffered.SetBuffered(false)
-				}
-				if err == nil {
-					t.Fatal("injected writer failure was lost")
-				}
-				finish()
-				fact := authenticationFact(t, view)
-				known := uint64(0)
-				if limit >= total-1 {
-					known = uint64(len(payload))
-				}
-				if fact != known {
-					t.Fatalf("limit %d, codec result %+v", limit, fact)
-				}
-				if output.Len() != limit {
-					t.Fatalf("accepted wire length: %d want %d", output.Len(), limit)
-				}
-			})
-		}
-	}
-}
-
-func TestInspectionAuthenticationBufferingAndNativeBatch(t *testing.T) {
-	for _, vector := range []bool{false, true} {
-		flow, view := authenticationFlow(t)
-		output := &authenticationOutput{limit: -1}
-		native, buffered := authenticationWriter(output, vector, protocol.TransferTypeStream)
-		writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
-		if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("first"))); err != nil {
-			t.Fatal(err)
-		}
-		if fact := authenticationFact(t, view); fact != 5 || output.Len() != 0 {
-			t.Fatalf("buffered payload credited: %+v", fact)
-		}
-		if err := buffered.SetBuffered(false); err != nil {
-			t.Fatal(err)
-		}
-		more := bytes.Repeat([]byte("m"), 3*buf.Size)
-		if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, more)); err != nil {
-			t.Fatal(err)
-		}
-		if err := writer.WriteMultiBuffer(nil); err != nil {
-			t.Fatal(err)
-		}
-		finish()
-		if fact := authenticationFact(t, view); fact != uint64(5+len(more)) {
-			t.Fatalf("codec payload/framing: %+v", fact)
-		}
-		control := &authenticationOutput{limit: -1}
-		plain, plainBuffer := authenticationWriter(control, vector, protocol.TransferTypeStream)
-		unchanged, cleanup := crypto.ObserveAuthenticationWriter(plain, nil)
-		if unchanged != plain || cleanup != nil {
-			t.Fatal("disabled codec identity changed")
-		}
-		plain.WriteMultiBuffer(buf.MergeBytes(nil, []byte("first")))
-		plainBuffer.SetBuffered(false)
-		plain.WriteMultiBuffer(buf.MergeBytes(nil, more))
-		plain.WriteMultiBuffer(nil)
-		if !bytes.Equal(control.Bytes(), output.Bytes()) || !slices.Equal(control.writes, output.writes) {
-			t.Fatalf("native wire bytes/batch shape changed: %v / %v", control.writes, output.writes)
-		}
-	}
-}
-
-func TestInspectionAuthenticationFailedEmptyControlPreservesPayloadFacts(t *testing.T) {
-	for _, ended := range []bool{false, true} {
-		t.Run(strconv.FormatBool(ended), func(t *testing.T) {
-			flow, view := authenticationFlow(t)
-			output := &authenticationOutput{limit: -1}
-			native, buffered := authenticationWriter(output, false, protocol.TransferTypeStream)
-			writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
-			if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("known"))); err != nil {
-				t.Fatal(err)
-			}
-			if err := buffered.SetBuffered(false); err != nil {
-				t.Fatal(err)
-			}
-			if ended {
-				flow.Finish()
-			}
-			output.limit, output.fail = output.Len(), io.ErrClosedPipe
-			if err := writer.WriteMultiBuffer(nil); !errors.Is(err, io.ErrClosedPipe) {
-				t.Fatalf("native empty-control error: %v", err)
-			}
-			finish()
-			totals, err := view.ReadTotals()
-			if err != nil {
-				t.Fatal(err)
-			}
-			var found bool
-			for _, row := range totals.Rows {
-				if row.Outbound.Serial == 1 && row.Origin == fs.TrafficOriginUser {
-					found = true
-					if row.Downlink != 5 {
-						t.Fatalf("empty control contaminated payload facts: %+v", row.Downlink)
-					}
-				}
-			}
-			if !found {
-				t.Fatal("missing payload bucket")
-			}
-			if !ended && authenticationFact(t, view) != 5 {
-				t.Fatal("live bytes were contaminated")
-			}
-		})
-	}
-}
 
 type authenticationSealFailure struct {
 	crypto.Authenticator
@@ -214,117 +23,55 @@ func (a *authenticationSealFailure) Seal(dst, payload []byte) ([]byte, error) {
 	return a.Authenticator.Seal(dst, payload)
 }
 
-func TestInspectionAuthenticationSealFailureKeepsOlderBuffer(t *testing.T) {
-	flow, view := authenticationFlow(t)
-	output := &authenticationOutput{limit: -1}
-	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: output})
-	native := crypto.NewAuthenticationWriter(&authenticationSealFailure{Authenticator: authenticationAuth(), failAt: 3}, crypto.PlainChunkSizeParser{}, buffered, protocol.TransferTypeStream, nil)
-	writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
+func inspectionAuthenticationAuth() *crypto.AEADAuthenticator {
+	return &crypto.AEADAuthenticator{AEAD: crypto.NewAesGcm(make([]byte, 16)), NonceGenerator: crypto.GenerateStaticBytes(make([]byte, 12))}
+}
+
+func TestAuthenticationSealFailureKeepsOlderBufferedFrame(t *testing.T) {
+	var wire bytes.Buffer
+	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: &wire})
+	defer buf.DiscardBufferedWriter(buffered)
+	writer := crypto.NewAuthenticationWriter(&authenticationSealFailure{Authenticator: inspectionAuthenticationAuth(), failAt: 3}, crypto.PlainChunkSizeParser{}, buffered, protocol.TransferTypeStream, nil)
 	if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("kept"))); err != nil {
 		t.Fatal(err)
 	}
-	discarded := bytes.Repeat([]byte("d"), buf.Size+7)
-	if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, discarded)); err == nil {
+	if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, bytes.Repeat([]byte("d"), buf.Size+7))); err == nil {
 		t.Fatal("seal failure was lost")
+	}
+	if wire.Len() != 0 {
+		t.Fatal("buffered response was emitted before flush")
 	}
 	if err := buffered.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	finish()
-	if fact := authenticationFact(t, view); fact != 4 {
-		t.Fatalf("rollback erased older frame: %+v", fact)
+	reader := crypto.NewAuthenticationReader(inspectionAuthenticationAuth(), crypto.PlainChunkSizeParser{}, &wire, protocol.TransferTypeStream, nil)
+	mb, err := reader.ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.ReleaseMulti(mb)
+	if got := string(mb[0].Bytes()); got != "kept" {
+		t.Fatalf("earlier buffered frame = %q", got)
 	}
 }
 
-func TestInspectionAuthenticationPacketDropsAndAbandon(t *testing.T) {
-	flow, view := authenticationFlow(t)
-	output := &authenticationOutput{limit: -1}
-	native, buffered := authenticationWriter(output, false, protocol.TransferTypePacket)
-	writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
-	mb := buf.MergeBytes(nil, []byte("ok"))
+func TestAuthenticationPacketOversizeKeepsValidPacket(t *testing.T) {
+	var wire bytes.Buffer
+	writer := crypto.NewAuthenticationWriter(inspectionAuthenticationAuth(), crypto.PlainChunkSizeParser{}, &wire, protocol.TransferTypePacket, nil)
+	packets := buf.MergeBytes(nil, []byte("ok"))
 	oversized := buf.New()
 	oversized.Extend(buf.Size)
-	mb = append(mb, oversized)
-	if err := writer.WriteMultiBuffer(mb); err != nil {
+	packets = append(packets, oversized)
+	if err := writer.WriteMultiBuffer(packets); err != nil {
 		t.Fatal(err)
 	}
-	if err := buffered.SetBuffered(false); err != nil {
+	reader := crypto.NewAuthenticationReader(inspectionAuthenticationAuth(), crypto.PlainChunkSizeParser{}, &wire, protocol.TransferTypePacket, nil)
+	mb, err := reader.ReadMultiBuffer()
+	if err != nil {
 		t.Fatal(err)
 	}
-	finish()
-	if fact := authenticationFact(t, view); fact != 2 {
-		t.Fatalf("packet seal drop: %+v", fact)
-	}
-	other, otherView := authenticationFlow(t)
-	abandoned := &authenticationOutput{limit: -1}
-	prepared, abandonedBuffer := authenticationWriter(abandoned, false, protocol.TransferTypeStream)
-	observed, release := crypto.ObserveAuthenticationWriter(prepared, other)
-	observed.WriteMultiBuffer(buf.MergeBytes(nil, []byte("abandoned")))
-	release()
-	if err := abandonedBuffer.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	if abandoned.Len() != 0 {
-		t.Fatal("cleanup emitted a native-abandoned response")
-	}
-	if fact := authenticationFact(t, otherView); fact != 9 {
-		t.Fatalf("abandoned mapping: %+v", fact)
-	}
-}
-
-func TestInspectionAuthenticationFailedFlushContinuation(t *testing.T) {
-	flow, view := authenticationFlow(t)
-	output := &authenticationOutput{limit: 8, fail: io.ErrUnexpectedEOF}
-	native, buffered := authenticationWriter(output, false, protocol.TransferTypeStream)
-	writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
-	writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("old")))
-	if err := buffered.Flush(); err == nil {
-		t.Fatal("flush failure was lost")
-	}
-	output.limit = -1
-	writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("new")))
-	if err := buffered.SetBuffered(false); err != nil {
-		t.Fatal(err)
-	}
-	finish()
-	if fact := authenticationFact(t, view); fact != 6 {
-		t.Fatalf("stale failed-frame mapping: %+v", fact)
-	}
-}
-
-type opaqueAuthenticationOutput struct{ io.Writer }
-
-func (opaqueAuthenticationOutput) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	buf.ReleaseMulti(mb)
-	return nil
-}
-
-func TestInspectionAuthenticationUnavailableAndZeroProgress(t *testing.T) {
-	flow, view := authenticationFlow(t)
-	native := crypto.NewAuthenticationWriter(authenticationAuth(), crypto.PlainChunkSizeParser{}, opaqueAuthenticationOutput{Writer: io.Discard}, protocol.TransferTypeStream, nil)
-	writer, finish := crypto.ObserveAuthenticationWriter(native, flow)
-	if writer != native || finish == nil {
-		t.Fatal("decoded codec owner identity or cleanup was lost")
-	}
-	if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, []byte("accepted"))); err != nil {
-		t.Fatal(err)
-	}
-	finish()
-	if fact := authenticationFact(t, view); fact != 8 {
-		t.Fatalf("decoded operation result: %+v", fact)
-	}
-	other, otherView := authenticationFlow(t)
-	output := &authenticationOutput{limit: 0, fail: io.ErrUnexpectedEOF}
-	prepared, buffered := authenticationWriter(output, false, protocol.TransferTypeStream)
-	observed, release := crypto.ObserveAuthenticationWriter(prepared, other)
-	if err := observed.WriteMultiBuffer(buf.MergeBytes(nil, []byte("pending"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := buffered.Flush(); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("zero progress result: %v", err)
-	}
-	release()
-	if fact := authenticationFact(t, otherView); fact != 7 {
-		t.Fatalf("zero acceptance mapping: %+v", fact)
+	defer buf.ReleaseMulti(mb)
+	if len(mb) != 1 || string(mb[0].Bytes()) != "ok" {
+		t.Fatalf("valid packet changed: %+v", mb)
 	}
 }

@@ -25,7 +25,7 @@ func TestFlowInspectionP2BSuppliedTCP(t *testing.T) {
 		{name: "Hysteria", receiver: inspectionHysteriaReceiver},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			inspectionDecodedTCPReceiverAcceptance(t, test.receiver)
+			inspectionAppClientReceiverAcceptance(t, test.receiver)
 		})
 	}
 }
@@ -36,6 +36,14 @@ func inspectionDecodedTCPReceiverAcceptance(t *testing.T, receiver inspectionSup
 }
 
 func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectionSuppliedTCPReceiver, pendingPeerEOF bool) {
+	inspectionTCPReceiverAcceptanceAt(t, receiver, pendingPeerEOF, false)
+}
+
+func inspectionAppClientReceiverAcceptance(t *testing.T, receiver inspectionSuppliedTCPReceiver) {
+	inspectionTCPReceiverAcceptanceAt(t, receiver, false, true)
+}
+
+func inspectionTCPReceiverAcceptanceAt(t *testing.T, receiver inspectionSuppliedTCPReceiver, pendingPeerEOF, atClient bool) {
 	t.Helper()
 	t.Run("disabled", func(t *testing.T) {
 		receiving, _, outbound := receiver(t, false, false)
@@ -47,8 +55,12 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 		}
 	})
 	t.Run("payload-stop-sibling", func(t *testing.T) {
-		_, view, outbound := receiver(t, true, true)
-		sender, _, address := inspectionTCPOutboundThrough(t, false, outbound)
+		_, remoteView, outbound := receiver(t, true, true)
+		sender, senderView, address := inspectionTCPOutboundThrough(t, atClient, outbound)
+		view, tag := remoteView, "direct"
+		if atClient {
+			view, tag = senderView, outbound.Tag
+		}
 		destination := startOutboundStatsTCPServer(t)
 		payload := append([]byte("GET / HTTP/1.1\r\nHost: supplied.invalid\r\n\r\n"), bytes.Repeat([]byte("p"), 8192)...)
 		first := inspectionSOCKS(t, address, destination, payload)
@@ -62,7 +74,10 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 			firstRow = live.Rows[0]
 			return true
 		})
-		assertDecodedTCPReceiverFacts(t, firstRow, destination, uint64(len(payload)))
+		assertDecodedTCPReceiverFacts(t, firstRow, destination, uint64(len(payload)), tag)
+		if atClient {
+			assertNoDedicatedServerInspection(t, remoteView)
+		}
 
 		sibling := inspectionSOCKS(t, address, destination, payload)
 		inspectionWait(t, func() bool {
@@ -121,16 +136,17 @@ func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectio
 			}
 			return false
 		})
-		inspectionOutboundTotals(t, view, "direct", uint64(2*len(payload)+len(extra)))
-		if sender.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
+		inspectionOutboundTotals(t, view, tag, uint64(2*len(payload)+len(extra)))
+		if !atClient && sender.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
 			t.Fatal("disabled sender acquired inspection state")
 		}
 	})
 }
 
 func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
-	_, view, outbound := inspectionVLESSReceiver(t, true, false)
-	_, _, address := inspectionTCPOutboundThrough(t, false, outbound)
+	_, remoteView, outbound := inspectionVLESSReceiver(t, true, false)
+	_, view, address := inspectionTCPOutboundThrough(t, true, outbound)
+	defer assertNoDedicatedServerInspection(t, remoteView)
 	destination := startOutboundStatsTCPServer(t)
 	client := inspectionSOCKS(t, address, destination, nil)
 	var row fs.FlowRecord
@@ -140,7 +156,7 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 			return false
 		}
 		row = live.Rows[0]
-		return row.Outbound.Tag == "direct" && row.Outbound.Serial != 0
+		return row.Outbound.Tag == outbound.Tag && row.Outbound.Serial != 0
 	})
 	if row.Uplink != 0 || row.Downlink != 0 {
 		t.Fatalf("VLESS response framing credited before payload: %+v", row)
@@ -156,7 +172,7 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref && page.Rows[0].Flow.Downlink == 0
 	})
-	inspectionOutboundTotals(t, view, "direct", 0)
+	inspectionOutboundTotals(t, view, outbound.Tag, 0)
 }
 
 func TestFlowInspectionP2BSpecialCarriersNotAdmitted(t *testing.T) {
@@ -201,9 +217,9 @@ func inspectionEnableOutboundMux(t *testing.T, outbound *core.OutboundHandlerCon
 	outbound.SenderSettings = serial.ToTypedMessage(sender)
 }
 
-func assertDecodedTCPReceiverFacts(t *testing.T, row fs.FlowRecord, destination cnet.Destination, payload uint64) {
+func assertDecodedTCPReceiverFacts(t *testing.T, row fs.FlowRecord, destination cnet.Destination, payload uint64, tag string) {
 	t.Helper()
-	if row.Kind != cnet.Network_TCP || row.Destination != destination || row.Outbound.Tag != "direct" || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser || row.Uplink != payload || row.Downlink != payload {
+	if row.Kind != cnet.Network_TCP || row.Destination != destination || row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser || row.Uplink != payload || row.Downlink != payload {
 		t.Fatalf("supplied TCP facts: %+v", row)
 	}
 }

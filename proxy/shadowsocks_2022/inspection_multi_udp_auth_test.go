@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -19,7 +18,6 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
-	fs "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 )
 
@@ -119,7 +117,7 @@ func (*authDispatcher) Start() error      { return nil }
 func (*authDispatcher) Close() error      { return nil }
 func (*authDispatcher) Type() interface{} { return routing.DispatcherType() }
 
-func startAuthMulti(t *testing.T, master []byte, users map[string][]byte) (*MultiUserInbound, *authPacketConn, *authDispatcher, fs.FlowInspection) {
+func startAuthMulti(t *testing.T, master []byte, users map[string][]byte) (*MultiUserInbound, *authPacketConn, *authDispatcher) {
 	t.Helper()
 	instance, err := core.New(&core.Config{})
 	if err != nil {
@@ -138,13 +136,6 @@ func startAuthMulti(t *testing.T, master []byte, users map[string][]byte) (*Mult
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { inbound.Close() })
-	manager := new(appstats.Manager)
-	view, err := manager.EnableInspection(fs.ObservationOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { manager.Close() })
-	inbound.statsManager = manager
 	conn := newAuthPacketConn()
 	t.Cleanup(func() { conn.Close() })
 	dispatcher := &authDispatcher{received: make(chan authPayload, 16)}
@@ -158,7 +149,7 @@ func startAuthMulti(t *testing.T, master []byte, users map[string][]byte) (*Mult
 			t.Error("native UDP process did not exit")
 		}
 	})
-	return inbound, conn, dispatcher, view
+	return inbound, conn, dispatcher
 }
 
 func fixedAuthCodec(t *testing.T, userKey []byte, sessionID uint64) *UDPCodec {
@@ -202,7 +193,7 @@ func receiveAuthPayload(t *testing.T, dispatcher *authDispatcher) authPayload {
 
 func TestInspectionSS2022MultiUDPRemovedUser(t *testing.T) {
 	userKey := []byte("fedcba9876543210")
-	inbound, conn, dispatcher, view := startAuthMulti(t, []byte("0123456789abcdef"), map[string][]byte{"removed@example.invalid": userKey})
+	inbound, conn, dispatcher := startAuthMulti(t, []byte("0123456789abcdef"), map[string][]byte{"removed@example.invalid": userKey})
 	codec := fixedAuthCodec(t, userKey, 0x1122334455667788)
 	sendAuthPacket(t, conn, codec, "before removal")
 	if got := receiveAuthPayload(t, dispatcher); got.user != "removed@example.invalid" || got.payload != "before removal" {
@@ -220,15 +211,15 @@ func TestInspectionSS2022MultiUDPRemovedUser(t *testing.T) {
 	if dispatcher.calls.Load() != 1 {
 		t.Fatalf("removed user reopened association: %d", dispatcher.calls.Load())
 	}
-	live, err := view.ReadLive()
-	if err != nil || len(live.Rows) != 0 {
-		t.Fatalf("removed user's live flow remains: %+v %v", live, err)
-	}
+	inbound.udpConns.Range(func(_ multiUDPKey, _ *udpConnEntry) bool {
+		t.Fatal("removed user's native association remains")
+		return false
+	})
 }
 
 func TestInspectionSS2022MultiUDPCollidingSessionIDs(t *testing.T) {
 	firstKey, secondKey := []byte("fedcba9876543210"), []byte("ABCDEF0123456789")
-	_, conn, dispatcher, _ := startAuthMulti(t, []byte("0123456789abcdef"), map[string][]byte{"first@example.invalid": firstKey, "second@example.invalid": secondKey})
+	_, conn, dispatcher := startAuthMulti(t, []byte("0123456789abcdef"), map[string][]byte{"first@example.invalid": firstKey, "second@example.invalid": secondKey})
 	const sessionID uint64 = 0x1122334455667788
 	first, second := fixedAuthCodec(t, firstKey, sessionID), fixedAuthCodec(t, secondKey, sessionID)
 	sendAuthPacket(t, conn, first, "first")
@@ -246,7 +237,7 @@ func TestInspectionSS2022MultiUDPCollidingSessionIDs(t *testing.T) {
 
 func TestInspectionSS2022RelayToMultiUDPChain(t *testing.T) {
 	firstKey, relayKey, userKey := []byte("0123456789abcdef"), []byte("fedcba9876543210"), []byte("ABCDEF0123456789")
-	_, multiConn, multiDispatcher, _ := startAuthMulti(t, relayKey, map[string][]byte{"chain@example.invalid": userKey})
+	_, multiConn, multiDispatcher := startAuthMulti(t, relayKey, map[string][]byte{"chain@example.invalid": userKey})
 	instance, err := core.New(&core.Config{})
 	if err != nil {
 		t.Fatal(err)

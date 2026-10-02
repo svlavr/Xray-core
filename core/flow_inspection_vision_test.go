@@ -80,7 +80,7 @@ func inspectionVisionReceiverMode(t *testing.T, enabled, sniff, encrypted bool) 
 }
 
 func TestFlowInspectionVisionAdmissions(t *testing.T) {
-	inspectionDecodedTCPReceiverAcceptance(t, inspectionVisionReceiver)
+	inspectionAppClientReceiverAcceptance(t, inspectionVisionReceiver)
 }
 
 type inspectionVisionWire struct {
@@ -200,26 +200,24 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 				}
 				return row
 			}
-			firstRow := check(receiving, "direct", 1)
-			check(sending, "vision", 1)
+			assertNoDedicatedServerInspection(t, receiving)
+			firstRow := check(sending, "vision", 1)
 			burst(first, "second low-rate burst while both endpoints remain open")
-			secondRow := check(receiving, "direct", 1)
-			check(sending, "vision", 1)
+			secondRow := check(sending, "vision", 1)
 			if firstRow.Ref != secondRow.Ref || secondRow.Downlink <= firstRow.Downlink {
 				t.Fatal("raw transition lost active progress or continuity")
 			}
 			// The second write publishes native inbound splice readiness only
 			// after that write completes. A third burst exercises its raw pump.
 			burst(first, "third burst through both native splice handoffs")
-			thirdRow := check(receiving, "direct", 1)
-			check(sending, "vision", 1)
+			thirdRow := check(sending, "vision", 1)
 			if thirdRow.Ref != firstRow.Ref || thirdRow.Downlink <= secondRow.Downlink {
-				t.Fatal("inbound raw pump lost progress")
+				t.Fatal("app raw pump lost progress")
 			}
 			sibling, siblingWire := connect()
 			burst(sibling, "raw sibling")
-			check(receiving, "direct", 2)
-			outcomes, err := receiving.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
+			check(sending, "vision", 2)
+			outcomes, err := sending.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
 			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("Vision stop: %+v %v", outcomes, err)
 			}
@@ -228,7 +226,7 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 			}
 			burst(sibling, "sibling after raw stop")
 			siblingWire.Close()
-			for _, view := range []fs.FlowInspection{receiving, sending} {
+			for _, view := range []fs.FlowInspection{sending} {
 				inspectionWait(t, func() bool {
 					page, err := view.ReadTerminals()
 					if err != nil || len(page.Rows) != 2 {

@@ -64,9 +64,9 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer server.Close()
-				var view fs.FlowInspection
+				var serverView fs.FlowInspection
 				if enabled {
-					view, err = core.EnableFlowInspection(server, fs.ObservationOptions{})
+					serverView, err = core.EnableFlowInspection(server, fs.ObservationOptions{})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -74,11 +74,20 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 				if err = server.Start(); err != nil {
 					t.Fatal(err)
 				}
-				client, err := core.New(withDefaultApps(masqueClientConfig(serverPort, hash, h2, masqueAuthorization, tcpPort, tcp6Port, udpPort, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1"))))
+				clientConfig := masqueClientConfig(serverPort, hash, h2, masqueAuthorization, tcpPort, tcp6Port, udpPort, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1"))
+				clientConfig.App = append(clientConfig.App, serial.ToTypedMessage(&appstats.Config{}))
+				client, err := core.New(withDefaultApps(clientConfig))
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer client.Close()
+				var view fs.FlowInspection
+				if enabled {
+					view, err = core.EnableFlowInspection(client, fs.ObservationOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
 				if err = client.Start(); err != nil {
 					t.Fatal(err)
 				}
@@ -140,7 +149,7 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 				packet := dial("udp", udpPort)
 				exchange(packet)
 				if !enabled {
-					if server.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
+					if server.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil || client.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
 						t.Fatal("collection enabled unexpectedly")
 					}
 					return
@@ -176,13 +185,22 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 					t.Fatal("stopped TCP child remained readable")
 				}
 				exchange(sibling)
-				// The same UDP source creates a fresh virtual child after exact retirement.
-				exchange(packet)
+				// A new app association leaves shared tunnel and sibling traffic intact.
+				packet.Close()
+				exchange(dial("udp", udpPort))
 				rows = waitRows(2)
 				for _, row := range rows {
 					if row.Ref == firstRef || row.Ref == packetRef {
 						t.Fatalf("retired child survived: %+v", row)
 					}
+				}
+				live, err := serverView.ReadLive()
+				if err != nil || len(live.Rows) != 0 {
+					t.Fatalf("dedicated server rows: %+v %v", live, err)
+				}
+				ended, err := serverView.ReadTerminals()
+				if err != nil || len(ended.Rows) != 0 {
+					t.Fatalf("dedicated server ended rows: %+v %v", ended, err)
 				}
 			})
 		}

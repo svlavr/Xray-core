@@ -25,49 +25,12 @@ func ObserveTCP(ctx context.Context, manager stats.Manager, conn net.Conn, dest 
 	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_TCP, false)
 }
 
-// ObserveReturnedTCP binds the decoded endpoint before Dispatch returns its
-// native pipe link. ObserveTCP's exclusive endpoint and payload-only writer
-// requirements apply. The dispatcher consumes the one-shot role claim; its
-// cleanup releases only its cursor, while the actual endpoint owner finishes.
-func ObserveReturnedTCP(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, endpoint *transport.Link) (context.Context, func()) {
-	return observeEndpoint(ctx, manager, conn, dest, endpoint, net.Network_TCP, true)
-}
-
 // ObserveUDP attaches receipts to one exclusively owned, decoded UDP association.
 // The reader must preserve packet boundaries/destinations and the writer must
 // expose actual endpoint results, directly or through WithWriterReceipt.
 // The caller defers cleanup until DispatchLink returns, as for ObserveTCP.
 func ObserveUDP(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link) (context.Context, func()) {
 	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_UDP, false)
-}
-
-// ObserveFallback admits one dispatcher-bypassing fallback exchange before its
-// direct dial. The configured destination is recorded without fabricating a
-// routed outbound, and the existing buffered reader retains first-read custody.
-// Disabled collection returns before parsing the configured destination.
-func ObserveFallback(ctx context.Context, manager stats.Manager, conn io.Closer, network, address string, reader buf.Reader) (context.Context, buf.Reader, stats.Exchange, func()) {
-	store := ObservationStore(manager)
-	if store == nil {
-		return ctx, reader, nil, nil
-	}
-	if network == "tcp4" || network == "tcp6" {
-		network = "tcp"
-	}
-	destination, err := net.ParseDestination(network + ":" + address)
-	if err != nil {
-		destination = net.Destination{}
-	}
-	observedCtx, flow, cancel := BeginObservedEndpoint(ctx, store, conn, destination, net.Network_TCP)
-	if flow == nil {
-		return ctx, reader, nil, nil
-	}
-	flow.Route(stats.OutboundRef{})
-	flow.BindRoute()
-	cursor := buf.NewInspectionReader(reader, flow, func() { cancel(); conn.Close() })
-	return observedCtx, cursor, flow, func() {
-		cursor.Interrupt()
-		flow.Finish()
-	}
 }
 
 func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link, kind net.Network, returned bool) (context.Context, func()) {
@@ -107,14 +70,6 @@ func beginObservation(ctx context.Context, manager stats.Manager, conn io.Closer
 // produces them and defers cleanup until the endpoint owner returns.
 func BeginReturnedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, *session.LogicalObservation, func()) {
 	return beginOwnedObservation(ctx, manager, conn, dest, kind, true)
-}
-
-// BeginSuppliedObservation admits an exclusive decoded endpoint before its
-// protocol response is prepared. The caller attaches decoded receipts only
-// after preparation succeeds, so response framing and failed preparation stay
-// outside logical payload accounting.
-func BeginSuppliedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, *session.LogicalObservation, func()) {
-	return beginOwnedObservation(ctx, manager, conn, dest, kind, false)
 }
 
 // BeginExecutionObservation admits request-local work whose decoded input is

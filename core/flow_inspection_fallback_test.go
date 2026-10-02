@@ -3,7 +3,6 @@ package core_test
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -55,69 +54,21 @@ func TestFlowInspectionFallback(t *testing.T) {
 
 func inspectionFallbackAcceptance(t *testing.T, protocol string, xver uint64) {
 	t.Helper()
-	_, configuredAddress := inspectionFallbackTarget(t, xver)
-	_, view, address := inspectionFallbackCore(t, protocol, true, xver, configuredAddress)
+	_, configured := inspectionFallbackTarget(t, xver)
+	_, view, address := inspectionFallbackCore(t, protocol, true, xver, configured)
 	payload := append([]byte("GET /fallback HTTP/1.1\r\nHost: retained.invalid\r\n\r\n"), bytes.Repeat([]byte("p"), 4096)...)
 	first := inspectionFallbackClient(t, address, payload)
 	inspectionFallbackResponse(t, first, payload)
-	configured, err := cnet.ParseDestination("tcp:" + configuredAddress)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var firstRow fs.FlowRecord
-	inspectionWait(t, func() bool {
-		live, err := view.ReadLive()
-		if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != uint64(len(payload)) {
-			return false
-		}
-		firstRow = live.Rows[0]
-		return true
-	})
-	assertFallbackFacts(t, firstRow, configured, uint64(len(payload)))
-	assertFallbackTotals(t, view, uint64(len(payload)))
-
-	if xver != 0 {
-		first.Close()
-		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals()
-			return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == firstRow.Ref && page.Rows[0].Flow.Uplink == uint64(len(payload)) && page.Rows[0].Flow.Downlink == uint64(len(payload))
-		})
-		return
-	}
-
-	siblingPayload := []byte("fallback sibling")
-	sibling := inspectionFallbackClient(t, address, siblingPayload)
-	inspectionFallbackResponse(t, sibling, siblingPayload)
-	inspectionWait(t, func() bool {
-		live, err := view.ReadLive()
-		return err == nil && len(live.Rows) == 2
-	})
-	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{firstRow.Ref})
-	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
-		t.Fatalf("fallback exact stop: %+v %v", outcomes, err)
-	}
-	if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
-		t.Fatalf("stopped fallback endpoint returned %d, %v", n, err)
-	}
-	extra := []byte(" sibling remains live")
+	sibling := inspectionFallbackClient(t, address, []byte("fallback sibling"))
+	inspectionFallbackResponse(t, sibling, []byte("fallback sibling"))
+	first.Close()
+	extra := []byte("sibling after peer close")
 	if _, err := sibling.Write(extra); err != nil {
 		t.Fatal(err)
 	}
 	inspectionFallbackResponse(t, sibling, extra)
 	sibling.Close()
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 2 {
-			return false
-		}
-		for _, row := range page.Rows {
-			if row.Flow.Ref == firstRow.Ref {
-				return true
-			}
-		}
-		return false
-	})
-	assertFallbackTotals(t, view, uint64(len(payload)+len(siblingPayload)+len(extra)))
+	assertNoDedicatedServerInspection(t, view)
 }
 
 func inspectionFallbackCore(t *testing.T, protocol string, enabled bool, xver uint64, target string) (*core.Instance, fs.FlowInspection, string) {
@@ -255,35 +206,6 @@ func inspectionFallbackResponse(t *testing.T, conn net.Conn, want []byte) {
 	}
 }
 
-func assertFallbackFacts(t *testing.T, row fs.FlowRecord, configured cnet.Destination, payload uint64) {
-	t.Helper()
-	if row.Kind != cnet.Network_TCP || row.Destination != configured || row.Outbound.Serial != 0 || row.Outbound.Tag != "" || row.Uplink != payload || row.Downlink != payload {
-		t.Fatalf("fallback facts: %+v", row)
-	}
-}
-
-func assertFallbackTotals(t *testing.T, view fs.FlowInspection, want uint64) {
-	t.Helper()
-	totals, err := view.ReadTotals()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var uplink, downlink uint64
-	for _, row := range totals.Rows {
-		if row.Outbound.Serial != 0 {
-			if row.Uplink != 0 || row.Downlink != 0 {
-				t.Fatalf("fallback invented routed totals: %+v", row)
-			}
-			continue
-		}
-		uplink += row.Uplink
-		downlink += row.Downlink
-	}
-	if uplink != want || downlink != want {
-		t.Fatalf("fallback totals %d/%d, want %d", uplink, downlink, want)
-	}
-}
-
 func inspectionFallbackDialFailure(t *testing.T, protocol string) {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -297,10 +219,7 @@ func inspectionFallbackDialFailure(t *testing.T, protocol string) {
 	if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
 		t.Fatalf("failed fallback dial returned %d, %v", n, err)
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == 0 && page.Rows[0].Flow.Downlink == 0 && page.Rows[0].Flow.Outbound.Serial == 0
-	})
+	assertNoDedicatedServerInspection(t, view)
 }
 
 func inspectionFallbackPeerReset(t *testing.T, protocol string) {
@@ -345,16 +264,5 @@ func inspectionFallbackPeerReset(t *testing.T, protocol string) {
 	if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
 		t.Fatalf("reset fallback returned %d, %v", n, err)
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 {
-			return false
-		}
-		row := page.Rows[0]
-		if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != uint64(len(payload)) {
-			t.Fatalf("post-dial reset lost error or payload facts: %+v", row)
-		}
-		return true
-	})
-	assertFallbackTotals(t, view, uint64(len(payload)))
+	assertNoDedicatedServerInspection(t, view)
 }

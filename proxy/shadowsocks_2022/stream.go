@@ -13,7 +13,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
-	"github.com/xtls/xray-core/features/stats"
 )
 
 var addrParser = protocol.NewAddressParser(
@@ -63,18 +62,11 @@ func AddrPortLength(dest net.Destination) int {
 }
 
 type StreamWriter struct {
-	writer  io.Writer
-	cipher  cipher.AEAD
-	nonce   [StreamNonceSize]byte
-	lenBuf  [2]byte
-	buf     []byte
-	receipt stats.Exchange
-}
-
-// WithWriterReceipt keeps accounting at the native encrypted-frame result.
-func (w *StreamWriter) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
-	w.receipt = receipt
-	return w
+	writer io.Writer
+	cipher cipher.AEAD
+	nonce  [StreamNonceSize]byte
+	lenBuf [2]byte
+	buf    []byte
 }
 
 func NewStreamWriter(w io.Writer, c cipher.AEAD) *StreamWriter {
@@ -108,9 +100,6 @@ func (w *StreamWriter) WriteChunk(payload []byte) error {
 	n, err := w.writer.Write(w.buf)
 	if n != len(w.buf) && err == nil {
 		err = io.ErrShortWrite
-	}
-	if err == nil && w.receipt != nil {
-		w.receipt.AddDownlink(uint64(payloadLen))
 	}
 	return err
 }

@@ -9,7 +9,6 @@ import (
 
 	cnet "github.com/xtls/xray-core/common/net"
 	fin "github.com/xtls/xray-core/features/inbound"
-	fs "github.com/xtls/xray-core/features/stats"
 	ss "github.com/xtls/xray-core/proxy/shadowsocks_2022"
 )
 
@@ -98,41 +97,17 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 			siblingPayload := []byte("sibling")
 			exchange(client, first, payload, 0x19)
 			exchange(sibling, first, siblingPayload, 0x19)
-			var original fs.FlowRef
-			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive()
-				for _, row := range live.Rows {
-					if row.Uplink == uint64(len(payload)) && row.Downlink == row.Uplink {
-						original = row.Ref
-					}
-				}
-				return len(live.Rows) == 2 && original.ID != 0
-			})
+			assertNoDedicatedServerInspection(t, view)
 			transport.Conn.Close()
 			transport.Conn = dial()
 			exchange(client, second, extra, 0x37)
-			inspectionWait(t, func() bool {
-				live, _ := view.ReadLive()
-				for _, row := range live.Rows {
-					if row.Ref == original {
-						return row.Uplink == uint64(len(payload)+len(extra)) && row.Downlink == row.Uplink
-					}
-				}
-				return false
-			})
-			inspectionClosePacketCallback(t, view, original)
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == original
-			})
-			// The same wire session creates a fresh logical admission after stop.
 			exchange(client, first, payload, 0x19)
 			exchange(sibling, second, siblingPayload, 0x37)
-			inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 2 })
+			assertNoDedicatedServerInspection(t, view)
 			if err := instance.GetFeature(fin.ManagerType()).(fin.Manager).RemoveHandler(context.Background(), "ss2022-receiver"); err != nil {
 				t.Fatal(err)
 			}
-			inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 0 })
+			assertNoDedicatedServerInspection(t, view)
 		})
 	}
 }

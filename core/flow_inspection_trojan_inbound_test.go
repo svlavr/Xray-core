@@ -9,46 +9,21 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	fout "github.com/xtls/xray-core/features/outbound"
 	frouting "github.com/xtls/xray-core/features/routing"
-	fs "github.com/xtls/xray-core/features/stats"
 )
 
 func TestFlowInspectionTrojanInboundTCP(t *testing.T) {
 	// The shared receiver acceptance sends the SOCKS request and payload in one
 	// write. The native Trojan client can coalesce its header and first payload;
 	// receiver sniffing must replay that payload without double uplink credit.
-	inspectionDecodedTCPReceiverAcceptance(t, inspectionTrojanReceiver)
+	inspectionAppClientReceiverAcceptance(t, inspectionTrojanReceiver)
 }
 
 func TestFlowInspectionTrojanInboundRejected(t *testing.T) {
-	receiving, view, outbound := inspectionTrojanReceiver(t, true, true)
-	routing := receiving.GetFeature(frouting.RouterType()).(frouting.Router)
-	if err := routing.AddRule(serial.ToTypedMessage(&router.Config{Rule: []*router.RoutingRule{{
-		RuleTag: "missing", Networks: []cnet.Network{cnet.Network_TCP}, TargetTag: &router.RoutingRule_Tag{Tag: "absent"},
-	}}}), true); err != nil {
-		t.Fatal(err)
-	}
-	_, _, address := inspectionTCPOutboundThrough(t, false, outbound)
-	destination := cnet.TCPDestination(cnet.LocalHostIP, 1)
-	client := inspectionSOCKS(t, address, destination, nil)
-	payload := []byte("GET / HTTP/1.1\r\nHost: trojan-rejected.invalid\r\n\r\n")
-	if _, err := client.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 {
-			return false
-		}
-		row := page.Rows[0]
-		if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Serial != 0 {
-			t.Fatalf("Trojan rejected receipt: %+v", row)
-		}
-		return true
-	})
+	inspectionAppClientRejectedReceiver(t, inspectionTrojanReceiver)
 }
 
 func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
-	receiving, view, outbound := inspectionTrojanReceiver(t, true, true)
+	receiving, remote, outbound := inspectionTrojanReceiver(t, true, true)
 	manager := receiving.GetFeature(fout.ManagerType()).(fout.Manager)
 	if err := manager.AddHandler(context.Background(), inspectionUnclaimedHandler{}); err != nil {
 		t.Fatal(err)
@@ -59,7 +34,7 @@ func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
 	}}}), true); err != nil {
 		t.Fatal(err)
 	}
-	_, _, address := inspectionTCPOutboundThrough(t, false, outbound)
+	_, view, address := inspectionTCPOutboundThrough(t, true, outbound)
 	client := inspectionSOCKS(t, address, cnet.TCPDestination(cnet.LocalHostIP, 1), nil)
 	payload := []byte("GET / HTTP/1.1\r\nHost: trojan-unclaimed.invalid\r\n\r\n")
 	if _, err := client.Write(payload); err != nil {
@@ -71,28 +46,28 @@ func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
 		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(payload)) {
 			return false
 		}
-		if page.Rows[0].Flow.Outbound.Tag != "unclaimed" || page.Rows[0].Flow.Outbound.Serial == 0 {
+		if page.Rows[0].Flow.Outbound.Tag != outbound.Tag || page.Rows[0].Flow.Outbound.Serial == 0 {
 			t.Fatalf("Trojan unclaimed route: %+v", page.Rows[0].Flow)
 		}
 		return true
 	})
 	totals, err := view.ReadTotals()
 	if err != nil {
-		t.Fatalf("Trojan unclaimed totals: %+v %v", totals, err)
+		t.Fatal(err)
 	}
 	var known uint64
-
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial != 0 {
-			t.Fatalf("Trojan unclaimed owner acquired an outbound: %+v", row)
-		}
-		if row.Origin == fs.TrafficOriginUser {
+		if row.Outbound.Tag == outbound.Tag {
 			known += row.Uplink
+			if row.Downlink != 0 {
+				t.Fatalf("unclaimed server produced response bytes: %+v", row)
+			}
 		}
 	}
 	if known != uint64(len(payload)) {
-		t.Fatalf("Trojan unclaimed totals: %+v", totals)
+		t.Fatalf("app uplink total: %d", known)
 	}
+	assertNoDedicatedServerInspection(t, remote)
 }
 
 func TestFlowInspectionTrojanInboundMuxChild(t *testing.T) {

@@ -15,9 +15,9 @@ import (
 	"github.com/xtls/xray-core/proxy/socks"
 )
 
-func inspectionPacketCallbackSender(t *testing.T, outbound *core.OutboundHandlerConfig) string {
+func inspectionPacketCallbackSenderAt(t *testing.T, outbound *core.OutboundHandlerConfig, enabled, sniff bool) (*core.Instance, fs.FlowInspection, string) {
 	t.Helper()
-	sender, _, address := inspectionSOCKSUDPListener(t, false, false)
+	sender, view, address := inspectionSOCKSUDPListener(t, enabled, sniff)
 	if err := core.AddOutboundHandler(sender, outbound); err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +26,7 @@ func inspectionPacketCallbackSender(t *testing.T, outbound *core.OutboundHandler
 	}}}), true); err != nil {
 		t.Fatal(err)
 	}
-	return address
+	return sender, view, address
 }
 
 func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
@@ -40,8 +40,8 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			for _, mode := range []string{"enabled", "sniff", "disabled", "rejected"} {
 				t.Run(mode, func(t *testing.T) {
-					receiving, view, outbound := test.receiver(t, mode != "disabled", mode == "sniff")
-					address := inspectionPacketCallbackSender(t, outbound)
+					receiving, remote, outbound := test.receiver(t, mode != "disabled", mode == "sniff")
+					sending, view, address := inspectionPacketCallbackSenderAt(t, outbound, mode != "disabled", mode == "sniff")
 					_, client, relay := inspectionSOCKSAssociation(t, address)
 					firstDest, secondDest := startOutboundStatsUDPServer(t, 0x19), startOutboundStatsUDPServer(t, 0x37)
 					payload, extra := []byte("decoded callback input and response"), []byte("second packet destination")
@@ -60,7 +60,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						var ref fs.FlowRef
 						inspectionWait(t, func() bool {
 							live, _ := view.ReadLive()
-							if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial != 0 || live.Rows[0].Uplink != uint64(len(payload)) {
+							if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial == 0 || live.Rows[0].Outbound.Tag != outbound.Tag || live.Rows[0].Uplink != uint64(len(payload)) {
 								return false
 							}
 							ref = live.Rows[0].Ref
@@ -71,6 +71,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 							page, _ := view.ReadTerminals()
 							return len(page.Rows) == 1 && page.Rows[0].Flow.Downlink == 0
 						})
+						assertNoDedicatedServerInspection(t, remote)
 						return
 					}
 					inspectionSOCKSPacket(t, client, relay, firstDest, payload, 0x19)
@@ -78,7 +79,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 					_, sibling, siblingRelay := inspectionSOCKSAssociation(t, address)
 					inspectionSOCKSPacket(t, sibling, siblingRelay, firstDest, payload, 0x19)
 					if mode == "disabled" {
-						if receiving.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
+						if receiving.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil || sending.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
 							t.Fatal("disabled receiver acquired inspection state")
 						}
 						return
@@ -99,7 +100,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						return first.Ref.ID != 0 && other.Ref.ID != 0 && first.Downlink == first.Uplink && other.Downlink == uint64(len(payload))
 					})
 					for _, row := range []fs.FlowRecord{first, other} {
-						if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "direct" || row.Outbound.Serial == 0 {
+						if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 {
 							t.Fatalf("callback facts: %+v", row)
 						}
 					}
@@ -136,7 +137,8 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						page, _ := view.ReadTerminals()
 						return len(page.Rows) == 3
 					})
-					inspectionOutboundTotals(t, view, "direct", uint64(3*len(payload)+2*len(extra)))
+					inspectionOutboundTotals(t, view, outbound.Tag, uint64(3*len(payload)+2*len(extra)))
+					assertNoDedicatedServerInspection(t, remote)
 				})
 			}
 		})

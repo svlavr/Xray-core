@@ -21,7 +21,6 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -43,7 +42,6 @@ type Server struct {
 	streamSettings  *internet.MemoryStreamConfig
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
-	statsManager    stats.Manager
 
 	tun   tun.Device
 	stack *stack.Stack
@@ -127,7 +125,6 @@ func NewServer(ctx context.Context, conf *DeviceConfig) (*Server, error) {
 		streamSettings:  streamSettings,
 		uplinkCounter:   uplinkCounter,
 		downlinkCounter: downlinkCounter,
-		statsManager:    v.GetFeature(stats.ManagerType()).(stats.Manager),
 
 		tun:   tun,
 		stack: stack,
@@ -382,19 +379,8 @@ func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
 	errors.LogInfo(ctx, "processing from ", source, " to ", dest)
 
 	link := &transport.Link{
-		Reader: buf.NewReader(conn),
+		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
 		Writer: buf.NewWriter(conn),
-	}
-	var finish func()
-	if dest.Network == net.Network_UDP {
-		ctx, finish = proxy.ObserveUDP(ctx, s.statsManager, conn, dest, link)
-	} else {
-		ctx, finish = proxy.ObserveTCP(ctx, s.statsManager, conn, dest, link)
-	}
-	if finish != nil {
-		defer finish()
-	} else {
-		link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 	}
 	if err := s.dispatcher.DispatchLink(ctx, dest, link); err != nil {
 		errors.LogError(ctx, errors.New("connection closed").Base(err))

@@ -26,8 +26,6 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -50,7 +48,6 @@ type MultiUserInbound struct {
 	udpConns        *utils.TypedSyncMap[multiUDPKey, *udpConnEntry]
 	udpMasterCipher cipher.Block
 	policyManager   policy.Manager
-	statsManager    stats.Manager
 }
 
 type multiUDPKey struct {
@@ -97,7 +94,6 @@ func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiU
 		udpConns:        utils.NewTypedSyncMap[multiUDPKey, *udpConnEntry](),
 		udpMasterCipher: masterBlock,
 		policyManager:   v.GetFeature(policy.ManagerType()).(policy.Manager),
-		statsManager:    v.GetFeature(stats.ManagerType()).(stats.Manager),
 	}
 
 	for idx, user := range config.Users {
@@ -304,10 +300,6 @@ func (i *MultiUserInbound) processTCP(ctx context.Context, conn net.Conn, dispat
 	})
 
 	errors.LogInfo(ctx, "tunneling request to ", dest, " for user ", user.Email)
-	ctx, bodyReader, bodyWriter, finish := observeTCP(ctx, i.statsManager, conn, dest, reader, writer, len(reqHeader.EarlyData))
-	if finish != nil {
-		defer finish()
-	}
 
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
@@ -329,12 +321,12 @@ func (i *MultiUserInbound) processTCP(ctx context.Context, conn net.Conn, dispat
 
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		return buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer))
+		return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer))
 	}
 
 	responseDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
-		return buf.Copy(link.Reader, bodyWriter, buf.UpdateActivity(timer))
+		return buf.Copy(link.Reader, writer, buf.UpdateActivity(timer))
 	}
 
 	responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
@@ -467,12 +459,6 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 					Status: log.AccessAccepted,
 					Email:  currentUser.Email,
 				})
-				var observation *session.LogicalObservation
-				var finish func()
-				sessCtx, observation, finish = proxy.BeginReturnedObservation(sessCtx, i.statsManager, newEntry, dest, net.Network_UDP)
-				if observation != nil {
-					newEntry.setObservation(observation.Exchange, finish)
-				}
 
 				link, err := dispatcher.Dispatch(sessCtx, dest)
 				if err != nil {
@@ -522,16 +508,13 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 								if rb.UDP != nil {
 									responseDest = *rb.UDP
 								}
-								payloadLen := rb.Len()
+
 								encPacket, err := i.encodeServerUDPPacket(key, uPSK, block, responseDest, rb.Bytes())
 								rb.Release()
 								if err != nil {
 									continue
 								}
 								n, writeErr := cEntry.writePacket(encPacket)
-								if writeErr == nil {
-									proxy.RecordPacketWrite(cEntry.receipt, uint64(payloadLen), len(encPacket), n)
-								}
 								if writeErr != nil || n != len(encPacket) {
 									return
 								}
@@ -550,10 +533,6 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 			pBuf.Write(payload)
 			packetDest := dest
 			pBuf.UDP = &packetDest
-			if entry.receipt != nil {
-				entry.receipt.PacketDestination(packetDest)
-				entry.receipt.AddUplink(uint64(len(payload)))
-			}
 			_ = entry.link.Writer.WriteMultiBuffer(buf.MultiBuffer{pBuf})
 		}
 	}

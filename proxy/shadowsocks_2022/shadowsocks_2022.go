@@ -8,7 +8,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -20,8 +19,6 @@ type udpConnEntry struct {
 	closed    bool
 	cancel    context.CancelFunc
 	onClose   func()
-	receipt   stats.Exchange
-	finish    func()
 	transport stat.Connection
 	peer      net.Addr
 }
@@ -54,16 +51,6 @@ func (e *udpConnEntry) writePacket(packet []byte) (int, error) {
 	return conn.Write(packet)
 }
 
-func (e *udpConnEntry) setObservation(receipt stats.Exchange, finish func()) {
-	e.Lock()
-	e.receipt, e.finish = receipt, finish
-	closed := e.closed
-	e.Unlock()
-	if closed && finish != nil {
-		finish()
-	}
-}
-
 func (e *udpConnEntry) isClosed() bool {
 	e.RLock()
 	closed := e.closed
@@ -93,7 +80,7 @@ func (e *udpConnEntry) Close() error {
 		return nil
 	}
 	e.closed = true
-	link, cancel, onClose, finish, timer := e.link, e.cancel, e.onClose, e.finish, e.timer
+	link, cancel, onClose, timer := e.link, e.cancel, e.onClose, e.timer
 	e.Unlock()
 	if link != nil {
 		common.Interrupt(link.Reader)
@@ -104,9 +91,6 @@ func (e *udpConnEntry) Close() error {
 	}
 	if onClose != nil {
 		onClose()
-	}
-	if finish != nil {
-		finish()
 	}
 	if timer != nil {
 		timer.SetTimeout(0)

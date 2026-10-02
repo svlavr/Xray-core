@@ -119,18 +119,6 @@ func TestObserveTCPDisabledPreservesEndpoint(t *testing.T) {
 	}
 }
 
-func TestObserveReturnedTCPDisabledPreservesEndpoint(t *testing.T) {
-	for _, manager := range []fs.Manager{nil, fs.NoopManager{}, new(appstats.Manager)} {
-		ctx := context.Background()
-		link := &transport.Link{Reader: buf.NewReader(strings.NewReader("payload")), Writer: buf.Discard}
-		original := *link
-		observed, finish := proxy.ObserveReturnedTCP(ctx, manager, nil, cnet.Destination{}, link)
-		if observed != ctx || finish != nil || *link != original {
-			t.Fatal("disabled returned collection changed the endpoint")
-		}
-	}
-}
-
 func TestBeginReturnedObservationExcludesReservedCarrier(t *testing.T) {
 	manager := new(appstats.Manager)
 	view, err := manager.EnableInspection(fs.ObservationOptions{})
@@ -149,16 +137,8 @@ func TestBeginReturnedObservationExcludesReservedCarrier(t *testing.T) {
 		if observed != ctx || observation != nil || cleanup != nil {
 			t.Fatal("reserved carrier was admitted")
 		}
-		observed, observation, cleanup = proxy.BeginSuppliedObservation(ctx, manager, conn, destination, cnet.Network_TCP)
-		if observed != ctx || observation != nil || cleanup != nil {
-			t.Fatal("supplied carrier was admitted")
-		}
 		link := &transport.Link{Reader: buf.NewReader(conn), Writer: buf.NewWriter(conn)}
 		original := *link
-		observed, cleanup = proxy.ObserveReturnedTCP(ctx, manager, conn, destination, link)
-		if observed != ctx || cleanup != nil || *link != original {
-			t.Fatal("returned TCP carrier changed the endpoint")
-		}
 		observed, cleanup = proxy.ObserveTCP(ctx, manager, conn, destination, link)
 		if observed != ctx || cleanup != nil || *link != original {
 			t.Fatal("supplied TCP carrier was admitted")
@@ -373,164 +353,5 @@ func TestObserveTCPCustomWriterRemainsUnavailable(t *testing.T) {
 	live, err := view.ReadLive()
 	if err != nil || len(live.Rows) != 1 {
 		t.Fatalf("unsupported endpoint result: %+v %v", live, err)
-	}
-}
-
-func TestObserveReturnedTCPDispatcherCleanupAndOwnerEnd(t *testing.T) {
-	manager := new(appstats.Manager)
-	view, err := manager.EnableInspection(fs.ObservationOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { manager.Close() })
-	conn, peer := net.Pipe()
-	t.Cleanup(func() { conn.Close(); peer.Close() })
-	link := &transport.Link{Reader: buf.NewReader(strings.NewReader("payload")), Writer: buf.NewWriter(conn)}
-	ctx, finish := proxy.ObserveReturnedTCP(context.Background(), manager, conn, cnet.TCPDestination(cnet.LocalHostIP, 80), link)
-	if finish == nil {
-		t.Fatal("returned observation was not enabled")
-	}
-	observation := session.LogicalObservationFromContext(ctx)
-	if observation == nil || !observation.ReturnedLink.CompareAndSwap(true, false) {
-		t.Fatal("dispatcher role was not claimed")
-	}
-	observation.Exchange.Route(fs.OutboundRef{Tag: "selected", Serial: 7})
-	observation.Exchange.BindRoute()
-
-	releasePump := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-releasePump:
-		default:
-			close(releasePump)
-		}
-	})
-	pumpDone := make(chan struct{})
-	request, response := func() error {
-		<-releasePump
-		observation.Exchange.AddUplink(7)
-		return nil
-	}, func() error { return nil }
-	go func() {
-		defer close(pumpDone)
-		_ = request()
-	}()
-	if err := response(); err != nil {
-		t.Fatal(err)
-	}
-	finish()
-	if page, err := view.ReadTerminals(); err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
-		t.Fatalf("owner-end snapshot: %+v %v", page, err)
-	}
-	close(releasePump)
-	select {
-	case <-pumpDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("late inbound pump did not release")
-	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "selected" || page.Rows[0].Flow.Uplink != 0 {
-		t.Fatalf("late pump mutated history: %+v %v", page, err)
-	}
-	totals, _ := view.ReadTotals()
-	var known uint64
-	for _, row := range totals.Rows {
-		known += row.Uplink
-	}
-	if known != 7 {
-		t.Fatalf("late pump missing from totals: %+v", totals)
-	}
-}
-
-func TestObserveReturnedTCPCleanupEndsUnclaimed(t *testing.T) {
-	manager := new(appstats.Manager)
-	view, err := manager.EnableInspection(fs.ObservationOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { manager.Close() })
-	conn, peer := net.Pipe()
-	t.Cleanup(func() { conn.Close(); peer.Close() })
-	link := &transport.Link{Reader: buf.NewReader(strings.NewReader("payload")), Writer: buf.NewWriter(conn)}
-	ctx, finish := proxy.ObserveReturnedTCP(context.Background(), manager, conn, cnet.TCPDestination(cnet.LocalHostIP, 80), link)
-	observation := session.LogicalObservationFromContext(ctx)
-	if finish == nil || observation == nil || !observation.ReturnedLink.CompareAndSwap(true, false) {
-		t.Fatal("returned dispatcher claim failed")
-	}
-	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
-		t.Fatalf("unclaimed owner-end snapshot: %+v %v", page, err)
-	}
-	observation.Exchange.Route(fs.OutboundRef{Tag: "selected", Serial: 9})
-	downstream := buf.NewInspectionReader(&buf.BufferedReader{Reader: buf.NewReader(strings.NewReader(""))}, observation.Exchange, nil)
-	downstream.InputAlreadyObserved = true
-	if claimed := proxy.ClaimObservedEndpoint(ctx, downstream, true); claimed != observation {
-		t.Fatal("late downstream role claim was not returned")
-	}
-	finish()
-	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
-		t.Fatalf("late attribution mutated owner-end history: %+v %v", page, err)
-	}
-}
-
-func TestObserveReturnedTCPUnconsumedOwnerEndsIncomplete(t *testing.T) {
-	manager := new(appstats.Manager)
-	view, err := manager.EnableInspection(fs.ObservationOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { manager.Close() })
-	conn, peer := net.Pipe()
-	t.Cleanup(func() { conn.Close(); peer.Close() })
-	link := &transport.Link{Reader: buf.NewReader(strings.NewReader("payload")), Writer: buf.NewWriter(conn)}
-	ctx, finish := proxy.ObserveReturnedTCP(context.Background(), manager, conn, cnet.TCPDestination(cnet.LocalHostIP, 80), link)
-	observation := session.LogicalObservationFromContext(ctx)
-	if finish == nil || observation == nil || !observation.ReturnedLink.Load() {
-		t.Fatal("returned claim token was not installed")
-	}
-	finish()
-	observation.Exchange.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
-		t.Fatalf("unconsumed owner snapshot: %+v %v", page, err)
-	}
-	totals, err := view.ReadTotals()
-	if err != nil {
-		t.Fatalf("unconsumed returned owner lost uncertainty: %+v %v", totals, err)
-	}
-	for _, row := range totals.Rows {
-		if row.Outbound.Serial != 0 {
-			t.Fatalf("unconsumed returned owner acquired an outbound: %+v", row)
-		}
-	}
-}
-
-func TestObserveReturnedTCPRoleClaimAfterBoundStop(t *testing.T) {
-	manager := new(appstats.Manager)
-	view, err := manager.EnableInspection(fs.ObservationOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { manager.Close() })
-	conn, peer := net.Pipe()
-	t.Cleanup(func() { conn.Close(); peer.Close() })
-	link := &transport.Link{Reader: buf.NewReader(strings.NewReader("payload")), Writer: buf.NewWriter(conn)}
-	ctx, finish := proxy.ObserveReturnedTCP(context.Background(), manager, conn, cnet.TCPDestination(cnet.LocalHostIP, 80), link)
-	observation := session.LogicalObservationFromContext(ctx)
-	// Statistical owner ending does not replace the native launch/cancel guard.
-	observation.Exchange.BindRoute()
-	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{observation.Exchange.Ref()})
-	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
-		t.Fatalf("pre-dispatch stop: %+v %v", outcomes, err)
-	}
-	if !observation.ReturnedLink.CompareAndSwap(true, false) {
-		t.Fatal("owner ending blocked the native role claim")
-	}
-	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
-		t.Fatalf("failed dispatch ordering: %+v %v", page, err)
 	}
 }

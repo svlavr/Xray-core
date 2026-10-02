@@ -2,9 +2,11 @@ package core_test
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common/geodata"
@@ -16,6 +18,8 @@ import (
 	frouting "github.com/xtls/xray-core/features/routing"
 	fs "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/proxy/socks"
+	"github.com/xtls/xray-core/testing/servers/tcp"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -57,11 +61,16 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 			}
 			t.Cleanup(func() { bridge.Worker.Close(); bridge.Timer.SetTimeout(0) })
 			inspectionWait(t, func() bool { return bridge.Connections() > 0 })
-			client, _, address := inspectionCore(t, false, false)
-			if err := core.AddOutboundHandler(client, proto.Clone(vmess).(*core.OutboundHandlerConfig)); err != nil {
+			// Ordinary user traffic enters at the app-facing SOCKS owner. VMess
+			// remains the native reverse carrier, without a dedicated collector.
+			port := tcp.PickPort()
+			if err := core.AddInboundHandler(portalCore, &core.InboundHandlerConfig{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{Listen: cnet.NewIPOrDomain(cnet.LocalHostIP), PortList: &cnet.PortList{Range: []*cnet.PortRange{cnet.SinglePortRange(port)}}}),
+				ProxySettings:    serial.ToTypedMessage(&socks.ServerConfig{AuthType: socks.AuthType_NO_AUTH}),
+			}); err != nil {
 				t.Fatal(err)
 			}
-			setInspectionRoute(t, client, vmess.Tag)
+			address := net.JoinHostPort("127.0.0.1", port.String())
 			dest := startOutboundStatsTCPServer(t)
 			payload := []byte("GET / HTTP/1.1\r\nHost: ordinary.invalid\r\n\r\n")
 			a := inspectionSOCKS(t, address, dest, payload)
@@ -237,7 +246,7 @@ func setInspectionRoute(t *testing.T, instance *core.Instance, tag string) {
 }
 
 func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
-	remote, view, vmess := inspectionVMessReceiver(t, true, true)
+	remote, remoteView, vmess := inspectionVMessReceiver(t, true, true)
 	portal, err := reverse.NewPortal(&reverse.PortalConfig{Tag: "portal", Domain: "bridge.invalid"}, remote.GetFeature(fout.ManagerType()).(fout.Manager))
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +263,7 @@ func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
 		t.Fatal(err)
 	}
 	setInspectionRoute(t, remote, "same-domain")
-	client, _, _ := inspectionCore(t, false, false)
+	client, view, _ := inspectionCore(t, true, false)
 	if err := core.AddOutboundHandler(client, vmess); err != nil {
 		t.Fatal(err)
 	}
@@ -277,8 +286,9 @@ func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
 			return false
 		}
 		r := live.Rows[0]
-		return r.Destination == target && r.Outbound.Tag == "same-domain" && r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload))
+		return r.Destination == target && r.Outbound.Tag == vmess.Tag && r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload))
 	})
+	assertNoDedicatedServerInspection(t, remoteView)
 	conn.Close()
 	inspectionWait(t, func() bool {
 		page, _ := view.ReadTerminals()

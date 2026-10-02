@@ -19,8 +19,6 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -39,7 +37,6 @@ type Inbound struct {
 	udpCodec      *UDPServerCodec
 	udpConns      *utils.TypedSyncMap[uint64, *udpConnEntry]
 	policyManager policy.Manager
-	statsManager  stats.Manager
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
@@ -79,7 +76,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 		udpCodec:      udpCodec,
 		udpConns:      utils.NewTypedSyncMap[uint64, *udpConnEntry](),
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		statsManager:  v.GetFeature(stats.ManagerType()).(stats.Manager),
 	}, nil
 }
 
@@ -150,10 +146,6 @@ func (i *Inbound) processTCP(ctx context.Context, conn net.Conn, dispatcher rout
 	})
 
 	errors.LogInfo(ctx, "tunneling request to ", dest)
-	ctx, bodyReader, bodyWriter, finish := observeTCP(ctx, i.statsManager, conn, dest, reader, writer, len(reqHeader.EarlyData))
-	if finish != nil {
-		defer finish()
-	}
 
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
@@ -175,12 +167,12 @@ func (i *Inbound) processTCP(ctx context.Context, conn net.Conn, dispatcher rout
 
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		return buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer))
+		return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer))
 	}
 
 	responseDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
-		return buf.Copy(link.Reader, bodyWriter, buf.UpdateActivity(timer))
+		return buf.Copy(link.Reader, writer, buf.UpdateActivity(timer))
 	}
 
 	responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
@@ -219,12 +211,6 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 					Status: log.AccessAccepted,
 					Email:  i.user.Email,
 				})
-				var observation *session.LogicalObservation
-				var finish func()
-				sessCtx, observation, finish = proxy.BeginReturnedObservation(sessCtx, i.statsManager, newEntry, decoded.Destination, net.Network_UDP)
-				if observation != nil {
-					newEntry.setObservation(observation.Exchange, finish)
-				}
 
 				link, err := dispatcher.Dispatch(sessCtx, decoded.Destination)
 				if err != nil {
@@ -265,16 +251,13 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 								if rb.UDP != nil {
 									responseDest = *rb.UDP
 								}
-								payloadLen := rb.Len()
+
 								encPacket, err := i.udpCodec.EncodeServerPacket(sessID, responseDest, rb.Bytes())
 								rb.Release()
 								if err != nil {
 									continue
 								}
 								n, writeErr := cEntry.writePacket(encPacket)
-								if writeErr == nil {
-									proxy.RecordPacketWrite(cEntry.receipt, uint64(payloadLen), len(encPacket), n)
-								}
 								if writeErr != nil || n != len(encPacket) {
 									return
 								}
@@ -294,10 +277,6 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 			payloadBuf.Write(decoded.Payload)
 			packetDest := decoded.Destination
 			payloadBuf.UDP = &packetDest
-			if entry.receipt != nil {
-				entry.receipt.PacketDestination(packetDest)
-				entry.receipt.AddUplink(uint64(len(decoded.Payload)))
-			}
 			b.Release()
 			_ = entry.link.Writer.WriteMultiBuffer(buf.MultiBuffer{payloadBuf})
 		}

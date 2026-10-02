@@ -10,81 +10,47 @@ import (
 	"testing"
 	"time"
 
-	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	cnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
-	fs "github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"lukechampine.com/blake3"
 )
 
 func TestInspectionSS2022PacketCodecResults(t *testing.T) {
-	for _, methodName := range []string{MethodAES128GCM, MethodAES256GCM, MethodChaCha20Poly1305} {
-		for _, outcome := range []string{"complete", "zero-error", "partial-error", "complete-error", "short-nil"} {
-			t.Run(methodName+"/"+outcome, func(t *testing.T) {
-				method, err := GetCipherMethod(methodName)
-				if err != nil {
-					t.Fatal(err)
-				}
-				key := make([]byte, method.KeySaltLength)
-				client, err := NewUDPPacketCodec(method, key)
-				if err != nil {
-					t.Fatal(err)
-				}
-				server, err := NewUDPServerCodec(method, key, time.Minute)
-				if err != nil {
-					t.Fatal(err)
-				}
-				destination := cnet.UDPDestination(cnet.LocalHostIP, 8080)
-				wire, err := client.EncodeClientPacket(destination, []byte("request"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				decoded, err := server.DecodePacket(bytes.Clone(wire.Bytes()))
-				wire.Release()
-				if err != nil || string(decoded.Payload) != "request" || decoded.Destination != destination {
-					t.Fatalf("decoded: %+v %v", decoded, err)
-				}
-				manager := new(appstats.Manager)
-				view, err := manager.EnableInspection(fs.ObservationOptions{})
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { manager.Close() })
-				flow := manager.Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, destination, nil)
-				flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-				flow.BindRoute()
-				flow.PacketDestination(decoded.Destination)
-				flow.AddUplink(uint64(len(decoded.Payload)))
-				response, err := server.EncodeServerPacket(decoded.SessionID, destination, []byte("response"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				written, writeErr := len(response), error(nil)
-				switch outcome {
-				case "zero-error":
-					written, writeErr = 0, io.ErrUnexpectedEOF
-				case "partial-error":
-					written, writeErr = 1, io.ErrUnexpectedEOF
-				case "complete-error":
-					writeErr = io.ErrUnexpectedEOF
-				case "short-nil":
-					written = 1
-				}
-				if writeErr == nil {
-					proxy.RecordPacketWrite(flow, 8, len(response), written)
-				}
-				row := inspectionLive(t, view)
-				want := uint64(0)
-				if outcome == "complete" {
-					want = 8
-				}
-				if row.Uplink != 7 || row.Downlink != want || row.Destination != destination {
-					t.Fatalf("packet result: %+v", row)
-				}
-			})
-		}
+	for _, name := range []string{MethodAES128GCM, MethodAES256GCM, MethodChaCha20Poly1305} {
+		t.Run(name, func(t *testing.T) {
+			method, err := GetCipherMethod(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := make([]byte, method.KeySaltLength)
+			client, err := NewUDPPacketCodec(method, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, err := NewUDPServerCodec(method, key, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dest := cnet.UDPDestination(cnet.LocalHostIP, 8080)
+			wire, err := client.EncodeClientPacket(dest, []byte("request"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := server.DecodePacket(bytes.Clone(wire.Bytes()))
+			wire.Release()
+			if err != nil || string(decoded.Payload) != "request" || decoded.Destination != dest {
+				t.Fatalf("request: %+v %v", decoded, err)
+			}
+			response, err := server.EncodeServerPacket(decoded.SessionID, dest, []byte("response"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			answer, err := client.DecodePacket(response)
+			if err != nil || string(answer.Payload) != "response" || answer.Destination != dest {
+				t.Fatalf("response: %+v %v", answer, err)
+			}
+		})
 	}
 }
 

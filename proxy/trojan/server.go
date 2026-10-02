@@ -21,9 +21,6 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
-	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -39,7 +36,6 @@ func init() {
 // Server is an inbound connection handler that handles messages in trojan protocol.
 type Server struct {
 	policyManager policy.Manager
-	statsManager  stats.Manager
 	validator     *Validator
 	fallbacks     map[string]map[string]map[string]*Fallback // or nil
 	cone          bool
@@ -62,7 +58,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
 	server := &Server{
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		statsManager:  v.GetFeature(stats.ManagerType()).(stats.Manager),
 		validator:     validator,
 		cone:          ctx.Value("cone").(bool),
 	}
@@ -234,7 +229,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	sessionPolicy = s.policyManager.ForLevel(user.Level)
 
 	if destination.Network == net.Network_UDP { // handle udp request
-		return s.handleUDPPayload(ctx, sessionPolicy, conn, &PacketReader{Reader: clientReader}, &PacketWriter{Writer: conn}, dispatcher)
+		return s.handleUDPPayload(ctx, sessionPolicy, &PacketReader{Reader: clientReader}, &PacketWriter{Writer: conn}, dispatcher)
 	}
 
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
@@ -246,32 +241,21 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	})
 
 	errors.LogInfo(ctx, "received request for ", destination)
-	endpoint := transport.Link{Reader: clientReader, Writer: buf.NewWriter(conn)}
-	var cleanup func()
-	ctx, cleanup = proxy.ObserveReturnedTCP(ctx, s.statsManager, conn, destination, &endpoint)
-	if cleanup != nil {
-		defer cleanup()
-	}
-	return s.handleConnection(ctx, sessionPolicy, destination, endpoint.Reader, endpoint.Writer, dispatcher)
+	return s.handleConnection(ctx, sessionPolicy, destination, clientReader, buf.NewWriter(conn), dispatcher)
 }
 
-func (s *Server) handleUDPPayload(ctx context.Context, sessionPolicy policy.Session, conn stat.Connection, clientReader *PacketReader, clientWriter *PacketWriter, dispatcher routing.Dispatcher) error {
+func (s *Server) handleUDPPayload(ctx context.Context, sessionPolicy policy.Session, clientReader *PacketReader, clientWriter *PacketWriter, dispatcher routing.Dispatcher) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 	defer timer.SetTimeout(0)
-	store := proxy.ObservationStore(s.statsManager)
 	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
 		udpPayload := packet.Payload
 		if udpPayload.UDP == nil {
 			udpPayload.UDP = &packet.Source
 		}
 
-		var receipt stats.Exchange
-		if observation := session.LogicalObservationFromContext(ctx); observation != nil {
-			receipt = observation.Exchange
-		}
-		if err := clientWriter.writeMultiBuffer(buf.MultiBuffer{udpPayload}, receipt); err != nil {
+		if err := clientWriter.WriteMultiBuffer(buf.MultiBuffer{udpPayload}); err != nil {
 			errors.LogWarningInner(ctx, err, "failed to write response")
 			cancel()
 		} else {
@@ -286,15 +270,6 @@ func (s *Server) handleUDPPayload(ctx context.Context, sessionPolicy policy.Sess
 	var dest *net.Destination
 
 	requestDone := func() error {
-		// task.Run can return before this reader. Keep admission and Finish
-		// with the actual request task, including a late first decoded packet.
-		ctx := ctx
-		var flow stats.Exchange
-		defer func() {
-			if flow != nil {
-				flow.Finish()
-			}
-		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -314,14 +289,6 @@ func (s *Server) handleUDPPayload(ctx context.Context, sessionPolicy policy.Sess
 				}
 				timer.Update()
 				destination := *b.UDP
-				if flow == nil && store != nil {
-					var cancel context.CancelFunc
-					ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, conn, destination, net.Network_UDP)
-					if flow != nil {
-						udpServer.Observation = flow
-						defer cancel()
-					}
-				}
 
 				currentPacketCtx := ctx
 				if inbound.Source.IsValid() {
@@ -483,10 +450,6 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
-	ctx, fallbackReader, observation, cleanup := proxy.ObserveFallback(ctx, s.statsManager, connection, fb.Type, fb.Dest, reader)
-	if cleanup != nil {
-		defer cleanup()
-	}
 
 	var conn net.Conn
 	if err := retry.ExponentialBackoff(5, 100).On(func() error {
@@ -560,16 +523,13 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 				return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err)
 			}
 		}
-		if err := buf.Copy(fallbackReader, serverWriter, buf.UpdateActivity(timer)); err != nil {
+		if err := buf.Copy(reader, serverWriter, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to fallback request payload").Base(err)
 		}
 		return nil
 	}
 
 	writer := buf.NewWriter(connection)
-	if observation != nil {
-		writer = buf.AttachWriterReceipt(writer, observation)
-	}
 
 	getResponse := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)

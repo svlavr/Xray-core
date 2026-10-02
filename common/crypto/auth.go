@@ -10,7 +10,6 @@ import (
 	"github.com/xtls/xray-core/common/bytespool"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
-	"github.com/xtls/xray-core/features/stats"
 )
 
 type BytesGenerator func() []byte
@@ -232,7 +231,6 @@ type AuthenticationWriter struct {
 	sizeParser   ChunkSizeEncoder
 	transferType protocol.TransferType
 	padding      PaddingLengthGenerator
-	receipt      stats.Exchange
 }
 
 func NewAuthenticationWriter(auth Authenticator, sizeParser ChunkSizeEncoder, writer io.Writer, transferType protocol.TransferType, padding PaddingLengthGenerator) *AuthenticationWriter {
@@ -246,27 +244,6 @@ func NewAuthenticationWriter(auth Authenticator, sizeParser ChunkSizeEncoder, wr
 		w.padding = padding
 	}
 	return w
-}
-
-// ObserveAuthenticationWriter binds decoded operation results after the native
-// header/IV was prepared and before any body write. The returned cleanup must
-// run after the response owner's last native write/flush. It discards buffered
-// output without emitting it.
-// Nil observation preserves the native writer identity and allocates nothing.
-func ObserveAuthenticationWriter(writer buf.Writer, flow stats.Exchange) (buf.Writer, func()) {
-	if flow == nil {
-		return writer, nil
-	}
-	w, ok := writer.(*AuthenticationWriter)
-	if !ok {
-		return writer, nil
-	}
-	w.receipt = flow
-	return w, func() {
-		if buffered, ok := w.writer.(*buf.BufferedWriter); ok {
-			buf.DiscardBufferedWriter(buffered)
-		}
-	}
 }
 
 func (w *AuthenticationWriter) seal(b []byte) (*buf.Buffer, error) {
@@ -300,10 +277,6 @@ func (w *AuthenticationWriter) seal(b []byte) (*buf.Buffer, error) {
 
 func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
-	var payload uint64
-	if w.receipt != nil {
-		payload = uint64(mb.Len())
-	}
 
 	var maxPadding int32
 	if w.padding != nil {
@@ -333,14 +306,13 @@ func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
 		}
 	}
 
-	return w.writeBatch(mb2Write, payload)
+	return w.writer.WriteMultiBuffer(mb2Write)
 }
 
 func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
 
 	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
-	var payload uint64
 
 	for _, b := range mb {
 		if b.IsEmpty() {
@@ -353,16 +325,13 @@ func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
 		}
 
 		mb2Write = append(mb2Write, eb)
-		if w.receipt != nil {
-			payload += uint64(b.Len())
-		}
 	}
 
 	if mb2Write.IsEmpty() {
 		return nil
 	}
 
-	return w.writeBatch(mb2Write, payload)
+	return w.writer.WriteMultiBuffer(mb2Write)
 }
 
 // WriteMultiBuffer implements buf.Writer.
@@ -370,7 +339,7 @@ func (w *AuthenticationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if mb.IsEmpty() {
 		eb, err := w.seal([]byte{})
 		common.Must(err)
-		return w.writeBatch(buf.MultiBuffer{eb}, 0)
+		return w.writer.WriteMultiBuffer(buf.MultiBuffer{eb})
 	}
 
 	if w.transferType == protocol.TransferTypeStream {
@@ -378,12 +347,4 @@ func (w *AuthenticationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 
 	return w.writePacket(mb)
-}
-
-func (w *AuthenticationWriter) writeBatch(mb buf.MultiBuffer, payload uint64) error {
-	err := w.writer.WriteMultiBuffer(mb)
-	if w.receipt != nil && err == nil && payload != 0 {
-		w.receipt.AddDownlink(payload)
-	}
-	return err
 }

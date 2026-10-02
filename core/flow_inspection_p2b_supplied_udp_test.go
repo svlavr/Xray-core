@@ -27,14 +27,14 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 	t.Helper()
 	for _, mode := range []string{"disabled", "enabled", "sniff"} {
 		t.Run(mode, func(t *testing.T) {
-			receiving, view, outbound := receiver(t, mode != "disabled", mode == "sniff")
+			receiving, remote, outbound := receiver(t, mode != "disabled", mode == "sniff")
 			destination := startOutboundStatsUDPServer(t, 0x19)
-			_, _, address := inspectionUDPInboundThrough(t, destination, false, false, outbound)
+			sending, view, address := inspectionUDPInboundThrough(t, destination, mode != "disabled", false, outbound)
 			client, sibling := inspectionUDPClient(t), inspectionUDPClient(t)
 			extra := []byte("sibling after packet stop")
 			inspectionUDPExchange(t, client, address, payload, 0x19)
 			if mode == "disabled" {
-				if receiving.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
+				if receiving.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil || sending.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
 					t.Fatal("disabled receiver acquired observation")
 				}
 				return
@@ -48,7 +48,7 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 				first = live.Rows[0]
 				return true
 			})
-			if first.Kind != cnet.Network_UDP || first.Origin != fs.TrafficOriginUser || first.Outbound.Tag != "direct" || first.Outbound.Serial == 0 || first.Destination != destination {
+			if first.Kind != cnet.Network_UDP || first.Origin != fs.TrafficOriginUser || first.Outbound.Tag != outbound.Tag || first.Outbound.Serial == 0 || first.Destination != destination {
 				t.Fatalf("supplied packet facts: %+v", first)
 			}
 			inspectionUDPExchange(t, sibling, address, payload, 0x19)
@@ -72,14 +72,16 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 				page, _ := view.ReadTerminals()
 				return len(page.Rows) == 2
 			})
-			inspectionOutboundTotals(t, view, "direct", uint64(2*len(payload)+len(extra)))
+			inspectionOutboundTotals(t, view, outbound.Tag, uint64(2*len(payload)+len(extra)))
+			assertNoDedicatedServerInspection(t, remote)
 		})
 	}
 }
 
 func TestFlowInspectionP2BHysteriaPacketDestinations(t *testing.T) {
-	_, view, outbound := inspectionHysteriaReceiver(t, true, false)
-	address := inspectionPacketCallbackSender(t, outbound)
+	_, remote, outbound := inspectionHysteriaReceiver(t, true, false)
+	_, view, address := inspectionPacketCallbackSenderAt(t, outbound, true, false)
+	defer assertNoDedicatedServerInspection(t, remote)
 	_, client, relay := inspectionSOCKSAssociation(t, address)
 	first, second := startOutboundStatsUDPServer(t, 0x19), startOutboundStatsUDPServer(t, 0x37)
 	payload, extra := []byte("first target"), []byte("second target")
@@ -103,5 +105,5 @@ func TestFlowInspectionP2BHysteriaPacketDestinations(t *testing.T) {
 		page, _ := view.ReadTerminals()
 		return len(page.Rows) == 1
 	})
-	inspectionOutboundTotals(t, view, "direct", uint64(len(payload)+len(extra)))
+	inspectionOutboundTotals(t, view, outbound.Tag, uint64(len(payload)+len(extra)))
 }

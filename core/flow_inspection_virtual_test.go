@@ -238,13 +238,7 @@ func TestFlowInspectionWireGuardTCPUDP(t *testing.T) {
 	clientSibling := inspectionWireGuardRow(t, clientView, cnet.Network_TCP, uint64(len(siblingPayload)), uint64(len(siblingPayload)))
 	inspectionWireGuardAssertRow(t, clientFirst, virtualTCP, "wireguard-client")
 	inspectionWireGuardAssertRow(t, clientSibling, virtualTCP, "wireguard-client")
-	serverFirst := inspectionWireGuardRow(t, serverView, cnet.Network_TCP, uint64(len(firstPayload)), uint64(len(firstPayload)))
-	serverSibling := inspectionWireGuardRow(t, serverView, cnet.Network_TCP, uint64(len(siblingPayload)), uint64(len(siblingPayload)))
-	inspectionWireGuardAssertRow(t, serverFirst, virtualTCP, "wireguard-server-direct")
-	inspectionWireGuardAssertRow(t, serverSibling, virtualTCP, "wireguard-server-direct")
-	if serverFirst.Source.Address != cnet.ParseAddress(inspectionWireGuardClientIP) || serverSibling.Source.Address != cnet.ParseAddress(inspectionWireGuardClientIP) {
-		t.Fatalf("WireGuard virtual sources: %v %v", serverFirst.Source, serverSibling.Source)
-	}
+	assertNoDedicatedServerInspection(t, serverView)
 
 	inspectionWireGuardStop(t, clientView, clientFirst.Ref)
 	if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
@@ -263,24 +257,21 @@ func TestFlowInspectionWireGuardTCPUDP(t *testing.T) {
 	udpPayload := []byte("WireGuard UDP virtual association")
 	inspectionSOCKSPacket(t, packet, relay, virtualUDP, udpPayload, mask)
 	clientUDP := inspectionWireGuardRow(t, clientView, cnet.Network_UDP, uint64(len(udpPayload)), uint64(len(udpPayload)))
-	serverUDP := inspectionWireGuardRow(t, serverView, cnet.Network_UDP, uint64(len(udpPayload)), uint64(len(udpPayload)))
 	// SOCKS admits before the first UDP packet; the requested packet fills Destination.
 	inspectionWireGuardAssertRow(t, clientUDP, virtualUDP, "wireguard-client")
-	inspectionWireGuardAssertRow(t, serverUDP, virtualUDP, "wireguard-server-direct")
-	if serverUDP.Source.Address != cnet.ParseAddress(inspectionWireGuardClientIP) {
-		t.Fatalf("WireGuard UDP virtual source: %v", serverUDP.Source)
-	}
-
-	inspectionWireGuardStop(t, serverView, serverUDP.Ref)
-	replacementPayload := []byte("WireGuard UDP after server exact stop")
-	inspectionSOCKSPacket(t, packet, relay, virtualUDP, replacementPayload, mask)
-	replacement := inspectionWireGuardRow(t, serverView, cnet.Network_UDP, uint64(len(replacementPayload)), uint64(len(replacementPayload)))
-	inspectionWireGuardAssertRow(t, replacement, virtualUDP, "wireguard-server-direct")
-	if replacement.Ref == serverUDP.Ref {
+	inspectionWireGuardStop(t, clientView, clientUDP.Ref)
+	control.Close()
+	replacementPayload := []byte("WireGuard UDP after client exact stop")
+	replacementControl, replacementPacket, replacementRelay := inspectionSOCKSAssociation(t, address)
+	defer replacementControl.Close()
+	inspectionSOCKSPacket(t, replacementPacket, replacementRelay, virtualUDP, replacementPayload, mask)
+	replacement := inspectionWireGuardRow(t, clientView, cnet.Network_UDP, uint64(len(replacementPayload)), uint64(len(replacementPayload)))
+	inspectionWireGuardAssertRow(t, replacement, virtualUDP, "wireguard-client")
+	if replacement.Ref == clientUDP.Ref {
 		t.Fatal("stopped WireGuard UDP owner was reused")
 	}
 
-	tcpExtraAfterServerStop := []byte("TCP sibling survives server UDP stop")
+	tcpExtraAfterServerStop := []byte("TCP sibling survives client UDP stop")
 	if _, err := sibling.Write(tcpExtraAfterServerStop); err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +279,7 @@ func TestFlowInspectionWireGuardTCPUDP(t *testing.T) {
 
 	want := uint64(len(firstPayload) + len(siblingPayload) + len(tcpExtra) + len(udpPayload) + len(replacementPayload) + len(tcpExtraAfterServerStop))
 	inspectionOutboundTotals(t, clientView, "wireguard-client", want)
-	inspectionOutboundTotals(t, serverView, "wireguard-server-direct", want)
+	assertNoDedicatedServerInspection(t, serverView)
 	control.Close()
 	sibling.Close()
 }

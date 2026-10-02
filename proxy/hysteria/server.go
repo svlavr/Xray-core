@@ -14,8 +14,6 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -27,7 +25,6 @@ type Server struct {
 	config        *ServerConfig
 	validator     *account.Validator
 	policyManager policy.Manager
-	stats         stats.Manager
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -55,7 +52,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		config:        config,
 		validator:     validator,
 		policyManager: p,
-		stats:         v.GetFeature(stats.ManagerType()).(stats.Manager),
 	}, nil
 }
 
@@ -126,16 +122,10 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			addr:   addr.NetAddr(),
 		}
 
-		link := &transport.Link{
+		return dispatcher.DispatchLink(ctx, *addr, &transport.Link{
 			Reader: reader,
 			Writer: writer,
-		}
-		var cleanup func()
-		ctx, cleanup = proxy.ObserveUDP(ctx, s.stats, conn, *addr, link)
-		if cleanup != nil {
-			defer cleanup()
-		}
-		return dispatcher.DispatchLink(ctx, *addr, link)
+		})
 	} else {
 		sessionPolicy := s.policyManager.ForLevel(inbound.User.Level)
 
@@ -164,12 +154,6 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			Email:  inbound.User.Email,
 		})
 		errors.LogInfo(ctx, "tunnelling request to ", dest)
-		var observation *session.LogicalObservation
-		var observationCleanup func()
-		ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, s.stats, conn, dest, net.Network_TCP)
-		if observationCleanup != nil {
-			defer observationCleanup()
-		}
 
 		bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 		err = WriteTCPResponse(bufferedWriter, true, "")
@@ -180,20 +164,10 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			return err
 		}
 
-		link := &transport.Link{
+		return dispatcher.DispatchLink(ctx, dest, &transport.Link{
 			Reader: buf.NewReader(conn),
 			Writer: bufferedWriter,
-		}
-		if observation != nil {
-			cursor := buf.NewInspectionReader(link.Reader, observation.Exchange, func() {})
-			link.Reader = cursor
-			link.Writer = buf.AttachWriterReceipt(link.Writer, observation.Exchange)
-			defer cursor.Interrupt()
-		}
-		if err := dispatcher.DispatchLink(ctx, dest, link); err != nil {
-			return err
-		}
-		return nil
+		})
 	}
 }
 

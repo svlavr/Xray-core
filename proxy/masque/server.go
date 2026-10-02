@@ -22,8 +22,6 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/wireguard"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -39,13 +37,12 @@ const (
 )
 
 type Server struct {
-	validator    *validator
-	dispatcher   routing.Dispatcher
-	statsManager stats.Manager
-	ctx          context.Context
-	tag          string
-	sniffing     session.SniffingRequest
-	mtu          int
+	validator  *validator
+	dispatcher routing.Dispatcher
+	ctx        context.Context
+	tag        string
+	sniffing   session.SniffingRequest
+	mtu        int
 
 	dev   tun.Device
 	pools []*addressPool
@@ -175,15 +172,14 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		validator:    users,
-		dispatcher:   v.GetFeature(routing.DispatcherType()).(routing.Dispatcher),
-		statsManager: v.GetFeature(stats.ManagerType()).(stats.Manager),
-		ctx:          core.ToBackgroundDetachedContext(ctx),
-		mtu:          mtu,
-		dev:          dev,
-		pools:        pools,
-		local:        local,
-		tunnels:      make(map[netip.Addr]*serverTunnel),
+		validator:  users,
+		dispatcher: v.GetFeature(routing.DispatcherType()).(routing.Dispatcher),
+		ctx:        core.ToBackgroundDetachedContext(ctx),
+		mtu:        mtu,
+		dev:        dev,
+		pools:      pools,
+		local:      local,
+		tunnels:    make(map[netip.Addr]*serverTunnel),
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		s.tag = inbound.Tag
@@ -540,19 +536,8 @@ func (s *Server) handleConnection(conn net.Conn, dest net.Destination) {
 	errors.LogInfo(ctx, "processing from ", source, " to ", dest)
 
 	link := &transport.Link{
-		Reader: buf.NewReader(conn),
+		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
 		Writer: buf.NewWriter(conn),
-	}
-	var finish func()
-	if dest.Network == net.Network_UDP {
-		ctx, finish = proxy.ObserveUDP(ctx, s.statsManager, conn, dest, link)
-	} else {
-		ctx, finish = proxy.ObserveTCP(ctx, s.statsManager, conn, dest, link)
-	}
-	if finish != nil {
-		defer finish()
-	} else {
-		link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 	}
 	if err := s.dispatcher.DispatchLink(ctx, dest, link); err != nil {
 		errors.LogError(ctx, errors.New("connection closed").Base(err))

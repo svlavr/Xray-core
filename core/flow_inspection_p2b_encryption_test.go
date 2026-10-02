@@ -6,7 +6,7 @@ import (
 
 func TestFlowInspectionP2BVLESSEncryption(t *testing.T) {
 	t.Run("TCP", func(t *testing.T) {
-		inspectionDecodedTCPReceiverAcceptance(t, inspectionVLESSEncryptedReceiver)
+		inspectionAppClientReceiverAcceptance(t, inspectionVLESSEncryptedReceiver)
 	})
 	t.Run("UDP", func(t *testing.T) {
 		t.Setenv("xray.cone.disabled", "true")

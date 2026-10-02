@@ -2,7 +2,6 @@ package encoding
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"strconv"
 	"sync"
@@ -47,52 +46,36 @@ func inspectionPacketFlow(t *testing.T) (fs.Exchange, fs.FlowInspection) {
 	return flow, view
 }
 
-func inspectionPacketFact(t *testing.T, view fs.FlowInspection) uint64 {
-	t.Helper()
-	live, err := view.ReadLive()
-	if err != nil || len(live.Rows) != 1 {
-		t.Fatalf("packet view: %+v %v", live, err)
-	}
-	return live.Rows[0].Downlink
-}
-
 func TestInspectionVLESSPacketPrefixResults(t *testing.T) {
 	for _, limit := range []int{-1, 0, 1, 2, 3, 7, 8, 11} {
 		t.Run(strconv.Itoa(limit), func(t *testing.T) {
-			flow, view := inspectionPacketFlow(t)
 			output := &inspectionPacketOutput{limit: limit, fail: io.ErrUnexpectedEOF}
 			buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: output})
 			buffered.Write([]byte{0, 0})
 			buffered.SetFlushNext()
 			native := NewMultiLengthPacketWriter(buffered)
-			writer := buf.AttachWriterReceipt(native, flow)
+			writer := native
 			mb := buf.MultiBuffer{buf.FromBytes([]byte("abc")), buf.FromBytes([]byte("de"))}
 			err := writer.WriteMultiBuffer(mb)
 			if (limit < 0) != (err == nil) {
 				t.Fatalf("lower result: %v", err)
 			}
-			fact := inspectionPacketFact(t, view)
-			known := uint64(5)
-			incomplete := false
-			if limit >= 0 {
-				known = 0
-				incomplete = true
-			}
-			if fact != known {
-				t.Fatalf("decoded operation result: %+v, want %d/%v", fact, known, incomplete)
+			for _, b := range mb {
+				if !b.IsEmpty() {
+					t.Fatal("input packet not released")
+				}
 			}
 		})
 	}
 }
 
 func TestInspectionVLESSPacketDropsAndAttachment(t *testing.T) {
-	flow, view := inspectionPacketFlow(t)
 	output := &inspectionPacketOutput{limit: -1}
 	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: output})
 	buffered.Write([]byte{0, 0})
 	native := NewMultiLengthPacketWriter(buffered)
 	buffered.SetFlushNext()
-	writer := buf.AttachWriterReceipt(native, flow)
+	writer := native
 	oversized := buf.New()
 	oversized.Extend(buf.Size)
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{oversized}); err != nil {
@@ -103,9 +86,6 @@ func TestInspectionVLESSPacketDropsAndAttachment(t *testing.T) {
 	}
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("ok"))}); err != nil {
 		t.Fatal(err)
-	}
-	if fact := inspectionPacketFact(t, view); fact != 2 {
-		t.Fatalf("drop/next packet: %+v", fact)
 	}
 	if output.Len() != 6 {
 		t.Fatalf("native header and packet shape: %d", output.Len())
@@ -123,29 +103,20 @@ func (w *inspectionBlockingPacketWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestInspectionVLESSPacketLateWriteAfterStop(t *testing.T) {
-	flow, view := inspectionPacketFlow(t)
+func TestInspectionVLESSPacketPendingWrite(t *testing.T) {
 	output := &inspectionBlockingPacketWriter{started: make(chan struct{}), release: make(chan struct{})}
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(output.release) }) })
 	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: output})
 	buffered.SetFlushNext()
-	writer := buf.AttachWriterReceipt(NewMultiLengthPacketWriter(buffered), flow)
+	writer := NewMultiLengthPacketWriter(buffered)
+	mb := buf.MultiBuffer{buf.FromBytes([]byte("late"))}
 	done := make(chan error, 1)
-	go func() { done <- writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("late"))}) }()
+	go func() { done <- writer.WriteMultiBuffer(mb) }()
 	select {
 	case <-output.started:
 	case <-time.After(3 * time.Second):
 		t.Fatal("write did not start")
-	}
-	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
-	if err != nil || out[0] != nil {
-		t.Fatalf("stop: %+v %v", out, err)
-	}
-	flow.Finish()
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("owner-end packet snapshot: %+v", page)
 	}
 	release.Do(func() { close(output.release) })
 	select {
@@ -154,19 +125,10 @@ func TestInspectionVLESSPacketLateWriteAfterStop(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("late write did not finish")
+		t.Fatal("write did not finish")
 	}
-	page, _ = view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("late packet result: %+v", page)
-	}
-	totals, _ := view.ReadTotals()
-	var known uint64
-	for _, total := range totals.Rows {
-		known += total.Downlink
-	}
-	if known != 4 {
-		t.Fatalf("late packet totals: %+v", totals)
+	if !mb[0].IsEmpty() {
+		t.Fatal("packet input not released")
 	}
 }
 

@@ -9,7 +9,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vless"
 	"google.golang.org/protobuf/proto"
@@ -93,12 +92,10 @@ func NewMultiLengthPacketWriter(writer buf.Writer) *MultiLengthPacketWriter {
 
 type MultiLengthPacketWriter struct {
 	buf.Writer
-	receipt stats.Exchange
 }
 
 func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer buf.ReleaseMulti(mb)
-	var payload uint64
 	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
 	for _, b := range mb {
 		length := b.Len()
@@ -119,25 +116,11 @@ func (w *MultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			continue
 		}
 		mb2Write = append(mb2Write, eb)
-		if w.receipt != nil {
-			payload += uint64(length)
-		}
 	}
 	if mb2Write.IsEmpty() {
 		return nil
 	}
-	err := w.Writer.WriteMultiBuffer(mb2Write)
-	if w.receipt != nil && err == nil && payload != 0 {
-		w.receipt.AddDownlink(payload)
-	}
-	return err
-}
-
-// WithWriterReceipt binds the decoded packet operation. The native encoder and
-// lower writer keep their batching and buffering behavior.
-func (w *MultiLengthPacketWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
-	w.receipt = flow
-	return w
+	return w.Writer.WriteMultiBuffer(mb2Write)
 }
 
 func NewLengthPacketWriter(writer io.Writer) *LengthPacketWriter {

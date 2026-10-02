@@ -6,7 +6,6 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
@@ -18,8 +17,6 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
@@ -28,7 +25,6 @@ type Server struct {
 	config        *ServerConfig
 	validator     *Validator
 	policyManager policy.Manager
-	statsManager  stats.Manager
 	cone          bool
 }
 
@@ -51,7 +47,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		config:        config,
 		validator:     validator,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		statsManager:  v.GetFeature(stats.ManagerType()).(stats.Manager),
 		cone:          ctx.Value("cone").(bool),
 	}
 
@@ -106,51 +101,34 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	}
 }
 
-func writeUDPResponse(ctx context.Context, conn stat.Connection, packet *udp_proto.Packet) {
-	var receipt stats.Exchange
-	if observation := session.LogicalObservationFromContext(ctx); observation != nil {
-		receipt = observation.Exchange
-	}
-	request := protocol.RequestHeaderFromContext(ctx)
-	payload := packet.Payload
-	n := uint64(payload.Len())
-	if request == nil {
-		payload.Release()
-		return
-	}
-
-	if payload.UDP != nil {
-		request = &protocol.RequestHeader{
-			User:    request.User,
-			Address: payload.UDP.Address,
-			Port:    payload.UDP.Port,
-		}
-	}
-
-	data, err := EncodeUDPPacket(request, payload.Bytes())
-	payload.Release()
-	if err != nil {
-		errors.LogWarningInner(ctx, err, "failed to encode UDP packet")
-		return
-	}
-
-	written, _ := conn.Write(data.Bytes())
-	proxy.RecordPacketWrite(receipt, n, int(data.Len()), written)
-	data.Release()
-}
-
 func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	store := proxy.ObservationStore(s.statsManager)
-	var flow stats.Exchange
 	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
-		writeUDPResponse(ctx, conn, packet)
-	})
-	defer func() {
-		udpServer.RemoveRay()
-		if flow != nil {
-			flow.Finish()
+		request := protocol.RequestHeaderFromContext(ctx)
+		payload := packet.Payload
+		if request == nil {
+			payload.Release()
+			return
 		}
-	}()
+
+		if payload.UDP != nil {
+			request = &protocol.RequestHeader{
+				User:    request.User,
+				Address: payload.UDP.Address,
+				Port:    payload.UDP.Port,
+			}
+		}
+
+		data, err := EncodeUDPPacket(request, payload.Bytes())
+		payload.Release()
+		if err != nil {
+			errors.LogWarningInner(ctx, err, "failed to encode UDP packet")
+			return
+		}
+
+		conn.Write(data.Bytes())
+		data.Release()
+	})
+	defer udpServer.RemoveRay()
 
 	inbound := session.InboundFromContext(ctx)
 	var dest *net.Destination
@@ -192,14 +170,6 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			}
 
 			destination := request.Destination()
-			if flow == nil && store != nil {
-				var cancel context.CancelFunc
-				ctx, flow, cancel = proxy.BeginObservedEndpoint(ctx, store, conn, destination, net.Network_UDP)
-				if flow != nil {
-					udpServer.Observation = flow
-					defer cancel()
-				}
-			}
 
 			currentPacketCtx := ctx
 			if inbound.Source.IsValid() {
@@ -267,10 +237,6 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 
 	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
-	ctx, observation, cleanup := proxy.BeginReturnedObservation(ctx, s.statsManager, conn, dest, net.Network_TCP)
-	if cleanup != nil {
-		defer cleanup()
-	}
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return err
@@ -280,16 +246,10 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
+		defer buf.DiscardBufferedWriter(bufferedWriter)
 		responseWriter, err := WriteTCPResponse(request, bufferedWriter)
 		if err != nil {
 			return errors.New("failed to write response").Base(err)
-		}
-		if observation != nil {
-			var finish func()
-			responseWriter, finish = crypto.ObserveAuthenticationWriter(responseWriter, observation.Exchange)
-			if finish != nil {
-				defer finish() // Native SS has no final flush on early failure.
-			}
 		}
 
 		{
@@ -315,11 +275,6 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 
 	requestDone := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		if observation != nil {
-			cursor := buf.NewInspectionReader(bodyReader, observation.Exchange, func() {})
-			defer cursor.Interrupt()
-			bodyReader = cursor
-		}
 
 		if err := buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to transport all TCP request").Base(err)

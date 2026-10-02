@@ -415,10 +415,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 			ctx, cancel := context.WithCancel(ctx)
 			timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
 			ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
-			ctx, fallbackReader, observation, cleanup := proxy.ObserveFallback(ctx, h.stats, connection, fb.Type, fb.Dest, reader)
-			if cleanup != nil {
-				defer cleanup()
-			}
 
 			var conn net.Conn
 			if err := retry.ExponentialBackoff(5, 100).On(func() error {
@@ -492,16 +488,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 						return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err)
 					}
 				}
-				if err := buf.Copy(fallbackReader, serverWriter, buf.UpdateActivity(timer)); err != nil {
+				if err := buf.Copy(reader, serverWriter, buf.UpdateActivity(timer)); err != nil {
 					return errors.New("failed to fallback request payload").Base(err)
 				}
 				return nil
 			}
 
 			writer := buf.NewWriter(connection)
-			if observation != nil {
-				writer = buf.AttachWriterReceipt(writer, observation)
-			}
 
 			getResponse := func() error {
 				defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
@@ -545,19 +538,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
 
 	account := request.User.Account.(*vless.MemoryAccount)
-	ordinary := request.Command == protocol.RequestCommandTCP || request.Command == protocol.RequestCommandUDP
-	var observation *session.LogicalObservation
-	var observationCleanup func()
-	if ordinary {
-		kind := net.Network_TCP
-		if request.Command == protocol.RequestCommandUDP {
-			kind = net.Network_UDP
-		}
-		ctx, observation, observationCleanup = proxy.BeginSuppliedObservation(ctx, h.stats, connection, request.Destination(), kind)
-		if observationCleanup != nil {
-			defer observationCleanup()
-		}
-	}
 
 	if account.Reverse != nil && request.Command != protocol.RequestCommandRvs {
 		return errors.New("for safety reasons, user " + account.ID.String() + " is not allowed to use forward proxy")
@@ -652,15 +632,6 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 
 	link := &transport.Link{Reader: clientReader, Writer: clientWriter}
-	if observation != nil && (requestAddons.Flow == "" || request.Command == protocol.RequestCommandTCP && requestAddons.Flow == vless.XRV) {
-		cursor := buf.NewInspectionReader(link.Reader, observation.Exchange, func() {})
-		if request.Command == protocol.RequestCommandUDP {
-			cursor.PacketDestination = request.Destination()
-		}
-		link.Reader = cursor
-		link.Writer = buf.AttachWriterReceipt(link.Writer, observation.Exchange)
-		defer cursor.Interrupt()
-	}
 	if err := dispatch.DispatchLink(ctx, request.Destination(), link); err != nil {
 		return errors.New("failed to dispatch request").Base(err)
 	}

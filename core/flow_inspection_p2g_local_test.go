@@ -281,15 +281,7 @@ func TestFlowInspectionP2GVLESSDecodedRejectionBeforeResponse(t *testing.T) {
 	if err == nil {
 		t.Fatal("VLESS XRV UDP request unexpectedly succeeded")
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1
-	})
-	page, _ := view.ReadTerminals()
-	row := page.Rows[0]
-	if row.Flow.Destination != request.Destination() || row.Flow.Outbound.Serial != 0 || row.Flow.Uplink != 0 || row.Flow.Downlink != 0 {
-		t.Fatalf("VLESS pre-response rejection: %+v", row)
-	}
+	assertNoDedicatedServerInspection(t, view)
 }
 
 func TestFlowInspectionP2GHysteriaResponsePreparationFailure(t *testing.T) {
@@ -306,15 +298,7 @@ func TestFlowInspectionP2GHysteriaResponsePreparationFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("Hysteria response preparation unexpectedly succeeded")
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1
-	})
-	page, _ := view.ReadTerminals()
-	row := page.Rows[0]
-	if row.Flow.Outbound.Serial != 0 || row.Flow.Uplink != 0 || row.Flow.Downlink != 0 {
-		t.Fatalf("Hysteria pre-response rejection: %+v", row)
-	}
+	assertNoDedicatedServerInspection(t, view)
 }
 
 func TestFlowInspectionP2GNaturalEOF(t *testing.T) {
@@ -326,11 +310,12 @@ func TestFlowInspectionP2GNaturalEOF(t *testing.T) {
 		{name: "Trojan", receiver: inspectionTrojanReceiver},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, view, outbound := test.receiver(t, true, false)
-			_, _, address := inspectionTCPOutboundThrough(t, false, outbound)
+			_, remote, outbound := test.receiver(t, true, false)
+			_, view, address := inspectionTCPOutboundThrough(t, true, outbound)
 			destination := startOutboundStatsTCPServer(t)
 			payload := bytes.Repeat([]byte("natural-eof"), 128)
 			client := inspectionSOCKS(t, address, destination, payload)
+			assertNoDedicatedServerInspection(t, remote)
 			client.Close()
 			inspectionWait(t, func() bool {
 				page, _ := view.ReadTerminals()

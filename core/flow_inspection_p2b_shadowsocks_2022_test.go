@@ -1,10 +1,7 @@
 package core_test
 
 import (
-	"context"
 	"testing"
-
-	fout "github.com/xtls/xray-core/features/outbound"
 )
 
 func TestFlowInspectionP2BShadowsocks2022TCP(t *testing.T) {
@@ -16,30 +13,8 @@ func TestFlowInspectionP2BShadowsocks2022TCP(t *testing.T) {
 		{"multi", inspectionShadowsocks2022MultiReceiver},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			inspectionDecodedTCPReceiverAcceptanceMode(t, test.receiver, true)
-			t.Run("rejected", func(t *testing.T) {
-				receiving, view, outbound := test.receiver(t, true, true)
-				if err := receiving.GetFeature(fout.ManagerType()).(fout.Manager).RemoveHandler(context.Background(), "direct"); err != nil {
-					t.Fatal(err)
-				}
-				_, _, address := inspectionTCPOutboundThrough(t, false, outbound)
-				payload := []byte("GET / HTTP/1.1\r\nHost: rejected.invalid\r\n\r\n")
-				client := inspectionSOCKS(t, address, startOutboundStatsTCPServer(t), nil)
-				if _, err := client.Write(payload); err != nil {
-					t.Fatal(err)
-				}
-				inspectionWait(t, func() bool {
-					page, err := view.ReadTerminals()
-					if err != nil || len(page.Rows) != 1 {
-						return false
-					}
-					row := page.Rows[0]
-					if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Serial != 0 {
-						t.Fatalf("SS2022 rejected admission: %+v", row)
-					}
-					return true
-				})
-			})
+			inspectionAppClientReceiverAcceptance(t, test.receiver)
+			t.Run("rejected", func(t *testing.T) { inspectionAppClientRejectedReceiver(t, test.receiver) })
 			t.Run("mux-child", func(t *testing.T) {
 				_, view, outbound := test.receiver(t, true, false)
 				inspectionEnableOutboundMux(t, outbound)

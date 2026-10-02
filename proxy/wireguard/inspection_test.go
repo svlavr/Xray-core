@@ -38,15 +38,6 @@ func TestInspectionUDPLargePacketAndDestination(t *testing.T) {
 }
 
 func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
-	manager := new(appstats.Manager)
-	view, err := manager.EnableInspection(fs.ObservationOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer manager.Close()
-	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
 	entered, release := make(chan struct{}), make(chan struct{})
 	dst := net.UDPDestination(net.LocalHostIP, 53)
 	alternate := net.UDPDestination(net.LocalHostIP, 5353)
@@ -67,9 +58,12 @@ func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
 		return nil
 	}
 	c := &udpConn{writeFunc: write, dst: dst}
-	writer := c.WithWriterReceipt(flow)
+	writer := c
 	done := make(chan error, 1)
-	first, second, tail := buf.FromBytes([]byte("ok")), buf.FromBytes([]byte("fail")), buf.FromBytes([]byte("tail"))
+	first, second, tail := buf.New(), buf.New(), buf.New()
+	first.WriteString("ok")
+	second.WriteString("fail")
+	tail.WriteString("tail")
 	second.UDP = &alternate
 	go func() { done <- writer.WriteMultiBuffer(buf.MultiBuffer{first, second, tail, buf.FromBytes(nil)}) }()
 	select {
@@ -78,35 +72,17 @@ func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
 		close(release)
 		t.Fatal("native write did not start")
 	}
-	flow.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 2 {
-		t.Errorf("owner-end write snapshot: %+v %v", page, err)
-	}
 	close(release)
 	if err := <-done; !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
-		t.Fatalf("terminal: %+v %v", page, err)
+	if calls != 2 {
+		t.Fatalf("native partial result: calls=%d", calls)
 	}
-	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact != 2 {
-		t.Fatalf("native partial result: calls=%d fact=%+v", calls, fact)
-	}
-	totals, _ := view.ReadTotals()
-	var found bool
-	for _, total := range totals.Rows {
-		if total.Outbound.Serial == 1 && total.Origin == fs.TrafficOriginUser {
-			found = true
-			if total.Downlink != 2 {
-				t.Fatalf("native partial total: %+v", total)
-			}
+	for _, b := range []*buf.Buffer{first, second, tail} {
+		if !b.IsEmpty() {
+			t.Fatal("native packet input not released")
 		}
-	}
-	if !found {
-		t.Fatalf("native partial total missing: %+v", totals)
 	}
 }
 
