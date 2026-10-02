@@ -17,7 +17,6 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	fs "github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 )
 

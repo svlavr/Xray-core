@@ -2,11 +2,13 @@ package shadowsocks_2022
 
 import (
 	"context"
+	"maps"
 	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -130,3 +132,36 @@ var (
 	ErrNoPadding         = errors.New("bad request: missing payload or padding")
 	ErrInvalidRequest    = errors.New("invalid request")
 )
+
+func packetContext(ctx context.Context, conn net.Conn) context.Context {
+	if owner, ok := conn.(interface {
+		PacketContext(context.Context) context.Context
+	}); ok {
+		return owner.PacketContext(ctx)
+	}
+	return ctx
+}
+
+// Native UDP sessions mutate routing metadata independently of their listener.
+func packetSessionContext(ctx context.Context) context.Context {
+	if original := session.InboundFromContext(ctx); original != nil {
+		inbound := *original
+		ctx = session.ContextWithInbound(ctx, &inbound)
+	}
+	if original := session.OutboundsFromContext(ctx); original != nil {
+		outbounds := make([]*session.Outbound, len(original))
+		for idx, outbound := range original {
+			if outbound != nil {
+				copy := *outbound
+				outbounds[idx] = &copy
+			}
+		}
+		ctx = session.ContextWithOutbounds(ctx, outbounds)
+	}
+	if original := session.ContentFromContext(ctx); original != nil {
+		content := *original
+		content.Attributes = maps.Clone(original.Attributes)
+		ctx = session.ContextWithContent(ctx, &content)
+	}
+	return ctx
+}

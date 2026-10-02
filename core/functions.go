@@ -3,12 +3,15 @@ package core
 import (
 	"bytes"
 	"context"
+	go_errors "errors"
+	"fmt"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
@@ -112,4 +115,20 @@ func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
 	}
 	observation.attach(conn)
 	return &inspectedAPIPacketConn{PacketConn: conn, observation: observation}, nil
+}
+
+// EnableFlowInspection enables the optional in-process observation capability.
+// Enablement is intentionally limited to the interval before Instance.Start.
+func EnableFlowInspection(instance *Instance, options stats.ObservationOptions) (stats.FlowInspection, error) {
+	instance.statusLock.Lock()
+	defer instance.statusLock.Unlock()
+	if instance.running {
+		return nil, fmt.Errorf("inspection enablement is too late")
+	}
+	feature := instance.GetFeature(stats.ManagerType())
+	provider, ok := feature.(stats.ObservationProvider)
+	if !ok {
+		return nil, go_errors.ErrUnsupported
+	}
+	return provider.EnableInspection(options)
 }

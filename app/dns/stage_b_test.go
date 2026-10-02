@@ -1020,7 +1020,7 @@ func TestTrackedDoHCloseJoinAndRetirement(t *testing.T) {
 		left, right := stdnet.Pipe()
 		defer right.Close()
 		server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0)}
-		conn, ok := server.lifetime.trackConnection(server.cacheController, left)
+		conn, ok := server.trackConnection(left)
 		if !ok {
 			t.Fatal("initial connection rejected")
 		}
@@ -1033,9 +1033,9 @@ func TestTrackedDoHCloseJoinAndRetirement(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		server.lifetime.mu.Lock()
-		remaining := len(server.lifetime.connections)
-		server.lifetime.mu.Unlock()
+		server.mu.Lock()
+		remaining := len(server.connections)
+		server.mu.Unlock()
 		if remaining != 0 {
 			t.Fatal("closed connection retained")
 		}
@@ -1066,16 +1066,16 @@ func TestDoHCloseCaptureLateDialPublication(t *testing.T) {
 	defer right.Close()
 	lower := &scriptedCloseConn{Conn: left}
 	server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0), httpClient: &http.Client{Transport: &http2.Transport{}}}
-	if !server.lifetime.beginDial(server.cacheController) {
+	if !server.beginDial() {
 		t.Fatal("dial rejected before close")
 	}
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- server.Close() }()
 	<-server.cacheController.ctx.Done()
-	if _, accepted := server.lifetime.trackConnection(server.cacheController, lower); accepted {
+	if _, accepted := server.trackConnection(lower); accepted {
 		t.Fatal("late DoH connection accepted")
 	}
-	server.lifetime.dialing.Done()
+	server.dialing.Done()
 	if err := <-closeDone; err != nil {
 		t.Fatal(err)
 	}
@@ -1170,21 +1170,20 @@ func TestDoHRejectedConnectionCloseFailureRetires(t *testing.T) {
 	defer right.Close()
 	lower := &scriptedCloseConn{Conn: left, errs: []error{failure}}
 	server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0)}
-	cache, lifetime, closeServer := server.cacheController, &server.lifetime, server.Close
-	cache.cancel()
-	tracked, accepted := lifetime.trackConnection(cache, lower)
+	server.cacheController.cancel()
+	tracked, accepted := server.trackConnection(lower)
 	if accepted {
 		t.Fatal("connection accepted after cancellation")
 	}
 	if err := tracked.Close(); !go_errors.Is(err, failure) {
 		t.Fatalf("rejected connection close: %v", err)
 	}
-	if err := closeServer(); err != nil {
+	if err := server.Close(); err != nil {
 		t.Fatalf("owner close retried terminal connection: %v", err)
 	}
-	lifetime.mu.Lock()
-	remaining := len(lifetime.connections)
-	lifetime.mu.Unlock()
+	server.mu.Lock()
+	remaining := len(server.connections)
+	server.mu.Unlock()
 	if remaining != 0 || lower.callCount() != 1 {
 		t.Fatalf("terminal connection retained=%d closes=%d", remaining, lower.callCount())
 	}
@@ -1256,7 +1255,7 @@ func TestDoHResourceCloseRejectsLateConnectionPublication(t *testing.T) {
 		httpClient:      &http.Client{Transport: &http2.Transport{}},
 	}
 	client, peer := stdnet.Pipe()
-	tracked, ok := server.lifetime.trackConnection(server.cacheController, client)
+	tracked, ok := server.trackConnection(client)
 	if !ok {
 		t.Fatal("initial connection was rejected")
 	}
@@ -1270,7 +1269,7 @@ func TestDoHResourceCloseRejectsLateConnectionPublication(t *testing.T) {
 	late, latePeer := stdnet.Pipe()
 	defer late.Close()
 	defer latePeer.Close()
-	if _, ok := server.lifetime.trackConnection(server.cacheController, late); ok {
+	if _, ok := server.trackConnection(late); ok {
 		t.Fatal("late connection published after close")
 	}
 	_ = tracked.Close()

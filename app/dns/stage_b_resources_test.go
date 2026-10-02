@@ -323,9 +323,9 @@ func TestStageBDoHPooledSiblingCancellation(t *testing.T) {
 	if err := server.Close(); err != nil {
 		t.Fatal(err)
 	}
-	server.lifetime.mu.Lock()
-	remaining := len(server.lifetime.connections)
-	server.lifetime.mu.Unlock()
+	server.mu.Lock()
+	remaining := len(server.connections)
+	server.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("whole nameserver close retained %d connections", remaining)
 	}
