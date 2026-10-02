@@ -32,7 +32,7 @@ func inspectionOnlyMuxFlow(t *testing.T, view fs.FlowInspection, conn net.Conn, 
 			return false
 		}
 		r := live.Rows[0]
-		if r.Destination != destination || r.Outbound.Tag != tag || r.Outbound.Serial == 0 || r.Origin != fs.TrafficOriginUser {
+		if r.Destination != destination || r.Outbound.Tag != tag || r.Outbound.Tag == "" || r.Origin != fs.TrafficOriginUser {
 			t.Fatalf("MUX logical owner: %+v", r)
 		}
 		ref = r.Ref

@@ -13,7 +13,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	fs "github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 )
 
@@ -74,8 +73,7 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 	}
 	defer manager.Close()
 	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{Tag: "direct"})
 	entered, release := make(chan struct{}), make(chan struct{})
 	dst := net.UDPDestination(net.LocalHostIP, 53)
 	alternate := net.UDPDestination(net.LocalHostIP, 5353)
@@ -135,7 +133,7 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 	totals, _ := view.ReadTotals()
 	var found bool
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 1 && row.Origin == fs.TrafficOriginUser {
+		if row.Outbound.Tag == "direct" && row.Origin == fs.TrafficOriginUser {
 			found = true
 			if row.Downlink != 2 {
 				t.Fatalf("native partial total: %+v", row)
@@ -155,8 +153,7 @@ type inspectionDispatcher struct {
 
 func (d *inspectionDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
 	if observation := session.LogicalObservationFromContext(ctx); observation != nil {
-		observation.Exchange.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-		proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
+		observation.Exchange.Route(fs.OutboundRef{Tag: "direct"})
 	}
 	if d.entered != nil {
 		d.entered <- ctx
@@ -273,8 +270,7 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 	}
 	defer manager.Close()
 	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, func() error { return nil })
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{Tag: "direct"})
 	entered, release := make(chan struct{}), make(chan struct{})
 	calls := 0
 	c := &udpConn{handler: newUdpConnectionHandler(nil, func([]byte, net.Destination, net.Destination) error {

@@ -55,16 +55,14 @@ func TestInspectionDestinationFollowsPacketsNotRouteCompletion(t *testing.T) {
 	older.AddUplink(3)
 	newer.PacketDestination(last)
 	newer.AddUplink(5)
-	newer.Route(featurestats.OutboundRef{Serial: 2, Tag: "newer"})
-	newer.BindRoute()
-	older.Route(featurestats.OutboundRef{Serial: 1, Tag: "older"})
-	older.BindRoute()
+	newer.Route(featurestats.OutboundRef{Tag: "newer"})
+	older.Route(featurestats.OutboundRef{Tag: "older"})
 	live, err := store.ReadLive()
 	if err != nil || len(live.Rows) != 1 || live.Rows[0].Destination != last || live.Rows[0].Uplink != 8 {
 		t.Fatalf("packet order changed by delayed route: %+v %v", live, err)
 	}
 	totals, _ := store.ReadTotals()
-	if findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Uplink != 3 || findTotal(t, totals.Rows, 2, featurestats.TrafficOriginUser).Uplink != 5 {
+	if findTotal(t, totals.Rows, "older", featurestats.TrafficOriginUser).Uplink != 3 || findTotal(t, totals.Rows, "newer", featurestats.TrafficOriginUser).Uplink != 5 {
 		t.Fatalf("per-leg byte attribution changed: %+v", totals)
 	}
 }

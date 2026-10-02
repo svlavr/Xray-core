@@ -158,13 +158,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var conn stat.Connection
 	target := ob.Target
 	account := rec.User.Account.(*vless.MemoryAccount)
-	ordinaryTarget := target.Network == net.Network_TCP || target.Network == net.Network_UDP
-	if target.Address.Family().IsDomain() {
-		domain := target.Address.Domain()
-		ordinaryTarget = ordinaryTarget && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
-	}
-	vision := account.Flow == vless.XRV || account.Flow == vless.XRV+"-udp443"
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget && (account.Flow == "" || vision))
 
 	if h.testpre > 0 && h.reverse == nil {
 		h.initpre.Do(func() {

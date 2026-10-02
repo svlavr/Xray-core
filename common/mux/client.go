@@ -32,7 +32,6 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 		worker, err := m.Picker.PickAvailable()
 		if err != nil {
 			// Failure before child launch owns no asynchronous work.
-			proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 			return err
 		}
 		if worker.Dispatch(ctx, link) {
@@ -40,7 +39,6 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 		}
 	}
 
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 	return errors.New("unable to find an available mux client")
 }
 
@@ -321,7 +319,7 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	if outbounds := session.OutboundsFromContext(ctx); outbounds[len(outbounds)-1].Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
 	}
-	if observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, true); observation != nil {
+	if observation := proxy.ObservedEndpoint(ctx, link.Reader, true); observation != nil {
 		s.inspection = observation.Exchange
 	}
 	if m.sessionManager.allocate(&m.strategy, s) == nil {

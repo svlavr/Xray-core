@@ -73,7 +73,7 @@ func controlOpen(t *testing.T, instance *core.Instance, view fs.FlowInspection, 
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
-			if !known[row.Ref] && row.Outbound.Serial != 0 && row.Downlink > 0 {
+			if !known[row.Ref] && row.Outbound.Tag != "" && row.Downlink > 0 {
 				found = row
 				return true
 			}
@@ -92,7 +92,7 @@ func controlRule(target string, network net.Network) *router.Config {
 
 func controlRoute(t *testing.T, row fs.FlowRecord, tag string) {
 	t.Helper()
-	if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != tag || row.Outbound.Serial == 0 {
+	if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != tag || row.Outbound.Tag == "" {
 		t.Fatalf("unexpected route: %+v", row)
 	}
 }
@@ -306,8 +306,8 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 	}
 	newConn, newRow := controlOpen(t, instance, view, original)
 	controlRoute(t, newRow, "p3-dynamic")
-	if newRow.Outbound.Serial == oldRow.Outbound.Serial {
-		t.Fatal("tag reuse reused the old incarnation")
+	if newRow.Outbound.Tag != oldRow.Outbound.Tag {
+		t.Fatal("tag reuse changed the cumulative series key")
 	}
 	if newRow.Destination != original || redirectedBytes.Load() == 0 {
 		t.Fatalf("redirect facts: %+v", newRow)
@@ -339,7 +339,7 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 	controlRoute(t, terminals.Rows[0].Flow, "p3-block")
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{oldRow.Ref})
 	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
-		t.Fatalf("old incarnation exact stop: %+v %v", outcomes, err)
+		t.Fatalf("captured old-flow exact stop: %+v %v", outcomes, err)
 	}
 	controlExchange(t, newConn, net.Network_TCP)
 }
@@ -362,9 +362,9 @@ func TestControlStatsP3NativeDuplicateFailureSideEffect(t *testing.T) {
 	if err := core.AddOutboundHandler(instance, inspectionFreedom("p3-dynamic")); err == nil {
 		t.Fatal("duplicate add succeeded")
 	}
-	rejectedDefault, id := m.(fout.HandlerResolver).ResolveHandler("", true)
-	if rejectedDefault == nil || rejectedDefault == tagged || id != 0 || m.GetHandler("p3-dynamic") != tagged {
-		t.Fatalf("native failed-add readback: default=%v serial=%d tagged=%v", rejectedDefault, id, m.GetHandler("p3-dynamic"))
+	rejectedDefault := m.GetDefaultHandler()
+	if rejectedDefault == nil || rejectedDefault == tagged || m.GetHandler("p3-dynamic") != tagged {
+		t.Fatalf("native failed-add readback: default=%v tagged=%v", rejectedDefault, m.GetHandler("p3-dynamic"))
 	}
 	// The rejected default is not in the manager's close inventory.
 	t.Cleanup(func() { rejectedDefault.Close() })

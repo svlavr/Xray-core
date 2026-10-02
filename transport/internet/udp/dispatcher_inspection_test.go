@@ -3,6 +3,7 @@ package udp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -74,8 +75,7 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 		go func() {
 			defer close(selectedDone)
 			<-roleSelected
-			observation.Exchange.Route(fs.OutboundRef{Serial: 41, Tag: "ordinary"})
-			observation.Exchange.BindRoute()
+			observation.Exchange.Route(fs.OutboundRef{Tag: "ordinary"})
 			observation.Exchange.(interface{ FinishSelectedLeg() }).FinishSelectedLeg()
 		}()
 		return &transport.Link{Reader: reader, Writer: inspectionDiscardWriter{}}, nil
@@ -96,7 +96,7 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	}
 	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
-		if total.Outbound.Serial == 41 {
+		if total.Outbound.Tag == "ordinary" {
 			if total.Uplink != uint64(len("pending input")) || total.Downlink != 0 {
 				t.Fatalf("late ordinary total: %+v", total)
 			}
@@ -126,12 +126,12 @@ func TestUDPDispatcherInspectionSynchronousRejection(t *testing.T) {
 	d.RemoveRay()
 	root.Finish()
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != want || page.Rows[0].Flow.Downlink != 0 || page.Rows[0].Flow.Outbound.Serial != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != want || page.Rows[0].Flow.Downlink != 0 || page.Rows[0].Flow.Outbound.Tag != "" {
 		t.Fatalf("synchronous rejection lost decoded custody: %+v", page.Rows)
 	}
 	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
-		if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 && (total.Uplink != want) {
+		if total.Origin == fs.TrafficOriginUser && total.Outbound.Tag == "" && (total.Uplink != want) {
 			t.Fatalf("rejected unassigned total: %+v", total)
 		}
 	}
@@ -149,17 +149,16 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 	t.Cleanup(func() { manager.Close() })
 	dest := net.UDPDestination(net.LocalHostIP, 53)
 	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, dest, nil)
-	var serial uint64
+	var rayCount uint64
 	var outputs []*pipe.Writer
 	firstStarted, releaseFirst, firstDone, secondDone := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
 	d := NewDispatcher(lifecycleDispatcher{dispatch: func(ctx context.Context, _ net.Destination) (*transport.Link, error) {
-		serial++
+		rayCount++
 		observation := session.LogicalObservationFromContext(ctx)
 		if observation == nil || !observation.ReturnedLink.CompareAndSwap(true, false) {
 			t.Fatal("missing fresh ray claim")
 		}
-		observation.Exchange.Route(fs.OutboundRef{Serial: serial})
-		observation.Exchange.BindRoute()
+		observation.Exchange.Route(fs.OutboundRef{Tag: fmt.Sprintf("ray-%d", rayCount)})
 		r, w := pipe.New()
 		t.Cleanup(r.Interrupt)
 		t.Cleanup(w.Interrupt)
@@ -186,7 +185,7 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 	lifecycleWait(t, firstStarted)
 	old.Close()
 	d.Dispatch(context.Background(), dest, buf.FromBytes([]byte("new input")))
-	if d.conn == old || serial != 2 {
+	if d.conn == old || rayCount != 2 {
 		t.Fatal("did not replace retired native ray")
 	}
 	old.Close() // A stale close must leave the new entry intact.
@@ -202,12 +201,12 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 	lifecycleWait(t, firstDone)
 	page, _ = view.ReadTerminals()
 	row := page.Rows[0].Flow
-	if row.Ref != root.Ref() || row.Uplink != 18 || row.Downlink != 12 || row.Outbound.Serial != 2 {
+	if row.Ref != root.Ref() || row.Uplink != 18 || row.Downlink != 12 || row.Outbound.Tag != "ray-2" {
 		t.Fatalf("overlapping ray facts: %+v", row)
 	}
 	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
-		if total.Outbound.Serial != 0 && (total.Uplink != 9 || total.Downlink != 12) {
+		if total.Outbound.Tag != "" && (total.Uplink != 9 || total.Downlink != 12) {
 			t.Fatalf("late callback moved buckets: %+v", total)
 		}
 	}
@@ -233,7 +232,7 @@ func TestUDPDispatcherInspectionUnclaimedOwner(t *testing.T) {
 	root.Finish()
 	lifecycleWait(t, done)
 	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "" {
 		t.Fatalf("unclaimed owner snapshot: %+v", page)
 	}
 }
@@ -261,8 +260,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 		if observation == nil || !observation.InputAtExecution || !observation.ReturnedLink.CompareAndSwap(true, false) {
 			t.Fatal("API ray did not retain execution-consumption custody")
 		}
-		observation.Exchange.Route(fs.OutboundRef{Serial: 17, Tag: "api"})
-		observation.Exchange.BindRoute()
+		observation.Exchange.Route(fs.OutboundRef{Tag: "api"})
 		uplinkReader, uplinkWriter := pipe.New()
 		downlinkReader, downlinkWriter := pipe.New()
 		input = buf.NewInspectionReader(&buf.BufferedReader{Reader: uplinkReader}, observation.Exchange, uplinkReader.Interrupt)
@@ -306,7 +304,7 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.Destination != destination || flow.Outbound.Serial != 17 {
+			if flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.Destination != destination || flow.Outbound.Tag != "api" {
 				t.Fatalf("API dispatcher facts: %+v", flow)
 			}
 			return
@@ -332,8 +330,7 @@ func TestInspectionDispatcherAPINaturalEndDrainsBeforeFinish(t *testing.T) {
 		if observation == nil || !observation.ReturnedLink.CompareAndSwap(true, false) {
 			t.Fatal("missing API ray observation")
 		}
-		observation.Exchange.Route(fs.OutboundRef{Serial: 23, Tag: "api"})
-		observation.Exchange.BindRoute()
+		observation.Exchange.Route(fs.OutboundRef{Tag: "api"})
 		downlinkReader, downlinkWriter := pipe.New()
 		response = downlinkWriter
 		return &transport.Link{Reader: downlinkReader, Writer: inspectionDiscardWriter{}}, nil
@@ -393,8 +390,7 @@ func TestInspectionDispatcherAPIExplicitCloseDrainsCache(t *testing.T) {
 	}
 	c := packetConn.(*dispatcherConn)
 	leg := root.NewLeg()
-	leg.Route(fs.OutboundRef{Serial: 29, Tag: "api"})
-	leg.BindRoute()
+	leg.Route(fs.OutboundRef{Tag: "api"})
 	callbackCtx := session.ContextWithLogicalObservation(context.Background(), &session.LogicalObservation{Exchange: leg})
 	buffers := make([]*buf.Buffer, cap(c.cache))
 	for i := range buffers {
@@ -438,8 +434,7 @@ func TestInspectionDispatcherAPIReadCloseSamePacket(t *testing.T) {
 	}
 	c := packetConn.(*dispatcherConn)
 	leg := root.NewLeg()
-	leg.Route(fs.OutboundRef{Serial: 31, Tag: "api"})
-	leg.BindRoute()
+	leg.Route(fs.OutboundRef{Tag: "api"})
 	payload := buf.New()
 	payload.WriteString("racing response")
 	c.callback(session.ContextWithLogicalObservation(context.Background(), &session.LogicalObservation{Exchange: leg}), &protocoludp.Packet{Payload: payload, Source: net.UDPDestination(net.LocalHostIP, 53)})
@@ -532,7 +527,7 @@ func TestInspectionDispatcherAPIUnclaimedEndReconcilesBeforeEOF(t *testing.T) {
 		t.Fatal("unclaimed ray did not retire")
 	}
 	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 0 {
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "" {
 		t.Fatalf("unclaimed root terminal: %+v %v", page.Rows, err)
 	}
 }

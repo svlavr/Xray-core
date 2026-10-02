@@ -49,7 +49,7 @@ func blackholeInspection(t *testing.T, link *transport.Link, network cnet.Networ
 	}
 	ctx, finish := observe(ctx, manager, conn, dest, link)
 	t.Cleanup(finish)
-	session.LogicalObservationFromContext(ctx).Exchange.Route(fs.OutboundRef{Serial: 1, Tag: "block"})
+	session.LogicalObservationFromContext(ctx).Exchange.Route(fs.OutboundRef{Tag: "block"})
 	return ctx, view, finish
 }
 
@@ -125,7 +125,7 @@ func TestInspectionBlackholePendingReadOwnerEnd(t *testing.T) {
 	}
 }
 
-func TestInspectionBlackholeDoesNotClaimInheritedContext(t *testing.T) {
+func TestInspectionBlackholeInheritedContextLeavesEndpointUnchanged(t *testing.T) {
 	for _, network := range []cnet.Network{cnet.Network_TCP, cnet.Network_UDP} {
 		link := &transport.Link{Reader: buf.NewReader(strings.NewReader("")), Writer: &buf.SequentialWriter{Writer: io.Discard}}
 		ctx, view, finish := blackholeInspection(t, link, network)
@@ -142,16 +142,12 @@ func TestInspectionBlackholeDoesNotClaimInheritedContext(t *testing.T) {
 			t.Fatal(err)
 		}
 		live, _ := view.ReadLive()
-		wantLive := 0
-		if network == cnet.Network_UDP {
-			wantLive = 1
-		}
-		if len(live.Rows) != wantLive || wantLive == 1 && live.Rows[0].Outbound.Serial != 1 {
+		if len(live.Rows) != 1 || live.Rows[0].Outbound.Tag != "block" || live.Rows[0].Uplink != 0 {
 			t.Fatalf("claimed an inherited-only endpoint: %+v", live)
 		}
 		finish()
 		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 1 {
+		if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "block" {
 			t.Fatalf("missing owner snapshot: %+v", page)
 		}
 		totals, err := view.ReadTotals()
@@ -159,8 +155,8 @@ func TestInspectionBlackholeDoesNotClaimInheritedContext(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, total := range totals.Rows {
-			if total.Outbound.Serial != 0 {
-				t.Fatalf("inherited endpoint acquired bucket: %+v", total)
+			if total.Uplink != 0 || total.Downlink != 0 {
+				t.Fatalf("inherited endpoint changed byte facts: %+v", total)
 			}
 		}
 	}

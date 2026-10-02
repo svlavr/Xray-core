@@ -60,7 +60,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						var ref fs.FlowRef
 						inspectionWait(t, func() bool {
 							live, _ := view.ReadLive()
-							if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial == 0 || live.Rows[0].Outbound.Tag != outbound.Tag || live.Rows[0].Uplink != uint64(len(payload)) {
+							if len(live.Rows) != 1 || live.Rows[0].Outbound.Tag == "" || live.Rows[0].Outbound.Tag != outbound.Tag || live.Rows[0].Uplink != uint64(len(payload)) {
 								return false
 							}
 							ref = live.Rows[0].Ref
@@ -100,7 +100,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						return first.Ref.ID != 0 && other.Ref.ID != 0 && first.Downlink == first.Uplink && other.Downlink == uint64(len(payload))
 					})
 					for _, row := range []fs.FlowRecord{first, other} {
-						if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 {
+						if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" {
 							t.Fatalf("callback facts: %+v", row)
 						}
 					}

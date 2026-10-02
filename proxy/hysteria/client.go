@@ -61,12 +61,6 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.Name = "hysteria"
 	ob.CanSpliceCopy = 3
 	target := ob.Target
-	ordinaryTarget := target.Network == net.Network_TCP || target.Network == net.Network_UDP
-	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
-		ordinaryTarget = false
-	}
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, ordinaryTarget)
-
 	conn, err := dialer.Dial(hysteria.ContextWithDatagram(ctx, target.Network == net.Network_UDP), c.server.Destination)
 	if err != nil {
 		return errors.New("failed to find an available destination").Base(err)

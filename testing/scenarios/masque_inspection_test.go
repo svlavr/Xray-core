@@ -221,7 +221,7 @@ func (g *masqueFirstDatagramGate) Snapshot() (sources int, forwarded uint64, err
 
 func inspectionMasqueTCPRow(t *testing.T, row fs.FlowRecord, target xnet.Destination, known uint64) {
 	t.Helper()
-	if row.Ref.ID == 0 || row.Kind != xnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Destination != target || row.Uplink != known || row.Downlink != known || row.Outbound.Tag != "masque-inspected" || row.Outbound.Serial == 0 {
+	if row.Ref.ID == 0 || row.Kind != xnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Destination != target || row.Uplink != known || row.Downlink != known || row.Outbound.Tag != "masque-inspected" || row.Outbound.Tag == "" {
 		t.Fatalf("logical MASQUE TCP flow: %+v", row)
 	}
 }
@@ -394,7 +394,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 						if total.Origin != fs.TrafficOriginUser || total.Uplink == 0 && total.Downlink == 0 {
 							continue
 						}
-						if total.Outbound.Tag != "masque-inspected" || total.Outbound.Serial == 0 {
+						if total.Outbound.Tag != "masque-inspected" || total.Outbound.Tag == "" {
 							t.Fatalf("unexpected MASQUE USER bucket: %+v", total)
 						}
 						up += total.Uplink
@@ -554,7 +554,7 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 						continue
 					}
 					userRows++
-					if total.Outbound.Tag != "masque-inspected" || total.Outbound.Serial == 0 || total.Uplink != uint64(len(payload)) || total.Downlink != uint64(len(payload)) {
+					if total.Outbound.Tag != "masque-inspected" || total.Outbound.Tag == "" || total.Uplink != uint64(len(payload)) || total.Downlink != uint64(len(payload)) {
 						t.Fatalf("successful MASQUE USER total: %+v", total)
 					}
 				}

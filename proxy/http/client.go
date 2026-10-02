@@ -24,7 +24,6 @@ import (
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -81,8 +80,6 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	if target.Network == net.Network_UDP {
 		return errors.New("UDP is not supported by HTTP outbound")
 	}
-
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
 
 	server := c.server
 	dest := server.Destination

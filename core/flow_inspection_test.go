@@ -157,7 +157,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			})
 			var selected fs.FlowRecord
 			for _, r := range rows {
-				if r.Origin != fs.TrafficOriginUser || r.Outbound.Serial == 0 || r.Outbound.Tag != "direct" {
+				if r.Origin != fs.TrafficOriginUser || r.Outbound.Tag == "" || r.Outbound.Tag != "direct" {
 					t.Fatalf("bad admission/route: %+v", r)
 				}
 				if r.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -208,7 +208,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			}
 			var up, down uint64
 			for _, r := range totals.Rows {
-				if r.Outbound.Serial != 0 && r.Origin == fs.TrafficOriginUser {
+				if r.Outbound.Tag != "" && r.Origin == fs.TrafficOriginUser {
 					up += r.Uplink
 					down += r.Downlink
 				}
@@ -225,7 +225,7 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 	instance, view, address := inspectionCore(t, true, false)
 	destination := startOutboundStatsTCPServer(t)
 	manager := instance.GetFeature(fout.ManagerType()).(fout.Manager)
-	var serials []uint64
+	var tags []string
 	for i := 0; i < 2; i++ {
 		c := inspectionSOCKS(t, address, destination, []byte("short"))
 		c.Close()
@@ -238,7 +238,7 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 			if row.Flow.Uplink != 5 || row.Flow.Downlink != 5 {
 				t.Fatalf("short final: %+v", row)
 			}
-			serials = append(serials, row.Flow.Outbound.Serial)
+			tags = append(tags, row.Flow.Outbound.Tag)
 			return true
 		})
 		if i == 0 {
@@ -252,8 +252,8 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 			}
 		}
 	}
-	if serials[0] == 0 || serials[0] == serials[1] {
-		t.Fatalf("incarnation reuse: %v", serials)
+	if tags[0] != "direct" || tags[1] != "direct" {
+		t.Fatalf("reused tag changed: %v", tags)
 	}
 	totals, err := view.ReadTotals()
 	if err != nil {
@@ -261,15 +261,15 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 	}
 	count := 0
 	for _, r := range totals.Rows {
-		if r.Outbound.Serial != 0 {
+		if r.Outbound.Tag != "" {
 			count++
-			if r.Uplink != 5 || r.Downlink != 5 {
-				t.Fatalf("bucket mixed: %+v", r)
+			if r.Uplink != 10 || r.Downlink != 10 {
+				t.Fatalf("reused-tag cumulative bucket: %+v", r)
 			}
 		}
 	}
-	if count != 2 {
-		t.Fatalf("want two incarnation buckets, got %d", count)
+	if count != 1 {
+		t.Fatalf("want one reused-tag bucket, got %d", count)
 	}
 }
 
@@ -295,14 +295,14 @@ func TestFlowInspectionRejectedSniffAndDisabled(t *testing.T) {
 		final = page.Rows[0]
 		return true
 	})
-	if final.Flow.Uplink != uint64(len(request)) || final.Flow.Outbound.Serial != 0 {
+	if final.Flow.Uplink != uint64(len(request)) || final.Flow.Outbound.Tag != "" {
 		t.Fatalf("rejected receipt: %+v", final)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, r := range totals.Rows {
 		if r.Origin == fs.TrafficOriginUser {
-			if r.Outbound.Serial != 0 {
+			if r.Outbound.Tag != "" {
 				t.Fatal("failed route credited outbound")
 			}
 			known += r.Uplink
@@ -420,10 +420,10 @@ func TestFlowInspectionForcedSelection(t *testing.T) {
 				t.Fatalf("sniff credit: %+v", final)
 			}
 			if tag == "direct" {
-				if final.Flow.Outbound.Serial == 0 {
+				if final.Flow.Outbound.Tag == "" {
 					t.Fatalf("forced selection: %+v", final)
 				}
-			} else if final.Flow.Outbound.Serial != 0 || final.Flow.Outbound.Tag != "" {
+			} else if final.Flow.Outbound.Tag != "" {
 				t.Fatalf("missing forced selection: %+v", final)
 			}
 		})
@@ -471,27 +471,26 @@ func TestFlowInspectionForwardingAttribution(t *testing.T) {
 		final = page.Rows[0]
 		return true
 	})
-	if final.Flow.Outbound.Tag != "direct" || final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != uint64(len(payload)) {
+	if final.Flow.Outbound.Tag != "forward" || final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != uint64(len(payload)) {
 		t.Fatalf("forwarded flow: %+v", final)
 	}
 	totals, _ := view.ReadTotals()
 	var up, down uint64
 	for _, row := range totals.Rows {
-		if row.Outbound.Tag == "forward" {
-			t.Fatalf("forwarding bucket created: %+v", row)
-		}
 		if row.Outbound.Tag == "direct" {
+			t.Fatalf("recursive route replaced the first selection: %+v", row)
+		}
+		if row.Outbound.Tag == "forward" {
 			up += row.Uplink
 			down += row.Downlink
 		}
 	}
 	if up != uint64(len(payload)) || down != up {
-		t.Fatalf("consuming totals %d/%d", up, down)
+		t.Fatalf("first-selected totals %d/%d", up, down)
 	}
 }
 
-// Deliberately lacks the optional inspection owner receipt. Keep this negative
-// case independent of which native outbounds gain P2 integration.
+// A native handler needs no consuming-confirmation hook for selected totals.
 type inspectionUnclaimedHandler struct{}
 
 func (inspectionUnclaimedHandler) Tag() string                               { return "unclaimed" }
@@ -501,7 +500,7 @@ func (inspectionUnclaimedHandler) SenderSettings() *serial.TypedMessage      { r
 func (inspectionUnclaimedHandler) ProxySettings() *serial.TypedMessage       { return nil }
 func (inspectionUnclaimedHandler) Dispatch(context.Context, *transport.Link) {}
 
-func TestFlowInspectionUnclaimedOwnerUsesUnassigned(t *testing.T) {
+func TestFlowInspectionSelectedOwnerNeedsNoConfirmation(t *testing.T) {
 	instance, view, address := inspectionCore(t, true, true)
 	manager := instance.GetFeature(fout.ManagerType()).(fout.Manager)
 	if err := manager.AddHandler(context.Background(), inspectionUnclaimedHandler{}); err != nil {
@@ -526,20 +525,22 @@ func TestFlowInspectionUnclaimedOwnerUsesUnassigned(t *testing.T) {
 		ended = snapshot.Rows[0].Flow
 		return ended.Uplink == uint64(len(payload))
 	})
-	if ended.Outbound.Tag != "unclaimed" || ended.Outbound.Serial == 0 || ended.Uplink != uint64(len(payload)) {
+	if ended.Outbound.Tag != "unclaimed" || ended.Outbound.Tag == "" || ended.Uplink != uint64(len(payload)) {
 		t.Fatalf("unclaimed owner snapshot: %+v", ended)
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial != 0 {
-			t.Fatalf("unclaimed outbound bucket: %+v", row)
+		if row.Outbound.Tag != "" && row.Outbound.Tag != "unclaimed" {
+			t.Fatalf("unexpected selected tag: %+v", row)
 		}
-		if row.Origin == fs.TrafficOriginUser {
+		if row.Origin == fs.TrafficOriginUser && row.Outbound.Tag == "unclaimed" {
 			known += row.Uplink
+		} else if row.Uplink != 0 {
+			t.Fatalf("duplicate unassigned credit: %+v", row)
 		}
 	}
 	if known != uint64(len(payload)) {
-		t.Fatalf("unassigned known %d", known)
+		t.Fatalf("selected known %d", known)
 	}
 }

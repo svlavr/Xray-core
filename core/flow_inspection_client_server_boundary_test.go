@@ -29,7 +29,7 @@ func inspectionAppClientRejectedReceiver(t *testing.T, receiver inspectionSuppli
 			return false
 		}
 		row := page.Rows[0].Flow
-		if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Downlink != 0 || row.Uplink > uint64(len(payload)) {
+		if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Downlink != 0 || row.Uplink > uint64(len(payload)) {
 			t.Fatalf("app rejected flow: %+v", row)
 		}
 		return true

@@ -156,7 +156,7 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 			return false
 		}
 		row = live.Rows[0]
-		return row.Outbound.Tag == outbound.Tag && row.Outbound.Serial != 0
+		return row.Outbound.Tag == outbound.Tag && row.Outbound.Tag != ""
 	})
 	if row.Uplink != 0 || row.Downlink != 0 {
 		t.Fatalf("VLESS response framing credited before payload: %+v", row)
@@ -219,7 +219,7 @@ func inspectionEnableOutboundMux(t *testing.T, outbound *core.OutboundHandlerCon
 
 func assertDecodedTCPReceiverFacts(t *testing.T, row fs.FlowRecord, destination cnet.Destination, payload uint64, tag string) {
 	t.Helper()
-	if row.Kind != cnet.Network_TCP || row.Destination != destination || row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser || row.Uplink != payload || row.Downlink != payload {
+	if row.Kind != cnet.Network_TCP || row.Destination != destination || row.Outbound.Tag != tag || row.Outbound.Tag == "" || row.Origin != fs.TrafficOriginUser || row.Uplink != payload || row.Downlink != payload {
 		t.Fatalf("supplied TCP facts: %+v", row)
 	}
 }

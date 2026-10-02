@@ -54,7 +54,7 @@ func inspectionHTTPOutboundTotals(t *testing.T, view fs.FlowInspection, want uin
 		}
 		var up, down uint64
 		for _, row := range totals.Rows {
-			if row.Outbound.Serial == 0 {
+			if row.Outbound.Tag == "" {
 				if row.Uplink != 0 || row.Downlink != 0 {
 					t.Fatalf("unexpected unassigned HTTP outbound credit: %+v", row)
 				}
@@ -99,7 +99,7 @@ func TestFlowInspectionHTTPOutbound(t *testing.T) {
 					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Outbound.Tag != "http-proxy" || row.Outbound.Serial == 0 || row.Destination != destination || row.Origin != fs.TrafficOriginUser {
+					if row.Outbound.Tag != "http-proxy" || row.Outbound.Tag == "" || row.Destination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("live proxy receipt: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {

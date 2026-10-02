@@ -180,7 +180,7 @@ func inspectionWireGuardRow(t *testing.T, view fs.FlowInspection, kind cnet.Netw
 
 func inspectionWireGuardAssertRow(t *testing.T, row fs.FlowRecord, destination cnet.Destination, outbound string) {
 	t.Helper()
-	if row.Origin != fs.TrafficOriginUser || row.Destination != destination || row.Outbound.Tag != outbound || row.Outbound.Serial == 0 {
+	if row.Origin != fs.TrafficOriginUser || row.Destination != destination || row.Outbound.Tag != outbound || row.Outbound.Tag == "" {
 		t.Fatalf("WireGuard logical facts: %+v", row)
 	}
 }

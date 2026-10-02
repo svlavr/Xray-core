@@ -24,8 +24,7 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store := testInspectionStore(t, fs.ObservationOptions{})
 			flow := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
-			flow.Route(fs.OutboundRef{Serial: 1, Tag: "selected"})
-			flow.BindRoute()
+			flow.Route(fs.OutboundRef{Tag: "selected"})
 			flow.AddUplink(7)
 			flow.AddDownlink(11)
 			first := xnet.UDPDestination(xnet.LocalHostIP, 53)
@@ -61,7 +60,6 @@ func TestInspectionRetainedProvenanceFence(t *testing.T) {
 func TestInspectionRetainedFenceRejectsConcurrentLateCredit(t *testing.T) {
 	store := testInspectionStore(t, fs.ObservationOptions{})
 	flow := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil).(*inspectionExchange)
-	flow.BindRoute()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -92,8 +90,7 @@ func TestInspectionAssociationCompletionKeepsLegBucket(t *testing.T) {
 	flow := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 
 	leg := flow.NewLeg()
-	leg.Route(fs.OutboundRef{Serial: 1, Tag: "leg"})
-	leg.BindRoute()
+	leg.Route(fs.OutboundRef{Tag: "leg"})
 	leg.AddUplink(7)
 	flow.Finish()
 	page, _ := store.ReadTerminals()
@@ -107,7 +104,7 @@ func TestInspectionAssociationCompletionKeepsLegBucket(t *testing.T) {
 	}
 	totals, _ := store.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 1 && (row.Uplink != 7) {
+		if row.Outbound.Tag == "leg" && (row.Uplink != 7) {
 			t.Fatalf("association completion contaminated leg bucket: %+v", row)
 		}
 	}

@@ -58,8 +58,7 @@ func TestInspectionDNSFallbackCreditsUnadaptedWriter(t *testing.T) {
 	}
 	defer manager.Close()
 	flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-	flow.Route(fs.OutboundRef{Serial: 1, Tag: "dns"})
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{Tag: "dns"})
 	lower := new(unadaptedDNSWriter)
 	writer, attached := buf.AttachWriterReceiptWithStatus(lower, flow)
 	if attached {
@@ -84,7 +83,7 @@ func TestInspectionDNSReturnedRouteBindsTotals(t *testing.T) {
 	defer manager.Close()
 	destination := cnet.UDPDestination(cnet.LocalHostIP, 53)
 	flow := manager.Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, destination, nil)
-	flow.Route(fs.OutboundRef{Serial: 7, Tag: "dns"})
+	flow.Route(fs.OutboundRef{Tag: "dns"})
 	query := new(dns.Msg)
 	query.SetQuestion("example.com.", dns.TypeA)
 	wire, err := query.Pack()
@@ -113,10 +112,10 @@ func TestInspectionDNSReturnedRouteBindsTotals(t *testing.T) {
 		if row.Origin != fs.TrafficOriginUser {
 			continue
 		}
-		switch row.Outbound.Serial {
-		case 7:
+		switch row.Outbound.Tag {
+		case "dns":
 			selected = row.Uplink
-		case 0:
+		case "":
 			unassigned = row.Uplink
 		}
 	}
@@ -146,7 +145,7 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 	ctx, finish := proxy.ObserveUDP(context.Background(), manager, local, target, link)
 	defer finish()
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.OutboundRef{Tag: "dns", Serial: 1})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "dns"})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 	lookup := &blockedInspectionDNS{entered: make(chan struct{}), release: make(chan struct{})}
 	handler := &Handler{client: lookup, timeout: time.Minute}
@@ -235,7 +234,7 @@ func TestInspectionDNSWebSocketEndpoint(t *testing.T) {
 	if observation.WriterReceiptAttached {
 		t.Fatal("WebSocket unexpectedly supports endpoint receipts")
 	}
-	observation.Exchange.Route(fs.OutboundRef{Serial: 1, Tag: "dns"})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "dns"})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 	handler := &Handler{timeout: time.Minute, rules: []*DNSRule{{action: RuleAction_Return, rCode: dnsmessage.RCodeRefused}}}
 	done := make(chan error, 1)

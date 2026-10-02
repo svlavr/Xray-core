@@ -297,7 +297,7 @@ func TestFlowInspectionP2GVLESSResponseEnding(t *testing.T) {
 					return false
 				}
 				row := page.Rows[0]
-				if row.Flow.Outbound.Tag != outbound.Tag || row.Flow.Outbound.Serial == 0 || row.Flow.Downlink != 0 {
+				if row.Flow.Outbound.Tag != outbound.Tag || row.Flow.Outbound.Tag == "" || row.Flow.Downlink != 0 {
 					t.Fatalf("response ending facts: %+v", row)
 				}
 				return true
@@ -333,7 +333,7 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 				row = live.Rows[0]
 				return true
 			})
-			if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Destination != destination {
+			if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Destination != destination {
 				t.Fatalf("Hysteria TCP facts: %+v", row)
 			}
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
@@ -373,7 +373,7 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 				if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 					return false
 				}
-				if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Destination != destination {
+				if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Destination != destination {
 					t.Fatalf("Hysteria UDP facts: %+v", row)
 				}
 				switch row.Source.Port {
@@ -418,7 +418,7 @@ func TestFlowInspectionP2AHysteriaOutbound(t *testing.T) {
 			row = live.Rows[0]
 			return true
 		})
-		if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Destination != destination {
+		if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Destination != destination {
 			t.Fatalf("fragmented UDP attribution: %+v", row)
 		}
 		outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})

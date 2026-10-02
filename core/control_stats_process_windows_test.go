@@ -34,7 +34,7 @@ func TestControlStatsP3WindowsProcessIdentity(t *testing.T) {
 			return false
 		}
 		row := live.Rows[0]
-		if row.Outbound.Tag != "p3-process" || row.Outbound.Serial == 0 {
+		if row.Outbound.Tag != "p3-process" || row.Outbound.Tag == "" {
 			t.Fatalf("native socket PID lookup did not select process rule: %+v", row)
 		}
 		return true

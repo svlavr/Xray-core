@@ -40,8 +40,7 @@ func TestInspectionConcurrentRetirementRejectsNewFacts(t *testing.T) {
 					flow = store.Begin(xnet.Network_UDP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { return nil })
 				}
 				if flow != nil {
-					flow.Route(featurestats.OutboundRef{Serial: 1})
-					flow.BindRoute()
+					flow.Route(featurestats.OutboundRef{Tag: "tag-1"})
 					flow.AddUplink(1)
 					flow.Finish()
 				}
@@ -127,10 +126,8 @@ func TestInspectionLifecycleTotalsClonesAndOwnerEnd(t *testing.T) {
 	}
 	exchange.AddUplink(5)
 	exchange.Route(featurestats.OutboundRef{
-		Serial: 7,
-		Tag:    strings.Repeat("t", 300),
+		Tag: strings.Repeat("t", 300),
 	})
-	exchange.BindRoute()
 	exchange.AddUplink(2)
 	exchange.AddDownlink(3)
 
@@ -183,7 +180,7 @@ func TestInspectionLifecycleTotalsClonesAndOwnerEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := findTotal(t, totals.Rows, 7, featurestats.TrafficOriginUser)
+	row := findTotal(t, totals.Rows, strings.Repeat("t", 300), featurestats.TrafficOriginUser)
 	if row.Uplink != 7 || row.Downlink != 5 {
 		t.Fatalf("unexpected attributed totals: %+v", row)
 	}
@@ -192,8 +189,7 @@ func TestInspectionLifecycleTotalsClonesAndOwnerEnd(t *testing.T) {
 func TestInspectionCapacityRejectedAttributionAndBoundedHistory(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{MaxLive: 1, MaxTerminals: 2, MaxBuckets: 1})
 	first := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-	first.Route(featurestats.OutboundRef{Serial: 1, Tag: "one"})
-	first.BindRoute()
+	first.Route(featurestats.OutboundRef{Tag: "one"})
 	first.AddUplink(1)
 
 	overflow := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
@@ -201,7 +197,6 @@ func TestInspectionCapacityRejectedAttributionAndBoundedHistory(t *testing.T) {
 		t.Fatalf("capacity-overflow exchange unexpectedly addressable: %+v", overflow.Ref())
 	}
 	overflow.Route(featurestats.OutboundRef{Tag: "attempted"})
-	overflow.BindRoute()
 	overflow.AddUplink(3)
 	overflow.Finish()
 
@@ -209,7 +204,7 @@ func TestInspectionCapacityRejectedAttributionAndBoundedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unassigned := findTotal(t, totals.Rows, 0, featurestats.TrafficOriginUser)
+	unassigned := findTotal(t, totals.Rows, "", featurestats.TrafficOriginUser)
 	if unassigned.Uplink != 3 {
 		t.Fatalf("rejected selection did not retain known unassigned bytes: %+v", unassigned)
 	}
@@ -295,8 +290,7 @@ func TestInspectionCloseOutcomesAndCallbackOutsideLocks(t *testing.T) {
 func TestInspectionConcurrentSnapshotAndLateTotals(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{MaxLive: 1, MaxTerminals: 1, MaxBuckets: 1})
 	exchange := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-	exchange.Route(featurestats.OutboundRef{Serial: 1})
-	exchange.BindRoute()
+	exchange.Route(featurestats.OutboundRef{Tag: "tag-1"})
 
 	const workers = 8
 	const additions = 500
@@ -336,19 +330,19 @@ func TestInspectionConcurrentSnapshotAndLateTotals(t *testing.T) {
 		t.Fatalf("concurrent terminal = %+v", page)
 	}
 	totals, _ := store.ReadTotals()
-	if got := findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Uplink; got != workers*additions {
+	if got := findTotal(t, totals.Rows, "tag-1", featurestats.TrafficOriginUser).Uplink; got != workers*additions {
 		t.Fatalf("late totals = %d", got)
 	}
 }
 
-func findTotal(t *testing.T, rows []featurestats.TotalRecord, serial uint64, origin featurestats.TrafficOrigin) featurestats.TotalRecord {
+func findTotal(t *testing.T, rows []featurestats.TotalRecord, tag string, origin featurestats.TrafficOrigin) featurestats.TotalRecord {
 	t.Helper()
 	for _, row := range rows {
-		if row.Outbound.Serial == serial && row.Origin == origin {
+		if row.Outbound.Tag == tag && row.Origin == origin {
 			return row
 		}
 	}
-	t.Fatalf("missing total serial=%d origin=%d", serial, origin)
+	t.Fatalf("missing total tag=%q origin=%d", tag, origin)
 	return featurestats.TotalRecord{}
 }
 
@@ -372,7 +366,7 @@ func TestInspectionStopPublishesAndPreservesLateTotals(t *testing.T) {
 		t.Fatalf("owner completion: %+v", page)
 	}
 	totals, _ := store.ReadTotals()
-	if got := findTotal(t, totals.Rows, 0, featurestats.TrafficOriginUser).Uplink; got != 3 {
+	if got := findTotal(t, totals.Rows, "", featurestats.TrafficOriginUser).Uplink; got != 3 {
 		t.Fatalf("late close totals: %d", got)
 	}
 }
@@ -392,31 +386,30 @@ func TestInspectionCloseFailureAndCanceledSuffix(t *testing.T) {
 	second.Finish()
 }
 
-func TestInspectionRouteCaptureRequiresOwnerBinding(t *testing.T) {
+func TestInspectionFirstRouteCapturesTagAndBucket(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	flow := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	flow.AddUplink(9)
-	flow.Route(featurestats.OutboundRef{Serial: 1, Tag: "forward"})
+	flow.Route(featurestats.OutboundRef{Tag: "forward"})
 	live, _ := store.ReadLive()
-	if live.Rows[0].Outbound.Serial != 1 {
-		t.Fatal("selection was not visible before owner binding")
+	if live.Rows[0].Outbound.Tag != "forward" {
+		t.Fatal("first selection label was not visible")
 	}
 	totals, _ := store.ReadTotals()
-	if len(totals.Rows) != 4 {
-		t.Fatal("selection created a bucket")
+	if len(totals.Rows) != 5 || findTotal(t, totals.Rows, "forward", featurestats.TrafficOriginUser).Uplink != 9 {
+		t.Fatal("selection did not bind pending bytes")
 	}
-	flow.Route(featurestats.OutboundRef{Serial: 2, Tag: "consumer"})
-	flow.BindRoute()
+	flow.Route(featurestats.OutboundRef{Tag: "consumer"})
 	flow.AddUplink(1)
 	flow.Finish()
 	page, _ := store.ReadTerminals()
 	row := page.Rows[0].Flow
-	if row.Outbound.Serial != 2 || row.Uplink != 10 {
+	if row.Outbound.Tag != "forward" || row.Uplink != 10 {
 		t.Fatalf("selected route and bytes: %+v", row)
 	}
 	totals, _ = store.ReadTotals()
-	if len(totals.Rows) != 5 || findTotal(t, totals.Rows, 2, featurestats.TrafficOriginUser).Uplink != 10 {
-		t.Fatalf("consuming totals: %+v", totals)
+	if len(totals.Rows) != 5 || findTotal(t, totals.Rows, "forward", featurestats.TrafficOriginUser).Uplink != 10 {
+		t.Fatalf("first-route totals: %+v", totals)
 	}
 }
 
@@ -428,7 +421,7 @@ func TestInspectionIndependentSample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fact := findTotal(t, snapshot.Rows, 0, featurestats.TrafficOriginUser).Uplink
+	fact := findTotal(t, snapshot.Rows, "", featurestats.TrafficOriginUser).Uplink
 	if fact != 1 || snapshot.At < 0 {
 		t.Fatalf("independent sample: %+v", snapshot)
 	}
@@ -452,8 +445,7 @@ func TestInspectionKnownDownlink(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	flow := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	flow.AddDownlink(3)
-	flow.Route(featurestats.OutboundRef{Serial: 1})
-	flow.BindRoute()
+	flow.Route(featurestats.OutboundRef{Tag: "tag-1"})
 	flow.AddDownlink(4)
 
 	flow.Finish()
@@ -469,7 +461,48 @@ func TestInspectionKnownDownlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := findTotal(t, totals.Rows, 1, featurestats.TrafficOriginUser).Downlink; got != 7 {
+	if got := findTotal(t, totals.Rows, "tag-1", featurestats.TrafficOriginUser).Downlink; got != 7 {
 		t.Fatalf("known totals: %+v", got)
 	}
+}
+
+func TestInspectionReusedTagMergesConcurrentLateTotals(t *testing.T) {
+	store := testInspectionStore(t, featurestats.ObservationOptions{})
+	old := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+	old.AddUplink(5)
+	old.Route(featurestats.OutboundRef{Tag: "reused"})
+	old.Finish()
+	current := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+	current.Route(featurestats.OutboundRef{Tag: "reused"})
+	internal := store.Begin(xnet.Network_TCP, featurestats.TrafficOriginInternal, xnet.Destination{}, xnet.Destination{}, nil)
+	internal.Route(featurestats.OutboundRef{Tag: "reused"})
+	internal.AddUplink(17)
+	var writers sync.WaitGroup
+	writers.Add(2)
+	go func() {
+		defer writers.Done()
+		for range 1000 {
+			old.AddUplink(1)
+		}
+	}()
+	go func() {
+		defer writers.Done()
+		for range 1000 {
+			current.AddUplink(2)
+		}
+	}()
+	writers.Wait()
+	totals, err := store.ReadTotals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(totals.Rows) != 6 || findTotal(t, totals.Rows, "reused", featurestats.TrafficOriginUser).Uplink != 3005 || findTotal(t, totals.Rows, "reused", featurestats.TrafficOriginInternal).Uplink != 17 {
+		t.Fatalf("tag reuse/origin totals: %+v", totals)
+	}
+	ended, err := store.ReadTerminals()
+	if err != nil || len(ended.Rows) != 1 || ended.Rows[0].Flow.Uplink != 5 {
+		t.Fatalf("late credit rewrote owner-end row: %+v %v", ended, err)
+	}
+	current.Finish()
+	internal.Finish()
 }

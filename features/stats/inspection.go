@@ -25,10 +25,9 @@ type FlowRef struct {
 	ID      uint64
 }
 
-// OutboundRef identifies a handler within its owning FlowInspection view.
+// OutboundRef identifies the selected logical outbound tag.
 type OutboundRef struct {
-	Serial uint64
-	Tag    string
+	Tag string
 }
 
 type ObservationOptions struct {
@@ -54,6 +53,8 @@ type TerminalRecord struct {
 	Ended time.Duration
 }
 
+// TotalRecord accumulates logical bytes by tag/origin for this store lifetime.
+// Tag reuse continues the series; empty tags share unassigned totals.
 type TotalRecord struct {
 	Outbound OutboundRef
 	Origin   TrafficOrigin
@@ -101,8 +102,8 @@ type ObservationProvider interface {
 type AdmissionStore interface {
 	Runtime() RuntimeID
 	Begin(net.Network, TrafficOrigin, net.Destination, net.Destination, func() error) Exchange
-	// PrepareTCP keeps endpoint facts local until the consuming role is known.
-	// BindRoute/Unassign (or genuine failed completion) registers it once.
+	// PrepareTCP keeps endpoint facts local until a logical route is selected.
+	// Route/Unassign (or genuine failed completion) registers it once.
 	PrepareTCP(TrafficOrigin, net.Destination, net.Destination, func() error) Exchange
 }
 
@@ -120,9 +121,9 @@ type Exchange interface {
 	// Legs share the root reference and byte facts, but own their route and Finish.
 	// Returns nil after stop.
 	NewLeg() Exchange
+	// Route captures the first selection for this exchange or UDP ray.
+	// A UDP association displays the latest ray selection.
 	Route(OutboundRef)
-	// BindRoute is called after the consuming owner is selected.
-	BindRoute()
 	Unassign()
 	// SetSource fills a previously unknown source once.
 	SetSource(net.Destination)

@@ -84,8 +84,7 @@ func TestVisionWriterPayloadPrefixes(t *testing.T) {
 			}
 			defer manager.Close()
 			flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-			flow.BindRoute()
+			flow.Route(fs.OutboundRef{Tag: "direct"})
 			lower := &visionPrefixWriter{limit: test.limit}
 			if test.fail {
 				lower.err = io.ErrClosedPipe
@@ -131,8 +130,7 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 	}
 	defer manager.Close()
 	flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{Tag: "direct"})
 	state := proxy.NewTrafficState(bytes.Repeat([]byte{0xaa}, 16))
 	lower := visionBlockedWriter{make(chan struct{}), make(chan struct{})}
 	writer := proxy.NewVisionWriter(buf.NewWriter(lower), state, true, context.Background(), nil, nil, nil)

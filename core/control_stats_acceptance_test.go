@@ -193,10 +193,19 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyed := func(rows []fs.TotalRecord) map[[2]uint64]fs.TotalRecord {
-		result := make(map[[2]uint64]fs.TotalRecord)
+	keyed := func(rows []fs.TotalRecord) map[struct {
+		tag    string
+		origin fs.TrafficOrigin
+	}]fs.TotalRecord {
+		result := make(map[struct {
+			tag    string
+			origin fs.TrafficOrigin
+		}]fs.TotalRecord)
 		for _, row := range rows {
-			result[[2]uint64{row.Outbound.Serial, uint64(row.Origin)}] = row
+			result[struct {
+				tag    string
+				origin fs.TrafficOrigin
+			}{row.Outbound.Tag, row.Origin}] = row
 		}
 		return result
 	}
@@ -299,13 +308,14 @@ func TestControlStatsP5DisabledStaticFootprint(t *testing.T) {
 	if !ok {
 		t.Fatal("native handler inventory missing")
 	}
-	serial, ok := outboundType.FieldByName("nextSerial")
-	if !ok {
-		t.Fatal("handler incarnation counter missing")
+	if _, ok := outboundType.FieldByName("nextSerial"); ok {
+		t.Fatal("removed handler serial counter retained")
 	}
-	entryType := tagged.Type.Elem().Elem()
+	if tagged.Type.Elem() != reflect.TypeFor[fout.Handler]() {
+		t.Fatal("native handler inventory gained an entry wrapper")
+	}
 	originCtx := session.ContextWithTrafficOrigin(context.Background(), session.TrafficOriginUser)
-	t.Logf("disabled static fields: handler entry=%d bytes, inventory reference=%d, manager serial=%d, nullable inspection pointer=%d; origin context object=%d bytes (created outside exchange benchmark timer)", entryType.Size(), tagged.Type.Elem().Size(), serial.Type.Size(), inspection.Type.Size(), reflect.TypeOf(originCtx).Elem().Size())
+	t.Logf("disabled static fields: native handler interface=%d bytes, nullable inspection pointer=%d; origin context object=%d bytes (outside exchange timer)", tagged.Type.Elem().Size(), inspection.Type.Size(), reflect.TypeOf(originCtx).Elem().Size())
 }
 
 func BenchmarkControlStatsP5TCPExchange(b *testing.B) {

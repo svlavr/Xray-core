@@ -90,7 +90,7 @@ func TestInspectionDNSEndpointTCPReturn(t *testing.T) {
 		}
 		if len(page.Rows) == 1 {
 			flow := page.Rows[0].Flow
-			if flow.Outbound.Tag != "dns-local" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(requestBytes)+2) || flow.Downlink != uint64(len(responseBytes)+2) {
+			if flow.Outbound.Tag != "dns-local" || flow.Outbound.Tag == "" || flow.Uplink != uint64(len(requestBytes)+2) || flow.Downlink != uint64(len(responseBytes)+2) {
 				t.Fatalf("source endpoint DNS facts: %+v; message sizes %d/%d", flow, len(requestBytes), len(responseBytes))
 			}
 			return

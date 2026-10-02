@@ -195,7 +195,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		},
 		connReady: make(chan struct{}, 1),
 	}
-	observation := proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
+	observation := proxy.ObservedEndpoint(ctx, link.Reader, true)
 	supplied := observation != nil && observation.SuppliedEndpoint
 	output := link.Writer
 	if supplied && !observation.WriterReceiptAttached {

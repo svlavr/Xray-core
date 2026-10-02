@@ -15,14 +15,13 @@ type inspectionHandler struct {
 	tag      string
 	startErr error
 	closes   int
-	ordinal  uint64
 }
 
 func (h *inspectionHandler) Tag() string  { return h.tag }
 func (h *inspectionHandler) Start() error { return h.startErr }
 func (h *inspectionHandler) Close() error { h.closes++; return nil }
 
-func TestInspectionHandlerIncarnation(t *testing.T) {
+func TestInspectionNativeHandlerReplacement(t *testing.T) {
 	m, err := New(context.Background(), &proxyman.OutboundConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -31,12 +30,12 @@ func TestInspectionHandlerIncarnation(t *testing.T) {
 	if err = m.AddHandler(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
-	h, id := m.ResolveHandler("reused", false)
-	if h != first || id == 0 {
+	h := m.GetHandler("reused")
+	if h != first {
 		t.Fatal("entry missing")
 	}
-	def, defID := m.ResolveHandler("", true)
-	if def != first || defID != id {
+	def := m.GetDefaultHandler()
+	if def != first {
 		t.Fatal("default identity differs")
 	}
 	if err = m.RemoveHandler(context.Background(), "reused"); err != nil {
@@ -49,9 +48,9 @@ func TestInspectionHandlerIncarnation(t *testing.T) {
 	if err = m.AddHandler(context.Background(), second); err != nil {
 		t.Fatal(err)
 	}
-	h, next := m.ResolveHandler("reused", false)
-	if h != second || next <= id {
-		t.Fatal("serial reused")
+	h = m.GetHandler("reused")
+	if h != second {
+		t.Fatal("replacement handler missing")
 	}
 	if err = m.Start(); err != nil {
 		t.Fatal(err)
@@ -61,8 +60,8 @@ func TestInspectionHandlerIncarnation(t *testing.T) {
 	if err = m.AddHandler(context.Background(), failed); !errors.Is(err, failure) {
 		t.Fatalf("start result: %v", err)
 	}
-	h, failedID := m.ResolveHandler(failed.tag, false)
-	if h != failed || failedID <= next {
+	h = m.GetHandler(failed.tag)
+	if h != failed {
 		t.Fatal("failed Start lost native registered entry")
 	}
 }
@@ -84,9 +83,9 @@ func TestInspectionConcurrentNativeEntries(t *testing.T) {
 					return
 				default:
 				}
-				h, id := m.ResolveHandler("same", false)
-				if h != nil && id != h.(*inspectionHandler).ordinal {
-					t.Errorf("mixed handler/serial: %d", id)
+				h := m.GetHandler("same")
+				if h != nil && h.Tag() != "same" {
+					t.Errorf("unexpected handler tag: %q", h.Tag())
 					return
 				}
 				m.Select([]string{"same"})
@@ -94,8 +93,8 @@ func TestInspectionConcurrentNativeEntries(t *testing.T) {
 		}()
 	}
 	defer func() { close(stop); wg.Wait() }()
-	for i := uint64(1); i <= 500; i++ {
-		h := &inspectionHandler{tag: "same", ordinal: i}
+	for i := 0; i < 500; i++ {
+		h := &inspectionHandler{tag: "same"}
 		if err = m.AddHandler(context.Background(), h); err != nil {
 			t.Fatal(err)
 		}

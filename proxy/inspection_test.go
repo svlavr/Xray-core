@@ -42,8 +42,7 @@ func TestRecordPacketWritePartialZeroPayload(t *testing.T) {
 			}
 			defer manager.Close()
 			flow := manager.Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.OutboundRef{Serial: 1})
-			flow.BindRoute()
+			flow.Route(fs.OutboundRef{Tag: "tag-1"})
 			proxy.RecordPacketWrite(flow, test.payload, 10, 3)
 			flow.Finish()
 			page, err := view.ReadTerminals()
@@ -92,8 +91,7 @@ func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 					flow = session.LogicalObservationFromContext(ctx).Exchange
 					t.Cleanup(finish)
 				}
-				flow.Route(fs.OutboundRef{Tag: "selected", Serial: 1})
-				flow.BindRoute()
+				flow.Route(fs.OutboundRef{Tag: "selected"})
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
 				if err != nil || len(outcomes) != 1 || (test.wantFailure && !errors.Is(outcomes[0], test.err)) || (!test.wantFailure && outcomes[0] != nil) {
 					t.Fatalf("exact stop: %+v %v, want failure=%t", outcomes, err, test.wantFailure)
@@ -154,7 +152,7 @@ func TestBeginReturnedObservationExcludesReservedCarrier(t *testing.T) {
 	}
 }
 
-func TestInspectionClaimObservedEndpoint(t *testing.T) {
+func TestInspectionObservedEndpoint(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		eligible    bool
@@ -177,7 +175,7 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 			}
 			t.Cleanup(func() { manager.Close() })
 			flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUnknown, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.OutboundRef{Serial: 1, Tag: "selected"})
+			flow.Route(fs.OutboundRef{Tag: "selected"})
 			flow.AddUplink(7)
 			observation := &session.LogicalObservation{Exchange: flow}
 			ctx := context.Background()
@@ -192,7 +190,7 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 				reader = &buf.EndpointOverrideReader{Reader: reader}
 			}
 
-			claimed := proxy.ClaimObservedEndpoint(ctx, reader, test.eligible)
+			claimed := proxy.ObservedEndpoint(ctx, reader, test.eligible)
 			if (claimed == observation) != test.wantClaim {
 				t.Fatalf("claim=%t, want %t", claimed == observation, test.wantClaim)
 			}
@@ -209,7 +207,7 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 			}
 			bound := false
 			for _, total := range totals.Rows {
-				if total.Outbound.Serial == 1 {
+				if total.Outbound.Tag == "selected" {
 					bound = true
 					if total.Uplink != 7 {
 						t.Fatalf("bound credit: %+v", total)
@@ -218,8 +216,8 @@ func TestInspectionClaimObservedEndpoint(t *testing.T) {
 					t.Fatalf("unexpected credit: %+v", total)
 				}
 			}
-			if bound != test.wantClaim {
-				t.Fatalf("bucket bound=%t, want %t", bound, test.wantClaim)
+			if !bound {
+				t.Fatal("endpoint lookup changed selected-route accounting")
 			}
 		})
 	}
@@ -346,7 +344,7 @@ func TestObserveTCPCustomWriterRemainsUnavailable(t *testing.T) {
 		t.Fatal("inspection was not enabled")
 	}
 	defer finish()
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
+	session.LogicalObservationFromContext(ctx).Exchange.Route(fs.OutboundRef{Tag: "custom"})
 	if link.Writer != writer || buf.WriterReceipt(link.Writer) != nil {
 		t.Fatal("custom writer was replaced or given an unsupported receipt")
 	}

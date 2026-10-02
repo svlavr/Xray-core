@@ -181,7 +181,7 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 					}
 					return false
 				})
-				if row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
+				if row.Outbound.Tag != tag || row.Outbound.Tag == "" || row.Origin != fs.TrafficOriginUser {
 					t.Fatalf("Vision live facts: %+v", row)
 				}
 				if count == 1 {

@@ -117,7 +117,7 @@ func TestInspectionMasqueTCPClaimBeforeTunnelFailure(t *testing.T) {
 	link := &transport.Link{Reader: buf.NewReader(local), Writer: buf.NewWriter(local)}
 	ctx, finish := proxy.ObserveTCP(context.Background(), manager, local, target, link)
 	flow := session.LogicalObservationFromContext(ctx).Exchange
-	flow.Route(fs.OutboundRef{Tag: "masque-test", Serial: 1})
+	flow.Route(fs.OutboundRef{Tag: "masque-test"})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 	if err := client.Process(ctx, link, inspectionFailDialer{}); err == nil {
 		t.Fatal("failed tunnel establishment succeeded")
@@ -148,7 +148,7 @@ func TestInspectionMasqueFirstRequestStopDuringEstablishment(t *testing.T) {
 	ctx, finish := proxy.ObserveTCP(context.Background(), manager, local, target, link)
 	t.Cleanup(finish)
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.OutboundRef{Tag: "masque-test", Serial: 1})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "masque-test"})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 
 	release := make(chan struct{})
@@ -222,7 +222,7 @@ func TestInspectionMasqueStopVirtualAssociation(t *testing.T) {
 	ctx, finish := proxy.ObserveUDP(context.Background(), manager, local, target, link)
 	t.Cleanup(finish)
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.OutboundRef{Tag: "masque-test", Serial: 1})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "masque-test"})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 	ctx = session.ContextWithTimeoutOnly(ctx, true)
 	done := make(chan error, 1)

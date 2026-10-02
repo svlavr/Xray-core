@@ -42,7 +42,7 @@ func preconnectInspection(t *testing.T, target cnet.Destination, flow string, co
 	}
 	observation := session.LogicalObservationFromContext(ctx)
 	if observation != nil {
-		observation.Exchange.Route(fs.OutboundRef{Serial: 1, Tag: "vless"})
+		observation.Exchange.Route(fs.OutboundRef{Tag: "vless"})
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -129,7 +129,7 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 	t.Fatal("preconnect flow did not finish")
 }
 
-func TestInspectionVLESSPreconnectCommandClaims(t *testing.T) {
+func TestInspectionVLESSPreconnectKeepsSelectedEndpoint(t *testing.T) {
 	tests := []struct {
 		name    string
 		target  cnet.Destination
@@ -138,7 +138,7 @@ func TestInspectionVLESSPreconnectCommandClaims(t *testing.T) {
 		claimed bool
 	}{
 		{name: "mux", target: cnet.TCPDestination(cnet.DomainAddress("v1.mux.cool"), 0)},
-		{name: "reverse", target: cnet.Destination{Address: cnet.DomainAddress("v1.rvs.cool")}},
+		{name: "reverse", target: cnet.Destination{Address: cnet.DomainAddress("v1.rvs.cool")}, claimed: true},
 		{name: "vision", target: cnet.TCPDestination(cnet.DomainAddress("vision.invalid"), 443), flow: vless.XRV, claimed: true},
 		{name: "cone-xudp", target: cnet.UDPDestination(cnet.DomainAddress("cone.invalid"), 80), cone: true, claimed: true},
 	}
@@ -156,9 +156,9 @@ func TestInspectionVLESSPreconnectCommandClaims(t *testing.T) {
 			}
 			observation := session.LogicalObservationFromContext(ctx)
 			live, err := view.ReadLive()
-			claimed := observation != nil && len(live.Rows) == 1 && live.Rows[0].Outbound.Serial != 0
+			claimed := observation != nil && len(live.Rows) == 1 && live.Rows[0].Outbound.Tag != ""
 			if err != nil || claimed != test.claimed {
-				t.Fatal("command claim disagrees with logical endpoint eligibility")
+				t.Fatal("protocol preparation changed the already selected logical endpoint")
 			}
 			if test.name == "mux" && observation != nil {
 				t.Fatal("reserved carrier created a logical root")

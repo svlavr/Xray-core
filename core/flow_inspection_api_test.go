@@ -81,7 +81,7 @@ func TestFlowInspectionAPIDialTCPOrigins(t *testing.T) {
 				t.Fatal(err)
 			}
 			flow := inspectionAPITerminal(t, view).Flow
-			if flow.Kind != net.Network_TCP || flow.Origin != origin || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 {
+			if flow.Kind != net.Network_TCP || flow.Origin != origin || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) || flow.Outbound.Tag != "direct" || flow.Outbound.Tag == "" {
 				t.Fatalf("API TCP facts: %+v", flow)
 			}
 		})
@@ -138,7 +138,7 @@ func TestFlowInspectionAPIDialUDPPacketConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.Destination != destination || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 {
+	if flow.Kind != net.Network_UDP || flow.Origin != fs.TrafficOriginInternal || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.Destination != destination || flow.Outbound.Tag != "direct" || flow.Outbound.Tag == "" {
 		t.Fatalf("API PacketConn facts: %+v", flow)
 	}
 }
@@ -166,7 +166,7 @@ func TestFlowInspectionAPITaggedForcedHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	flow := inspectionAPITerminal(t, view).Flow
-	if flow.Origin != fs.TrafficOriginControlledMeasurement || flow.Outbound.Tag != "direct" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) {
+	if flow.Origin != fs.TrafficOriginControlledMeasurement || flow.Outbound.Tag != "direct" || flow.Outbound.Tag == "" || flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(len(payload)) {
 		t.Fatalf("tagged API facts: %+v", flow)
 	}
 }
@@ -194,7 +194,7 @@ func TestFlowInspectionAPILoopbackContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := inspectionAPITerminal(t, view)
-	if page.Flow.Origin != fs.TrafficOriginUnknown || page.Flow.Outbound.Tag != "direct" || page.Flow.Uplink != uint64(len(payload)) || page.Flow.Downlink != uint64(len(payload)) {
+	if page.Flow.Origin != fs.TrafficOriginUnknown || page.Flow.Outbound.Tag != "forward" || page.Flow.Uplink != uint64(len(payload)) || page.Flow.Downlink != uint64(len(payload)) {
 		t.Fatalf("loopback API continuation: %+v", page)
 	}
 }
@@ -215,7 +215,7 @@ func TestFlowInspectionAPILocalStop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial == 0 {
+		if len(live.Rows) != 1 || live.Rows[0].Outbound.Tag == "" {
 			return false
 		}
 		ref = live.Rows[0].Ref

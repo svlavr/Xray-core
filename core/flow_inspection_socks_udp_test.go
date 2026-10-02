@@ -81,7 +81,7 @@ func TestFlowInspectionSOCKSUDPOutbound(t *testing.T) {
 					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "socks-proxy" || row.Outbound.Serial == 0 ||
+					if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "socks-proxy" || row.Outbound.Tag == "" ||
 						row.Destination != destination {
 						t.Fatalf("SOCKS UDP logical facts: %+v", row)
 					}
@@ -156,7 +156,7 @@ func TestFlowInspectionSOCKSUDPOutboundRejected(t *testing.T) {
 			return false
 		}
 		row := page.Rows[0].Flow
-		if row.Kind != cnet.Network_UDP || row.Outbound.Tag != "socks-proxy" || row.Outbound.Serial == 0 || row.Uplink != 0 || row.Downlink != 0 {
+		if row.Kind != cnet.Network_UDP || row.Outbound.Tag != "socks-proxy" || row.Outbound.Tag == "" || row.Uplink != 0 || row.Downlink != 0 {
 			t.Fatalf("failed UDP handshake fabricated payload: %+v", row)
 		}
 		return true

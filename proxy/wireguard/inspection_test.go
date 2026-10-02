@@ -197,7 +197,7 @@ func TestInspectionWireGuardStopPendingVirtualDial(t *testing.T) {
 	ctx, finish := proxy.ObserveTCP(context.Background(), manager, local, target, link)
 	defer finish()
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.OutboundRef{Tag: "wg-device", Serial: 1})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "wg-device"})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 	ctx = session.ContextWithTimeoutOnly(ctx, true)
 	done := make(chan error, 1)

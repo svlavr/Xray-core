@@ -46,7 +46,7 @@ func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
 		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(payload)) {
 			return false
 		}
-		if page.Rows[0].Flow.Outbound.Tag != outbound.Tag || page.Rows[0].Flow.Outbound.Serial == 0 {
+		if page.Rows[0].Flow.Outbound.Tag != outbound.Tag || page.Rows[0].Flow.Outbound.Tag == "" {
 			t.Fatalf("Trojan unclaimed route: %+v", page.Rows[0].Flow)
 		}
 		return true

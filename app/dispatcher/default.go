@@ -472,25 +472,11 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	ob := outbounds[len(outbounds)-1]
 
 	var handler outbound.Handler
-	var serial uint64
 	observation := session.LogicalObservationFromContext(ctx)
 	// Only the admitted endpoint binds P1 facts. Returned-link continuations and
 	// physical detours need their own P2 owner integration.
 	if _, ok := link.Reader.(*buf.InspectionReader); !ok {
 		observation = nil
-	}
-	resolve := func(tag string, useDefault bool) outbound.Handler {
-		if observation != nil {
-			if manager, ok := d.ohm.(outbound.HandlerResolver); ok {
-				h, id := manager.ResolveHandler(tag, useDefault)
-				serial = id
-				return h
-			}
-		}
-		if useDefault {
-			return d.ohm.GetDefaultHandler()
-		}
-		return d.ohm.GetHandler(tag)
 	}
 	reject := func() {
 		if observation != nil {
@@ -503,7 +489,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	isPickRoute := 0
 	if forcedOutboundTag := session.GetForcedOutboundTagFromContext(ctx); forcedOutboundTag != "" {
 		ctx = session.SetForcedOutboundTagToContext(ctx, "")
-		if h := resolve(forcedOutboundTag, false); h != nil {
+		if h := d.ohm.GetHandler(forcedOutboundTag); h != nil {
 			isPickRoute = 1
 			errors.LogInfo(ctx, "taking platform initialized detour [", forcedOutboundTag, "] for [", destination, "]")
 			handler = h
@@ -517,7 +503,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	} else if d.router != nil {
 		if route, err := d.router.PickRoute(routingLink); err == nil {
 			outTag := route.GetOutboundTag()
-			if h := resolve(outTag, false); h != nil {
+			if h := d.ohm.GetHandler(outTag); h != nil {
 				isPickRoute = 2
 				if route.GetRuleTag() == "" {
 					errors.LogInfo(ctx, "taking detour [", outTag, "] for [", destination, "]")
@@ -538,7 +524,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 
 	if handler == nil {
-		handler = resolve("", true)
+		handler = d.ohm.GetDefaultHandler()
 	}
 
 	if handler == nil {
@@ -555,7 +541,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		}
 	}
 	if observation != nil {
-		observation.Exchange.Route(stats.OutboundRef{Serial: serial, Tag: handler.Tag()})
+		observation.Exchange.Route(stats.OutboundRef{Tag: handler.Tag()})
 	}
 	ob.Tag = handler.Tag()
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {

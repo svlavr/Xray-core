@@ -14,7 +14,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -61,12 +60,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob := outbounds[len(outbounds)-1]
 	ob.Name = "blackhole"
 
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, ob.Target.Network == net.Network_TCP || ob.Target.Network == net.Network_UDP)
-
 	if len(h.response) > 0 {
 		mbc := buf.MultiBufferContainer{}
 		common.Must2(mbc.Write(h.response))
-		_ = link.Writer.WriteMultiBuffer(mbc.MultiBuffer)
+		link.Writer.WriteMultiBuffer(mbc.MultiBuffer)
 		// Sleep a little here to make sure the response is sent to client.
 		time.Sleep(time.Second)
 	}

@@ -16,7 +16,6 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -80,7 +79,6 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			return errors.New("failed to create udp packet codec").Base(err)
 		}
 	}
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, network == net.Network_TCP || network == net.Network_UDP)
 
 	errors.LogInfo(ctx, "tunneling request to ", destination, " via ", o.server.NetAddr())
 

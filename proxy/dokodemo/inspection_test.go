@@ -85,8 +85,7 @@ func TestInspectionPacketWriterRawResults(t *testing.T) {
 				}
 				defer manager.Close()
 				flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-				flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-				flow.BindRoute()
+				flow.Route(fs.OutboundRef{Tag: "direct"})
 				destination := net.UDPDestination(net.LocalHostIP, 53)
 				socket := &inspectionResultSocket{result: tc.n, err: tc.err}
 				native := NewPacketWriter(socket, &destination, 0, &net.UDPAddr{}).(*PacketWriter)
@@ -121,8 +120,7 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 	}
 	defer manager.Close()
 	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{Tag: "direct"})
 	destination := net.UDPDestination(net.LocalHostIP, 53)
 	socket := &inspectionResultSocket{result: 2, err: io.ErrClosedPipe, entered: make(chan struct{}), release: make(chan struct{})}
 	native := NewPacketWriter(socket, &destination, 0, &net.UDPAddr{}).(*PacketWriter)

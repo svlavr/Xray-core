@@ -15,16 +15,14 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	if a.Ref() != root.Ref() || b.Ref() != root.Ref() || a.NewLeg() != nil {
 		t.Fatal("ray changed association identity or admitted nested legs")
 	}
-	a.Route(fs.OutboundRef{Serial: 11, Tag: "old"})
+	a.Route(fs.OutboundRef{Tag: "old"})
 	a.AddUplink(3)
 	a.AddDownlink(2)
-	b.Route(fs.OutboundRef{Serial: 12, Tag: "new"})
+	b.Route(fs.OutboundRef{Tag: "new"})
 	b.AddUplink(5)
-	b.BindRoute()
+	a.Route(fs.OutboundRef{Tag: "old-repeat"}) // Cannot overwrite the newer ray display.
 	newDest := xnet.UDPDestination(xnet.LocalHostIP, 53)
 	b.PacketDestination(newDest)
-	a.BindRoute() // Late old binding must not roll back the latest route.
-	a.BindRoute()
 	a.AddDownlink(7)
 	b.AddDownlink(9)
 	out, err := s.CloseFlows(context.Background(), []fs.FlowRef{root.Ref()})
@@ -42,21 +40,21 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	root.Finish()
 	page, _ = s.ReadTerminals()
 	f := page.Rows[0].Flow
-	if f.Ref != root.Ref() || f.Uplink != 8 || f.Downlink != 18 || f.Outbound.Serial != 12 || f.Destination != newDest {
+	if f.Ref != root.Ref() || f.Uplink != 8 || f.Downlink != 18 || f.Outbound.Tag != "new" || f.Destination != newDest {
 		t.Fatalf("association facts: %+v", f)
 	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		switch row.Outbound.Serial {
-		case 0:
+		switch row.Outbound.Tag {
+		case "":
 			if row.Uplink != 0 || row.Downlink != 0 {
 				t.Fatalf("inactive root fabricated unassigned facts: %+v", row)
 			}
-		case 11:
+		case "old":
 			if row.Uplink != 16 || row.Downlink != 9 {
 				t.Fatalf("old-ray totals: %+v", row)
 			}
-		case 12:
+		case "new":
 			if row.Uplink != 5 || row.Downlink != 9 {
 				t.Fatalf("new-ray totals: %+v", row)
 			}
@@ -72,17 +70,14 @@ func TestInspectionRayPendingUnassignedCredit(t *testing.T) {
 
 	a.Unassign()
 	a.Finish() // No consuming route: only this ray's pending bytes are unassigned.
-	b.Route(fs.OutboundRef{Serial: 8})
+	b.Route(fs.OutboundRef{Tag: "tag-8"})
 	b.AddUplink(5)
-
-	b.BindRoute()
 	c := root.NewLeg()
-	c.Route(fs.OutboundRef{Serial: 8})
-	c.BindRoute()
+	c.Route(fs.OutboundRef{Tag: "tag-8"})
 
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 8 && (row.Uplink != 5) {
+		if row.Outbound.Tag == "tag-8" && (row.Uplink != 5) {
 			t.Fatalf("independent leg incompleteness: %+v", row)
 		}
 	}
@@ -91,7 +86,7 @@ func TestInspectionRayPendingUnassignedCredit(t *testing.T) {
 	root.Finish()
 	totals, _ = s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Origin == fs.TrafficOriginInternal && row.Outbound.Serial == 0 && row.Uplink != 3 {
+		if row.Origin == fs.TrafficOriginInternal && row.Outbound.Tag == "" && row.Uplink != 3 {
 			t.Fatalf("unassigned pending credit: %+v", row)
 		}
 	}
@@ -101,8 +96,7 @@ func TestInspectionFinishedRayLateFactsReachLiveRoot(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	leg := root.NewLeg()
-	leg.Route(fs.OutboundRef{Serial: 7})
-	leg.BindRoute()
+	leg.Route(fs.OutboundRef{Tag: "tag-7"})
 	leg.Finish()
 	leg.AddUplink(9)
 
@@ -119,18 +113,18 @@ func TestInspectionFinishedRayLateFactsReachLiveRoot(t *testing.T) {
 	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 7 && row.Uplink == 13 {
+		if row.Outbound.Tag == "tag-7" && row.Uplink == 13 {
 			return
 		}
 	}
 	t.Fatalf("late aggregate credit missing: %+v", totals)
 }
 
-func TestInspectionSelectedUnclaimedRayIsUnassigned(t *testing.T) {
+func TestInspectionSelectedRayKeepsTagWithoutConsumption(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	leg := root.NewLeg()
-	leg.Route(fs.OutboundRef{Serial: 19, Tag: "selected-only"})
+	leg.Route(fs.OutboundRef{Tag: "selected-only"})
 	leg.AddUplink(5)
 	leg.Unassign()
 
@@ -138,16 +132,16 @@ func TestInspectionSelectedUnclaimedRayIsUnassigned(t *testing.T) {
 	root.Finish()
 
 	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 19 {
-		t.Fatalf("selected route became a consuming owner: %+v", page)
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "selected-only" {
+		t.Fatalf("selected route label changed: %+v", page)
 	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Origin == fs.TrafficOriginUser && row.Outbound.Serial == 0 && row.Uplink == 5 {
+		if row.Origin == fs.TrafficOriginUser && row.Outbound.Tag == "selected-only" && row.Uplink == 5 {
 			return
 		}
 	}
-	t.Fatalf("unclaimed selected ray missing from unassigned totals: %+v", totals)
+	t.Fatalf("selected ray missing from selected totals: %+v", totals)
 }
 
 func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
@@ -165,8 +159,7 @@ func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
 	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 11 || page.Rows[0].Flow.Downlink != 13 || page.Rows[0].Flow.Destination != destination {
 		t.Fatalf("pre-classification terminal: %+v", page)
 	}
-	leg.Route(fs.OutboundRef{Serial: 31, Tag: "ordinary"})
-	leg.BindRoute()
+	leg.Route(fs.OutboundRef{Tag: "ordinary"})
 	leg.AddUplink(17)
 
 	again, _ := s.ReadTerminals()
@@ -175,7 +168,7 @@ func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
 	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 31 {
+		if row.Outbound.Tag == "ordinary" {
 			if row.Uplink != 28 || row.Downlink != 13 {
 				t.Fatalf("late ordinary totals: %+v", row)
 			}
@@ -185,62 +178,61 @@ func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
 	t.Fatalf("late ordinary bucket missing: %+v", totals)
 }
 
-func TestInspectionRouteThenOwnerEndBeforeBind(t *testing.T) {
+func TestInspectionSelectedRayOwnerEndKeepsLateTotals(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	leg := root.NewLeg().(*inspectionExchange)
-	destination := xnet.UDPDestination(xnet.DomainAddress("route-before-bind.example"), 53)
+	destination := xnet.UDPDestination(xnet.DomainAddress("selected-before-end.example"), 53)
 	leg.AddUplink(23)
 	leg.PacketDestination(destination)
-	leg.Route(fs.OutboundRef{Serial: 35, Tag: "later-claim"})
+	leg.Route(fs.OutboundRef{Tag: "selected-ray"})
 	leg.Finish()
 	root.Finish()
 
 	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 23 || page.Rows[0].Flow.Destination != destination || page.Rows[0].Flow.Outbound.Serial != 35 {
-		t.Fatalf("route-before-bind lower bound: %+v", page)
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 23 || page.Rows[0].Flow.Destination != destination || page.Rows[0].Flow.Outbound.Tag != "selected-ray" {
+		t.Fatalf("selected owner-end lower bound: %+v", page)
 	}
-	leg.BindRoute()
 	leg.AddDownlink(29)
 	leg.FinishSelectedLeg()
 
 	again, _ := s.ReadTerminals()
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Outbound.Serial != 35 || again.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("late claim changed immutable terminal: %+v", again)
+	if len(again.Rows) != 1 || again.Rows[0].Flow.Outbound.Tag != "selected-ray" || again.Rows[0].Flow.Downlink != 0 {
+		t.Fatalf("late receipt changed immutable terminal: %+v", again)
 	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 35 {
+		if row.Outbound.Tag == "selected-ray" {
 			if row.Uplink != 23 || row.Downlink != 29 {
-				t.Fatalf("late claim totals: %+v", row)
+				t.Fatalf("late receipt totals: %+v", row)
 			}
 			return
 		}
 	}
-	t.Fatalf("late claim bucket missing: %+v", totals)
+	t.Fatalf("late receipt bucket missing: %+v", totals)
 }
 
-func TestInspectionEarlyFinishedSelectedLegWithoutClaimIsUnassigned(t *testing.T) {
+func TestInspectionEarlyFinishedRaySelectionSettlesPendingCredit(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{})
 	root := s.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
 	leg := root.NewLeg().(*inspectionExchange)
 	leg.AddUplink(19)
 	leg.Finish()
-	leg.Route(fs.OutboundRef{Serial: 37, Tag: "selected-no-claim"})
+	leg.Route(fs.OutboundRef{Tag: "selected-ray"})
 	leg.FinishSelectedLeg()
 	root.Finish()
 
 	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Serial != 37 || page.Rows[0].Flow.Uplink != 19 {
-		t.Fatalf("selected no-claim terminal: %+v", page)
+	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "selected-ray" || page.Rows[0].Flow.Uplink != 19 {
+		t.Fatalf("selected ray terminal: %+v", page)
 	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
-		if row.Origin == fs.TrafficOriginUser && row.Outbound.Serial == 0 && row.Uplink == 19 {
+		if row.Origin == fs.TrafficOriginUser && row.Outbound.Tag == "selected-ray" && row.Uplink == 19 {
 			return
 		}
 	}
-	t.Fatalf("selected no-claim unassigned total missing: %+v", totals)
+	t.Fatalf("selected ray total missing: %+v", totals)
 }
 
 func TestInspectionTCPDoesNotCreatePacketLeg(t *testing.T) {

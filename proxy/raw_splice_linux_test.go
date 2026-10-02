@@ -36,7 +36,6 @@ func (e *rawSpliceTestExchange) Ref() stats.FlowRef                          { r
 func (e *rawSpliceTestExchange) NewLeg() stats.Exchange                      { return nil }
 func (e *rawSpliceTestExchange) Rebind(stats.RuntimeID, stats.TrafficOrigin) {}
 func (e *rawSpliceTestExchange) Route(stats.OutboundRef)                     {}
-func (e *rawSpliceTestExchange) BindRoute()                                  {}
 func (e *rawSpliceTestExchange) PacketDestination(xnet.Destination)          {}
 func (e *rawSpliceTestExchange) Unassign()                                   {}
 func (e *rawSpliceTestExchange) Effective(xnet.Destination)                  {}

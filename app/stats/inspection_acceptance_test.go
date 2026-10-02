@@ -28,8 +28,7 @@ func acceptanceOwnedExchange(store *inspectionStore, carrier bool) (fs.Exchange,
 		return store.PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, stop), ref
 	}
 	exchange := store.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, stop)
-	exchange.Route(fs.OutboundRef{Serial: 1, Tag: "direct"})
-	exchange.BindRoute()
+	exchange.Route(fs.OutboundRef{Tag: "direct"})
 	return exchange, ref
 }
 
@@ -57,7 +56,7 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if row := findTotal(t, totals.Rows, 1, fs.TrafficOriginUser); row.Downlink != 8 {
+		if row := findTotal(t, totals.Rows, "direct", fs.TrafficOriginUser); row.Downlink != 8 {
 			t.Fatalf("late total: %+v", row)
 		}
 		terminal, err := store.ReadTerminals()
@@ -94,8 +93,7 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 		var stopped atomic.Int32
 		root := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, func() error { stopped.Add(1); return nil })
 		leg := root.NewLeg()
-		leg.Route(fs.OutboundRef{Serial: 1})
-		leg.BindRoute()
+		leg.Route(fs.OutboundRef{Tag: "tag-1"})
 		leg.Finish()
 		outcomes, err := store.CloseFlows(context.Background(), []fs.FlowRef{root.Ref()})
 		if err != nil || outcomes[0] != nil || stopped.Load() != 1 {
@@ -108,8 +106,7 @@ func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
 	store := testInspectionStore(t, fs.ObservationOptions{MaxTerminals: 2})
 	add := func(n int) {
 		e := store.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-		e.Route(fs.OutboundRef{Serial: 1, Tag: "original"})
-		e.BindRoute()
+		e.Route(fs.OutboundRef{Tag: "original"})
 		e.AddUplink(uint64(n))
 		e.Finish()
 	}
@@ -175,15 +172,14 @@ func TestInspectionAcceptanceStopRequestedIsVisible(t *testing.T) {
 	<-done
 }
 
-func acceptanceFillMetadata(store *inspectionStore, serial uint64, index int) *inspectionExchange {
+func acceptanceFillMetadata(store *inspectionStore, tagIndex uint64, index int) *inspectionExchange {
 	domain := func(label string) xnet.Destination {
 		return xnet.UDPDestination(xnet.DomainAddress(fmt.Sprintf("%08d-%s-", index, label)+strings.Repeat("d", 300)), 53)
 	}
 	e := store.Begin(xnet.Network_UDP, fs.TrafficOriginUser, domain("source"), domain("initial"), nil).(*inspectionExchange)
 	for i := 0; i < 4; i++ {
-		e.Route(fs.OutboundRef{Serial: serial, Tag: strings.Repeat("t", 300)})
+		e.Route(fs.OutboundRef{Tag: fmt.Sprintf("%08d", tagIndex) + strings.Repeat("t", 292)})
 	}
-	e.BindRoute()
 	for i := 0; i < 8; i++ {
 		e.PacketDestination(domain(fmt.Sprintf("packet-%d", i)))
 	}

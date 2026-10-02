@@ -33,8 +33,7 @@ func TestSOCKSUDPResponseReceipts(t *testing.T) {
 			view, _ := manager.EnableInspection(fs.ObservationOptions{})
 			defer manager.Close()
 			flow := manager.Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
-			flow.Route(fs.OutboundRef{Serial: 1})
-			flow.BindRoute()
+			flow.Route(fs.OutboundRef{Tag: "tag-1"})
 			ctx := session.ContextWithLogicalObservation(context.Background(), &session.LogicalObservation{Exchange: flow})
 			request := &protocol.RequestHeader{Address: cnet.LocalHostIP, Port: 53}
 			if mode == "encode-error" {

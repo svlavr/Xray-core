@@ -41,8 +41,7 @@ func inspectionPacketFlow(t *testing.T) (fs.Exchange, fs.FlowInspection) {
 	}
 	t.Cleanup(func() { manager.Close() })
 	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, func() error { return nil })
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{Tag: "direct"})
 	return flow, view
 }
 

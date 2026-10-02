@@ -79,7 +79,7 @@ func inspectionOutboundTotals(t *testing.T, view fs.FlowInspection, tag string, 
 			if row.Uplink == 0 && row.Downlink == 0 {
 				continue
 			}
-			if row.Outbound.Tag != tag || row.Outbound.Serial == 0 || row.Origin != fs.TrafficOriginUser {
+			if row.Outbound.Tag != tag || row.Outbound.Tag == "" || row.Origin != fs.TrafficOriginUser {
 				t.Fatalf("outbound attribution: %+v", row)
 			}
 			up += row.Uplink
@@ -129,7 +129,7 @@ func inspectionOutboundTCP(t *testing.T, config func(*testing.T) *core.OutboundH
 					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Destination != destination || row.Origin != fs.TrafficOriginUser {
+					if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Destination != destination || row.Origin != fs.TrafficOriginUser {
 						t.Fatalf("outbound TCP live facts: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -197,7 +197,7 @@ func inspectionOutboundUDP(t *testing.T, config func(*testing.T) *core.OutboundH
 				selected = live.Rows[0]
 				return true
 			})
-			if selected.Kind != cnet.Network_UDP || selected.Destination != destination || selected.Outbound.Tag != outbound.Tag || selected.Outbound.Serial == 0 {
+			if selected.Kind != cnet.Network_UDP || selected.Destination != destination || selected.Outbound.Tag != outbound.Tag || selected.Outbound.Tag == "" {
 				t.Fatalf("outbound UDP live facts: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
@@ -246,7 +246,7 @@ func inspectionOutboundPreparationFailure(t *testing.T, outbound *core.OutboundH
 			return false
 		}
 		row := page.Rows[0].Flow
-		if row.Outbound.Tag != outbound.Tag || row.Outbound.Serial == 0 || row.Uplink != uint64(len(payload)) || row.Downlink != 0 {
+		if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Uplink != uint64(len(payload)) || row.Downlink != 0 {
 			t.Fatalf("failed preparation lost sniff credit or invented payload: %+v", row)
 		}
 		return true

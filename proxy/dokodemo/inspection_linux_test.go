@@ -45,8 +45,7 @@ func (d *inspectionRedirectDispatcher) DispatchLink(ctx context.Context, dest ne
 		d.t.Errorf("redirect target: %v", dest)
 	}
 	if o := session.LogicalObservationFromContext(ctx); o != nil {
-		o.Exchange.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-		proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
+		o.Exchange.Route(fs.OutboundRef{Tag: "direct"})
 	}
 	mb, err := link.Reader.ReadMultiBuffer()
 	got := mb.String()

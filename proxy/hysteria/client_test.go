@@ -126,8 +126,7 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 			}
 			t.Cleanup(func() { manager.Close() })
 			flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-			flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-			flow.BindRoute()
+			flow.Route(fs.OutboundRef{Tag: "direct"})
 			failure := errors.New("packet result failure")
 			calls := 0
 			writer := &UDPWriter{addr: "127.0.0.1:53", writer: udpWriterFunc(func(p []byte) (int, error) {
@@ -198,8 +197,7 @@ func TestInspectionHysteriaPacketBatchFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { manager.Close() })
 	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
-	flow.Route(fs.OutboundRef{Tag: "direct", Serial: 1})
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{Tag: "direct"})
 	calls := 0
 	native := &UDPWriter{addr: "127.0.0.1:53", writer: udpWriterFunc(func(p []byte) (int, error) {
 		calls++

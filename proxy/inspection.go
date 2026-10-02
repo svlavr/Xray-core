@@ -184,10 +184,9 @@ func RecordPacketOutcome(receipt stats.Exchange, payload uint64, complete bool) 
 	}
 }
 
-// ClaimObservedEndpoint binds an eligible endpoint to its actual consuming
-// outbound. Protocol-specific eligibility and effective target remain with the
-// caller.
-func ClaimObservedEndpoint(ctx context.Context, reader buf.Reader, eligible bool) *session.LogicalObservation {
+// ObservedEndpoint returns the admitted endpoint when this reader owns it.
+// Protocol-specific eligibility and effective target remain with the caller.
+func ObservedEndpoint(ctx context.Context, reader buf.Reader, eligible bool) *session.LogicalObservation {
 	if !eligible {
 		return nil
 	}
@@ -201,6 +200,5 @@ func ClaimObservedEndpoint(ctx context.Context, reader buf.Reader, eligible bool
 	if observation == nil {
 		return nil
 	}
-	observation.Exchange.BindRoute()
 	return observation
 }

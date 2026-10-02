@@ -12,12 +12,11 @@ import (
 )
 
 type aggregateKey struct {
-	serial uint64
+	tag    string
 	origin featurestats.TrafficOrigin
 }
 
 type aggregateCell struct {
-	tag      string
 	uplink   atomic.Uint64
 	downlink atomic.Uint64
 }
@@ -157,7 +156,7 @@ func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
 		appendCell(&s.unassigned[i], featurestats.OutboundRef{}, featurestats.TrafficOrigin(i))
 	}
 	for key, cell := range s.buckets {
-		appendCell(cell, featurestats.OutboundRef{Serial: key.serial, Tag: cell.tag}, key.origin)
+		appendCell(cell, featurestats.OutboundRef{Tag: key.tag}, key.origin)
 	}
 	return featurestats.TotalsSnapshot{
 		At:   s.elapsed(),
@@ -221,10 +220,10 @@ func (s *inspectionStore) lookup(id uint64) *inspectionExchange {
 }
 
 func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) *aggregateCell {
-	if outbound.Serial == 0 {
+	if outbound.Tag == "" {
 		return &s.unassigned[int(origin)]
 	}
-	key := aggregateKey{serial: outbound.Serial, origin: origin}
+	key := aggregateKey{tag: outbound.Tag, origin: origin}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cell := s.buckets[key]; cell != nil {
@@ -236,7 +235,7 @@ func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin fe
 	if uint32(len(s.buckets)) >= s.limits.MaxBuckets {
 		return &s.unassigned[int(origin)]
 	}
-	cell := &aggregateCell{tag: outbound.Tag}
+	cell := &aggregateCell{}
 	s.buckets[key] = cell
 	return cell
 }
@@ -292,7 +291,6 @@ type inspectionExchange struct {
 	*inspectionFlow
 	isLeg           bool
 	hasLegs         bool
-	route           featurestats.OutboundRef
 	pending         *pendingCredit
 	bucket          *aggregateCell
 	published       bool
@@ -336,21 +334,11 @@ func (e *inspectionExchange) ExcludeCarrier() bool {
 func (e *inspectionExchange) Route(outbound featurestats.OutboundRef) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || e.published {
+	if e.excluded || e.published || e.bucket != nil {
 		return
 	}
 	e.record.Outbound = outbound
-	if e.bucket == nil {
-		e.route = outbound
-	}
-}
-
-func (e *inspectionExchange) BindRoute() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.published {
-		e.bindLocked(e.route)
-	}
+	e.bindLocked(outbound)
 }
 
 func (e *inspectionExchange) Unassign() {

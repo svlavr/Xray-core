@@ -39,9 +39,6 @@ func (*portalUDPDataOutbound) SenderSettings() *serial.TypedMessage { return nil
 func (*portalUDPDataOutbound) ProxySettings() *serial.TypedMessage { return nil }
 
 func (*portalUDPDataOutbound) Dispatch(ctx context.Context, link *transport.Link) {
-	if observation := session.LogicalObservationFromContext(ctx); observation != nil {
-		observation.Exchange.BindRoute()
-	}
 	mb, err := link.Reader.ReadMultiBuffer()
 	if err == nil {
 		err = link.Writer.WriteMultiBuffer(mb)
@@ -179,7 +176,7 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	})
 }
 
-func TestFlowInspectionP2GUDPCustomHandlerReturnStaysPending(t *testing.T) {
+func TestFlowInspectionP2GUDPCustomSelectionSettlesObservedBytes(t *testing.T) {
 	instance, view, _ := inspectionCore(t, true, false)
 	manager := instance.GetFeature(outbound.ManagerType()).(outbound.Manager)
 	handler := &portalUDPNoClaimOutbound{portalUDPDataOutbound: portalUDPDataOutbound{tag: "no-claim"}, returned: make(chan struct{})}
@@ -209,21 +206,30 @@ func TestFlowInspectionP2GUDPCustomHandlerReturnStaysPending(t *testing.T) {
 		t.Fatalf("unclaimed terminal: %+v %v", page, err)
 	}
 	flow := page.Rows[0].Flow
-	if flow.Outbound.Tag != "no-claim" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(payload)) {
+	if flow.Outbound.Tag != "no-claim" || flow.Outbound.Tag == "" || flow.Uplink != uint64(len(payload)) {
 		t.Fatalf("custom pending facts: %+v", page.Rows[0])
 	}
 	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var selected uint64
 	for _, total := range totals.Rows {
-		if total.Uplink != 0 || total.Downlink != 0 {
-			t.Fatalf("custom handler return settled pending credit: %+v", total)
+		if total.Outbound.Tag == "no-claim" && total.Origin == fs.TrafficOriginUser {
+			selected += total.Uplink
+		} else if total.Uplink != 0 {
+			t.Fatalf("duplicate or foreign credit: %+v", total)
 		}
+		if total.Downlink != 0 {
+			t.Fatalf("non-consuming handler returned byte facts: %+v", total)
+		}
+	}
+	if selected != uint64(len(payload)) {
+		t.Fatalf("selected custom bytes=%d", selected)
 	}
 }
 
-func TestFlowInspectionP2GNativeHandlerReturnSettlesNoClaim(t *testing.T) {
+func TestFlowInspectionP2GNativeRejectionKeepsSelectedTotals(t *testing.T) {
 	instance, view, _ := inspectionCore(t, true, false)
 	if err := core.AddOutboundHandler(instance, &core.OutboundHandlerConfig{
 		Tag: "native-no-claim",
@@ -253,7 +259,7 @@ func TestFlowInspectionP2GNativeHandlerReturnSettlesNoClaim(t *testing.T) {
 			return false
 		}
 		for _, total := range totals.Rows {
-			if total.Origin == fs.TrafficOriginUser && total.Outbound.Serial == 0 {
+			if total.Origin == fs.TrafficOriginUser && total.Outbound.Tag == "native-no-claim" {
 				return total.Uplink == uint64(len(payload))
 			}
 		}
@@ -266,7 +272,7 @@ func TestFlowInspectionP2GNativeHandlerReturnSettlesNoClaim(t *testing.T) {
 		t.Fatalf("native no-claim terminal: %+v %v", page, err)
 	}
 	flow := page.Rows[0].Flow
-	if flow.Outbound.Tag != "native-no-claim" || flow.Outbound.Serial == 0 || flow.Uplink != uint64(len(payload)) {
+	if flow.Outbound.Tag != "native-no-claim" || flow.Outbound.Tag == "" || flow.Uplink != uint64(len(payload)) {
 		t.Fatalf("native no-claim facts: %+v", page.Rows[0])
 	}
 }

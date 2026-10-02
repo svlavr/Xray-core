@@ -139,7 +139,7 @@ func startObservedHTTP2Endpoint(t *testing.T, client *Client, manager *appstats.
 		t.Fatal("inspection was not enabled")
 	}
 	observation := session.LogicalObservationFromContext(ctx)
-	observation.Exchange.Route(fs.OutboundRef{Serial: serial, Tag: "http-proxy"})
+	observation.Exchange.Route(fs.OutboundRef{Tag: "http-proxy"})
 	done := make(chan error, 1)
 	go func() {
 		defer finish()
@@ -212,10 +212,10 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 			if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 				return false
 			}
-			if row.Outbound.Tag != "http-proxy" || row.Outbound.Serial == 0 || row.Destination != target {
+			if row.Outbound.Tag != "http-proxy" || row.Outbound.Tag == "" || row.Destination != target {
 				t.Fatalf("live HTTP/2 receipt: %+v", row)
 			}
-			if row.Outbound.Serial == 1 {
+			if row.Source.Port == 1 {
 				selected = row.Ref
 			}
 		}
@@ -255,7 +255,7 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 	var up, down uint64
 	var selectedBuckets int
 	for _, row := range totals.Rows {
-		if row.Outbound.Serial == 0 {
+		if row.Outbound.Tag == "" {
 			if row.Uplink != 0 || row.Downlink != 0 {
 				t.Fatalf("unexpected unassigned HTTP/2 credit: %+v", row)
 			}
@@ -268,7 +268,7 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 		up += row.Uplink
 		down += row.Downlink
 	}
-	if selectedBuckets != 2 || up != want || down != want {
+	if selectedBuckets != 1 || up != want || down != want {
 		t.Fatalf("HTTP/2 framing included or payload lost: buckets=%d %d/%d want %d", selectedBuckets, up, down, want)
 	}
 }

@@ -138,7 +138,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
 						return false
 					}
-					if row.Kind != cnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" || row.Destination != destination {
+					if row.Kind != cnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag == "" || row.Outbound.Tag != "direct" || row.Destination != destination {
 						t.Fatalf("admission/route: %+v", row)
 					}
 					if row.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
@@ -202,7 +202,7 @@ func inspectionTCPTotals(t *testing.T, view fs.FlowInspection, want uint64) {
 			if row.Uplink == 0 && row.Downlink == 0 {
 				continue
 			}
-			if row.Origin != fs.TrafficOriginUser || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" {
+			if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag == "" || row.Outbound.Tag != "direct" {
 				t.Fatalf("total attribution/accuracy: %+v", row)
 			}
 			up += row.Uplink
@@ -280,7 +280,7 @@ func TestFlowInspectionHTTPDelegationKeepAliveControl(t *testing.T) {
 			t.Fatal("pipelined HTTP requests reused one FlowRef")
 		}
 		for _, row := range page.Rows {
-			if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Serial == 0 || row.Flow.Uplink == 0 || row.Flow.Downlink == 0 {
+			if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Tag == "" || row.Flow.Uplink == 0 || row.Flow.Downlink == 0 {
 				t.Fatalf("plain HTTP request receipt: %+v", row)
 			}
 		}
@@ -314,7 +314,7 @@ func TestFlowInspectionTCPAdmissionsRejected(t *testing.T) {
 					return false
 				}
 				final := page.Rows[0]
-				if final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != 0 || final.Flow.Outbound.Serial != 0 {
+				if final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != 0 || final.Flow.Outbound.Tag != "" {
 					t.Fatalf("rejected receipt: %+v", final)
 				}
 				return true

@@ -48,7 +48,7 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 				first = live.Rows[0]
 				return true
 			})
-			if first.Kind != cnet.Network_UDP || first.Origin != fs.TrafficOriginUser || first.Outbound.Tag != outbound.Tag || first.Outbound.Serial == 0 || first.Destination != destination {
+			if first.Kind != cnet.Network_UDP || first.Origin != fs.TrafficOriginUser || first.Outbound.Tag != outbound.Tag || first.Outbound.Tag == "" || first.Destination != destination {
 				t.Fatalf("supplied packet facts: %+v", first)
 			}
 			inspectionUDPExchange(t, sibling, address, payload, 0x19)

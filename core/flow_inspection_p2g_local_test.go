@@ -122,7 +122,7 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 		t.Fatal("keep-alive requests reused one FlowRef")
 	}
 	for _, row := range page.Rows {
-		if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Serial == 0 || row.Flow.Uplink == 0 || row.Flow.Downlink <= uint64(len("origin:/one")) {
+		if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Tag == "" || row.Flow.Uplink == 0 || row.Flow.Downlink <= uint64(len("origin:/one")) {
 			t.Fatalf("HTTP request receipt: %+v", row)
 		}
 	}
@@ -182,7 +182,7 @@ func TestFlowInspectionP2GHTTPRequestExactStop(t *testing.T) {
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
 		live, _ := view.ReadLive()
-		if len(live.Rows) != 1 || live.Rows[0].Outbound.Serial == 0 {
+		if len(live.Rows) != 1 || live.Rows[0].Outbound.Tag == "" {
 			return false
 		}
 		ref = live.Rows[0].Ref

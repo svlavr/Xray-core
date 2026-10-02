@@ -44,7 +44,7 @@ func (s stopAdmissionStore) PrepareTCP(origin fs.TrafficOrigin, source, dest net
 	flow := s.AdmissionStore.PrepareTCP(origin, source, dest, stop)
 	// This fault provider classifies the logical endpoint before exposing it,
 	// then injects stop before its native session endpoints are published.
-	flow.BindRoute()
+	flow.Route(fs.OutboundRef{})
 	s.view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
 	return flow
 }
@@ -123,8 +123,7 @@ func TestMuxEndRetiresBeforeLateInitialFrame(t *testing.T) {
 	response.Close()
 	d := &retainedDispatcher{dispatch: func(ctx context.Context) (*transport.Link, error) {
 		observation := session.LogicalObservationFromContext(ctx)
-		observation.Exchange.Route(fs.OutboundRef{Serial: 1})
-		observation.Exchange.BindRoute()
+		observation.Exchange.Route(fs.OutboundRef{Tag: "tag-1"})
 		return link, nil
 	}}
 	carrier := &blockedCarrier{entered: make(chan struct{}), release: make(chan struct{})}

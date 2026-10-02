@@ -35,7 +35,7 @@ func TestInspectionSourceClaimAfterSniffReplay(t *testing.T) {
 	ctx, finish := ObserveTCP(context.Background(), manager, local, cnet.TCPDestination(cnet.LocalHostIP, 53), link)
 	defer finish()
 	root := session.LogicalObservationFromContext(ctx).Exchange
-	root.Route(fs.OutboundRef{Tag: "dns", Serial: 1})
+	root.Route(fs.OutboundRef{Tag: "dns"})
 	go func() { _, _ = peer.Write(frame) }()
 	cursor := link.Reader.(*buf.InspectionReader)
 	sniff := buf.New()
@@ -43,7 +43,7 @@ func TestInspectionSourceClaimAfterSniffReplay(t *testing.T) {
 	if err := cursor.Cache(sniff, time.Second); err != nil || !strings.Contains(string(sniff.Bytes()), string(payload)) {
 		t.Fatalf("sniff replay: %q %v", sniff.Bytes(), err)
 	}
-	claimed := ClaimObservedEndpoint(ctx, link.Reader, true)
+	claimed := ObservedEndpoint(ctx, link.Reader, true)
 	if claimed == nil || claimed.Exchange.Ref() != root.Ref() {
 		t.Fatal("DNS did not claim the supplied endpoint")
 	}

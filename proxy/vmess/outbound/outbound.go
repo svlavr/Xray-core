@@ -21,7 +21,6 @@ import (
 	"github.com/xtls/xray-core/common/xudp"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/proxy/vmess/encoding"
 	"github.com/xtls/xray-core/transport"
@@ -66,20 +65,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Name = "vmess"
 	ob.CanSpliceCopy = 3
 
-	target := ob.Target
-	command := protocol.RequestCommandTCP
-	if target.Network == net.Network_UDP {
-		command = protocol.RequestCommandUDP
-	}
-	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
-		command = protocol.RequestCommandMux
-	}
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, command == protocol.RequestCommandTCP || command == protocol.RequestCommandUDP)
-	useXUDP := command == protocol.RequestCommandUDP && h.cone && target.Port != 53 && target.Port != 443
-	if useXUDP {
-		command = protocol.RequestCommandMux
-	}
-
 	rec := h.server
 	var conn stat.Connection
 
@@ -97,7 +82,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	defer conn.Close()
 
+	target := ob.Target
 	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
+
+	command := protocol.RequestCommandTCP
+	if target.Network == net.Network_UDP {
+		command = protocol.RequestCommandUDP
+	}
+	if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.cool" {
+		command = protocol.RequestCommandMux
+	}
 
 	user := rec.User
 	request := &protocol.RequestHeader{
@@ -149,7 +143,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}, sessionPolicy.Timeouts.ConnectionIdle)
 
-	if useXUDP {
+	if request.Command == protocol.RequestCommandUDP && h.cone && request.Port != 53 && request.Port != 443 {
+		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")
 		request.Port = net.Port(666)
 	}

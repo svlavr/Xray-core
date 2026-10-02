@@ -252,8 +252,6 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, true)
-
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() {

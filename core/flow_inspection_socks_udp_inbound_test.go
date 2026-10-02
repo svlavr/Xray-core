@@ -118,7 +118,7 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 			})
 			// The association begins before the first datagram with unavailable
 			// peer and target. Accepted packets fill the peer and latest requested target.
-			if selected.Kind != cnet.Network_UDP || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.Destination != secondDest || selected.Outbound.Tag != "direct" || selected.Outbound.Serial == 0 {
+			if selected.Kind != cnet.Network_UDP || selected.Origin != fs.TrafficOriginUser || selected.Source != cnet.DestinationFromAddr(client.LocalAddr()) || selected.Destination != secondDest || selected.Outbound.Tag != "direct" || selected.Outbound.Tag == "" {
 				t.Fatalf("association facts: %+v", selected)
 			}
 			out, err := view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
@@ -209,7 +209,7 @@ func TestFlowInspectionSOCKSUDPInboundRejected(t *testing.T) {
 	}
 	inspectionWait(t, func() bool {
 		live, err := view.ReadLive()
-		return err == nil && len(live.Rows) == 1 && live.Rows[0].Outbound.Serial == 0 &&
+		return err == nil && len(live.Rows) == 1 && live.Rows[0].Outbound.Tag == "" &&
 			live.Rows[0].Uplink == uint64(len(payload)) && live.Rows[0].Downlink == 0
 	})
 	control.Close()
@@ -234,7 +234,7 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 	var ref fs.FlowRef
 	inspectionWait(t, func() bool {
 		live, err := view.ReadLive()
-		if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Serial != 0 ||
+		if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Tag != "" ||
 			live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != 0 {
 			return false
 		}

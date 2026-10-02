@@ -142,7 +142,7 @@ func inspectionUDPRow(t *testing.T, view fs.FlowInspection, source cnet.Port, de
 			if row.Uplink != uplink || row.Downlink != downlink {
 				return false
 			}
-			if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Destination != destination || row.Outbound.Serial == 0 || row.Outbound.Tag != "direct" {
+			if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Destination != destination || row.Outbound.Tag == "" || row.Outbound.Tag != "direct" {
 				t.Fatalf("UDP logical facts: %+v", row)
 			}
 			found = row
@@ -319,7 +319,7 @@ func inspectionUDPBatchThrough(t *testing.T, instance *core.Instance, view fs.Fl
 	var up, down uint64
 	for _, total := range totals.Rows {
 		if total.Uplink != 0 || total.Downlink != 0 {
-			if total.Outbound.Tag != outboundTag || total.Outbound.Serial == 0 || total.Origin != fs.TrafficOriginUser {
+			if total.Outbound.Tag != outboundTag || total.Outbound.Tag == "" || total.Origin != fs.TrafficOriginUser {
 				t.Fatalf("batch total attribution: %+v", total)
 			}
 			up += total.Uplink

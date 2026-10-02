@@ -15,7 +15,6 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
-	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -56,8 +55,6 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.CanSpliceCopy = 3
 	destination := ob.Target
 	network := destination.Network
-
-	proxy.ClaimObservedEndpoint(ctx, link.Reader, network == net.Network_TCP || network == net.Network_UDP)
 
 	server := c.server
 	dest := server.Destination

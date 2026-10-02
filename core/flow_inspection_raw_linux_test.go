@@ -42,7 +42,7 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 						t.Fatal(err)
 					}
 					for _, row := range totals.Rows {
-						if row.Outbound.Serial == flow.Outbound.Serial && row.Origin == fs.TrafficOriginUser {
+						if row.Outbound.Tag == flow.Outbound.Tag && row.Origin == fs.TrafficOriginUser {
 							if row.Downlink != want {
 								return false
 							}
