@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"runtime"
 	"testing"
 	"time"
 
@@ -148,8 +147,10 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				if len(rows) != 2 {
 					return false
 				}
+				// Echo delivery can precede the native writer's receipt. Observe
+				// both directions before closing and freezing the ended row.
 				for _, r := range rows {
-					if r.Uplink != uint64(len(payload)) {
+					if r.Uplink != uint64(len(payload)) || r.Downlink != uint64(len(payload)) {
 						return false
 					}
 				}
@@ -162,9 +163,6 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 				}
 				if r.Source.Port == cnet.Port(first.LocalAddr().(*net.TCPAddr).Port) {
 					selected = r
-				}
-				if runtime.GOOS == "windows" && r.Downlink != uint64(len(payload)) {
-					t.Fatalf("missing incremental output: %+v", r.Downlink)
 				}
 			}
 			if selected.Ref.ID == 0 {
@@ -202,21 +200,21 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			inspectionResponse(t, second, extra)
 			second.Close()
 			inspectionWait(t, func() bool { live, _ := view.ReadLive(); return len(live.Rows) == 0 })
-			totals, err := view.ReadTotals()
-			if err != nil {
-				t.Fatal(err)
-			}
-			var up, down uint64
-			for _, r := range totals.Rows {
-				if r.Outbound.Tag != "" && r.Origin == fs.TrafficOriginUser {
-					up += r.Uplink
-					down += r.Downlink
-				}
-			}
 			want := uint64(2*len(payload) + len(extra))
-			if up != want || down != want {
-				t.Fatalf("totals up=%d down=%d want=%d", up, down, want)
-			}
+			inspectionWait(t, func() bool {
+				totals, err := view.ReadTotals()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var up, down uint64
+				for _, r := range totals.Rows {
+					if r.Outbound.Tag != "" && r.Origin == fs.TrafficOriginUser {
+						up += r.Uplink
+						down += r.Downlink
+					}
+				}
+				return up == want && down == want
+			})
 		})
 	}
 }
