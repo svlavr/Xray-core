@@ -32,6 +32,61 @@ func (c *udpTestConn) SetDeadline(time.Time) error               { return nil }
 func (c *udpTestConn) SetReadDeadline(time.Time) error           { return nil }
 func (c *udpTestConn) SetWriteDeadline(time.Time) error          { return nil }
 
+type udpTestPacketConn struct {
+	*udpTestConn
+	readFrom func([]byte) (int, net.Addr, error)
+}
+
+func (c *udpTestPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return c.readFrom(p) }
+func (c *udpTestPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return c.Write(p) }
+
+func TestUDPPacketReadPreservesDataWithError(t *testing.T) {
+	native := errors.New("native packet read failure")
+	for _, mode := range []string{"packet", "packet-cancel", "empty-error", "reply-limit"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := UDPEchoRequest{Destination: netip.MustParseAddrPort("127.0.0.1:9"), Count: 1, PacketBytes: 32, ReplyWait: time.Second, MaxReplies: 1}
+			payload := make([]byte, r.PacketBytes)
+			copy(payload, "MUE1")
+			written := make(chan struct{})
+			c := &udpTestPacketConn{udpTestConn: &udpTestConn{closed: make(chan struct{})}}
+			c.write = func(p []byte) (int, error) { close(written); return len(p), nil }
+			c.readFrom = func(p []byte) (int, net.Addr, error) {
+				<-written
+				if mode == "packet-cancel" {
+					cancel()
+				}
+				n := copy(p, payload)
+				if mode == "empty-error" {
+					n = 0
+				}
+				return n, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, native
+			}
+			var receipt UDPEchoReceipt
+			if mode == "reply-limit" {
+				receipt.Replies = []UDPReplyRecord{{Issue: UDPReplyMalformed}}
+			}
+			err := runUDPTrain(ctx, c, r, payload, time.Now(), &receipt)
+			finalizeUDPReplies(&receipt, r)
+			if !errors.Is(err, native) || receipt.WindowComplete || len(receipt.Sends) != 1 || receipt.Sends[0].WriteReturned == nil {
+				t.Fatalf("native read facts: %+v, %v", receipt, err)
+			}
+			if mode == "empty-error" {
+				if len(receipt.Replies) != 0 {
+					t.Fatal("fabricated a datagram from a pure read error")
+				}
+			} else if mode == "reply-limit" {
+				if !errors.Is(err, ErrUDPReplyLimit) || !receipt.ReplyLimitHit || len(receipt.Replies) != 1 {
+					t.Fatalf("lost reply-limit/native errors: %+v, %v", receipt, err)
+				}
+			} else if len(receipt.Replies) != 1 || receipt.Replies[0].Bytes != len(payload) || receipt.Replies[0].Source != r.Destination || receipt.Replies[0].Issue != UDPReplyValid || receipt.Replies[0].Sequence == nil || *receipt.Replies[0].Sequence != 0 || receipt.Replies[0].RoundTrip == nil {
+				t.Fatalf("lost datagram with native error: %+v, %v", receipt, err)
+			}
+		})
+	}
+}
+
 func TestUDPTrainPartialFailedWritesAndBatchError(t *testing.T) {
 	native := errors.New("native packet failure")
 	for _, mode := range []string{"partial", "error-count", "batch-error", "batch-limit"} {

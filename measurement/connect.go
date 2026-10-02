@@ -41,15 +41,10 @@ func (e *Executor) TCPConnect(ctx context.Context, request TCPConnectRequest) (r
 	}
 	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
 	defer cancel()
-	select {
-	case e.slots <- struct{}{}:
-	case <-ctx.Done():
-		return receipt, ctx.Err()
-	}
-	defer func() { <-e.slots }()
-	if err := ctx.Err(); err != nil {
+	if err := e.acquire(ctx); err != nil {
 		return receipt, err
 	}
+	defer func() { <-e.slots }()
 	started := time.Now()
 	dest := xnet.TCPDestination(xnet.IPAddress(request.Destination.Addr().AsSlice()), xnet.Port(request.Destination.Port()))
 	conn, err := internet.DialSystemTCPConnect(ctx, dest)
@@ -63,5 +58,5 @@ func (e *Executor) TCPConnect(ctx context.Context, request TCPConnectRequest) (r
 		receipt.DestinationConnected = true
 		_ = conn.Close()
 	}
-	return receipt, err
+	return receipt, errors.Join(err, ctx.Err())
 }

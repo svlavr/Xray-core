@@ -5,6 +5,7 @@ import (
 	go_errors "errors"
 	"io"
 	"math/rand"
+	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common"
@@ -114,6 +115,9 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
 		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
+			// Graceful QUIC Close does not unblock a flow-controlled Write.
+			// Interrupt this stream's I/O before ordinary connection teardown.
+			_ = conn.SetDeadline(time.Now())
 			return errors.New("connection ends").Base(err)
 		}
 

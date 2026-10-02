@@ -18,7 +18,83 @@ import (
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	"github.com/xtls/xray-core/common/signal/semaphore"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
+
+func TestMeasurementTCPBlockedWriteDeadlinePreservesSibling(t *testing.T) {
+	certificate, _ := cert.MustGenerate(nil)
+	serverTLS := &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{certificate.Certificate}, PrivateKey: common.Must2(x509.ParsePKCS8PrivateKey(certificate.PrivateKey))}}, NextProtos: []string{"fixture"}}
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{InitialStreamReceiveWindow: 1024, MaxStreamReceiveWindow: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	carrier, err := quic.DialAddr(ctx, listener.Addr().String(), &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"fixture"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer carrier.CloseWithError(0, "")
+	peer, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.CloseWithError(0, "")
+	stream, err := carrier.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &stat.CounterConnection{Connection: &interConn{stream: stream}}
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() { n, err := conn.Write(make([]byte, 64<<10)); done <- result{n, err} }()
+	if _, err := peer.AcceptStream(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("fixture did not block the native writer: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	// Apply the proxy error-path teardown through its normal stats wrapper.
+	_ = conn.SetDeadline(time.Now())
+	_ = conn.Close()
+	select {
+	case got := <-done:
+		if got.n <= 0 || got.n >= 64<<10 || got.err == nil {
+			t.Fatalf("blocked write lost partial/error facts: %+v", got)
+		}
+	case <-time.After(time.Second):
+		_ = conn.SetDeadline(time.Now())
+		_ = carrier.CloseWithError(0, "fixture cleanup")
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("native stream teardown left its writer blocked")
+	}
+	sibling, err := carrier.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sibling.Write([]byte("sibling")); err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := peer.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload [7]byte
+	if _, err := io.ReadFull(receiver, payload[:]); err != nil || string(payload[:]) != "sibling" {
+		t.Fatalf("teardown broke shared-carrier sibling: %q, %v", payload, err)
+	}
+	_ = sibling.Close()
+	receiver.CancelRead(0)
+}
 
 func TestMeasurementUDPWriteClose(t *testing.T) {
 	m := &udpSessionManager{m: make(map[uint32]*InterConn)}

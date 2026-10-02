@@ -131,31 +131,30 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 		options := &httpExchangeOptions{destination: dest, body: bytes.NewReader(wire), headers: http.Header{"Accept": {"application/dns-message"}, "Content-Type": {"application/dns-message"}}}
 		https := HTTPSRequest{Route: request.Route, URL: "https://" + net.JoinHostPort(request.ServerName, strconv.Itoa(int(request.Resolver.Port()))) + request.DoHPath, Timeout: request.Timeout, MaxBodyBytes: int64(request.MaxResponseBytes), MaxHeaderBytes: request.MaxHeaderBytes, RootCAs: request.RootCAs}
 		// The POST body has a finite known length. No upload acknowledgment is inferred.
-		r, err := e.exchangeHTTP(ctx, https, http.MethodPost, nil, options, func(_ context.Context, response *http.Response, r *HTTPSReceipt) error {
+		r, err := e.exchangeHTTP(ctx, https, http.MethodPost, nil, options, func(ctx context.Context, response *http.Response, r *HTTPSReceipt) error {
 			readErr := readHTTPSBody(response, r, https.MaxBodyBytes)
 			media, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
 			if response.StatusCode < 200 || response.StatusCode >= 300 || mediaErr != nil || media != "application/dns-message" {
 				return errors.Join(readErr, ErrDNSResponse)
 			}
-			return readErr
+			if readErr != nil {
+				return readErr
+			}
+			var err error
+			receipt.Message, err = parseDNSResponse(ctx, r.Body, query)
+			return err
 		})
 		receipt.Wire, receipt.ResponseComplete = r.Body, r.BodyComplete
 		receipt.Elapsed, receipt.EndpointTLS = r.Elapsed, r.EndpointTLS
 		receipt.OutboundError = r.OutboundError
 		receipt.HTTPStatus, receipt.HTTPContentType = r.StatusCode, r.Header.Get("Content-Type")
 		// net/http does not expose an independent POST payload writer count here.
-		if err != nil {
-			return receipt, err
-		}
-		receipt.Message, err = parseDNSResponse(ctx, receipt.Wire, query)
 		return receipt, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
 	defer cancel()
-	select {
-	case e.slots <- struct{}{}:
-	case <-ctx.Done():
-		return receipt, ctx.Err()
+	if err := e.acquire(ctx); err != nil {
+		return receipt, err
 	}
 	defer func() { <-e.slots }()
 	started := time.Now()

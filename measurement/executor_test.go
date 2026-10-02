@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -12,7 +13,42 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/measurement"
+	"github.com/xtls/xray-core/transport/internet"
 )
+
+func TestExecutorCanceledAdmissionDoesNotOpenOrRetainSlot(t *testing.T) {
+	e, err := measurement.New(instance(t), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := &originDialer{t: t}
+	internet.UseAlternativeSystemDialer(dialer)
+	defer internet.UseAlternativeSystemDialer(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	for range 16 {
+		for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
+			if r, err := e.UDPEcho(ctx, udpRequest(addr, kind)); !errors.Is(err, context.Canceled) || r.Elapsed != 0 || len(r.Sends) != 0 {
+				t.Fatalf("canceled UDP admission: %+v, %v", r, err)
+			}
+			for _, transport := range []measurement.DNSTransport{measurement.DNSUDP, measurement.DNSTCP, measurement.DNSDoT, measurement.DNSDoH} {
+				req := dnsRequest(addr, transport, kind)
+				req.ServerName, req.DoHPath, req.MaxHeaderBytes = "fixture.invalid", "/dns-query", 4096
+				if r, err := e.DNSQuery(ctx, req); !errors.Is(err, context.Canceled) || r.Elapsed != 0 || r.WrittenBytes != nil || len(r.Wire) != 0 {
+					t.Fatalf("canceled DNS admission: %+v, %v", r, err)
+				}
+			}
+		}
+	}
+	if dialer.calls.Load() != 0 {
+		t.Fatal("canceled admission invoked the native socket owner")
+	}
+	pc := udpFixture(t, func(pc net.PacketConn, p []byte, a net.Addr) { _, _ = pc.WriteTo(p, a) })
+	if r, err := e.UDPEcho(context.Background(), udpRequest(pc.LocalAddr(), measurement.Direct)); err != nil || !r.WindowComplete || len(r.Replies) != 3 {
+		t.Fatalf("canceled admissions retained the executor slot: %+v, %v", r, err)
+	}
+}
 
 func TestExecutorRejectsInvalidConcurrency(t *testing.T) {
 	v := instance(t)

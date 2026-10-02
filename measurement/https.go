@@ -103,13 +103,8 @@ func (e *Executor) exchangeHTTP(ctx context.Context, request HTTPSRequest, metho
 	}
 	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
 	defer cancel()
-	if err := ctx.Err(); err != nil {
+	if err := e.acquire(ctx); err != nil {
 		return receipt, err
-	}
-	select {
-	case e.slots <- struct{}{}:
-	case <-ctx.Done():
-		return receipt, ctx.Err()
 	}
 	started := time.Now()
 	o := new(operation)

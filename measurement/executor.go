@@ -36,6 +36,21 @@ func New(instance *core.Instance, maxConcurrent int) (*Executor, error) {
 	return &Executor{instance: instance, slots: make(chan struct{}, maxConcurrent)}, nil
 }
 
+// acquire admits one live invocation and rechecks cancellation before native
+// work. A free slot and a canceled context can both satisfy the select.
+func (e *Executor) acquire(ctx context.Context) error {
+	select {
+	case e.slots <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-e.slots
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 type operation struct {
 	mu          sync.Mutex
 	nativeError error

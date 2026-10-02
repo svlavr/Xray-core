@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/netip"
 )
 
@@ -31,12 +32,16 @@ type IdentityReceipt struct {
 	CountrySource string
 }
 
-func (e *Executor) EgressIdentity(ctx context.Context, request IdentityRequest) (IdentityReceipt, error) {
-	response, err := e.HTTPS(ctx, request.HTTPS)
-	if err != nil {
-		return IdentityReceipt{HTTPS: response}, err
-	}
-	return IdentityFromHTTPS(response, request.Family)
+func (e *Executor) EgressIdentity(ctx context.Context, request IdentityRequest) (result IdentityReceipt, resultErr error) {
+	result.HTTPS, resultErr = e.exchangeHTTP(ctx, request.HTTPS, http.MethodGet, nil, nil, func(_ context.Context, response *http.Response, receipt *HTTPSReceipt) error {
+		if err := readHTTPSBody(response, receipt, request.HTTPS.MaxBodyBytes); err != nil {
+			return err
+		}
+		var err error
+		result, err = IdentityFromHTTPS(*receipt, request.Family)
+		return err
+	})
+	return result, resultErr
 }
 
 // IdentityFromHTTPS reuses a completed exchange whose transport error the caller

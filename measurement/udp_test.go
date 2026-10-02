@@ -273,6 +273,7 @@ func TestUDPEchoInputRepresentation(t *testing.T) {
 		func(r *measurement.UDPEchoRequest) { r.PacketBytes = 65536 },
 		func(r *measurement.UDPEchoRequest) { r.MaxReplies = 0 },
 		func(r *measurement.UDPEchoRequest) { r.Interval = -1 },
+		func(r *measurement.UDPEchoRequest) { r.Count, r.Interval = 3, time.Duration(1<<63-1)/2+1 },
 		func(r *measurement.UDPEchoRequest) { r.Timeout = 0 },
 		func(r *measurement.UDPEchoRequest) { r.Route.Tag = "illegal" },
 	} {

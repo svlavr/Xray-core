@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"time"
@@ -94,6 +95,9 @@ func validateUDPEcho(r UDPEchoRequest) error {
 	if r.Count < 1 || uint64(r.Count) > 1<<32 || r.PacketBytes < 24 || r.PacketBytes > 65535 || r.MaxReplies < 1 || r.Interval < 0 || r.ReplyWait < 0 || r.Timeout <= 0 {
 		return errors.New("invalid UDP train budget")
 	}
+	if r.Interval > 0 && uint64(r.Count-1) > uint64(math.MaxInt64/int64(r.Interval)) {
+		return errors.New("UDP train schedule overflows duration")
+	}
 	return nil
 }
 
@@ -109,10 +113,8 @@ func (e *Executor) UDPEcho(ctx context.Context, request UDPEchoRequest) (receipt
 	request.Destination = netip.AddrPortFrom(request.Destination.Addr().Unmap(), request.Destination.Port())
 	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
 	defer cancel()
-	select {
-	case e.slots <- struct{}{}:
-	case <-ctx.Done():
-		return receipt, ctx.Err()
+	if err := e.acquire(ctx); err != nil {
+		return receipt, err
 	}
 	defer func() { <-e.slots }()
 	started := time.Now()
@@ -243,18 +245,21 @@ func runUDPTrain(ctx context.Context, conn net.Conn, r UDPEchoRequest, payload [
 			packet := make([]byte, 65536) // Detect full oversized datagrams without truncation.
 			for ctx.Err() == nil {
 				n, addr, err := pc.ReadFrom(packet)
+				if n > 0 || err == nil {
+					var source netip.AddrPort
+					if udp, ok := addr.(*net.UDPAddr); ok {
+						a := udp.AddrPort()
+						source = netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
+					}
+					if readErr = observeUDPReply(receipt, packet[:n], source, r, payload, started); readErr != nil {
+						readErr = errors.Join(readErr, err)
+						return
+					}
+				}
 				if err != nil {
-					if ctx.Err() == nil {
+					if n > 0 || ctx.Err() == nil {
 						readErr = err
 					}
-					return
-				}
-				var source netip.AddrPort
-				if udp, ok := addr.(*net.UDPAddr); ok {
-					a := udp.AddrPort()
-					source = netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
-				}
-				if readErr = observeUDPReply(receipt, packet[:n], source, r, payload, started); readErr != nil {
 					return
 				}
 			}

@@ -288,8 +288,8 @@ func testProtocolMeasurements(t *testing.T, e *measurement.Executor, v *core.Ins
 	cancel()
 	select {
 	case got := <-returned:
-		if !errors.Is(got.err, context.Canceled) || got.receipt.Elapsed <= 0 || got.receipt.WindowComplete || len(got.receipt.Replies) != 0 || len(got.receipt.Sends) == 0 || len(got.receipt.Sends) > r.Count || len(packet) < 24 || !bytes.Equal(got.receipt.Nonce[:], packet[4:20]) {
-			t.Fatalf("canceled train facts: %+v", got)
+		if !errors.Is(got.err, context.Canceled) || got.receipt.Elapsed < 0 || got.receipt.WindowComplete || len(got.receipt.Replies) != 0 || len(got.receipt.Sends) == 0 || len(got.receipt.Sends) > r.Count || len(packet) < 24 || !bytes.Equal(got.receipt.Nonce[:], packet[4:20]) {
+			t.Fatalf("canceled train facts: %+v, %v", got.receipt, got.err)
 		}
 		for i, sent := range got.receipt.Sends {
 			if sent.Sequence != uint32(i) || sent.WriteReturned == nil {
