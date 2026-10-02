@@ -2,7 +2,6 @@ package shadowsocks_2022
 
 import (
 	"context"
-	"io"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -14,7 +13,6 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
@@ -108,35 +106,29 @@ func (i *Inbound) processTCP(ctx context.Context, conn net.Conn, dispatcher rout
 		return errors.New("unable to set read deadline").Base(err)
 	}
 
+	// 1. Single read call for Salt + Fixed-length header chunk per SIP022 §3.1.4
+	headerLen := i.method.KeySaltLength + RequestHeaderFixedChunkLength + AEADTagSize
+	headerBuf := make([]byte, headerLen)
+	n, err := conn.Read(headerBuf)
+	if err != nil || n < headerLen {
+		ResetTCPConn(conn)
+		return errors.New("failed to read complete handshake header")
+	}
+
 	var salt [32]byte
+	copy(salt[:i.method.KeySaltLength], headerBuf[:i.method.KeySaltLength])
 	saltSlice := salt[:i.method.KeySaltLength]
-	if _, err := io.ReadFull(conn, saltSlice); err != nil {
-		return err
-	}
+	fixedChunk := headerBuf[i.method.KeySaltLength:]
 
-	if !i.saltFilter.Check(salt) {
-		return ErrSaltNotUnique
-	}
-
-	sessionKey := DeriveSessionSubKey(i.psk, saltSlice, i.method.KeySaltLength)
-	aead, err := i.method.NewAEAD(sessionKey)
+	reader, reqHeader, err := InitServerStream(conn, i.method, i.psk, saltSlice, salt, fixedChunk, i.saltFilter)
 	if err != nil {
+		ResetTCPConn(conn)
 		return err
 	}
 
-	reader := NewStreamReader(conn, aead)
-
-	reqHeader, err := ReadClientRequestHeader(conn, reader)
-	if err != nil {
-		return err
-	}
-	conn.SetReadDeadline(time.Time{})
 	dest := reqHeader.Destination
 
-	writer, err := WriteTCPResponse(conn, i.method, i.psk, saltSlice, nil)
-	if err != nil {
-		return err
-	}
+	writer := NewServerStreamWriter(conn, i.method, i.psk, saltSlice)
 
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   conn.RemoteAddr(),
@@ -153,36 +145,19 @@ func (i *Inbound) processTCP(ctx context.Context, conn net.Conn, dispatcher rout
 	}
 
 	if len(reqHeader.EarlyData) > 0 {
-		earlyBuf := buf.New()
-		earlyBuf.Write(reqHeader.EarlyData)
-		if err := link.Writer.WriteMultiBuffer(buf.MultiBuffer{earlyBuf}); err != nil {
+		mb := buf.MergeBytes(nil, reqHeader.EarlyData)
+		if err := link.Writer.WriteMultiBuffer(mb); err != nil {
 			return err
 		}
 	}
 
-	sessionPolicy = i.policyManager.ForLevel(uint32(i.user.Level))
-	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
-	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
-
-	requestDone := func() error {
-		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer))
-	}
-
-	responseDone := func() error {
-		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
-		return buf.Copy(link.Reader, writer, buf.UpdateActivity(timer))
-	}
-
-	responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-	return task.Run(ctx, requestDone, responseDoneAndCloseWriter)
+	return TransportTCP(ctx, i.policyManager.ForLevel(uint32(i.user.Level)), reader, writer, link)
 }
 
 func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	udpConns := i.udpConns
 
-	reader := buf.NewReader(conn)
+	reader := buf.NewPacketReader(conn)
 	for {
 		mb, err := reader.ReadMultiBuffer()
 		if err != nil {

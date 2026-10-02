@@ -28,7 +28,6 @@ import (
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -459,22 +458,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	return nil
 }
 
-// Only these native wrappers preserve packet addresses. Dialer-proxy links are fixed-target.
-type packetConn interface {
-	net.Conn
-	net.PacketConn
-}
-
-func freedomPacketConn(conn net.Conn) packetConn {
-	switch c := conn.(type) {
-	case *internet.PacketConnWrapper:
-		return c
-	case *finalmask.PacketConnWrapper:
-		return c
-	}
-	return nil
-}
-
 type fixedPacketWriter struct {
 	writer           buf.Writer
 	target, override net.Destination
@@ -520,14 +503,14 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 	if statConn != nil {
 		counter = statConn.ReadCounter
 	}
-	if c := freedomPacketConn(iConn); c != nil && !h.usesDialerProxy {
+	if c, ok := iConn.(*net.PacketConnWrapper); ok && !h.usesDialerProxy {
 		isOverridden := false
 		if UDPOverride.Address != nil || UDPOverride.Port != 0 {
 			isOverridden = true
 		}
 
 		return &PacketReader{
-			packetConn:        c,
+			PacketConnWrapper: c,
 			Counter:           counter,
 			Handler:           h,
 			DefaultRule:       defaultRule,
@@ -540,7 +523,7 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 }
 
 type PacketReader struct {
-	packetConn
+	*net.PacketConnWrapper
 	stats.Counter
 	Handler           *Handler
 	DefaultRule       *FinalRule
@@ -553,7 +536,7 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.New()
 	b.Resize(0, buf.Size)
 	for {
-		n, d, err := r.packetConn.ReadFrom(b.Bytes())
+		n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
 		if err != nil {
 			b.Release()
 			return nil, err
@@ -595,7 +578,7 @@ func NewPacketWriter(ctx context.Context, conn net.Conn, h *Handler, defaultRule
 	if statConn != nil {
 		counter = statConn.WriteCounter
 	}
-	if c := freedomPacketConn(iConn); c != nil && !h.usesDialerProxy {
+	if c, ok := iConn.(*net.PacketConnWrapper); ok && !h.usesDialerProxy {
 		// If DialDest is a domain, it will be resolved in dialer
 		// check this behavior and add it to map
 		resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
@@ -603,14 +586,14 @@ func NewPacketWriter(ctx context.Context, conn net.Conn, h *Handler, defaultRule
 			resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
 		}
 		return &PacketWriter{
-			Context:         ctx,
-			packetConn:      c,
-			Counter:         counter,
-			Handler:         h,
-			DefaultRule:     defaultRule,
-			UDPOverride:     UDPOverride,
-			ResolvedUDPAddr: resolvedUDPAddr,
-			OutGateway:      outGateway,
+			Context:           ctx,
+			PacketConnWrapper: c,
+			Counter:           counter,
+			Handler:           h,
+			DefaultRule:       defaultRule,
+			UDPOverride:       UDPOverride,
+			ResolvedUDPAddr:   resolvedUDPAddr,
+			OutGateway:        outGateway,
 		}
 	}
 	if h.usesDialerProxy {
@@ -621,7 +604,7 @@ func NewPacketWriter(ctx context.Context, conn net.Conn, h *Handler, defaultRule
 
 type PacketWriter struct {
 	Context context.Context
-	packetConn
+	*net.PacketConnWrapper
 	stats.Counter
 	*Handler
 	DefaultRule *FinalRule
@@ -692,9 +675,9 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				b.Release()
 				continue
 			}
-			n, err = w.packetConn.WriteTo(b.Bytes(), destAddr)
+			n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
 		} else {
-			n, err = w.packetConn.Write(b.Bytes())
+			n, err = w.PacketConnWrapper.Write(b.Bytes())
 		}
 		b.Release()
 		if err != nil {

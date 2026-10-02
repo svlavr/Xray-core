@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/cipher"
 	"encoding/binary"
-	"io"
 	"strconv"
 	"time"
 
@@ -16,7 +15,6 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
@@ -139,28 +137,36 @@ func (i *RelayInbound) processTCP(ctx context.Context, conn net.Conn, dispatcher
 		return errors.New("unable to set read deadline").Base(err)
 	}
 
-	// Read Salt + Outer EIH
+	// Read initial handshake in a single read call per SIP022 §3.1.3 & §3.1.4
 	needed := i.method.KeySaltLength + AESBlockSize
-	var headerBuf [48]byte
-	headerSlice := headerBuf[:needed]
-	if _, err := io.ReadFull(conn, headerSlice); err != nil {
-		return err
-	}
-
-	salt := headerSlice[:i.method.KeySaltLength]
-	eih := headerSlice[i.method.KeySaltLength:]
-
-	identitySubkey := DeriveIdentitySubKey(i.relayPSK, salt, i.method.KeySaltLength)
-	block, err := i.method.NewBlock(identitySubkey)
+	requestHeader := buf.New()
+	n, err := requestHeader.ReadFrom(conn)
 	if err != nil {
+		requestHeader.Release()
+		ResetTCPConn(conn)
 		return err
 	}
+	if int(n) < needed {
+		requestHeader.Release()
+		ResetTCPConn(conn)
+		return ErrInvalidRequest
+	}
 
-	var decryptedHash [AESBlockSize]byte
-	block.Decrypt(decryptedHash[:], eih)
+	headerSlice := requestHeader.Bytes()
+	salt := headerSlice[:i.method.KeySaltLength]
+	eih := headerSlice[i.method.KeySaltLength:needed]
+
+	decryptedHash, err := DecryptEIH(i.method, i.relayPSK, salt, eih)
+	if err != nil {
+		requestHeader.Release()
+		ResetTCPConn(conn)
+		return err
+	}
 
 	targetDest, ok := i.destinations[decryptedHash]
 	if !ok {
+		requestHeader.Release()
+		ResetTCPConn(conn)
 		return ErrInvalidRequest
 	}
 	conn.SetReadDeadline(time.Time{})
@@ -182,33 +188,22 @@ func (i *RelayInbound) processTCP(ctx context.Context, conn net.Conn, dispatcher
 
 	link, err := dispatcher.Dispatch(ctx, targetDest.destination)
 	if err != nil {
+		requestHeader.Release()
 		return err
 	}
 
-	// Unwrap outer EIH: send client salt to next hop, stripping this hop's EIH
-	saltBuf := buf.New()
-	saltBuf.Write(salt)
-	if err := link.Writer.WriteMultiBuffer(buf.MultiBuffer{saltBuf}); err != nil {
+	// Unwrap outer EIH: send client salt and remaining handshake bytes to next hop
+	// in a single write call, satisfying downstream server's single-read handshake expectation (SIP022 §3.1.3).
+	var saltCopy [32]byte
+	copy(saltCopy[:i.method.KeySaltLength], salt)
+	copy(requestHeader.Bytes()[AESBlockSize:AESBlockSize+i.method.KeySaltLength], saltCopy[:i.method.KeySaltLength])
+	requestHeader.Advance(AESBlockSize)
+
+	if err := link.Writer.WriteMultiBuffer(buf.MultiBuffer{requestHeader}); err != nil {
 		return err
 	}
 
-	sessionPolicy = i.policyManager.ForLevel(targetDest.level)
-	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
-	ctx = policy.ContextWithBufferPolicy(ctx, sessionPolicy.Buffer)
-
-	requestDone := func() error {
-		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
-		return buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer))
-	}
-
-	responseDone := func() error {
-		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
-		return buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer))
-	}
-
-	responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-	return task.Run(ctx, requestDone, responseDoneAndCloseWriter)
+	return TransportTCP(ctx, i.policyManager.ForLevel(targetDest.level), buf.NewReader(conn), buf.NewWriter(conn), link)
 }
 
 func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
@@ -220,7 +215,7 @@ func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dis
 		})
 	}()
 
-	reader := buf.NewReader(conn)
+	reader := buf.NewPacketReader(conn)
 	for {
 		mb, err := reader.ReadMultiBuffer()
 		if err != nil {

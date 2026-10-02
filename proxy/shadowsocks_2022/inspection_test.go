@@ -2,13 +2,23 @@ package shadowsocks_2022
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"io"
+	stdnet "net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type inspectionWriteFunc func([]byte) (int, error)
@@ -101,5 +111,150 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 		if !b.IsEmpty() {
 			t.Fatal("native input buffer not released")
 		}
+	}
+}
+
+func TestInspectionSS2022HandshakeShortWrite(t *testing.T) {
+	method, _ := GetCipherMethod(MethodAES128GCM)
+	key := make([]byte, method.KeySaltLength)
+	short := inspectionWriteFunc(func([]byte) (int, error) { return 1, nil })
+	_, err := WriteTCPRequest(short, method, [][]byte{key}, net.TCPDestination(net.LocalHostIP, 443), key, []byte("request"))
+	if err != io.ErrShortWrite {
+		t.Fatalf("request handshake: %v", err)
+	}
+	writer := NewServerStreamWriter(short, method, key, key)
+	if n, err := writer.Write([]byte("response")); n != 0 || err != io.ErrShortWrite {
+		t.Fatalf("response handshake: n=%d err=%v", n, err)
+	}
+}
+
+func TestInspectionSS2022StreamWriteAcceptedPrefix(t *testing.T) {
+	method, _ := GetCipherMethod(MethodAES128GCM)
+	key := make([]byte, method.KeySaltLength)
+	for _, response := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stream", true: "response"}[response], func(t *testing.T) {
+			calls := 0
+			output := inspectionWriteFunc(func(p []byte) (int, error) {
+				calls++
+				if calls == 2 {
+					return 1, io.ErrUnexpectedEOF
+				}
+				return len(p), nil
+			})
+			var writer io.Writer
+			if response {
+				writer = NewServerStreamWriter(output, method, key, key)
+			} else {
+				aead, _ := method.NewAEAD(key)
+				writer = NewStreamWriter(output, aead)
+			}
+			payload := bytes.Repeat([]byte{7}, MaxPacketSize+10)
+			if n, err := writer.Write(payload); n != MaxPacketSize || err != io.ErrUnexpectedEOF {
+				t.Fatalf("accepted prefix: n=%d err=%v", n, err)
+			}
+		})
+	}
+}
+
+type inspectionPartialReader struct {
+	buf.Reader
+	mb  buf.MultiBuffer
+	err error
+}
+
+func (r *inspectionPartialReader) ReadMultiBufferTimeout(time.Duration) (buf.MultiBuffer, error) {
+	mb := r.mb
+	r.mb = nil
+	return mb, r.err
+}
+func (*inspectionPartialReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, io.EOF }
+
+type inspectionPipeDialer struct {
+	internet.Dialer
+	conn stat.Connection
+}
+
+func (d inspectionPipeDialer) Dial(context.Context, net.Destination) (stat.Connection, error) {
+	return d.conn, nil
+}
+
+func TestInspectionSS2022EarlyPayloadAndTerminalError(t *testing.T) {
+	for _, terminal := range []error{io.EOF, io.ErrUnexpectedEOF} {
+		t.Run(terminal.Error(), func(t *testing.T) {
+			instance, err := core.New(&core.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { instance.Close() })
+			ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
+			dest := net.TCPDestination(net.LocalHostIP, 443)
+			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: dest}})
+			key := make([]byte, 16)
+			outbound, err := NewClient(ctx, &ClientConfig{Method: MethodAES128GCM, Key: base64.StdEncoding.EncodeToString(key), Address: net.NewIPOrDomain(net.LocalHostIP), Port: 8388})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, server := stdnet.Pipe()
+			t.Cleanup(func() { client.Close(); server.Close() })
+			client.SetDeadline(time.Now().Add(3 * time.Second))
+			server.SetDeadline(time.Now().Add(3 * time.Second))
+			received := make(chan []byte, 1)
+			serverDone := make(chan error, 1)
+			go func() {
+				defer server.Close()
+				method, _ := GetCipherMethod(MethodAES128GCM)
+				header := make([]byte, method.KeySaltLength+RequestHeaderFixedChunkLength+AEADTagSize)
+				if _, err := io.ReadFull(server, header); err != nil {
+					serverDone <- err
+					return
+				}
+				salt := header[:method.KeySaltLength]
+				aead, _ := method.NewAEAD(DeriveSessionSubKey(key, salt, method.KeySaltLength))
+				reader := NewStreamReader(server, aead)
+				request, err := ReadClientRequestHeaderWithFixed(reader, header[method.KeySaltLength:])
+				if err != nil {
+					serverDone <- err
+					return
+				}
+				payload := bytes.Clone(request.EarlyData)
+				if len(payload) > 0 {
+					mb, err := reader.ReadMultiBuffer()
+					if err != nil {
+						serverDone <- err
+						return
+					}
+					payload = append(payload, []byte(mb.String())...)
+					buf.ReleaseMulti(mb)
+				}
+				received <- payload
+				_, err = NewServerStreamWriter(server, method, key, salt).Write([]byte("answer"))
+				serverDone <- err
+			}()
+			first, second := buf.New(), buf.New()
+			first.WriteString("first")
+			second.WriteString("second")
+			reader := &inspectionPartialReader{mb: buf.MultiBuffer{first, second}, err: terminal}
+			var answer bytes.Buffer
+			err = outbound.Process(ctx, &transport.Link{Reader: reader, Writer: buf.NewWriter(&answer)}, inspectionPipeDialer{conn: client})
+			if terminal == io.EOF {
+				if err != nil || answer.String() != "answer" {
+					t.Fatalf("EOF completion: answer=%q err=%v", answer.String(), err)
+				}
+			} else if errors.Cause(err) != terminal {
+				t.Fatalf("terminal error lost: %v", err)
+			}
+			select {
+			case payload := <-received:
+				if string(payload) != "firstsecond" {
+					t.Fatalf("early payload lost: %q", payload)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("server did not receive request")
+			}
+			if !first.IsEmpty() || !second.IsEmpty() {
+				t.Fatal("early buffers not released")
+			}
+			<-serverDone
+		})
 	}
 }

@@ -79,9 +79,9 @@ type ServerUDPSession struct {
 
 	ServerSessionID   uint64
 	ServerPacketID    atomic.Uint64
-	ServerCipher      cipher.AEAD
-	ServerBlockCipher cipher.Block
-	ServerChaCha      cipher.AEAD
+	serverBodyCipher  cipher.AEAD
+	serverHeaderBlock cipher.Block
+	serverChaCha      cipher.AEAD
 }
 
 func (s *ServerUDPSession) GetRemoteCipher() cipher.AEAD {

@@ -52,24 +52,24 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			newCodec := func() *ss.UDPPacketCodec {
-				var codec *ss.UDPPacketCodec
-				if len(keys) == 2 {
-					codec, err = ss.NewUDPPacketCodec(method, keys[1], keys[0])
-				} else {
-					codec, err = ss.NewUDPPacketCodec(method, keys[0])
-				}
+			newCodec := func() *ss.ClientUDPSession {
+				codec, err := ss.NewUDPPacketCodec(method, keys)
 				if err != nil {
 					t.Fatal(err)
 				}
-				return codec
+				client, err := codec.NewClientSession()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return client
 			}
+
 			client, sibling := newCodec(), newCodec()
 			first, second := startOutboundStatsUDPServer(t, 0x19), startOutboundStatsUDPServer(t, 0x37)
-			exchange := func(codec *ss.UDPPacketCodec, destination cnet.Destination, payload []byte, mask byte) {
+			exchange := func(codec *ss.ClientUDPSession, destination cnet.Destination, payload []byte, mask byte) {
 				t.Helper()
 				transport.SetDeadline(time.Now().Add(3 * time.Second))
-				packet, err := codec.EncodeClientPacket(destination, payload)
+				packet, err := codec.EncodePacket(destination, payload)
 				if err != nil {
 					t.Fatal(err)
 				}

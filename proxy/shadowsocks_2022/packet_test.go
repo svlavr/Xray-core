@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestInspectionSS2022PacketCodecResults(t *testing.T) {
 				t.Fatal(err)
 			}
 			key := make([]byte, method.KeySaltLength)
-			client, err := NewUDPPacketCodec(method, key)
+			client, err := inspectionClientSession(method, [][]byte{key})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -33,7 +34,7 @@ func TestInspectionSS2022PacketCodecResults(t *testing.T) {
 				t.Fatal(err)
 			}
 			dest := cnet.UDPDestination(cnet.LocalHostIP, 8080)
-			wire, err := client.EncodeClientPacket(dest, []byte("request"))
+			wire, err := client.EncodePacket(dest, []byte("request"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -57,12 +58,12 @@ func TestInspectionSS2022PacketCodecResults(t *testing.T) {
 func TestSS2022MultiUserUDPIdentityHeader(t *testing.T) {
 	method, _ := GetCipherMethod(MethodAES128GCM)
 	master, user := []byte("0123456789abcdef"), []byte("fedcba9876543210")
-	client, err := NewUDPPacketCodec(method, user, master)
+	client, err := inspectionClientSession(method, [][]byte{master, user})
 	if err != nil {
 		t.Fatal(err)
 	}
 	destination := cnet.UDPDestination(cnet.LocalHostIP, 8080)
-	wire, err := client.EncodeClientPacket(destination, []byte("packet"))
+	wire, err := client.EncodePacket(destination, []byte("packet"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,13 +94,12 @@ func TestSS2022MultiUserUDPIdentityHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := parsePlainUDPPacket(client.clientSessionID, 1, plain)
+	decoded, err := parsePlainUDPPacket(client.clientSessionID, 0, plain)
 	if err != nil || string(decoded.Payload) != "packet" {
 		t.Fatalf("body: %+v %v", decoded, err)
 	}
 	session := server.sessions.GetOrCreate(decoded.SessionID)
-	userBlock, _ := method.NewBlock(user)
-	if err := session.EnsureServerState(method, userBlock, nil, user); err != nil {
+	if err := session.EnsureServerState(method, user); err != nil {
 		t.Fatal(err)
 	}
 	response, err := session.EncodeServerPacket(method, decoded.SessionID, destination, []byte("answer"))
@@ -115,11 +115,11 @@ func TestSS2022MultiUserUDPIdentityHeader(t *testing.T) {
 func TestSS2022UDPIdentityChainWire(t *testing.T) {
 	method, _ := GetCipherMethod(MethodAES128GCM)
 	keys := [][]byte{[]byte("0123456789abcdef"), []byte("fedcba9876543210"), []byte("ABCDEF0123456789")}
-	client, err := NewUDPPacketCodec(method, keys[2], keys[0], keys[1])
+	client, err := inspectionClientSession(method, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
-	packet, err := client.EncodeClientPacket(cnet.UDPDestination(cnet.LocalHostIP, 8080), []byte("chain"))
+	packet, err := client.EncodePacket(cnet.UDPDestination(cnet.LocalHostIP, 8080), []byte("chain"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestSS2022UDPIdentityChainWire(t *testing.T) {
 	first, _ := aes.NewCipher(keys[0])
 	var raw [AESBlockSize]byte
 	first.Decrypt(raw[:], wire[:AESBlockSize])
-	if binary.BigEndian.Uint64(raw[:8]) != client.clientSessionID || binary.BigEndian.Uint64(raw[8:]) != 1 {
+	if binary.BigEndian.Uint64(raw[:8]) != client.clientSessionID || binary.BigEndian.Uint64(raw[8:]) != 0 {
 		t.Fatal("first header mismatch")
 	}
 	for hop := 0; hop < 2; hop++ {
@@ -150,14 +150,14 @@ func TestSS2022UDPIdentityChainWire(t *testing.T) {
 
 func TestSS2022NativeUDPWriterShortResult(t *testing.T) {
 	method, _ := GetCipherMethod(MethodAES128GCM)
-	codec, err := NewUDPPacketCodec(method, make([]byte, method.KeySaltLength))
+	codec, err := inspectionClientSession(method, [][]byte{make([]byte, method.KeySaltLength)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	writer := &UDPWriter{
 		Writer:      inspectionWriteFunc(func([]byte) (int, error) { return 1, nil }),
 		Destination: cnet.UDPDestination(cnet.LocalHostIP, 8080),
-		Codec:       codec,
+		Session:     codec,
 	}
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("request"))}); err != io.ErrShortWrite {
 		t.Fatalf("short packet write: %v", err)
@@ -182,5 +182,61 @@ func TestSS2022PacketMetadataIsolation(t *testing.T) {
 	wg.Wait()
 	if session.InboundFromContext(base).Name != "parent" || session.OutboundsFromContext(base)[0].Tag != "parent" || session.ContentFromContext(base).Attributes["test"] != "parent" {
 		t.Fatal("shared packet metadata mutated")
+	}
+}
+
+func inspectionClientSession(method *CipherMethod, keys [][]byte) (*ClientUDPSession, error) {
+	codec, err := NewUDPPacketCodec(method, keys)
+	if err != nil {
+		return nil, err
+	}
+	return codec.NewClientSession()
+}
+
+func TestInspectionSS2022ConcurrentAuthenticatedReplay(t *testing.T) {
+	for _, name := range []string{MethodAES128GCM, MethodAES256GCM, MethodChaCha20Poly1305} {
+		t.Run(name, func(t *testing.T) {
+			method, _ := GetCipherMethod(name)
+			key := make([]byte, method.KeySaltLength)
+			client, err := inspectionClientSession(method, [][]byte{key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, err := NewUDPServerCodec(method, key, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			packet, err := client.EncodePacket(cnet.UDPDestination(cnet.LocalHostIP, 8080), []byte("once"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer packet.Release()
+			wire := bytes.Clone(packet.Bytes())
+			invalid := bytes.Clone(wire)
+			invalid[len(invalid)-1] ^= 1
+			if _, err := server.DecodePacket(invalid); err == nil {
+				t.Fatal("unauthenticated packet accepted")
+			}
+			start := make(chan struct{})
+			var accepted atomic.Int32
+			var workers sync.WaitGroup
+			for range 32 {
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					<-start
+					if _, err := server.DecodePacket(wire); err == nil {
+						accepted.Add(1)
+					} else if err != ErrPacketIdNotUnique {
+						t.Errorf("decode: %v", err)
+					}
+				}()
+			}
+			close(start)
+			workers.Wait()
+			if n := accepted.Load(); n != 1 {
+				t.Fatalf("authenticated packet accepted %d times", n)
+			}
+		})
 	}
 }

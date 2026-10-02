@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -164,4 +165,11 @@ func packetSessionContext(ctx context.Context) context.Context {
 		ctx = session.ContextWithContent(ctx, &content)
 	}
 	return ctx
+}
+
+func ResetTCPConn(conn net.Conn) {
+	rawConn, _, _ := proxy.UnwrapRawConn(conn)
+	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetLinger(0)
+	}
 }

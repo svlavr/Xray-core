@@ -152,10 +152,10 @@ func startAuthMulti(t *testing.T, master []byte, users map[string][]byte) (*Mult
 	return inbound, conn, dispatcher
 }
 
-func fixedAuthCodec(t *testing.T, userKey []byte, sessionID uint64) *UDPCodec {
+func fixedAuthCodec(t *testing.T, userKey []byte, sessionID uint64) *ClientUDPSession {
 	t.Helper()
 	method, _ := GetCipherMethod(MethodAES128GCM)
-	codec, err := NewUDPPacketCodec(method, userKey, []byte("0123456789abcdef"))
+	codec, err := inspectionClientSession(method, [][]byte{[]byte("0123456789abcdef"), userKey})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,9 +170,9 @@ func fixedAuthCodec(t *testing.T, userKey []byte, sessionID uint64) *UDPCodec {
 	return codec
 }
 
-func sendAuthPacket(t *testing.T, conn *authPacketConn, codec *UDPCodec, payload string) {
+func sendAuthPacket(t *testing.T, conn *authPacketConn, codec *ClientUDPSession, payload string) {
 	t.Helper()
-	packet, err := codec.EncodeClientPacket(net.UDPDestination(net.LocalHostIP, 8080), []byte(payload))
+	packet, err := codec.EncodePacket(net.UDPDestination(net.LocalHostIP, 8080), []byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestInspectionSS2022RelayToMultiUDPChain(t *testing.T) {
 		}
 	})
 	method, _ := GetCipherMethod(MethodAES128GCM)
-	codec, err := NewUDPPacketCodec(method, userKey, firstKey, relayKey)
+	codec, err := inspectionClientSession(method, [][]byte{firstKey, relayKey, userKey})
 	if err != nil {
 		t.Fatal(err)
 	}

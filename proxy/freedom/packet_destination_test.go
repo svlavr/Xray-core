@@ -9,7 +9,6 @@ import (
 	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -38,7 +37,7 @@ func TestFreedomPacketAddressesThroughNativeWrappers(t *testing.T) {
 			}
 			sender, first, second := listen(), listen(), listen()
 			target := net.DestinationFromAddr(first.LocalAddr())
-			var conn net.Conn = &internet.PacketConnWrapper{PacketConn: sender, Dest: target.RawNetAddr()}
+			var conn net.Conn = &net.PacketConnWrapper{PacketConn: sender, Dest: target.RawNetAddr()}
 			if mode != "direct" {
 				var masks []finalmask.UDPMask
 				if mode == "masked" {
