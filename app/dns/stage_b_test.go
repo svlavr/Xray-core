@@ -154,8 +154,10 @@ func TestStageBExplicitEmptyAndNoCandidate(t *testing.T) {
 	}
 	stageBLookup(t, client, "active.test", net.IP{192, 0, 2, 40})
 	before := calls.Load()
-	if result := ApplyConfig(context.Background(), client, &Config{}); result.Applied || result.Err == nil {
-		t.Fatalf("empty explicit apply: %+v", result)
+	for _, invalid := range []*Config{nil, {}} {
+		if result := ApplyConfig(context.Background(), client, invalid); result.Applied || result.Err == nil {
+			t.Fatalf("invalid explicit apply (%v): %+v", invalid, result)
+		}
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()

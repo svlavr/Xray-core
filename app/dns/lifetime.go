@@ -66,7 +66,7 @@ func (s *DNS) initRuntime(resolver *DNS) {
 func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	rt := s.runtime
 	clone := proto.Clone(config).(*Config)
-	if len(clone.NameServer) == 0 {
+	if clone == nil || len(clone.NameServer) == 0 {
 		return ApplyResult{Err: fmt.Errorf("explicit DNS update requires a nameserver")}
 	}
 	if err := ctx.Err(); err != nil {
