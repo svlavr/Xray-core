@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"strings"
 	"time"
 
 	xnet "github.com/xtls/xray-core/common/net"
@@ -50,6 +51,24 @@ type HTTPSReceipt struct {
 	OutboundError    error
 }
 
+// HTTPRequest uses the existing transaction budgets for HTTP or HTTPS probes.
+// HEAD permits MaxBodyBytes=0; GET requires a positive retained-payload budget.
+type HTTPRequest HTTPSRequest
+
+// HTTPReceipt has the same raw facts; EndpointTLS is absent for plain HTTP.
+type HTTPReceipt = HTTPSReceipt
+
+// HTTP performs one HEAD or GET through the requested native route. Status
+// qualification and scheduling remain with the caller, including for HEAD.
+func (e *Executor) HTTP(ctx context.Context, method string, request HTTPRequest) (HTTPReceipt, error) {
+	if method != http.MethodHead && method != http.MethodGet {
+		return HTTPReceipt{}, errors.New("HTTP probe method must be HEAD or GET")
+	}
+	return e.exchange(ctx, HTTPSRequest(request), method, nil, nil, func(_ context.Context, response *http.Response, receipt *HTTPSReceipt) error {
+		return readHTTPSBody(response, receipt, request.MaxBodyBytes)
+	})
+}
+
 // The standard library's trace context key is private. Mask its typed value
 // before installing our trace, preserving cancellation and other caller values.
 // Inherited Got1xxResponse hooks would reset net/http's aggregate header limit.
@@ -75,16 +94,25 @@ type httpExchangeOptions struct {
 	headers     http.Header
 }
 
-// exchangeHTTP owns route, socket, TLS and cleanup for all HTTP operations.
+// exchangeHTTP preserves the HTTPS-only contract of existing operation APIs.
 func (e *Executor) exchangeHTTP(ctx context.Context, request HTTPSRequest, method string, upload *uploadBody, options *httpExchangeOptions, consume func(context.Context, *http.Response, *HTTPSReceipt) error) (receipt HTTPSReceipt, resultErr error) {
+	scheme, _, found := strings.Cut(request.URL, ":")
+	if !found || !strings.EqualFold(scheme, "https") {
+		return receipt, errors.New("invalid bounded HTTPS URL")
+	}
+	return e.exchange(ctx, request, method, upload, options, consume)
+}
+
+// exchange owns the one native HTTP transport, route, TLS and cleanup path.
+func (e *Executor) exchange(ctx context.Context, request HTTPSRequest, method string, upload *uploadBody, options *httpExchangeOptions, consume func(context.Context, *http.Response, *HTTPSReceipt) error) (receipt HTTPSReceipt, resultErr error) {
 	if ctx == nil {
 		return receipt, errors.New("nil request context")
 	}
 	u, err := url.Parse(request.URL)
-	if err != nil || u.Scheme != "https" {
-		return receipt, errors.New("invalid bounded HTTPS URL")
+	if err != nil || u.Scheme != "https" && u.Scheme != "http" {
+		return receipt, errors.New("invalid bounded HTTP URL")
 	}
-	if request.Timeout <= 0 || request.MaxBodyBytes < 1 || request.MaxBodyBytes == math.MaxInt64 || request.MaxHeaderBytes < 1 {
+	if request.Timeout <= 0 || request.MaxBodyBytes < 0 || request.MaxBodyBytes == 0 && method != http.MethodHead || request.MaxBodyBytes == math.MaxInt64 || request.MaxHeaderBytes < 1 {
 		return receipt, errors.New("invalid HTTPS byte/time budget")
 	}
 	if !request.Route.valid() {
@@ -93,6 +121,9 @@ func (e *Executor) exchangeHTTP(ctx context.Context, request HTTPSRequest, metho
 	port := u.Port()
 	if port == "" {
 		port = "443"
+		if u.Scheme == "http" {
+			port = "80"
+		}
 	}
 	dest, err := xnet.ParseDestination("tcp:" + net.JoinHostPort(u.Hostname(), port))
 	if err != nil {

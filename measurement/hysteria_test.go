@@ -194,6 +194,11 @@ func testProtocolMeasurements(t *testing.T, e *measurement.Executor, v *core.Ins
 			t.Fatalf("sample: %+v", sample)
 		}
 	}
+	head := measurement.HTTPRequest(request(s, measurement.ExactOutbound))
+	head.MaxBodyBytes = 0
+	if got, err := e.HTTP(context.Background(), http.MethodHead, head); err != nil || got.StatusCode != 200 || got.BodyBytes != 0 || len(got.Body) != 0 || !got.BodyComplete || got.EndpointTLS == nil || got.FirstByteElapsed == nil {
+		t.Fatalf("native node HEAD facts: %+v, %v", got, err)
+	}
 	download := downloadRequest(s, measurement.ExactOutbound)
 	download.HTTPS.URL += "/partial"
 	partial, err := e.Download(context.Background(), download)

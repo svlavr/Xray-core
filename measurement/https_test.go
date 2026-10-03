@@ -777,3 +777,171 @@ func (d *stalledDialer) Dial(ctx context.Context, source xnet.Address, dest xnet
 	return d.native.Dial(ctx, source, dest, opts)
 }
 func (*stalledDialer) DestIpAddress() xnet.IP { return nil }
+
+func TestHTTPProbeMethodsSchemesAndRoutes(t *testing.T) {
+	for _, useTLS := range []bool{false, true} {
+		start := httptest.NewServer
+		if useTLS {
+			start = httptest.NewTLSServer
+		}
+		methods := make(chan string, 8)
+		s := start(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			methods <- r.Method
+			w.Header().Set("Content-Length", "7")
+			w.Header().Set("X-Fact", "raw")
+			if r.Method != http.MethodHead {
+				_, _ = io.WriteString(w, "payload")
+			}
+		}))
+		func() {
+			defer s.Close()
+			e := executor(t, instance(t))
+			for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
+				for _, method := range []string{http.MethodHead, http.MethodGet} {
+					r := measurement.HTTPRequest{Route: measurement.Route{Kind: kind}, URL: s.URL, Timeout: time.Second, MaxBodyBytes: 8, MaxHeaderBytes: 4096}
+					if kind == measurement.ExactOutbound {
+						r.Route.Tag = "exact"
+					}
+					if useTLS {
+						r.RootCAs = x509.NewCertPool()
+						r.RootCAs.AddCert(s.Certificate())
+					}
+					if method == http.MethodHead {
+						r.MaxBodyBytes = 0
+					}
+					got, err := e.HTTP(context.Background(), method, r)
+					if err != nil || got.StatusCode != 200 || got.Header.Get("X-Fact") != "raw" || got.Header.Get("Content-Length") != "7" || !got.BodyComplete || got.FirstByteElapsed == nil || (got.EndpointTLS != nil) != useTLS {
+						t.Fatalf("HTTP probe TLS=%v method=%s route=%v: %+v, %v", useTLS, method, kind, got, err)
+					}
+					wantBody := "payload"
+					if method == http.MethodHead {
+						wantBody = ""
+					}
+					if string(got.Body) != wantBody || got.BodyBytes != int64(len(wantBody)) || <-methods != method {
+						t.Fatalf("method/payload facts: %+v", got)
+					}
+				}
+			}
+		}()
+	}
+}
+
+func TestHTTPProbeRawStatusBoundsAndHTTPSCompatibility(t *testing.T) {
+	var calls atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Location", "/must-not-follow")
+		w.WriteHeader(http.StatusFound)
+		_, _ = io.WriteString(w, "payload")
+	}))
+	defer s.Close()
+	v := instance(t)
+	e := executor(t, v)
+	r := measurement.HTTPRequest{Route: measurement.Route{Kind: measurement.ExactOutbound, Tag: "exact"}, URL: s.URL, Timeout: time.Second, MaxBodyBytes: 16, MaxHeaderBytes: 4096}
+	for _, method := range []string{http.MethodHead, http.MethodGet} {
+		got, err := e.HTTP(context.Background(), method, r)
+		if err != nil || got.StatusCode != 302 || got.Header.Get("Location") != "/must-not-follow" {
+			t.Fatalf("raw redirect: %+v, %v", got, err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatal("HTTP probe followed a redirect or issued another request")
+	}
+	r.MaxBodyBytes = 3
+	if got, err := e.HTTP(context.Background(), http.MethodGet, r); !errors.Is(err, measurement.ErrBodyLimit) || string(got.Body) != "pay" || got.BodyBytes != 3 || got.BodyComplete {
+		t.Fatalf("bounded HTTP payload: %+v, %v", got, err)
+	}
+	before := calls.Load()
+	if _, err := e.HTTP(context.Background(), http.MethodPost, r); err == nil {
+		t.Fatal("HTTP probe accepted a different operation method")
+	}
+	r.MaxBodyBytes = 0
+	if _, err := e.HTTP(context.Background(), http.MethodGet, r); err == nil {
+		t.Fatal("GET accepted an empty payload budget")
+	}
+	r.MaxBodyBytes = 16
+	legacy := measurement.HTTPSRequest(r)
+	if _, err := e.HTTPS(context.Background(), legacy); err == nil {
+		t.Fatal("legacy HTTPS accepted plain HTTP")
+	}
+	if _, err := e.Download(context.Background(), measurement.DownloadRequest{HTTPS: legacy, TransferTimeout: time.Second}); err == nil {
+		t.Fatal("download accepted plain HTTP")
+	}
+	if _, err := e.Upload(context.Background(), measurement.UploadRequest{HTTPS: legacy, PayloadBytes: 1, TransferTimeout: time.Second}); err == nil {
+		t.Fatal("upload accepted plain HTTP")
+	}
+	if _, err := e.EgressIdentity(context.Background(), measurement.IdentityRequest{HTTPS: legacy}); err == nil {
+		t.Fatal("identity accepted plain HTTP")
+	}
+	r.Route.Tag = "absent"
+	if _, err := e.HTTP(context.Background(), http.MethodHead, r); err == nil {
+		t.Fatal("missing exact HTTP tag fell back")
+	}
+	if calls.Load() != before {
+		t.Fatal("rejected operation reached the endpoint")
+	}
+	// An inactive candidate uses an explicitly registered native tag, without
+	// replacing the default route or creating another Measurement/core owner.
+	if err := core.AddOutboundHandler(v, config("new-node", false)); err != nil {
+		t.Fatal(err)
+	}
+	r.Route.Tag = "new-node"
+	if got, err := e.HTTP(context.Background(), http.MethodHead, r); err != nil || got.StatusCode != 302 || calls.Load() != before+1 {
+		t.Fatalf("new native node route: %+v, %v", got, err)
+	}
+}
+
+func TestHTTPHeadCancellationAndHeaderLimit(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/large" {
+			w.Header().Set("X-Large", strings.Repeat("x", 8192))
+			return
+		}
+		entered <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer s.Close()
+	e := executor(t, instance(t))
+	r := measurement.HTTPRequest{Route: measurement.Route{Kind: measurement.ExactOutbound, Tag: "exact"}, URL: s.URL, Timeout: time.Second, MaxHeaderBytes: 4096}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := e.HTTP(ctx, http.MethodHead, r); done <- err }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("HEAD did not reach the native route")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("HEAD cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HEAD cancellation retained native I/O")
+	}
+	r.URL += "/large"
+	if got, err := e.HTTP(context.Background(), http.MethodHead, r); err == nil || got.StatusCode != 0 {
+		t.Fatalf("HEAD exceeded its header budget: %+v, %v", got, err)
+	}
+}
+
+func TestHTTPSProbePreservesCaseInsensitiveScheme(t *testing.T) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "case") }))
+	defer s.Close()
+	e := executor(t, instance(t))
+	for _, scheme := range []string{"HTTPS", "hTtPs"} {
+		r := request(s, measurement.ExactOutbound)
+		r.URL = scheme + strings.TrimPrefix(s.URL, "https")
+		if got, err := e.HTTPS(context.Background(), r); err != nil || string(got.Body) != "case" || !got.BodyComplete {
+			t.Fatalf("legacy HTTPS scheme %s: %+v, %v", scheme, got, err)
+		}
+	}
+	r := request(s, measurement.ExactOutbound)
+	r.URL = "HtTp" + strings.TrimPrefix(s.URL, "https")
+	if _, err := e.HTTPS(context.Background(), r); err == nil {
+		t.Fatal("case-insensitive HTTP escaped HTTPS-only gateway")
+	}
+}
