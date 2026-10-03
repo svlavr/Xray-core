@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"net/textproto"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -518,13 +520,33 @@ func (d *originDialer) Dial(ctx context.Context, source xnet.Address, dest xnet.
 }
 func (*originDialer) DestIpAddress() xnet.IP { return nil }
 
+// Native dialer replacement requires no concurrent readers. A separate test
+// process keeps earlier native outbound workers outside this fixture's owner.
+func isolatedSystemDialer(t *testing.T) bool {
+	t.Helper()
+	const key = "XRAY_MEASUREMENT_DIALER_TEST"
+	if os.Getenv(key) == t.Name() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.timeout=20s")
+	cmd.Env = append(os.Environ(), key+"="+t.Name())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("isolated system dialer fixture: %v\n%s", err, output)
+	}
+	return true
+}
+
 func TestHTTPSOriginAtSocketOwner(t *testing.T) {
+	if isolatedSystemDialer(t) {
+		return
+	}
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
 	defer s.Close()
 	e := executor(t, instance(t))
 	dialer := &originDialer{t: t}
 	internet.UseAlternativeSystemDialer(dialer)
-	defer internet.UseAlternativeSystemDialer(nil)
 	for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
 		if _, err := e.HTTPS(context.Background(), request(s, kind)); err != nil {
 			t.Fatal(err)

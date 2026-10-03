@@ -17,13 +17,15 @@ import (
 )
 
 func TestExecutorCanceledAdmissionDoesNotOpenOrRetainSlot(t *testing.T) {
+	if isolatedSystemDialer(t) {
+		return
+	}
 	e, err := measurement.New(instance(t), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dialer := &originDialer{t: t}
 	internet.UseAlternativeSystemDialer(dialer)
-	defer internet.UseAlternativeSystemDialer(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}

@@ -140,10 +140,12 @@ func TestTCPConnectValidationExactAndPrecancelBeforeNetwork(t *testing.T) {
 }
 
 func TestTCPConnectAlternativeDialerRejectedBeforeInvocation(t *testing.T) {
+	if isolatedSystemDialer(t) {
+		return
+	}
 	e := executor(t, instance(t))
 	d := &originDialer{t: t}
 	internet.UseAlternativeSystemDialer(d)
-	defer internet.UseAlternativeSystemDialer(nil)
 	req := measurement.TCPConnectRequest{Route: measurement.Route{Kind: measurement.Direct}, Destination: netip.MustParseAddrPort("127.0.0.1:9"), Timeout: time.Second}
 	r, err := e.TCPConnect(context.Background(), req)
 	if !errors.Is(err, measurement.ErrUnsupported) || r.NativeDialElapsed != nil || r.DestinationConnected || d.calls.Load() != 0 {

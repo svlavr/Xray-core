@@ -95,13 +95,15 @@ func (d *nativeHTTPDialer) Dial(context.Context, xnet.Address, xnet.Destination,
 func (*nativeHTTPDialer) DestIpAddress() xnet.IP { return nil }
 
 func TestHTTPSNativeNilConnectionDoesNotRetainSlot(t *testing.T) {
+	if isolatedSystemDialer(t) {
+		return
+	}
 	e, err := measurement.New(instance(t), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	d := new(nativeHTTPDialer)
 	internet.UseAlternativeSystemDialer(d)
-	defer internet.UseAlternativeSystemDialer(nil)
 	req := measurement.HTTPSRequest{URL: "https://127.0.0.1:443/", Route: measurement.Route{Kind: measurement.Direct}, Timeout: time.Second, MaxBodyBytes: 32, MaxHeaderBytes: 1024}
 	for range 2 {
 		r, err := e.HTTPS(context.Background(), req)

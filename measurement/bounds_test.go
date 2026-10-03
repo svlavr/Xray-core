@@ -95,9 +95,11 @@ func (d *bufferPolicyDialer) Dial(ctx context.Context, source xnet.Address, dest
 func (*bufferPolicyDialer) DestIpAddress() xnet.IP { return nil }
 
 func TestNativeMeasurementPreservesCallerBufferPolicy(t *testing.T) {
+	if isolatedSystemDialer(t) {
+		return
+	}
 	d := &bufferPolicyDialer{observed: make(chan policyfeature.Buffer, 1)}
 	internet.UseAlternativeSystemDialer(d)
-	defer internet.UseAlternativeSystemDialer(nil)
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "bounded") }))
 	defer s.Close()
 	e := executor(t, instance(t))
