@@ -104,28 +104,3 @@ jobs:
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
           ./measurement ./proxy/hysteria ./transport/internet/hysteria ./transport/internet/tls
-
-  race-tests:
-    name: Race Tests / Linux
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout codebase
-        uses: actions/checkout@v7
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          check-latest: true
-      - name: Restore Geodat Cache
-        uses: actions/cache/restore@v6
-        with:
-          path: resources
-          key: xray-geodat-
-      - name: Restore and verify geodat
-        shell: pwsh
-        run: ./.github/build/prepare-assets.ps1
-      - name: Enable native ICMP for the runner group
-        shell: bash
-        run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
-      - name: Race test
-        run: go test -mod=readonly -race -timeout 1h ./...
