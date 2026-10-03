@@ -73,27 +73,15 @@ func (f *SlidingWindow) CheckAndAdd(counter uint64) bool {
 
 type ServerUDPSession struct {
 	sync.Mutex
-	RemoteCipher atomic.Pointer[cipher.AEAD]
-	Window       SlidingWindow
-	LastActive   atomic.Int64 // Unix timestamp in seconds
+	clientBodyCipher cipher.AEAD
+	Window           SlidingWindow
+	LastActive       atomic.Int64 // Unix timestamp in seconds
 
 	ServerSessionID   uint64
 	ServerPacketID    atomic.Uint64
 	serverBodyCipher  cipher.AEAD
 	serverHeaderBlock cipher.Block
 	serverChaCha      cipher.AEAD
-}
-
-func (s *ServerUDPSession) GetRemoteCipher() cipher.AEAD {
-	ptr := s.RemoteCipher.Load()
-	if ptr == nil {
-		return nil
-	}
-	return *ptr
-}
-
-func (s *ServerUDPSession) SetRemoteCipher(c cipher.AEAD) {
-	s.RemoteCipher.Store(&c)
 }
 
 type UDPSessionManager[K comparable] struct {

@@ -37,8 +37,7 @@ type CacheController struct {
 	cacheCleanup  *task.Periodic
 	highWatermark int
 	requestGroup  singleflight.Group
-	migrations    sync.WaitGroup
-	pulls         sync.WaitGroup
+	workers       sync.WaitGroup
 	ctx           context.Context
 	cancel        context.CancelFunc
 }
@@ -117,11 +116,11 @@ func (c *CacheController) startPull(ctx context.Context, s CachedNameserver, fqd
 		c.Unlock()
 		return
 	}
-	c.pulls.Add(1)
+	c.workers.Add(1)
 	c.Unlock()
 	// Keep query metadata while the cache owner controls refresh cancellation.
 	ctx = &dnsRequestContext{Context: context.WithoutCancel(ctx), caller: c.ctx}
-	go func() { defer c.pulls.Done(); pull(ctx, s, fqdn, option) }()
+	go func() { defer c.workers.Done(); pull(ctx, s, fqdn, option) }()
 }
 
 func (c *CacheController) collectExpiredKeys() ([]string, error) {
@@ -222,9 +221,9 @@ func (c *CacheController) writeAndShrink(expiredKeys []string) {
 		c.dirtyips = c.ips
 		c.ips = make(map[string]*record, int(float64(lenAfter)*1.1))
 		c.highWatermark = lenAfter
-		c.migrations.Add(1)
+		c.workers.Add(1)
 		go func() {
-			defer c.migrations.Done()
+			defer c.workers.Done()
 			c.migrate()
 		}()
 	}
@@ -432,6 +431,5 @@ func (c *CacheController) Close() {
 	c.Lock()
 	c.subs = nil
 	c.Unlock()
-	c.migrations.Wait()
-	c.pulls.Wait()
+	c.workers.Wait()
 }

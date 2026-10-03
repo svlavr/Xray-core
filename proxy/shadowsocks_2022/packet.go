@@ -251,7 +251,7 @@ func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, s
 	if !s.Window.Check(packetID) {
 		return DecodedUDPPacket{}, ErrPacketIdNotUnique
 	}
-	bodyAead := s.GetRemoteCipher()
+	bodyAead := s.clientBodyCipher
 	isNewCipher := false
 	if bodyAead == nil {
 		bodyKey := DeriveSessionSubKey(psk, rawHeader[:8], method.KeySaltLength)
@@ -281,7 +281,7 @@ func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, s
 	s.Window.Add(packetID)
 
 	if isNewCipher {
-		s.SetRemoteCipher(bodyAead)
+		s.clientBodyCipher = bodyAead
 	}
 
 	return decoded, nil

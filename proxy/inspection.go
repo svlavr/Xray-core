@@ -22,7 +22,7 @@ import (
 // cleanup until DispatchLink returns. Disabled collection leaves the context and
 // link unchanged and returns nil cleanup.
 func ObserveTCP(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link) (context.Context, func()) {
-	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_TCP, false)
+	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_TCP)
 }
 
 // ObserveUDP attaches receipts to one exclusively owned, decoded UDP association.
@@ -30,46 +30,48 @@ func ObserveTCP(ctx context.Context, manager stats.Manager, conn net.Conn, dest 
 // expose actual endpoint results, directly or through WithWriterReceipt.
 // The caller defers cleanup until DispatchLink returns, as for ObserveTCP.
 func ObserveUDP(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link) (context.Context, func()) {
-	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_UDP, false)
+	return observeEndpoint(ctx, manager, conn, dest, link, net.Network_UDP)
 }
 
-func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link, kind net.Network, returned bool) (context.Context, func()) {
+func observeEndpoint(ctx context.Context, manager stats.Manager, conn net.Conn, dest net.Destination, link *transport.Link, kind net.Network) (context.Context, func()) {
 	if isMuxCarrier(dest) {
 		return ctx, nil
 	}
-	observedCtx, observation, cancel := beginObservation(ctx, manager, conn, dest, kind, returned)
-	if observation == nil {
+	observedCtx, flow, cancel := BeginObservedEndpoint(ctx, ObservationStore(manager), conn, dest, kind)
+	if flow == nil {
 		return ctx, nil
 	}
-	observation.SuppliedEndpoint = !returned
-	flow := observation.Exchange
+	observation := &session.LogicalObservation{Exchange: flow, SuppliedEndpoint: true}
 	cursor := buf.NewInspectionReader(link.Reader, flow, func() { cancel(); conn.Close() })
 	if kind == net.Network_UDP {
 		cursor.PacketDestination = dest
 	}
 	link.Reader = cursor
 	link.Writer, observation.WriterReceiptAttached = buf.AttachWriterReceiptWithStatus(link.Writer, flow)
-	return observedCtx, func() {
+	return session.ContextWithLogicalObservation(observedCtx, observation), func() {
 		cursor.Interrupt()
 		flow.Finish()
 	}
-}
-
-func beginObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network, returned bool) (context.Context, *session.LogicalObservation, context.CancelFunc) {
-	observedCtx, flow, cancel := BeginObservedEndpoint(ctx, ObservationStore(manager), conn, dest, kind)
-	if flow == nil {
-		return ctx, nil, nil
-	}
-	observation := &session.LogicalObservation{Exchange: flow}
-	observation.ReturnedLink.Store(returned)
-	return session.ContextWithLogicalObservation(observedCtx, observation), observation, cancel
 }
 
 // BeginReturnedObservation admits an exclusive codec endpoint before Dispatch.
 // The caller binds its decoded input and codec output when native preparation
 // produces them and defers cleanup until the endpoint owner returns.
 func BeginReturnedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network) (context.Context, *session.LogicalObservation, func()) {
-	return beginOwnedObservation(ctx, manager, conn, dest, kind, true)
+	if isMuxCarrier(dest) {
+		return ctx, nil, nil
+	}
+	ctx, flow, cancel := BeginObservedEndpoint(ctx, ObservationStore(manager), conn, dest, kind)
+	if flow == nil {
+		return ctx, nil, nil
+	}
+	observation := &session.LogicalObservation{Exchange: flow}
+	observation.ReturnedLink.Store(true)
+	return session.ContextWithLogicalObservation(ctx, observation), observation, func() {
+		cancel()
+		conn.Close()
+		flow.Finish()
+	}
 }
 
 // BeginExecutionObservation admits request-local work whose decoded input is
@@ -93,23 +95,6 @@ func BeginExecutionObservation(ctx context.Context, manager stats.Manager, owner
 	return session.ContextWithLogicalObservation(ctx, observation), observation, func() {
 		owner.Close()
 		flow.Finish()
-	}
-}
-
-func beginOwnedObservation(ctx context.Context, manager stats.Manager, conn io.Closer, dest net.Destination, kind net.Network, returned bool) (context.Context, *session.LogicalObservation, func()) {
-	// The native MUX dispatcher recognizes this reserved carrier address even
-	// when an incoming protocol command did not explicitly name MUX.
-	if isMuxCarrier(dest) {
-		return ctx, nil, nil
-	}
-	ctx, observation, cancel := beginObservation(ctx, manager, conn, dest, kind, returned)
-	if observation == nil {
-		return ctx, nil, nil
-	}
-	return ctx, observation, func() {
-		cancel()
-		conn.Close()
-		observation.Exchange.Finish()
 	}
 }
 

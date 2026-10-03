@@ -48,34 +48,40 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 	return root, nil
 }
 
-type certificateSet struct {
+type certificateSet[T any] struct {
 	access sync.RWMutex
-	certs  []*tls.Certificate
+	certs  []T
 }
 
-func (s *certificateSet) append(cert *tls.Certificate) int {
+func (s *certificateSet[T]) append(cert T) int {
 	s.access.Lock()
 	defer s.access.Unlock()
 	s.certs = append(s.certs, cert)
 	return len(s.certs) - 1
 }
 
-func (s *certificateSet) load(index int) *tls.Certificate {
+func (s *certificateSet[T]) load(index int) T {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	return s.certs[index]
 }
 
-func (s *certificateSet) replace(index int, cert *tls.Certificate) {
+func (s *certificateSet[T]) replace(index int, cert T) {
 	s.access.Lock()
 	s.certs[index] = cert
 	s.access.Unlock()
 }
 
-func (s *certificateSet) snapshot() []*tls.Certificate {
+func (s *certificateSet[T]) snapshot() []T {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	return slices.Clone(s.certs)
+}
+
+func (s *certificateSet[T]) len() int {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return len(s.certs)
 }
 
 func cloneCertificateConfig(entry *Certificate) *Certificate {
@@ -102,8 +108,8 @@ func withOCSPStaple(cert *tls.Certificate, staple []byte) *tls.Certificate {
 	return &cloned
 }
 
-func (c *Config) buildCertificateSet(watch bool, owner *configOwner) *certificateSet {
-	set := new(certificateSet)
+func (c *Config) buildCertificateSet(owner *RandCarrier) *certificateSet[*tls.Certificate] {
+	set := new(certificateSet[*tls.Certificate])
 	for _, source := range c.Certificate {
 		entry := cloneCertificateConfig(source)
 		if entry.Usage != Certificate_ENCIPHERMENT {
@@ -114,9 +120,6 @@ func (c *Config) buildCertificateSet(watch bool, owner *configOwner) *certificat
 			continue
 		}
 		index := set.append(keyPair)
-		if !watch {
-			continue
-		}
 		setupOcspTicker(owner, entry, func(isReloaded, isOcspstapling bool) {
 			current := set.load(index)
 			next := current
@@ -145,26 +148,7 @@ func (c *Config) buildCertificateSet(watch bool, owner *configOwner) *certificat
 // BuildCertificates returns an immutable point-in-time snapshot. GetTLSConfig
 // owns the live reload selector used by server handshakes.
 func (c *Config) BuildCertificates() []*tls.Certificate {
-	return c.buildCertificateSet(false, nil).snapshot()
-}
-
-type configOwner struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	workers sync.WaitGroup
-}
-
-func newConfigOwner() *configOwner {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &configOwner{ctx: ctx, cancel: cancel}
-}
-
-func (o *configOwner) close() {
-	if o == nil {
-		return
-	}
-	o.cancel()
-	o.workers.Wait()
+	return c.buildCertificateSet(nil).snapshot()
 }
 
 // CloseConfig retires workers attached to the config's RandCarrier. Clones
@@ -176,14 +160,17 @@ func CloseConfig(config *tls.Config) {
 		return
 	}
 	if carrier, ok := config.Rand.(*RandCarrier); ok {
-		carrier.owner.close()
+		carrier.close()
 	}
 }
 
-func setupOcspTicker(owner *configOwner, entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
+func setupOcspTicker(owner *RandCarrier, entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
 	hasReloadPaths := entry.CertificatePath != "" && entry.KeyPath != ""
 	if owner == nil || entry.OneTimeLoading || !hasReloadPaths && entry.OcspStapling == 0 {
 		return
+	}
+	if owner.ctx == nil {
+		owner.ctx, owner.cancel = context.WithCancel(context.Background())
 	}
 	owner.workers.Add(1)
 	go func() {
@@ -265,38 +252,8 @@ func issueCertificate(rawCA *Certificate, domain string) (*tls.Certificate, erro
 	return &issued, nil
 }
 
-type certificateAuthoritySet struct {
-	access sync.RWMutex
-	certs  []*Certificate
-}
-
-func (s *certificateAuthoritySet) append(cert *Certificate) int {
-	s.access.Lock()
-	defer s.access.Unlock()
-	s.certs = append(s.certs, cert)
-	return len(s.certs) - 1
-}
-
-func (s *certificateAuthoritySet) replace(index int, cert *Certificate) {
-	s.access.Lock()
-	s.certs[index] = cert
-	s.access.Unlock()
-}
-
-func (s *certificateAuthoritySet) snapshot() []*Certificate {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return slices.Clone(s.certs)
-}
-
-func (s *certificateAuthoritySet) len() int {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return len(s.certs)
-}
-
-func (c *Config) getCustomCA(owner *configOwner) *certificateAuthoritySet {
-	set := new(certificateAuthoritySet)
+func (c *Config) getCustomCA(owner *RandCarrier) *certificateSet[*Certificate] {
+	set := new(certificateSet[*Certificate])
 	for _, source := range c.Certificate {
 		if source.Usage != Certificate_AUTHORITY_ISSUE {
 			continue
@@ -382,14 +339,14 @@ func (c *issuedCertificateCache) getOrIssue(domain string, authorities []*Certif
 	return value.(*tls.Certificate), nil
 }
 
-func getGetCertificateFunc(ca *certificateAuthoritySet) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getGetCertificateFunc(ca *certificateSet[*Certificate]) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	cache := new(issuedCertificateCache)
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		return cache.getOrIssue(hello.ServerName, ca.snapshot())
 	}
 }
 
-func getNewGetCertificateFunc(certs *certificateSet, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(certs *certificateSet[*tls.Certificate], rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		certs.access.RLock()
 		defer certs.access.RUnlock()
@@ -505,7 +462,9 @@ type RandCarrier struct {
 	RootCAs              *x509.CertPool
 	VerifyPeerCertByName []string
 	PinnedPeerCertSha256 [][]byte
-	owner                *configOwner
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	workers              sync.WaitGroup
 	client               bool
 	reader               io.Reader
 }
@@ -517,18 +476,12 @@ func (r *RandCarrier) Read(p []byte) (n int, err error) {
 	return rand.Read(p)
 }
 
-func (c *Config) needsServerWorker() bool {
-	for _, entry := range c.Certificate {
-		if entry.OneTimeLoading {
-			continue
-		}
-		paths := entry.CertificatePath != "" && entry.KeyPath != ""
-		if entry.Usage == Certificate_AUTHORITY_ISSUE && paths ||
-			entry.Usage == Certificate_ENCIPHERMENT && (paths || entry.OcspStapling != 0) {
-			return true
-		}
+// The carrier is shared by tls.Config.Clone; do not copy its live worker state.
+func (r *RandCarrier) close() {
+	if r.cancel != nil {
+		r.cancel()
+		r.workers.Wait()
 	}
-	return false
 }
 
 // GetTLSConfig converts this Config into tls.Config.
@@ -579,16 +532,15 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 		}
 	}
 
-	var owner *configOwner
-	if !randCarrier.client && c.needsServerWorker() {
-		owner = newConfigOwner()
-		randCarrier.owner = owner
+	var owner *RandCarrier
+	if !randCarrier.client {
+		owner = randCarrier
 	}
 	caCerts := c.getCustomCA(owner)
 	if caCerts.len() > 0 {
 		config.GetCertificate = getGetCertificateFunc(caCerts)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateSet(owner != nil, owner), c.RejectUnknownSni)
+		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateSet(owner), c.RejectUnknownSni)
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {

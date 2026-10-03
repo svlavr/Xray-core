@@ -63,7 +63,7 @@ func testCertificate(t *testing.T, commonName string, names ...string) (*Certifi
 func TestCertificateSetConcurrentPublish(t *testing.T) {
 	_, exact := testCertificate(t, "exact.example", "exact.example")
 	_, wildcard := testCertificate(t, "*.wild.example", "*.wild.example")
-	set := new(certificateSet)
+	set := new(certificateSet[*tls.Certificate])
 	set.append(exact)
 	set.append(wildcard)
 	selectCertificate := getNewGetCertificateFunc(set, false)
@@ -152,7 +152,7 @@ func TestTLSConfigOwnerRetiresProactiveReload(t *testing.T) {
 	server := (&Config{Certificate: []*Certificate{oldEntry}}).GetTLSConfig()
 	t.Cleanup(func() { CloseConfig(server) })
 	carrier := server.Rand.(*RandCarrier)
-	if carrier.owner == nil {
+	if carrier.ctx == nil {
 		t.Fatal("server config has no worker owner")
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -167,7 +167,7 @@ func TestTLSConfigOwnerRetiresProactiveReload(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	CloseConfig(server)
-	if carrier.owner.ctx.Err() == nil {
+	if carrier.ctx.Err() == nil {
 		t.Fatal("server worker owner remains open")
 	}
 	CloseConfig(server)
@@ -178,7 +178,7 @@ func TestTLSClientModeHasNoServerWorker(t *testing.T) {
 	entry.OcspStapling = 1
 	config := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig(WithClient())
 	carrier := config.Rand.(*RandCarrier)
-	if carrier.owner != nil {
+	if carrier.ctx != nil {
 		t.Fatal("client config started a server worker owner")
 	}
 	if config.GetCertificate == nil {
@@ -190,13 +190,13 @@ func TestTLSClientModeHasNoServerWorker(t *testing.T) {
 func TestTLSStaticServerHasNoWorkerOwner(t *testing.T) {
 	entry, _ := testCertificate(t, "static-owner.example", "static-owner.example")
 	config := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig()
-	if config.Rand.(*RandCarrier).owner != nil {
+	if config.Rand.(*RandCarrier).ctx != nil {
 		t.Fatal("static server config allocated a worker owner")
 	}
 	entry.OneTimeLoading = true
 	entry.CertificatePath, entry.KeyPath = "unused-cert.pem", "unused-key.pem"
 	oneTime := (&Config{Certificate: []*Certificate{entry}}).GetTLSConfig()
-	if oneTime.Rand.(*RandCarrier).owner != nil {
+	if oneTime.Rand.(*RandCarrier).ctx != nil {
 		t.Fatal("one-time certificate allocated a worker owner")
 	}
 	CloseConfig(config)
@@ -213,7 +213,7 @@ func TestTLSRandOverridePreservesOwnerAndReader(t *testing.T) {
 	if config.GetCertificate == nil {
 		t.Fatal("Rand override lost server certificate selector")
 	}
-	if config.Rand.(*RandCarrier).owner == nil {
+	if config.Rand.(*RandCarrier).ctx == nil {
 		t.Fatal("Rand option silently disabled live server refresh")
 	}
 	data := make([]byte, 3)
@@ -224,7 +224,7 @@ func TestTLSRandOverridePreservesOwnerAndReader(t *testing.T) {
 		config.Rand = rand.Reader
 	}, WithClient())
 	defer CloseConfig(client)
-	if client.Rand.(*RandCarrier).owner != nil {
+	if client.Rand.(*RandCarrier).ctx != nil {
 		t.Fatal("client marker was lost after a custom Rand option")
 	}
 }
@@ -273,9 +273,9 @@ func TestCertificateSetPathReloadPublishesImmutableReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldEntry.CertificatePath, oldEntry.KeyPath = certPath, keyPath
-	owner := newConfigOwner()
+	owner := new(RandCarrier)
 	t.Cleanup(owner.close)
-	set := (&Config{Certificate: []*Certificate{oldEntry}}).buildCertificateSet(true, owner)
+	set := (&Config{Certificate: []*Certificate{oldEntry}}).buildCertificateSet(owner)
 	initial := set.load(0)
 	// The watcher's first reload can finish before this snapshot is captured.
 	initialName := initial.Leaf.Subject.CommonName
@@ -346,7 +346,7 @@ func TestCertificateAuthorityConcurrentHandshakesAndReload(t *testing.T) {
 	secondEntry := ParseCertificate(secondCA)
 	secondEntry.Usage = Certificate_AUTHORITY_ISSUE
 
-	authorities := new(certificateAuthoritySet)
+	authorities := new(certificateSet[*Certificate])
 	authorities.append(cloneCertificateConfig(firstEntry))
 	serverConfig := &tls.Config{GetCertificate: getGetCertificateFunc(authorities)}
 
@@ -426,7 +426,7 @@ func TestCertificateAuthorityPathReloadPublishesClone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	owner := newConfigOwner()
+	owner := new(RandCarrier)
 	t.Cleanup(owner.close)
 	authorities := (&Config{Certificate: []*Certificate{firstEntry}}).getCustomCA(owner)
 	deadline := time.Now().Add(time.Second)

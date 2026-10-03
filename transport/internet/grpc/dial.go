@@ -114,7 +114,7 @@ func frozenOutbounds(ctx context.Context, direct bool) []*session.Outbound {
 		if last == nil {
 			return []*session.Outbound{nil}
 		}
-		return []*session.Outbound{{Gateway: cloneAddress(last.Gateway)}}
+		return []*session.Outbound{{Gateway: last.Gateway}}
 	}
 	frozen := make([]*session.Outbound, len(outbounds))
 	for i, ob := range outbounds {
@@ -122,34 +122,13 @@ func frozenOutbounds(ctx context.Context, direct bool) []*session.Outbound {
 			continue
 		}
 		copy := *ob
-		cloneDest := func(d net.Destination) net.Destination {
-			if d.Address != nil {
-				d.Address = cloneAddress(d.Address)
-			}
-			return d
-		}
-		copy.OriginalTarget = cloneDest(ob.OriginalTarget)
-		copy.Target = cloneDest(ob.Target)
-		copy.RouteTarget = cloneDest(ob.RouteTarget)
-		copy.Gateway = cloneAddress(ob.Gateway)
 		frozen[i] = &copy
 	}
 	return frozen
 }
 
-func cloneAddress(address net.Address) net.Address {
-	if address == nil {
-		return nil
-	}
-	if address.Family().IsIP() {
-		return net.IPAddress(append([]byte(nil), address.IP()...))
-	}
-	return net.DomainAddress(address.Domain())
-}
-
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
 	pooled := grpcClientPooled(ctx, streamSettings)
-	route := frozenOutbounds(ctx, streamSettings.SocketSettings == nil || streamSettings.SocketSettings.DialerProxy == "")
 	key := dialerConf{Destination: dest, MemoryStreamConfig: streamSettings}
 	owner := streamSettings.Owner
 	globalDialerAccess.Lock()
@@ -171,6 +150,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		}
 	}
 
+	route := frozenOutbounds(ctx, streamSettings.SocketSettings == nil || streamSettings.SocketSettings.DialerProxy == "")
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
