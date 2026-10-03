@@ -4,9 +4,7 @@ package measurement
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
-	"net"
 	"sync"
 	"time"
 
@@ -63,22 +61,6 @@ func (o *operation) SubmitError(err error) {
 	if o.nativeError == nil {
 		o.nativeError = err
 	}
-}
-
-// handshakeTLS records the observed phase even on failure. Keeping it in the
-// operation also preserves this fact when subsequent I/O has not returned.
-func (o *operation) handshakeTLS(ctx context.Context, conn net.Conn, config *tls.Config) (net.Conn, error) {
-	tlsConn := tls.Client(conn, config)
-	started := time.Now()
-	err := tlsConn.HandshakeContext(ctx)
-	elapsed := time.Since(started)
-	o.mu.Lock()
-	o.tlsTime = &elapsed
-	o.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	return tlsConn, nil
 }
 
 var _ session.TrackedRequestErrorFeedback = (*operation)(nil)

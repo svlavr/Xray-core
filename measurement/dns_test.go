@@ -408,6 +408,9 @@ func TestDNSCancelDeadlineAndExactMissing(t *testing.T) {
 			if !errors.Is(err, context.DeadlineExceeded) || time.Since(began) > 1500*time.Millisecond || got.Message != nil {
 				t.Fatalf("cancel failed transport=%d kind=%d %+v %v", transport, kind, got, err)
 			}
+			if transport == measurement.DNSDoT && got.EndpointTLS == nil {
+				t.Fatal("lost failed endpoint TLS phase")
+			}
 			select {
 			case <-opened:
 			default:

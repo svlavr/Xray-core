@@ -69,6 +69,7 @@ func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (recei
 	var conn *icmp.PacketConn
 	defer func() {
 		receipt.Elapsed = time.Since(started)
+		resultErr = errors.Join(resultErr, ctx.Err())
 		cancel()
 		if conn != nil {
 			_ = conn.Close()
@@ -94,7 +95,7 @@ func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (recei
 	var err error
 	conn, err = icmp.ListenPacket(network, local)
 	if err != nil {
-		return receipt, errors.Join(err, ctx.Err())
+		return receipt, err
 	}
 	var native net.PacketConn
 	if v4 := conn.IPv4PacketConn(); v4 != nil {
@@ -104,7 +105,7 @@ func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (recei
 	}
 	raw, err := native.(syscall.Conn).SyscallConn()
 	if err != nil {
-		return receipt, errors.Join(err, ctx.Err())
+		return receipt, err
 	}
 	internet.ControllersLock.Lock()
 	controllers := slices.Clone(internet.Controllers)
@@ -124,11 +125,11 @@ func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (recei
 			return receipt, err
 		}
 		if err := control(controllerNetwork, controllerAddress, raw); err != nil {
-			return receipt, errors.Join(err, ctx.Err())
+			return receipt, err
 		}
 	}
 	resultErr = exchangeICMPEcho(ctx, conn, request.Destination, payload, datagram, &receipt)
-	return receipt, errors.Join(resultErr, ctx.Err())
+	return receipt, resultErr
 }
 
 func exchangeICMPEcho(ctx context.Context, conn net.PacketConn, destination netip.Addr, payload []byte, datagram bool, receipt *ICMPEchoReceipt) error {

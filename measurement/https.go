@@ -64,9 +64,7 @@ func (e *Executor) HTTP(ctx context.Context, method string, request HTTPRequest)
 	if method != http.MethodHead && method != http.MethodGet {
 		return HTTPReceipt{}, errors.New("HTTP probe method must be HEAD or GET")
 	}
-	return e.exchange(ctx, HTTPSRequest(request), method, nil, nil, func(_ context.Context, response *http.Response, receipt *HTTPSReceipt) error {
-		return readHTTPSBody(response, receipt, request.MaxBodyBytes)
-	})
+	return e.exchange(ctx, HTTPSRequest(request), method, nil, nil, nil)
 }
 
 // The standard library's trace context key is private. Mask its typed value
@@ -83,9 +81,7 @@ func (c withoutHTTPTrace) Value(key any) any {
 }
 
 func (e *Executor) HTTPS(ctx context.Context, request HTTPSRequest) (receipt HTTPSReceipt, resultErr error) {
-	return e.exchangeHTTP(ctx, request, http.MethodGet, nil, nil, func(ctx context.Context, response *http.Response, receipt *HTTPSReceipt) error {
-		return readHTTPSBody(response, receipt, request.MaxBodyBytes)
-	})
+	return e.exchangeHTTP(ctx, request, http.MethodGet, nil, nil, nil)
 }
 
 type httpExchangeOptions struct {
@@ -228,7 +224,11 @@ func (e *Executor) exchange(ctx context.Context, request HTTPSRequest, method st
 	}
 	responseBody = response.Body
 	receipt.StatusCode, receipt.Header = response.StatusCode, response.Header.Clone()
-	err = consume(ctx, response, &receipt)
+	if consume == nil {
+		err = readHTTPSBody(response, &receipt, request.MaxBodyBytes)
+	} else {
+		err = consume(ctx, response, &receipt)
+	}
 	if ctx.Err() != nil {
 		err = errors.Join(ctx.Err(), err)
 	}

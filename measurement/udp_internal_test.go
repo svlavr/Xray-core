@@ -89,8 +89,10 @@ func TestUDPPacketReadPreservesDataWithError(t *testing.T) {
 
 func TestUDPTrainPartialFailedWritesAndBatchError(t *testing.T) {
 	native := errors.New("native packet failure")
-	for _, mode := range []string{"partial", "error-count", "batch-error", "batch-limit"} {
+	for _, mode := range []string{"partial", "error-count", "batch-error", "batch-cancel", "batch-limit"} {
 		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			r := UDPEchoRequest{Destination: netip.MustParseAddrPort("127.0.0.1:9"), Count: 1, PacketBytes: 32, ReplyWait: 40 * time.Millisecond, MaxReplies: 4}
 			payload := make([]byte, 32)
 			copy(payload, "MUE1")
@@ -123,12 +125,15 @@ func TestUDPTrainPartialFailedWritesAndBatchError(t *testing.T) {
 					mb[i].UDP = &dest
 				}
 				packetBuffers = append(packetBuffers, mb...)
+				if mode == "batch-cancel" {
+					cancel()
+				}
 				return mb, native
 			}
 			if mode == "batch-limit" {
 				r.MaxReplies = 2
 			}
-			err := runUDPTrain(context.Background(), c, r, payload, started, &got)
+			err := runUDPTrain(ctx, c, r, payload, started, &got)
 			finalizeUDPReplies(&got, r)
 			switch mode {
 			case "partial":
@@ -139,9 +144,12 @@ func TestUDPTrainPartialFailedWritesAndBatchError(t *testing.T) {
 				if !errors.Is(err, native) || got.Sends[0].WriterBytes != 32 || !errors.Is(got.Sends[0].Error, native) {
 					t.Fatalf("logical write error %+v %v", got, err)
 				}
-			case "batch-error":
+			case "batch-error", "batch-cancel":
 				if !errors.Is(err, native) || len(got.Replies) != 3 || !got.Replies[1].Duplicate {
 					t.Fatalf("batch %+v %v", got, err)
+				}
+				if mode == "batch-cancel" && !errors.Is(err, context.Canceled) {
+					t.Fatalf("lost cancellation: %v", err)
 				}
 			case "batch-limit":
 				if !errors.Is(err, ErrUDPReplyLimit) || !errors.Is(err, native) || !got.ReplyLimitHit || len(got.Replies) != 2 {

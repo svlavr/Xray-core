@@ -163,7 +163,7 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 	defer func() {
 		receipt.Elapsed = time.Since(started)
 		o.mu.Lock()
-		receipt.OutboundError, receipt.EndpointTLS = o.nativeError, o.tlsTime
+		receipt.OutboundError = o.nativeError
 		o.mu.Unlock()
 	}()
 	rawConn, err := e.open(ctx, request.Route, dest)
@@ -175,10 +175,15 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 	defer rawConn.Close()
 	conn := rawConn
 	if request.Transport == DNSDoT {
-		conn, err = o.handshakeTLS(ctx, conn, &tls.Config{ServerName: request.ServerName, MinVersion: tls.VersionTLS12, RootCAs: request.RootCAs})
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: request.ServerName, MinVersion: tls.VersionTLS12, RootCAs: request.RootCAs})
+		started := time.Now()
+		err := tlsConn.HandshakeContext(ctx)
+		elapsed := time.Since(started)
+		receipt.EndpointTLS = &elapsed
 		if err != nil {
-			return receipt, err
+			return receipt, errors.Join(err, ctx.Err())
 		}
+		conn = tlsConn
 	}
 	if err := exchangeDNSWire(conn, wire, request, &receipt); err != nil {
 		return receipt, errors.Join(err, ctx.Err())

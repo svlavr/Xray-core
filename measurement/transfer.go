@@ -164,9 +164,7 @@ func (e *Executor) Upload(ctx context.Context, request UploadRequest) (result Up
 	if request.RequireAcknowledgment {
 		body.accepted = sha256.New()
 	}
-	result.HTTPS, resultErr = e.exchangeHTTP(phaseCtx, request.HTTPS, http.MethodPost, body, nil, func(ctx context.Context, response *http.Response, receipt *HTTPSReceipt) error {
-		return readHTTPSBody(response, receipt, request.HTTPS.MaxBodyBytes)
-	})
+	result.HTTPS, resultErr = e.exchangeHTTP(phaseCtx, request.HTTPS, http.MethodPost, body, nil, nil)
 	// Native HTTP may return before its body writer. Snapshot observed raw
 	// counts without a completion certificate or a second cleanup deadline.
 	body.mu.Lock()

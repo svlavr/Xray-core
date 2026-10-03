@@ -139,8 +139,6 @@ func (e *Executor) UDPEcho(ctx context.Context, request UDPEchoRequest) (receipt
 	if err != nil {
 		return receipt, err
 	}
-	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stopClose()
 	defer conn.Close()
 	resultErr = runUDPTrain(ctx, conn, request, payload, started, &receipt)
 	return receipt, errors.Join(resultErr, ctx.Err())
@@ -287,7 +285,7 @@ func runUDPTrain(ctx context.Context, conn net.Conn, r UDPEchoRequest, payload [
 				return
 			}
 			if err != nil {
-				if ctx.Err() == nil {
+				if len(mb) > 0 || ctx.Err() == nil {
 					readErr = err
 				}
 				return
