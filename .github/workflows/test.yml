@@ -71,6 +71,10 @@ jobs:
       - name: Restore and verify geodat
         shell: pwsh
         run: ./.github/build/prepare-assets.ps1
+      - name: Enable native ICMP for the runner group
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
       - name: Test
         run: go test -mod=readonly -timeout 1h -v ./...
 
@@ -93,6 +97,9 @@ jobs:
       - name: Restore and verify geodat
         shell: pwsh
         run: ./.github/build/prepare-assets.ps1
+      - name: Enable native ICMP for the runner group
+        shell: bash
+        run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
       - name: Repeat measurement and native seam regressions
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
@@ -117,5 +124,8 @@ jobs:
       - name: Restore and verify geodat
         shell: pwsh
         run: ./.github/build/prepare-assets.ps1
+      - name: Enable native ICMP for the runner group
+        shell: bash
+        run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
       - name: Race test
         run: go test -mod=readonly -race -timeout 1h ./...
