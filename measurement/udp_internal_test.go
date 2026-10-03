@@ -148,8 +148,8 @@ func TestUDPTrainPartialFailedWritesAndBatchError(t *testing.T) {
 				if !errors.Is(err, native) || len(got.Replies) != 3 || !got.Replies[1].Duplicate {
 					t.Fatalf("batch %+v %v", got, err)
 				}
-				if mode == "batch-cancel" && !errors.Is(err, context.Canceled) {
-					t.Fatalf("lost cancellation: %v", err)
+				if mode == "batch-cancel" && !errors.Is(ctx.Err(), context.Canceled) {
+					t.Fatalf("batch fixture did not cancel its caller: %v", ctx.Err())
 				}
 			case "batch-limit":
 				if !errors.Is(err, ErrUDPReplyLimit) || !errors.Is(err, native) || !got.ReplyLimitHit || len(got.Replies) != 2 {
