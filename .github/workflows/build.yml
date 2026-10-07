@@ -2,9 +2,9 @@ name: CI / Platform Builds
 
 on:
   push:
-    branches: [codex/mu-core]
+    branches: [codex/xray-unified]
   pull_request:
-    branches: [codex/mu-core]
+    branches: [codex/xray-unified]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   required-platform-builds:
+    if: github.repository == 'svlavr/Xray-core'
     name: Required Platform Builds / ${{ matrix.name }}
     timeout-minutes: 90
     runs-on: ubuntu-latest
@@ -41,6 +42,7 @@ jobs:
           go build -o "${RUNNER_TEMP}/xray-${GOOS}-${GOARCH}" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid=" -v ./main
 
   android-build:
+    if: github.repository == 'svlavr/Xray-core'
     name: Android Build / ${{ matrix.goarch }}
     timeout-minutes: 90
     runs-on: ubuntu-latest
@@ -68,6 +70,7 @@ jobs:
           go build -o "${RUNNER_TEMP}/xray-android-${GOARCH}" -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMIT} -s -w -buildid= -checklinkname=0" -v ./main
 
   extended-build-matrix:
+    if: github.repository == 'svlavr/Xray-core'
     name: Extended Build Matrix / ${{ matrix.name }}
     timeout-minutes: 90
     runs-on: ubuntu-latest
@@ -117,6 +120,7 @@ jobs:
           fi
 
   windows-7-build:
+    if: github.repository == 'svlavr/Xray-core'
     name: Windows 7 Build / ${{ matrix.goarch }}
     timeout-minutes: 90
     runs-on: ubuntu-latest

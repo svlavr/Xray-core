@@ -3,7 +3,7 @@
 These files are preserved byte-for-byte from official Xray-core commit
 `7da5dae6502b787fc6d903863e9a6c5043d107a2`. GitHub does not execute workflows
 outside `.github/workflows`. Release, container publication and scheduled asset
-updates are not enabled on `codex/mu-core`.
+updates are not enabled on `codex/xray-unified`.
 
 The active workflows run source checks, ordinary Linux/Windows/macOS tests,
 full Linux race tests and 32 platform build jobs. The two MIPS jobs also compile
