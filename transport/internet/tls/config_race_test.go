@@ -348,7 +348,7 @@ func TestCertificateAuthorityConcurrentHandshakesAndReload(t *testing.T) {
 
 	authorities := new(certificateSet[*Certificate])
 	authorities.append(cloneCertificateConfig(firstEntry))
-	serverConfig := &tls.Config{GetCertificate: getGetCertificateFunc(authorities)}
+	serverConfig := &tls.Config{GetCertificate: getGetCertificateFunc(&tls.Config{}, authorities)}
 
 	cached, err := handshakeCertificate(serverConfig, "cached.example")
 	if err != nil {
@@ -440,7 +440,7 @@ func TestCertificateAuthorityPathReloadPublishesClone(t *testing.T) {
 		t.Fatal("CA path reload mutated the source protobuf")
 	}
 
-	serverConfig := &tls.Config{GetCertificate: getGetCertificateFunc(authorities)}
+	serverConfig := &tls.Config{GetCertificate: getGetCertificateFunc(&tls.Config{}, authorities)}
 	issued, err := handshakeCertificate(serverConfig, "path-reload.example")
 	if err != nil {
 		t.Fatal(err)
@@ -514,5 +514,32 @@ func TestIssuedCertificateCacheBoundsUntrustedNames(t *testing.T) {
 	}
 	if retained != 127 {
 		t.Fatalf("one new hostname evicted %d warm certificates", 128-retained)
+	}
+}
+
+func TestIssuedCertificateCacheReplacesExpiredEmptySNIFallback(t *testing.T) {
+	ca, _ := cert.MustGenerate(nil, cert.Authority(true), cert.KeyUsage(x509.KeyUsageCertSign))
+	entry := ParseCertificate(ca)
+	entry.Usage = Certificate_AUTHORITY_ISSUE
+	expiredCertificate, _ := cert.MustGenerate(ca, cert.CommonName("first.example"),
+		cert.DNSNames("first.example"), cert.NotAfter(time.Now().Add(-2*time.Minute)))
+	expired := parseCertificateEntry(ParseCertificate(expiredCertificate))
+	if expired == nil {
+		t.Fatal("invalid expiry fixture")
+	}
+	cache := &issuedCertificateCache{
+		firstIssued: expired,
+		byName:      map[string]*tls.Certificate{"first.example": expired},
+	}
+	replacement, err := cache.getOrIssue("", []*Certificate{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement == expired || isCertificateExpired(replacement) || cache.firstIssued != replacement {
+		t.Fatal("empty SNI retained an expired issued certificate")
+	}
+	again, err := cache.getOrIssue("", []*Certificate{entry})
+	if err != nil || again != replacement {
+		t.Fatalf("fresh empty-SNI fallback was not reused: %v", err)
 	}
 }

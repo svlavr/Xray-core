@@ -4,8 +4,6 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/xtls/xray-core/common"
-	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 )
@@ -18,35 +16,9 @@ var (
 	ErrUnknownCommand      = errors.New("Unknown command.")
 )
 
+// MarshalCommand rejects response commands; VMess no longer supports any types.
 func MarshalCommand(command interface{}, writer io.Writer) error {
-	if command == nil {
-		return ErrUnknownCommand
-	}
-
-	var cmdID byte
-	var factory CommandFactory
-	switch command.(type) {
-	default:
-		return ErrUnknownCommand
-	}
-
-	buffer := buf.New()
-	defer buffer.Release()
-
-	err := factory.Marshal(command, buffer)
-	if err != nil {
-		return err
-	}
-
-	auth := Authenticate(buffer.Bytes())
-	length := buffer.Len() + 4
-	if length > 255 {
-		return ErrCommandTooLarge
-	}
-
-	common.Must2(writer.Write([]byte{cmdID, byte(length), byte(auth >> 24), byte(auth >> 16), byte(auth >> 8), byte(auth)}))
-	common.Must2(writer.Write(buffer.Bytes()))
-	return nil
+	return ErrUnknownCommand
 }
 
 func UnmarshalCommand(cmdID byte, data []byte) (protocol.ResponseCommand, error) {
@@ -59,12 +31,7 @@ func UnmarshalCommand(cmdID byte, data []byte) (protocol.ResponseCommand, error)
 		return nil, ErrInvalidAuth
 	}
 
-	var factory CommandFactory
-	switch cmdID {
-	default:
-		return nil, ErrUnknownCommand
-	}
-	return factory.Unmarshal(data[4:])
+	return nil, ErrUnknownCommand
 }
 
 type CommandFactory interface {

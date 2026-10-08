@@ -86,7 +86,10 @@ func (c *ConnWriter) writeHeader() error {
 		return err
 	}
 
-	_, err := c.Writer.Write(buffer.Bytes())
+	n, err := c.Writer.Write(buffer.Bytes())
+	if err == nil && n != int(buffer.Len()) {
+		err = io.ErrShortWrite
+	}
 	if err == nil {
 		c.headerSent = true
 	}
@@ -141,9 +144,12 @@ func (w *PacketWriter) writePacket(payload []byte, dest net.Destination) (int, e
 	if _, err := buffer.Write(payload); err != nil {
 		return 0, err
 	}
-	_, err := w.Write(buffer.Bytes())
+	n, err := w.Write(buffer.Bytes())
 	if err != nil {
 		return 0, err
+	}
+	if n != int(buffer.Len()) {
+		return 0, io.ErrShortWrite
 	}
 
 	return length, nil

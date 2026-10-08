@@ -82,6 +82,9 @@ jobs:
         run: ./.github/build/prepare-assets.ps1
       - name: Test
         run: go test -mod=readonly -timeout 1h -v ./...
+      - name: Darwin UDP ownership and dual-stack regressions
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: go test -mod=readonly -race -timeout 10m -count=2 -run '^TestSystemUDP' ./transport/internet
 
   race-tests:
     if: github.repository == 'svlavr/Xray-core'
@@ -167,3 +170,11 @@ jobs:
       - name: Same-key cached DNS cancellation regressions
         if: ${{ !cancelled() }}
         run: go test -mod=readonly -race -timeout 5m -count=20 -run '^TestCachedFetch' ./app/dns
+      - name: Reconciled native Measurement prerequisite regressions
+        if: ${{ !cancelled() }}
+        run: >-
+          go test -mod=readonly -race -timeout 15m -count=2
+          -run '^(TestMeasurement|TestGRPC|TestResponseCommand|TestXHTTPManager|TestMaxConnections|TestCMaxReuseTimes|TestMaxConcurrency|TestDefault$|TestSystemUDP)'
+          ./common/mux ./proxy ./proxy/hysteria ./proxy/shadowsocks_2022 ./proxy/trojan
+          ./proxy/vmess/encoding ./transport/internet ./transport/internet/grpc/...
+          ./transport/internet/hysteria ./transport/internet/websocket ./transport/internet/splithttp

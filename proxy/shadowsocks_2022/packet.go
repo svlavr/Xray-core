@@ -349,7 +349,9 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 		if err := WriteAddressPort(plainBuf, dest); err != nil {
 			return nil, err
 		}
-		plainBuf.Write(payload)
+		if _, err := plainBuf.Write(payload); err != nil {
+			return nil, err
+		}
 
 		sealed := s.serverChaCha.Seal(nil, nonce[:], plainBuf.Bytes(), nil)
 		res := make([]byte, PacketNonceSize+len(sealed))
@@ -379,7 +381,9 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 	if err := WriteAddressPort(bodyBuf, dest); err != nil {
 		return nil, err
 	}
-	bodyBuf.Write(payload)
+	if _, err := bodyBuf.Write(payload); err != nil {
+		return nil, err
+	}
 
 	bodyNonce := rawHeader[4:16]
 	sealedBody := s.serverBodyCipher.Seal(nil, bodyNonce, bodyBuf.Bytes(), nil)
@@ -756,21 +760,24 @@ type UDPReader struct {
 func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	for {
 		buffer := buf.New()
-		_, err := buffer.ReadFrom(r.Reader)
-		if err != nil {
+		n, readErr := buffer.ReadFrom(r.Reader)
+		if n == 0 && readErr != nil {
 			buffer.Release()
-			return nil, err
+			return nil, readErr
 		}
 
 		decoded, err := r.Session.DecodePacket(buffer.Bytes())
 		if err != nil {
 			buffer.Release()
+			if readErr != nil {
+				return nil, readErr
+			}
 			continue
 		}
 		buffer.Clear()
 		buffer.Write(decoded.Payload)
 		dest := decoded.Destination
 		buffer.UDP = &dest
-		return buf.MultiBuffer{buffer}, nil
+		return buf.MultiBuffer{buffer}, readErr
 	}
 }

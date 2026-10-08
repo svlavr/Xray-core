@@ -82,7 +82,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 				}
 			})
 		}
-		packetConn, err := lc.ListenPacket(ctx, srcAddr.Network(), srcAddr.String())
+		packetConn, err := listenSystemUDP(ctx, &lc, srcAddr.(*net.UDPAddr))
 		if err != nil {
 			return nil, err
 		}

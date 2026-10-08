@@ -80,15 +80,20 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 	}
 
 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")
-	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunStreamName())
-	if err != nil {
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	closeStream := func() {
+		cancelStream()
 		if closeClient != nil {
 			closeClient()
 		}
+	}
+	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(streamCtx, grpcSettings.getServiceName(), grpcSettings.getTunStreamName())
+	if err != nil {
+		closeStream()
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
-	return encoding.NewHunkConn(grpcService, closeClient, nil), nil
+	return encoding.NewHunkConn(grpcService, closeStream, nil), nil
 }
 
 func grpcClientPooled(ctx context.Context, settings *internet.MemoryStreamConfig) bool {

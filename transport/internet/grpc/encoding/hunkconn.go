@@ -119,11 +119,14 @@ func (h *HunkReaderWriter) Write(buf []byte) (int, error) {
 
 func (h *HunkReaderWriter) Close() error {
 	if h.cancel != nil {
+		h.done.Close()
+		// Native cancellation releases Send/Recv without racing CloseSend against
+		// a concurrent Send. It ends this RPC, not its cached client channel.
 		h.cancel()
+		return nil
 	}
 	if sc, match := h.hc.(StreamCloser); match {
 		return sc.CloseSend()
 	}
-
 	return h.done.Close()
 }

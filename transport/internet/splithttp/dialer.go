@@ -64,12 +64,7 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 
 	if !found {
 		transportConfig := streamSettings.ProtocolSettings.(*Config)
-		var xmuxConfig XmuxConfig
-		if transportConfig.Xmux != nil {
-			xmuxConfig = *transportConfig.Xmux
-		}
-
-		xmuxManager = NewXmuxManager(xmuxConfig, func() XmuxConn {
+		xmuxManager = NewXmuxManager(transportConfig.Xmux, func() XmuxConn {
 			return createHTTPClient(dest, streamSettings)
 		})
 		globalDialerMap[key] = xmuxManager

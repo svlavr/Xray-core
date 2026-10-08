@@ -5,6 +5,7 @@ import (
 	go_errors "errors"
 	"io"
 	"math/rand"
+	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common"
@@ -115,6 +116,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
 		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
+			// Interrupt this stream before graceful QUIC teardown.
+			_ = conn.SetDeadline(time.Now())
 			return errors.New("connection ends").Base(err)
 		}
 
@@ -189,7 +192,10 @@ func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
 		message = make([]byte, size)
 	}
 	msg.Serialize(message)
-	_, err := w.writer.Write(message[:size])
+	n, err := w.writer.Write(message[:size])
+	if err == nil && n != size {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -228,7 +234,7 @@ func (w *UDPWriter) writePacket(b *buf.Buffer) (err error) {
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
 		fMsgs := FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
 		if len(fMsgs) == 0 {
-			return errors.New("failed to fragment UDP message")
+			return errors.New("failed to fragment UDP message").Base(err)
 		}
 		for _, fMsg := range fMsgs {
 			if err := w.SendMessage(&fMsg); err != nil {
@@ -257,31 +263,43 @@ func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error)
 	for {
 		var packet [1500]byte
 
-		n, err := r.reader.Read(packet[:])
-		if err != nil {
-			return 0, nil, err
+		n, readErr := r.reader.Read(packet[:])
+		if n == 0 && readErr != nil {
+			return 0, nil, readErr
 		}
 
 		msg, err := ParseUDPMessage(packet[:n])
 		if err != nil {
+			if readErr != nil {
+				return 0, nil, readErr
+			}
 			continue
 		}
 
 		dfMsg := r.df.Feed(msg)
 		if dfMsg == nil {
+			if readErr != nil {
+				return 0, nil, readErr
+			}
 			continue
 		}
 
 		dest, err := net.ParseDestination("udp:" + dfMsg.Addr)
 		if err != nil {
+			if readErr != nil {
+				return 0, nil, readErr
+			}
 			continue
 		}
 
 		if len(p) < len(dfMsg.Data) {
+			if readErr != nil {
+				return 0, nil, readErr
+			}
 			continue
 		}
 
-		return copy(p, dfMsg.Data), &dest, nil
+		return copy(p, dfMsg.Data), &dest, readErr
 	}
 }
 
@@ -294,11 +312,11 @@ func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.New()
 	b.Resize(0, buf.Size)
 	n, addr, err := r.ReadFrom(b.Bytes())
-	if err != nil {
+	if err != nil && n == 0 {
 		b.Release()
 		return nil, err
 	}
 	b.Resize(0, int32(n))
 	b.UDP = addr
-	return buf.MultiBuffer{b}, nil
+	return buf.MultiBuffer{b}, err
 }

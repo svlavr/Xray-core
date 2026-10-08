@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -274,13 +275,22 @@ func (c *Config) getCustomCA(owner *RandCarrier) *certificateSet[*Certificate] {
 }
 
 type issuedCertificateCache struct {
-	access   sync.Mutex
-	byName   map[string]*tls.Certificate
-	issuance singleflight.Group
+	access      sync.Mutex
+	byName      map[string]*tls.Certificate
+	issuance    singleflight.Group
+	firstIssued *tls.Certificate
 }
 
 func (c *issuedCertificateCache) getOrIssue(domain string, authorities []*Certificate) (*tls.Certificate, error) {
 	c.access.Lock()
+	if domain == "" && c.firstIssued != nil {
+		if !isCertificateExpired(c.firstIssued) {
+			first := c.firstIssued
+			c.access.Unlock()
+			return first, nil
+		}
+		c.firstIssued = nil
+	}
 	if c.byName == nil {
 		c.byName = make(map[string]*tls.Certificate)
 	}
@@ -328,6 +338,9 @@ func (c *issuedCertificateCache) getOrIssue(domain string, authorities []*Certif
 				}
 			}
 			c.byName[domain] = issued
+			if c.firstIssued == nil {
+				c.firstIssued = issued
+			}
 			c.access.Unlock()
 			return issued, nil
 		}
@@ -339,9 +352,19 @@ func (c *issuedCertificateCache) getOrIssue(domain string, authorities []*Certif
 	return value.(*tls.Certificate), nil
 }
 
-func getGetCertificateFunc(ca *certificateSet[*Certificate]) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getGetCertificateFunc(config *tls.Config, ca *certificateSet[*Certificate]) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// Options are immutable once published. Issuance never changes crypto/tls
+	// fields, including those shared with a caller's customized clone.
+	static := slices.Clone(config.Certificates)
+	byName := maps.Clone(config.NameToCertificate)
 	cache := new(issuedCertificateCache)
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if hello.ServerName == "" && len(static) > 0 {
+			return &static[0], nil
+		}
+		if cert := byName[hello.ServerName]; cert != nil && !isCertificateExpired(cert) {
+			return cert, nil
+		}
 		return cache.getOrIssue(hello.ServerName, ca.snapshot())
 	}
 }
@@ -538,7 +561,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	}
 	caCerts := c.getCustomCA(owner)
 	if caCerts.len() > 0 {
-		config.GetCertificate = getGetCertificateFunc(caCerts)
+		config.GetCertificate = getGetCertificateFunc(config, caCerts)
 	} else {
 		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateSet(owner), c.RejectUnknownSni)
 	}

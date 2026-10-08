@@ -52,6 +52,9 @@ func (c *connection) Read(b []byte) (int, error) {
 		nBytes, err := reader.Read(b)
 		if errors.Cause(err) == io.EOF {
 			c.reader = nil
+			if nBytes > 0 {
+				return nBytes, nil
+			}
 			continue
 		}
 		return nBytes, err
@@ -64,6 +67,9 @@ func (c *connection) getReader() (io.Reader, error) {
 	}
 
 	_, reader, err := c.conn.NextReader()
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		return nil, io.EOF
+	}
 	if err != nil {
 		return nil, err
 	}
