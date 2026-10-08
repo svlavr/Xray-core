@@ -545,7 +545,8 @@ type xmuxFixtureConn struct{}
 
 func (xmuxFixtureConn) IsClosed() bool { return false }
 
-// These explicit profile ceilings are native wire limits, not executor policy.
+// These profile ceilings bound complete native round trips, not executor policy.
+// A request may reach the peer above a smaller native reply-path limit.
 // A reply authenticates every echoed byte against the operation's original
 // random payload. Writer acceptance alone does not establish peer delivery.
 func testProtocolPacketBoundary(t *testing.T, e *measurement.Executor, tunnelHost string, limit int, aboveReachesPeer bool) {

@@ -80,7 +80,10 @@ func TestWireGuardProtocolMeasurements(t *testing.T) {
 	}
 	e := executor(t, v)
 	testProtocolMeasurementsAt(t, e, v, counters, target, true)
-	limit, abovePeer := 8192, false
+	// The native queue preserves larger requests; the client reply reader is
+	// bounded to buf.Size. Above this round-trip limit the peer still gets the
+	// complete request, but its echo must not become a valid full reply.
+	limit, abovePeer := 8192, true
 	if runtime.GOOS == "windows" {
 		// The pinned native device receives 2016 wire bytes on Windows. With
 		// MTU 1420, IPv4/UDP 28, WG 32 and native 16-byte padding, 1952 echoes fit;
