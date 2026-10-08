@@ -66,8 +66,10 @@ func TestMeasurementInheritedObservationIsolation(t *testing.T) {
 	ctx = session.ContextWithContent(ctx, content)
 	ctx = session.ContextWithTimeoutOnly(ctx, true)
 	e := executor(t, v)
-	r := measurement.HTTPRequest{Route: measurement.Route{Kind: measurement.ExactOutbound, Tag: "exact"},
-		URL: peer.URL, Timeout: 5 * time.Second, MaxBodyBytes: 128, MaxHeaderBytes: 4096}
+	r := measurement.HTTPRequest{
+		Route: measurement.Route{Kind: measurement.ExactOutbound, Tag: "exact"},
+		URL:   peer.URL, Timeout: 5 * time.Second, MaxBodyBytes: 128, MaxHeaderBytes: 4096,
+	}
 	got, err := e.HTTP(ctx, http.MethodGet, r)
 	if err != nil || !got.BodyComplete || string(got.Body) != "measurement-payload" {
 		t.Fatalf("exact native request: %+v %v", got, err)

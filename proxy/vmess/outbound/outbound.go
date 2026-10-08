@@ -120,6 +120,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	input := link.Reader
 	output := link.Writer
+	// Controlled UDP needs source-bearing responses on this invocation only.
+	requirePacketSource := session.TrafficOriginFromContext(ctx) == session.TrafficOriginControlledMeasurement && session.UDPPacketSourceRequired(ctx)
 
 	hashkdf := hmac.New(sha256.New, []byte("VMessBF"))
 	hashkdf.Write(account.ID.Bytes())
@@ -143,8 +145,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}, sessionPolicy.Timeouts.ConnectionIdle)
 
-	// Controlled UDP needs source-bearing responses on this invocation only.
-	requirePacketSource := session.TrafficOriginFromContext(ctx) == session.TrafficOriginControlledMeasurement && session.UDPPacketSourceRequired(ctx)
 	if request.Command == protocol.RequestCommandUDP && ((h.cone && request.Port != 53 && request.Port != 443) || requirePacketSource) {
 		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")
