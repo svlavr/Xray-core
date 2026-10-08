@@ -584,6 +584,48 @@ func b7ObservationMode(t *testing.T, mode string) {
 	}
 	pulse()
 	if view != nil {
+		if mode == "enabled-constrained" {
+			overlap := capture.ReadInto(nil)
+			overlapTotals, err := view.ReadTotals()
+			if err != nil || overlap.Dropped == 0 || !overlap.ExistingPartial || overlapTotals.BucketsOmitted == 0 || overlapTotals.User != want {
+				t.Fatalf("overlap capacity loss was hidden: capture=%+v totals=%+v err=%v", overlap, overlapTotals, err)
+			}
+			// The occupied live slot makes Measurement roots unindexed. Such
+			// roots deliberately do not enter the passive terminal ring.
+			terminals, err := view.ReadTerminals()
+			if err != nil || len(terminals.Rows) != 0 || terminals.Overwritten != 0 {
+				t.Fatalf("unindexed work fabricated terminal history: %+v %v", terminals, err)
+			}
+			for _, c := range ordinary {
+				c.Close()
+			}
+			waitEmpty := func() {
+				t.Helper()
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					live, err := view.ReadLiveInto(nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(live.Rows) == 0 {
+						return
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("indexed caller root did not close: %+v", live)
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}
+			waitEmpty()
+			// Reuse the now-free native slot; genuine indexed completions
+			// exercise terminal overwrite independently of live omissions.
+			for range 2 {
+				if got, err := e.HTTP(ctx, http.MethodGet, r); err != nil || !got.BodyComplete || string(got.Body) != "complete" {
+					t.Fatalf("indexed capacity cycle: %+v %v", got, err)
+				}
+				waitEmpty()
+			}
+		}
 		totals, err := view.ReadTotals()
 		if err != nil || totals.User != want {
 			t.Fatalf("controlled mode traffic entered USER totals: %+v %v", totals, err)
