@@ -3,12 +3,15 @@ package core
 import (
 	"bytes"
 	"context"
+	go_errors "errors"
+	"fmt"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
@@ -44,18 +47,32 @@ func StartInstance(configFormat string, configBytes []byte) (*Instance, error) {
 // It dispatches the request to the given destination by the given Xray instance.
 // Since it is under a proxy context, the LocalAddr() and RemoteAddr() in returned net.Conn
 // will not show real addresses being used for communication.
+// Logical USER totals require session.ContextWithTrafficOrigin(ctx,
+// session.TrafficOriginUser). Unmarked calls remain UNKNOWN; metadata and tags
+// never infer USER. Existing logical continuations retain their admission.
 //
 // xray:api:stable
 func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, error) {
 	ctx = toContext(ctx, v)
+	kind := net.Network_TCP
+	if dest.Network == net.Network_UDP {
+		kind = net.Network_UDP
+	}
+	ctx, observation := beginAPIObservation(ctx, v, dest, kind)
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {
+		if observation != nil {
+			observation.Close()
+		}
 		return nil, errors.New("routing.Dispatcher is not registered in Xray core")
 	}
 
 	r, err := dispatcher.(routing.Dispatcher).Dispatch(ctx, dest)
 	if err != nil {
+		if observation != nil {
+			observation.Close()
+		}
 		return nil, err
 	}
 	var readerOpt cnc.ConnectionOption
@@ -64,21 +81,59 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 	} else {
 		readerOpt = cnc.ConnectionOutputMultiUDP(r.Reader)
 	}
-	return cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt), nil
+	conn := cnc.NewConnection(cnc.ConnectionInputMulti(r.Writer), readerOpt)
+	if observation == nil {
+		return conn, nil
+	}
+	observation.attach(conn)
+	return &inspectedAPIConn{Conn: conn, observation: observation}, nil
 }
 
 // DialUDP provides a way to exchange UDP packets through Xray instance to remote servers.
 // Since it is under a proxy context, the LocalAddr() in returned PacketConn will not show the real address.
+// As with Dial, the caller must explicitly mark USER traffic in the context to
+// include it in logical USER totals. WriteTo queue acceptance is not delivery.
 //
 // TODO: SetDeadline() / SetReadDeadline() / SetWriteDeadline() are not implemented.
 //
 // xray:api:beta
 func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
 	ctx = toContext(ctx, v)
+	ctx, observation := beginAPIObservation(ctx, v, net.Destination{}, net.Network_UDP)
 
 	dispatcher := v.GetFeature(routing.DispatcherType())
 	if dispatcher == nil {
+		if observation != nil {
+			observation.Close()
+		}
 		return nil, errors.New("routing.Dispatcher is not registered in Xray core")
 	}
-	return udp.DialDispatcher(ctx, dispatcher.(routing.Dispatcher))
+	conn, err := udp.DialDispatcher(ctx, dispatcher.(routing.Dispatcher))
+	if err != nil {
+		if observation != nil {
+			observation.Close()
+		}
+		return nil, err
+	}
+	if observation == nil {
+		return conn, nil
+	}
+	observation.attach(conn)
+	return &inspectedAPIPacketConn{PacketConn: conn, observation: observation}, nil
+}
+
+// EnableFlowInspection enables the optional in-process observation capability.
+// Enablement is intentionally limited to the interval before Instance.Start.
+func EnableFlowInspection(instance *Instance, options stats.ObservationOptions) (stats.FlowInspection, error) {
+	instance.statusLock.Lock()
+	defer instance.statusLock.Unlock()
+	if instance.running {
+		return nil, fmt.Errorf("inspection enablement is too late")
+	}
+	feature := instance.GetFeature(stats.ManagerType())
+	provider, ok := feature.(stats.ObservationProvider)
+	if !ok {
+		return nil, go_errors.ErrUnsupported
+	}
+	return provider.EnableInspection(options)
 }

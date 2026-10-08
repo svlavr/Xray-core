@@ -2,161 +2,103 @@ package shadowsocks_2022
 
 import (
 	"context"
+	"maps"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
-	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/features/policy"
-	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-func (s *ServerUDPSession) UpdateConn(conn stat.Connection) {
-	if s.currentConn.Load() == nil {
-		s.currentConn.Store(conn)
-	}
-	if s.timer != nil {
-		s.timer.Update()
+type udpConnEntry struct {
+	sync.RWMutex
+	link      *transport.Link
+	timer     *signal.ActivityTimer
+	closed    bool
+	cancel    context.CancelFunc
+	onClose   func()
+	transport stat.Connection
+	peer      net.Addr
+}
+
+func (e *udpConnEntry) setTransport(conn stat.Connection) {
+	e.Lock()
+	e.transport, e.peer = conn, conn.RemoteAddr()
+	e.Unlock()
+}
+
+func (e *udpConnEntry) setTimer(timer *signal.ActivityTimer) {
+	e.Lock()
+	e.timer = timer
+	closed := e.closed
+	e.Unlock()
+	if closed {
+		timer.SetTimeout(0)
 	}
 }
 
-func (s *ServerUDPSession) WriteToClient(b []byte) error {
-	connVal := s.currentConn.Load()
-	if connVal == nil {
-		return errors.New("client connection closed")
+func (e *udpConnEntry) writePacket(packet []byte) (int, error) {
+	e.RLock()
+	conn, peer := e.transport, e.peer
+	e.RUnlock()
+	if writer, ok := conn.(interface {
+		WriteTo([]byte, net.Addr) (int, error)
+	}); ok {
+		return writer.WriteTo(packet, peer)
 	}
-	conn, ok := connVal.(stat.Connection)
-	if !ok || conn == nil {
-		return errors.New("client connection closed")
-	}
-	_, err := conn.Write(b)
-	return err
+	return conn.Write(packet)
 }
 
-func (s *ServerUDPSession) Close() {
-	if s.timer != nil {
-		s.timer.SetTimeout(0)
+func (e *udpConnEntry) isClosed() bool {
+	e.RLock()
+	closed := e.closed
+	e.RUnlock()
+	return closed
+}
+
+func (e *udpConnEntry) bind(link *transport.Link) bool {
+	e.Lock()
+	closed := e.closed
+	if !closed {
+		e.link = link
 	}
-	if link := s.link.Load(); link != nil {
+	e.Unlock()
+	if closed {
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
 	}
+	return !closed
 }
 
-func (s *ServerUDPSession) EnsureLink(
-	ctx context.Context,
-	conn stat.Connection,
-	dest net.Destination,
-	dispatcher routing.Dispatcher,
-	policyManager policy.Manager,
-	responseEncoder func(dest net.Destination, payload []byte) ([]byte, error),
-) (*transport.Link, error) {
-	s.UpdateConn(conn)
-
-	if link := s.link.Load(); link != nil {
-		return link, nil
+// Close retires one decoded association without closing its shared listener.
+func (e *udpConnEntry) Close() error {
+	e.Lock()
+	if e.closed {
+		e.Unlock()
+		return nil
 	}
-
-	s.Lock()
-	defer s.Unlock()
-
-	if link := s.link.Load(); link != nil {
-		return link, nil
+	e.closed = true
+	link, cancel, onClose, timer := e.link, e.cancel, e.onClose, e.timer
+	e.Unlock()
+	if link != nil {
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
 	}
-
-	sessCtx, cancel := context.WithCancel(ctx)
-	inbound := session.InboundFromContext(sessCtx)
-	if inbound != nil && s.User != nil {
-		inbound.User = s.User
-	}
-	var email string
-	var level uint32
-	if s.User != nil {
-		email = s.User.Email
-		level = s.User.Level
-	}
-	sessCtx = log.ContextWithAccessMessage(sessCtx, &log.AccessMessage{
-		From:   conn.RemoteAddr(),
-		To:     dest,
-		Status: log.AccessAccepted,
-		Email:  email,
-	})
-
-	link, err := dispatcher.Dispatch(sessCtx, dest)
-	if err != nil {
+	if cancel != nil {
 		cancel()
-		return nil, err
 	}
-
-	s.link.Store(link)
-	sessionPolicy := policyManager.ForLevel(level)
-	s.timer = signal.CancelAfterInactivity(sessCtx, func() {
-		if s.manager != nil {
-			s.manager.Delete(s.SessionID)
-		}
-		s.Close()
-		cancel()
-	}, sessionPolicy.Timeouts.ConnectionIdle)
-
-	go handleUDPResponse(s, link, dest, responseEncoder)
-	return link, nil
-}
-
-// ResetTCPConn sets SO_LINGER to 0 per SIP022 §3.1.4 to consistently send RST on close
-// when handshake or header validation fails.
-func ResetTCPConn(conn net.Conn) {
-	rawConn, _, _ := proxy.UnwrapRawConn(conn)
-	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
-		_ = tcpConn.SetLinger(0)
+	if onClose != nil {
+		onClose()
 	}
-}
-
-func handleUDPResponse(s *ServerUDPSession, link *transport.Link, fallbackDest net.Destination, encode func(dest net.Destination, payload []byte) ([]byte, error)) {
-	defer func() {
-		if s.timer != nil {
-			s.timer.SetTimeout(0)
-		}
-	}()
-	for {
-		resMb, err := link.Reader.ReadMultiBuffer()
-		if err != nil {
-			return
-		}
-		if s.timer != nil {
-			s.timer.Update()
-		}
-		for i, rb := range resMb {
-			b := rb.Bytes()
-			if encode != nil {
-				replyDest := fallbackDest
-				if rb.UDP != nil {
-					replyDest = *rb.UDP
-				}
-				encPacket, err := encode(replyDest, b)
-				rb.Release()
-				if err != nil {
-					continue
-				}
-				if err := s.WriteToClient(encPacket); err != nil {
-					buf.ReleaseMulti(resMb[i+1:])
-					return
-				}
-			} else {
-				err := s.WriteToClient(b)
-				rb.Release()
-				if err != nil {
-					buf.ReleaseMulti(resMb[i+1:])
-					return
-				}
-			}
-		}
+	if timer != nil {
+		timer.SetTimeout(0)
 	}
+	return nil
 }
 
 const (
@@ -191,3 +133,43 @@ var (
 	ErrNoPadding         = errors.New("bad request: missing payload or padding")
 	ErrInvalidRequest    = errors.New("invalid request")
 )
+
+func packetContext(ctx context.Context, conn net.Conn) context.Context {
+	if owner, ok := conn.(interface {
+		PacketContext(context.Context) context.Context
+	}); ok {
+		return owner.PacketContext(ctx)
+	}
+	return ctx
+}
+
+// Native UDP sessions mutate routing metadata independently of their listener.
+func packetSessionContext(ctx context.Context) context.Context {
+	if original := session.InboundFromContext(ctx); original != nil {
+		inbound := *original
+		ctx = session.ContextWithInbound(ctx, &inbound)
+	}
+	if original := session.OutboundsFromContext(ctx); original != nil {
+		outbounds := make([]*session.Outbound, len(original))
+		for idx, outbound := range original {
+			if outbound != nil {
+				copy := *outbound
+				outbounds[idx] = &copy
+			}
+		}
+		ctx = session.ContextWithOutbounds(ctx, outbounds)
+	}
+	if original := session.ContentFromContext(ctx); original != nil {
+		content := *original
+		content.Attributes = maps.Clone(original.Attributes)
+		ctx = session.ContextWithContent(ctx, &content)
+	}
+	return ctx
+}
+
+func ResetTCPConn(conn net.Conn) {
+	rawConn, _, _ := proxy.UnwrapRawConn(conn)
+	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetLinger(0)
+	}
+}

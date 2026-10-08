@@ -12,6 +12,9 @@ import (
 
 // MemoryStreamConfig is a parsed form of StreamConfig. It is used to reduce the number of Protobuf parses.
 type MemoryStreamConfig struct {
+	// Owner bounds shared transport clients to the native handler lifetime.
+	// Nil leaves the caller responsible for its own connection.
+	Owner            context.Context
 	Destination      *net.Destination
 	ProtocolName     string
 	ProtocolSettings interface{}

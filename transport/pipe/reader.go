@@ -1,6 +1,7 @@
 package pipe
 
 import (
+	"context"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -26,16 +27,8 @@ func (r *Reader) Interrupt() {
 	r.pipe.Interrupt()
 }
 
-// ReturnAnError makes ReadMultiBuffer return an error, only once.
-func (r *Reader) ReturnAnError(err error) {
-	r.pipe.errChan <- err
-}
-
-// Recover catches an error set by ReturnAnError, if exists.
-func (r *Reader) Recover() (err error) {
-	select {
-	case err = <-r.pipe.errChan:
-	default:
-	}
-	return
+// ReadMultiBufferContext cancels this read without closing the shared pipe.
+// Cancellation observed before dequeue leaves queued data for the next reader.
+func (r *Reader) ReadMultiBufferContext(ctx context.Context) (buf.MultiBuffer, error) {
+	return r.pipe.readMultiBuffer(ctx)
 }

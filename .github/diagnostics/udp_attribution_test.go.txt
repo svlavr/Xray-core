@@ -1,0 +1,90 @@
+package udp_test
+
+import (
+	"bytes"
+	"context"
+	cnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
+	"net"
+	"os"
+	"testing"
+	"time"
+)
+
+// Construct the equal-port kernel condition with native sockets. The outbound
+// socket is opened first, unlike the natural SOCKS failure; report that boundary.
+func TestSocketPortAttribution(t *testing.T) {
+	if os.Getenv("XRAY_CONTROL_ATTRIBUTION") != "1" {
+		t.Fatal("attribution execution flag absent")
+	}
+	if controlMode(t) != "off" {
+		t.Fatal("socket attribution requires OFF")
+	}
+	dialer := new(internet.DefaultSystemDialer)
+	conn, err := dialer.Dial(context.Background(), nil, cnet.UDPDestination(cnet.LocalHostIP, 9), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	packet, ok := conn.(*cnet.PacketConnWrapper)
+	if !ok {
+		t.Fatalf("unexpected native UDP type %T", conn)
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	if err != nil {
+		t.Logf("CONTROL_KERNEL outcome=bind-rejected outbound=%v requested-echo=127.0.0.1:%d err=%v", conn.LocalAddr(), port, err)
+		return
+	}
+	t.Cleanup(func() { echo.Close() })
+	packet.Dest = echo.LocalAddr()
+	payload := []byte("equal-port-native-write")
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	echo.SetDeadline(time.Now().Add(2 * time.Second))
+	n, err := conn.Write(payload)
+	t.Logf("CONTROL_KERNEL outbound-write local=%v dest=%v n=%d err=%v", conn.LocalAddr(), packet.Dest, n, err)
+	if err != nil || n != len(payload) {
+		t.Fatalf("native write result %d/%v", n, err)
+	}
+	buffer := make([]byte, 256)
+	n, peer, readErr := echo.ReadFromUDP(buffer)
+	t.Logf("CONTROL_KERNEL echo-read local=%v peer=%v n=%d err=%v", echo.LocalAddr(), peer, n, readErr)
+	var replyReturnedToEcho bool
+	if readErr == nil {
+		if !bytes.Equal(buffer[:n], payload) {
+			t.Fatal("echo payload changed")
+		}
+		for i := 0; i < n; i++ {
+			buffer[i] ^= 0x19
+		}
+		written, writeErr := echo.WriteToUDP(buffer[:n], peer)
+		t.Logf("CONTROL_KERNEL echo-write peer=%v n=%d err=%v", peer, written, writeErr)
+		if writeErr != nil || written != n {
+			t.Fatal("echo write failed")
+		}
+		wantReply := append([]byte(nil), buffer[:n]...)
+		echo.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		repeated, sender, repeatErr := echo.ReadFromUDP(buffer)
+		t.Logf("CONTROL_KERNEL echo-read-reply peer=%v n=%d err=%v payload=%x", sender, repeated, repeatErr, buffer[:max(0, repeated)])
+		replyReturnedToEcho = repeatErr == nil && bytes.Equal(buffer[:repeated], wantReply)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err = conn.Read(buffer)
+	t.Logf("CONTROL_KERNEL outbound-read local=%v n=%d err=%v payload=%x", conn.LocalAddr(), n, err, buffer[:max(0, n)])
+	if readErr != nil && err == nil && bytes.Equal(buffer[:n], payload) {
+		t.Log("CONTROL_KERNEL outcome=self-delivery echo-not-received outbound-returned-original")
+	} else if readErr == nil && err == nil {
+		want := append([]byte(nil), payload...)
+		for i := range want {
+			want[i] ^= 0x19
+		}
+		if !bytes.Equal(buffer[:n], want) {
+			t.Fatal("outbound did not receive echo reply")
+		}
+		t.Log("CONTROL_KERNEL outcome=echo-roundtrip")
+	} else if replyReturnedToEcho && err != nil {
+		t.Log("CONTROL_KERNEL outcome=reply-returned-to-echo outbound-no-reply")
+	} else {
+		t.Logf("CONTROL_KERNEL outcome=no-delivery echo-error=%v outbound-error=%v", readErr, err)
+	}
+}

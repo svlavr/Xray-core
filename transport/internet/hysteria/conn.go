@@ -111,9 +111,14 @@ func (c *InterConn) Read(p []byte) (int, error) {
 }
 
 func (c *InterConn) Write(p []byte) (int, error) {
-	if c.closed {
+	c.mutex.Lock()
+	closed := c.closed
+	c.mutex.Unlock()
+	if closed {
 		return 0, io.ErrClosedPipe
 	}
+	// An admitted send may finish after Close. Never hold the session mutex
+	// while QUIC waits for queue space: manager close/cleanup also needs it.
 	binary.BigEndian.PutUint32(p, c.id)
 	if err := c.write(p); err != nil {
 		return 0, err
@@ -161,6 +166,8 @@ type udpSessionManager struct {
 }
 
 func (m *udpSessionManager) close(udpConn *InterConn) {
+	udpConn.mutex.Lock()
+	defer udpConn.mutex.Unlock()
 	if !udpConn.closed {
 		udpConn.closed = true
 		close(udpConn.ch)
@@ -173,7 +180,10 @@ func (m *udpSessionManager) clean() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if m.closed {
+		m.RLock()
+		closed := m.closed
+		m.RUnlock()
+		if closed {
 			return
 		}
 

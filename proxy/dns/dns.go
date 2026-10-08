@@ -20,6 +20,8 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -151,6 +153,18 @@ func (h *Handler) applyRules(qType dnsmessage.Type, domain string) (RuleAction, 
 	return RuleAction_Return, dnsmessage.RCodeSuccess
 }
 
+type endpointReceiptWriter struct {
+	buf.Writer
+	receipt stats.Exchange
+}
+
+func (w *endpointReceiptWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	size := uint64(mb.Len())
+	err := w.Writer.WriteMultiBuffer(mb)
+	buf.RecordBufferOperation(w.receipt, size, err)
+	return err
+}
+
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.Dialer) error {
 	outbounds := session.OutboundsFromContext(ctx)
@@ -181,20 +195,26 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		},
 		connReady: make(chan struct{}, 1),
 	}
+	observation := proxy.ObservedEndpoint(ctx, link.Reader, true)
+	supplied := observation != nil && observation.SuppliedEndpoint
+	output := link.Writer
+	if supplied && !observation.WriterReceiptAttached {
+		output = &endpointReceiptWriter{Writer: output, receipt: observation.Exchange}
+	}
 
 	var reader dns_proto.MessageReader
 	var writer dns_proto.MessageWriter
 	if srcNetwork == net.Network_TCP {
 		reader = dns_proto.NewTCPReader(link.Reader)
 		writer = &dns_proto.TCPWriter{
-			Writer: link.Writer,
+			Writer: output,
 		}
 	} else {
 		reader = &dns_proto.UDPReader{
 			Reader: link.Reader,
 		}
 		writer = &dns_proto.UDPWriter{
-			Writer: link.Writer,
+			Writer: output,
 		}
 	}
 
@@ -214,8 +234,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 		}
 	}
 
-	if session.TimeoutOnlyFromContext(ctx) {
-		ctx = context.Background()
+	if session.TimeoutOnlyFromContext(ctx) && !supplied {
+		detached := context.Background()
+		if inbound := session.InboundFromContext(ctx); inbound != nil {
+			detached = session.ContextWithInbound(detached, &session.Inbound{Tag: inbound.Tag})
+		}
+		ctx = detached
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -271,7 +295,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 						return err
 					}
 				} else {
-					go h.handleIPQuery(id, qType, domain, writer, timer)
+					go h.handleIPQuery(ctx, id, qType, domain, writer, timer)
 				}
 			case RuleAction_Direct:
 				if err := connWriter.WriteMessage(b); err != nil {
@@ -310,20 +334,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, d internet.
 	return nil
 }
 
-func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter, timer *signal.ActivityTimer) {
+func (h *Handler) handleIPQuery(ctx context.Context, id uint16, qType dnsmessage.Type, domain string, writer dns_proto.MessageWriter, timer *signal.ActivityTimer) {
 	var ips []net.IP
 	var ttl uint32
 	var err error
 
 	switch qType {
 	case dnsmessage.TypeA:
-		ips, ttl, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl, err = dns.LookupIPContext(ctx, h.client, domain, dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: false,
 			FakeEnable: true,
 		})
 	case dnsmessage.TypeAAAA:
-		ips, ttl, err = h.client.LookupIP(domain, dns.IPOption{
+		ips, ttl, err = dns.LookupIPContext(ctx, h.client, domain, dns.IPOption{
 			IPv4Enable: false,
 			IPv6Enable: true,
 			FakeEnable: true,
@@ -493,6 +517,10 @@ func (c *outboundConn) Read(b []byte) (int, error) {
 
 func (c *outboundConn) Close() error {
 	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return nil
+	}
 	c.closed = true
 	close(c.connReady)
 	if c.conn != nil {

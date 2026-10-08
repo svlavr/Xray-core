@@ -16,10 +16,19 @@ type BufferToBytesWriter struct {
 
 	counter stats.Counter
 	cache   [][]byte
+	receipt stats.Exchange
+}
+
+// Write implements io.Writer and records the native scalar write result when observed.
+func (w *BufferToBytesWriter) Write(payload []byte) (int, error) {
+	if w.receipt == nil {
+		return w.Writer.Write(payload)
+	}
+	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
 }
 
 // WriteMultiBuffer implements Writer. This method takes ownership of the given buffer.
-func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
+func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) (err error) {
 	defer ReleaseMulti(mb)
 
 	size := mb.Len()
@@ -28,7 +37,7 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	}
 
 	if len(mb) == 1 {
-		return WriteAllBytes(w.Writer, mb[0].Bytes(), w.counter)
+		return WriteAllBytes(w, mb[0].Bytes(), w.counter)
 	}
 
 	if cap(w.cache) < len(mb) {
@@ -51,6 +60,11 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	defer func() {
 		if w.counter != nil {
 			w.counter.Add(wc)
+		}
+		if w.receipt != nil {
+			if wc > 0 {
+				w.receipt.AddDownlink(uint64(wc))
+			}
 		}
 	}()
 	for size > 0 {
@@ -239,12 +253,26 @@ func (w *BufferedWriter) Close() error {
 // SequentialWriter is a Writer that writes MultiBuffer sequentially into the underlying io.Writer.
 type SequentialWriter struct {
 	io.Writer
+	receipt stats.Exchange
+}
+
+// Write implements io.Writer and records the native scalar write result when observed.
+func (w *SequentialWriter) Write(payload []byte) (int, error) {
+	if w.receipt == nil {
+		return w.Writer.Write(payload)
+	}
+	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
 }
 
 // WriteMultiBuffer implements Writer.
 func (w *SequentialWriter) WriteMultiBuffer(mb MultiBuffer) error {
-	mb, err := WriteMultiBuffer(w.Writer, mb)
+	mb, written, err := writeMultiBuffer(w.Writer, mb)
 	ReleaseMulti(mb)
+	if w.receipt != nil {
+		if written > 0 {
+			w.receipt.AddDownlink(uint64(written))
+		}
+	}
 	return err
 }
 

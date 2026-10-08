@@ -607,12 +607,16 @@ func (c *Connection) Input(segments []Segment) {
 }
 
 func (c *Connection) flush() {
-	current := c.Elapsed()
+	c.flushAt(c.Elapsed())
+}
 
+func (c *Connection) flushAt(current uint32) {
+	// A concurrent input can publish a timestamp newer than this sample.
+	// Signed deltas preserve wraparound without treating that ordering as idle.
 	if c.State() == StateTerminated {
 		return
 	}
-	if c.State() == StateActive && current-atomic.LoadUint32(&c.lastIncomingTime) >= 30000 {
+	if c.State() == StateActive && int32(current-atomic.LoadUint32(&c.lastIncomingTime)) >= 30000 {
 		c.Close()
 	}
 	if c.State() == StateReadyToClose && c.sendingWorker.IsEmpty() {
@@ -623,16 +627,16 @@ func (c *Connection) flush() {
 		errors.LogDebug(context.Background(), "#", c.meta.Conversation, " sending terminating cmd.")
 		c.Ping(current, CommandTerminate)
 
-		if current-atomic.LoadUint32(&c.stateBeginTime) > 8000 {
+		if int32(current-atomic.LoadUint32(&c.stateBeginTime)) > 8000 {
 			c.SetState(StateTerminated)
 		}
 		return
 	}
-	if c.State() == StatePeerTerminating && current-atomic.LoadUint32(&c.stateBeginTime) > 4000 {
+	if c.State() == StatePeerTerminating && int32(current-atomic.LoadUint32(&c.stateBeginTime)) > 4000 {
 		c.SetState(StateTerminating)
 	}
 
-	if c.State() == StateReadyToClose && current-atomic.LoadUint32(&c.stateBeginTime) > 15000 {
+	if c.State() == StateReadyToClose && int32(current-atomic.LoadUint32(&c.stateBeginTime)) > 15000 {
 		c.SetState(StateTerminating)
 	}
 
@@ -640,7 +644,7 @@ func (c *Connection) flush() {
 	c.receivingWorker.Flush(current)
 	c.sendingWorker.Flush(current)
 
-	if current-atomic.LoadUint32(&c.lastPingTime) >= 3000 {
+	if int32(current-atomic.LoadUint32(&c.lastPingTime)) >= 3000 {
 		c.Ping(current, CommandPing)
 	}
 }

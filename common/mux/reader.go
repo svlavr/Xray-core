@@ -48,7 +48,8 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 	r.eof = true
 	if r.dest != nil && r.dest.Network == net.Network_UDP {
-		b.UDP = r.dest
+		dest := *r.dest
+		b.UDP = &dest
 	}
 	return buf.MultiBuffer{b}, nil
 }

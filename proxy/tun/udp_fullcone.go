@@ -9,6 +9,8 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 )
 
 type packet struct {
@@ -84,6 +86,8 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	if u.udpConns[conn.src] == conn {
 		delete(u.udpConns, conn.src)
 		close(conn.egress)
+		for range conn.egress {
+		} // release unconsumed packet storage at retirement
 	}
 	u.Unlock()
 }
@@ -92,9 +96,10 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 type udpConn struct {
 	handler *udpConnectionHandler
 
-	egress chan *packet
-	src    net.Destination
-	dst    net.Destination
+	egress  chan *packet
+	src     net.Destination
+	dst     net.Destination
+	receipt stats.Exchange
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -104,7 +109,12 @@ func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			return nil, io.EOF
 		}
 
-		b := buf.New()
+		var b *buf.Buffer
+		if len(e.data) > buf.Size {
+			b = buf.NewWithSize(int32(len(e.data)))
+		} else {
+			b = buf.New()
+		}
 		if _, err := b.Write(e.data); err != nil {
 			errors.LogErrorInner(context.Background(), err, "drop packet to ", e.dest, " with size ", len(e.data))
 			b.Release()
@@ -140,6 +150,9 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 		err := c.handler.writePacket(b.Bytes(), dst, c.src)
+		if c.receipt != nil {
+			proxy.RecordPacketOutcome(c.receipt, uint64(b.Len()), err == nil)
+		}
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
@@ -154,7 +167,7 @@ func (c *udpConn) Write(p []byte) (int, error) {
 	// sending packets back mean sending payload with source/destination reversed
 	err := c.handler.writePacket(p, c.dst, c.src)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 
 	return len(p), nil
@@ -164,6 +177,11 @@ func (c *udpConn) Close() error {
 	c.handler.connectionFinished(c)
 
 	return nil
+}
+
+func (c *udpConn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
+	c.receipt = receipt
+	return c
 }
 
 func (c *udpConn) LocalAddr() net.Addr {

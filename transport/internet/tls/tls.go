@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/utils"
+	"github.com/xtls/xray-core/features/stats"
 )
 
 type Interface interface {
@@ -31,6 +32,7 @@ var (
 type Conn struct {
 	*tls.Conn
 	suppressCloseNotify atomic.Bool
+	receipt             stats.Exchange
 }
 
 const tlsCloseTimeout = 250 * time.Millisecond
@@ -50,11 +52,29 @@ func (c *Conn) Close() error {
 	return c.Conn.Close()
 }
 
+func (c *Conn) Write(p []byte) (int, error) {
+	if c.receipt == nil {
+		return c.Conn.Write(p)
+	}
+	return buf.WriteBytesWithReceipt(c.Conn, p, c.receipt)
+}
+
 func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	mb = buf.Compact(mb)
 	mb, err := buf.WriteMultiBuffer(c, mb)
 	buf.ReleaseMulti(mb)
 	return err
+}
+
+// WithWriterReceipt binds decoded writes before this connection's exclusive
+// body use. The native compact-then-scalar path retains each actual result.
+func (c *Conn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
+	c.receipt = receipt
+	return c
+}
+
+func (c *Conn) WriterReceipt() stats.Exchange {
+	return c.receipt
 }
 
 func (c *Conn) HandshakeContextServerName(ctx context.Context) string {

@@ -14,6 +14,8 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
@@ -31,17 +33,18 @@ type relayDest struct {
 	destination net.Destination
 	email       string
 	level       uint32
+	key         []byte
 	blockCipher cipher.Block
 }
 
 type RelayInbound struct {
-	networks      []net.Network
-	method        *CipherMethod
-	relayPSK      []byte
-	relayBlock    cipher.Block
-	destinations  map[[AESBlockSize]byte]*relayDest
-	udpSessions   *UDPSessionManager
-	policyManager policy.Manager
+	networks        []net.Network
+	method          *CipherMethod
+	relayPSK        []byte
+	relayBlock      cipher.Block
+	destinations    map[[AESBlockSize]byte]*relayDest
+	rawDestinations []*RelayDestination
+	policyManager   policy.Manager
 }
 
 func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbound, error) {
@@ -73,13 +76,13 @@ func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbou
 
 	v := core.MustFromContext(ctx)
 	i := &RelayInbound{
-		networks:      networks,
-		method:        method,
-		relayPSK:      relayPSK,
-		relayBlock:    relayBlock,
-		destinations:  make(map[[AESBlockSize]byte]*relayDest),
-		udpSessions:   NewUDPSessionManager(500 * time.Second),
-		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+		networks:        networks,
+		method:          method,
+		relayPSK:        relayPSK,
+		relayBlock:      relayBlock,
+		destinations:    make(map[[AESBlockSize]byte]*relayDest),
+		rawDestinations: config.Destinations,
+		policyManager:   v.GetFeature(policy.ManagerType()).(policy.Manager),
 	}
 
 	for idx, d := range config.Destinations {
@@ -103,6 +106,7 @@ func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbou
 			destination: net.TCPDestination(d.Address.AsAddress(), net.Port(d.Port)),
 			email:       d.Email,
 			level:       uint32(d.Level),
+			key:         destKey,
 			blockCipher: destBlock,
 		}
 	}
@@ -122,7 +126,7 @@ func (i *RelayInbound) Process(ctx context.Context, network net.Network, connect
 	if network == net.Network_TCP {
 		return i.processTCP(ctx, connection, dispatcher)
 	}
-	return i.processUDP(ctx, connection, dispatcher)
+	return i.processUDP(packetContext(ctx, connection), connection, dispatcher)
 }
 
 func (i *RelayInbound) processTCP(ctx context.Context, conn net.Conn, dispatcher routing.Dispatcher) error {
@@ -203,6 +207,14 @@ func (i *RelayInbound) processTCP(ctx context.Context, conn net.Conn, dispatcher
 }
 
 func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
+	udpConns := utils.NewTypedSyncMap[uint64, *udpConnEntry]()
+	defer func() {
+		udpConns.Range(func(key uint64, entry *udpConnEntry) bool {
+			entry.Close()
+			return true
+		})
+	}()
+
 	reader := buf.NewPacketReader(conn)
 	for {
 		mb, err := reader.ReadMultiBuffer()
@@ -221,7 +233,11 @@ func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dis
 			var packetHeader [AESBlockSize]byte
 			i.relayBlock.Decrypt(packetHeader[:], data[:AESBlockSize])
 
-			eiHeader := DecryptUDPEIH(i.relayBlock, packetHeader[:], data[AESBlockSize:2*AESBlockSize])
+			var eiHeader [AESBlockSize]byte
+			i.relayBlock.Decrypt(eiHeader[:], data[AESBlockSize:2*AESBlockSize])
+			for idx := 0; idx < AESBlockSize; idx++ {
+				eiHeader[idx] ^= packetHeader[idx]
+			}
 
 			targetDest, ok := i.destinations[eiHeader]
 			if !ok {
@@ -242,24 +258,62 @@ func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dis
 			dest := targetDest.destination
 			dest.Network = net.Network_UDP
 
-			sessionItem := i.udpSessions.GetOrCreate(sessionID)
-			if sessionItem.User == nil {
-				sessionItem.Lock()
-				if sessionItem.User == nil {
-					sessionItem.User = &protocol.MemoryUser{
-						Email: targetDest.email,
-						Level: targetDest.level,
-					}
+			entry, ok := udpConns.Load(sessionID)
+			if !ok {
+				sessCtx, cancel := context.WithCancel(packetSessionContext(ctx))
+				inbound := session.InboundFromContext(sessCtx)
+				inbound.User = &protocol.MemoryUser{
+					Email: targetDest.email,
+					Level: targetDest.level,
 				}
-				sessionItem.Unlock()
-			}
-			link, err := sessionItem.EnsureLink(ctx, conn, dest, dispatcher, i.policyManager, nil)
-			if err != nil {
-				b.Release()
-				continue
+
+				sessCtx = log.ContextWithAccessMessage(sessCtx, &log.AccessMessage{
+					From:   conn.RemoteAddr(),
+					To:     dest,
+					Status: log.AccessAccepted,
+					Email:  targetDest.email,
+				})
+
+				link, err := dispatcher.Dispatch(sessCtx, dest)
+				if err != nil {
+					cancel()
+					b.Release()
+					continue
+				}
+
+				newEntry := &udpConnEntry{cancel: cancel}
+				newEntry.onClose = func() {
+					udpConns.CompareAndDelete(sessionID, newEntry)
+				}
+				newEntry.bind(link)
+				sessionPolicy := i.policyManager.ForLevel(targetDest.level)
+				newEntry.setTimer(signal.CancelAfterInactivity(sessCtx, func() { newEntry.Close() }, sessionPolicy.Timeouts.ConnectionIdle))
+
+				actual, loaded := udpConns.LoadOrStore(sessionID, newEntry)
+				if loaded {
+					newEntry.Close()
+					entry = actual
+				} else {
+					entry = newEntry
+					go func(cEntry *udpConnEntry) {
+						defer cEntry.Close()
+						for {
+							resMb, err := cEntry.link.Reader.ReadMultiBuffer()
+							if err != nil {
+								return
+							}
+							cEntry.timer.Update()
+							for _, rb := range resMb {
+								_, _ = conn.Write(rb.Bytes())
+								rb.Release()
+							}
+						}
+					}(entry)
+				}
 			}
 
-			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
+			entry.timer.Update()
+			_ = entry.link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
 		}
 	}
 }

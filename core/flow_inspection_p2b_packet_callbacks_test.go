@@ -1,0 +1,160 @@
+package core_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/xtls/xray-core/app/router"
+	cnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/core"
+	fout "github.com/xtls/xray-core/features/outbound"
+	frouting "github.com/xtls/xray-core/features/routing"
+	fs "github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy/socks"
+)
+
+func inspectionPacketCallbackSenderAt(t *testing.T, outbound *core.OutboundHandlerConfig, enabled, sniff bool) (*core.Instance, fs.FlowInspection, string) {
+	t.Helper()
+	sender, view, address := inspectionSOCKSUDPListener(t, enabled, sniff)
+	if err := core.AddOutboundHandler(sender, outbound); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.GetFeature(frouting.RouterType()).(frouting.Router).AddRule(serial.ToTypedMessage(&router.Config{Rule: []*router.RoutingRule{{
+		Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: outbound.Tag},
+	}}}), true); err != nil {
+		t.Fatal(err)
+	}
+	return sender, view, address
+}
+
+func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		receiver inspectionSuppliedTCPReceiver
+	}{
+		{"Trojan", inspectionTrojanReceiver},
+		{"Shadowsocks", inspectionShadowsocksReceiver},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, mode := range []string{"enabled", "sniff", "disabled", "rejected"} {
+				t.Run(mode, func(t *testing.T) {
+					receiving, remote, outbound := test.receiver(t, mode != "disabled", mode == "sniff")
+					sending, view, address := inspectionPacketCallbackSenderAt(t, outbound, mode != "disabled", mode == "sniff")
+					_, client, relay := inspectionSOCKSAssociation(t, address)
+					firstDest, secondDest := startOutboundStatsUDPServer(t, 0x19), startOutboundStatsUDPServer(t, 0x37)
+					payload, extra := []byte("decoded callback input and response"), []byte("second packet destination")
+					if mode == "rejected" {
+						if err := receiving.GetFeature(fout.ManagerType()).(fout.Manager).RemoveHandler(context.Background(), "direct"); err != nil {
+							t.Fatal(err)
+						}
+						message, err := socks.EncodeUDPPacket(&protocol.RequestHeader{Address: firstDest.Address, Port: firstDest.Port}, payload)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer message.Release()
+						if _, err := client.WriteToUDP(message.Bytes(), relay); err != nil {
+							t.Fatal(err)
+						}
+						var ref fs.FlowRef
+						var liveStorage62 []fs.FlowRecord
+						inspectionWait(t, func() bool {
+							live, _ := view.ReadLiveInto(liveStorage62)
+							liveStorage62 = live.Rows
+							if len(live.Rows) != 1 || live.Rows[0].Outbound.Tag == "" || live.Rows[0].Outbound.Tag != outbound.Tag || live.Rows[0].Uplink != uint64(len(payload)) {
+								return false
+							}
+							ref = live.Rows[0].Ref
+							return true
+						})
+						inspectionClosePacketCallback(t, view, ref)
+						inspectionWait(t, func() bool {
+							page, _ := view.ReadTerminals()
+							return len(page.Rows) == 1 && page.Rows[0].Flow.Downlink == 0
+						})
+						assertNoDedicatedServerInspection(t, remote)
+						return
+					}
+					inspectionSOCKSPacket(t, client, relay, firstDest, payload, 0x19)
+					inspectionSOCKSPacket(t, client, relay, secondDest, extra, 0x37)
+					_, sibling, siblingRelay := inspectionSOCKSAssociation(t, address)
+					inspectionSOCKSPacket(t, sibling, siblingRelay, firstDest, payload, 0x19)
+					if mode == "disabled" {
+						if receiving.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil || sending.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
+							t.Fatal("disabled receiver acquired inspection state")
+						}
+						return
+					}
+					var first, other fs.FlowRecord
+					var liveStorage89 []fs.FlowRecord
+					inspectionWait(t, func() bool {
+						live, _ := view.ReadLiveInto(liveStorage89)
+						liveStorage89 = live.Rows
+						if len(live.Rows) != 2 {
+							return false
+						}
+						for _, row := range live.Rows {
+							if row.Uplink == uint64(len(payload)+len(extra)) {
+								first = row
+							} else {
+								other = row
+							}
+						}
+						return first.Ref.ID != 0 && other.Ref.ID != 0 && first.Downlink == first.Uplink && other.Downlink == uint64(len(payload))
+					})
+					for _, row := range []fs.FlowRecord{first, other} {
+						if row.Kind != cnet.Network_UDP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" {
+							t.Fatalf("callback facts: %+v", row)
+						}
+					}
+					if first.Destination != secondDest || other.Destination != firstDest {
+						t.Fatalf("packet destinations: %+v", first)
+					}
+					inspectionClosePacketCallback(t, view, first.Ref)
+					inspectionWait(t, func() bool {
+						page, _ := view.ReadTerminals()
+						return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink == uint64(len(payload)+len(extra))
+					})
+					inspectionSOCKSPacket(t, sibling, siblingRelay, secondDest, extra, 0x37)
+					inspectionClosePacketCallback(t, view, other.Ref)
+					inspectionWait(t, func() bool {
+						page, _ := view.ReadTerminals()
+						return len(page.Rows) == 2
+					})
+					_, replacement, replacementRelay := inspectionSOCKSAssociation(t, address)
+					inspectionSOCKSPacket(t, replacement, replacementRelay, firstDest, payload, 0x19)
+					var replacementRef fs.FlowRef
+					var liveStorage125 []fs.FlowRecord
+					inspectionWait(t, func() bool {
+						live, _ := view.ReadLiveInto(liveStorage125)
+						liveStorage125 = live.Rows
+						if len(live.Rows) != 1 || live.Rows[0].Downlink != uint64(len(payload)) {
+							return false
+						}
+						replacementRef = live.Rows[0].Ref
+						return true
+					})
+					if replacementRef == first.Ref || replacementRef == other.Ref {
+						t.Fatal("new association reused a stopped reference")
+					}
+					inspectionClosePacketCallback(t, view, replacementRef)
+					inspectionWait(t, func() bool {
+						page, _ := view.ReadTerminals()
+						return len(page.Rows) == 3
+					})
+					inspectionOutboundTotals(t, view, outbound.Tag, uint64(3*len(payload)+2*len(extra)))
+					assertNoDedicatedServerInspection(t, remote)
+				})
+			}
+		})
+	}
+}
+
+func inspectionClosePacketCallback(t *testing.T, view fs.FlowInspection, ref fs.FlowRef) {
+	t.Helper()
+	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
+	if err != nil || len(out) != 1 || out[0] != nil {
+		t.Fatalf("callback exact stop: %+v %v", out, err)
+	}
+}

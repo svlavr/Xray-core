@@ -16,6 +16,7 @@ type Manager struct {
 	onlineMaps map[string]*OnlineMap
 	channels   map[string]*Channel
 	running    bool
+	inspection *inspectionStore
 }
 
 // NewManager creates an instance of Statistics Manager.
@@ -258,6 +259,9 @@ func (m *Manager) Close() error {
 	m.access.Lock()
 	defer m.access.Unlock()
 	m.running = false
+	if m.inspection != nil {
+		m.inspection.close()
+	}
 	for name := range m.onlineMaps {
 		errors.LogDebug(context.Background(), "remove OnlineMap ", name)
 		delete(m.onlineMaps, name)

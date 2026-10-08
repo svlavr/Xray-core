@@ -133,10 +133,15 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			var initialPayload []byte
 			var firstBuf *buf.Buffer
 			var remainingMB buf.MultiBuffer
+			var initialErr error
 			if timeoutReader, ok := link.Reader.(buf.TimeoutReader); ok {
-				if mb, err := timeoutReader.ReadMultiBufferTimeout(0); err == nil && !mb.IsEmpty() {
+				mb, err := timeoutReader.ReadMultiBufferTimeout(0)
+				initialErr = err
+				if !mb.IsEmpty() {
 					remainingMB, firstBuf = buf.SplitFirst(mb)
 					initialPayload = firstBuf.Bytes()
+				} else {
+					buf.ReleaseMulti(mb)
 				}
 			}
 
@@ -153,6 +158,12 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 				if err := bodyWriter.WriteMultiBuffer(remainingMB); err != nil {
 					return err
 				}
+			}
+			if initialErr != nil && initialErr != buf.ErrReadTimeout {
+				if errors.Cause(initialErr) == io.EOF {
+					return nil
+				}
+				return errors.New("failed to read request payload").Base(initialErr)
 			}
 
 			return buf.Copy(link.Reader, bodyWriter, buf.UpdateActivity(timer))

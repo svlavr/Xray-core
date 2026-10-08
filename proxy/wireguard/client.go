@@ -25,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.zx2c4.com/wireguard/device"
@@ -34,6 +35,8 @@ type Handler struct {
 	conf          *DeviceConfig
 	policyManager policy.Manager
 	dns           dns.Client
+	deviceCtx     context.Context
+	deviceCancel  context.CancelFunc
 
 	streamSettings  *internet.MemoryStreamConfig
 	uplinkCounter   stats.Counter
@@ -124,10 +127,15 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		return nil, err
 	}
 
+	deviceCtx := session.ContextWithFullHandler(core.ToBackgroundDetachedContext(ctx), session.FullHandlerFromContext(ctx))
+	deviceCtx = session.ContextWithTrafficOrigin(deviceCtx, session.TrafficOriginInternal)
+	deviceCtx, deviceCancel := context.WithCancel(deviceCtx)
 	return &Handler{
 		conf:          conf,
 		policyManager: p,
 		dns:           d,
+		deviceCtx:     deviceCtx,
+		deviceCancel:  deviceCancel,
 
 		streamSettings:  streamSettings,
 		uplinkCounter:   uplinkCounter,
@@ -148,8 +156,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Name = "wireguard"
 	ob.CanSpliceCopy = 3
 	dialer.SetOutboundGateway(ctx, ob)
-
-	if err := h.init(ctx); err != nil {
+	eligible := ob.Target.Network == net.Network_TCP || ob.Target.Network == net.Network_UDP
+	if ob.Target.Address.Family().IsDomain() {
+		domain := ob.Target.Address.Domain()
+		eligible = eligible && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
+	}
+	observation := proxy.ObservedEndpoint(ctx, link.Reader, eligible)
+	if err := h.init(ob.Gateway); err != nil {
 		return err
 	}
 
@@ -167,9 +180,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			newCancel()
 		}
 	}, sessionPolicy.Timeouts.ConnectionIdle)
+	requestCtx := ctx
 
 	if newCtx != nil {
 		ctx = newCtx
+	}
+	dialCtx := ctx
+	if observation != nil {
+		dialCtx = requestCtx
 	}
 
 	var reader buf.Reader
@@ -180,9 +198,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		var conn net.Conn
 		var err error
 		if sessionPolicy.Timeouts.Handshake != 0 {
-			timeoutCtx, timeoutCancel := context.WithTimeout(ctx, sessionPolicy.Timeouts.Handshake)
+			timeoutCtx, timeoutCancel := context.WithTimeout(dialCtx, sessionPolicy.Timeouts.Handshake)
 			conn, err = h.tnet.DialContext(timeoutCtx, "tcp", ob.Target.NetAddr())
 			timeoutCancel()
+		} else if observation != nil {
+			conn, err = h.tnet.DialContext(dialCtx, "tcp", ob.Target.NetAddr())
 		} else {
 			conn, err = h.tnet.Dial("tcp", ob.Target.NetAddr())
 		}
@@ -193,7 +213,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		reader = buf.NewReader(conn)
 		writer = buf.NewWriter(conn)
 	case net.Network_UDP:
-		conn, err := h.tnet.Dial("udp", ob.Target.NetAddr())
+		var conn net.Conn
+		var err error
+		if observation != nil {
+			conn, err = h.tnet.DialContext(dialCtx, "udp", ob.Target.NetAddr())
+		} else {
+			conn, err = h.tnet.Dial("udp", ob.Target.NetAddr())
+		}
 		if err != nil {
 			return errors.New("failed to create UDP connection").Base(err)
 		}
@@ -229,6 +255,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 }
 
 func (h *Handler) Close() (err error) {
+	if h.deviceCancel != nil {
+		h.deviceCancel()
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.dev != nil {
@@ -242,11 +271,14 @@ func (h *Handler) Close() (err error) {
 	return nil
 }
 
-func (h *Handler) init(ctx context.Context) error {
+func (h *Handler) init(gateway net.Address) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.tun == nil {
 		return errors.New("closed")
+	}
+	if err := h.deviceCtx.Err(); err != nil {
+		return err
 	}
 	if h.dev != nil {
 		return h.dev.Up()
@@ -257,6 +289,9 @@ func (h *Handler) init(ctx context.Context) error {
 		if err != nil {
 			return nil, err
 		}
+		// A reconnect belongs to the device, not its first logical request.
+		// Each physical dial also owns fresh mutable outbound metadata.
+		ctx := h.carrierContext(dest, gateway)
 		var pktConn net.PacketConn
 		if h.streamSettings.FinalMask != nil {
 			conn, err := h.streamSettings.FinalMask.DialUDP(ctx, dest)
@@ -287,13 +322,7 @@ func (h *Handler) init(ctx context.Context) error {
 		}
 		return pktConn, nil
 	}
-	// device.NewDevice may use the bind right away (Up -> BindUpdate -> Open),
-	// so everything it reads must be set before creating the device.
-	bind := &bind{
-		resolveFunc: resolveFunc,
-		listenFunc:  listenFunc,
-		reserved:    h.conf.Reserved,
-	}
+	bind := &bind{resolveFunc: resolveFunc, listenFunc: listenFunc, reserved: h.conf.Reserved}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {
 			log.Record(&log.GeneralMessage{
@@ -308,8 +337,12 @@ func (h *Handler) init(ctx context.Context) error {
 			})
 		},
 	}
+	// NewDevice starts the TUN event reader, which may immediately open the bind.
+	// Publish its device-dependent callback before Open can start a receiver.
+	bind.mu.Lock()
 	dev := device.NewDevice(h.tun, bind, logger)
-	bind.setDownFunc(dev.Down)
+	bind.downFunc = dev.Down
+	bind.mu.Unlock()
 	var cfg strings.Builder
 	cfg.WriteString("private_key=" + h.conf.SecretKey + "\n")
 	for _, peer := range h.conf.Peers {
@@ -335,6 +368,13 @@ func (h *Handler) init(ctx context.Context) error {
 	}
 	h.dev = dev
 	return nil
+}
+
+func (h *Handler) carrierContext(dest net.Destination, gateway net.Address) context.Context {
+	return session.ContextWithOutbounds(h.deviceCtx, []*session.Outbound{{
+		OriginalTarget: dest, Target: dest, RouteTarget: dest, Gateway: gateway,
+		Tag: session.FullHandlerFromContext(h.deviceCtx).Tag(), Name: "wireguard", CanSpliceCopy: 3,
+	}})
 }
 
 func (h *Handler) resolveLocal(host string) (net.IP, error) {

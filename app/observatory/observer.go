@@ -148,7 +148,8 @@ func (o *Observer) probe(outbound string) ProbeResult {
 				if err != nil {
 					return errors.New("cannot understand address").Base(err)
 				}
-				trackedCtx := session.TrackedConnectionError(o.ctx, errorCollectorForRequest)
+				trackedCtx := session.ContextWithTrafficOrigin(o.ctx, session.TrafficOriginControlledMeasurement)
+				trackedCtx = session.TrackedConnectionError(trackedCtx, errorCollectorForRequest)
 				conn, err := tagged.Dialer(trackedCtx, o.dispatcher, dest, outbound)
 				if err != nil {
 					return errors.New("cannot dial remote address ", dest).Base(err)

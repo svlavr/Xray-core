@@ -25,6 +25,7 @@ type TempUDPConn struct {
 	AssociatedTCPConn net.Conn
 	ExpectedRemote    atomic.Pointer[net.UDPAddr]
 	Timer             *signal.ActivityTimer
+	closed            atomic.Bool
 }
 
 func (c *TempUDPConn) Read(b []byte) (n int, err error) {
@@ -61,12 +62,22 @@ func (c *TempUDPConn) RemoteAddr() net.Addr {
 
 func (c *TempUDPConn) SetTimeout(d time.Duration) {
 	c.Timer = signal.CancelAfterInactivity(context.Background(), func() {
-		c.Close()
+		// The callback may run before CancelAfterInactivity returns the timer.
+		c.close(false)
 	}, d)
 }
 
 func (c *TempUDPConn) Close() error {
-	c.Timer.SetTimeout(0)
+	return c.close(true)
+}
+
+func (c *TempUDPConn) close(stopTimer bool) error {
+	if c.closed.Swap(true) {
+		return nil
+	}
+	if stopTimer && c.Timer != nil {
+		c.Timer.SetTimeout(0)
+	}
 	c.AssociatedTCPConn.Close()
 	return c.PacketConn.Close()
 }

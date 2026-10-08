@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common"
-	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
@@ -50,45 +49,108 @@ var (
 
 func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (net.Conn, error) {
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
+	pooled := grpcClientPooled(ctx, streamSettings)
 
 	conn, err := getGrpcClient(ctx, dest, streamSettings)
 	if err != nil {
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 	client := encoding.NewGRPCServiceClient(conn)
+	// A standalone stream owns its ClientConn. A handler-owned stream only owns
+	// its RPC; closing it must not interrupt sibling streams on the pooled client.
+	var closeClient context.CancelFunc
+	if !pooled {
+		closeConn := func() { _ = conn.Close() }
+		stopOwner := func() bool { return false }
+		if streamSettings.Owner != nil {
+			stopOwner = context.AfterFunc(streamSettings.Owner, closeConn)
+		}
+		closeClient = func() { stopOwner(); closeConn() }
+	}
 	if grpcSettings.MultiMode {
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
 		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
 		if err != nil {
+			if closeClient != nil {
+				closeClient()
+			}
 			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
-		return encoding.NewMultiHunkConn(grpcService, nil, nil), nil
+		return encoding.NewMultiHunkConn(grpcService, closeClient, nil), nil
 	}
 
 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")
 	grpcService, err := client.(encoding.GRPCServiceClientX).TunCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunStreamName())
 	if err != nil {
+		if closeClient != nil {
+			closeClient()
+		}
 		return nil, errors.New("Cannot dial gRPC").Base(err)
 	}
 
-	return encoding.NewHunkConn(grpcService, nil, nil), nil
+	return encoding.NewHunkConn(grpcService, closeClient, nil), nil
+}
+
+func grpcClientPooled(ctx context.Context, settings *internet.MemoryStreamConfig) bool {
+	if settings.Owner == nil || (settings.SocketSettings != nil && settings.SocketSettings.DialerProxy != "") {
+		return false
+	}
+	// Source addresses can vary per flow (ViaCidr/srcip). Keep these clients
+	// stream-owned rather than accumulating one pooled connection per address.
+	outbounds := session.OutboundsFromContext(ctx)
+	return len(outbounds) == 0 || outbounds[len(outbounds)-1] == nil || outbounds[len(outbounds)-1].Gateway == nil
+}
+
+// A reconnect needs a stable route but must not retain the first stream's
+// context or mutable session outbounds. A direct TCP dial only uses Gateway;
+// a DialerProxy redirect needs the complete tag history.
+func frozenOutbounds(ctx context.Context, direct bool) []*session.Outbound {
+	outbounds := session.OutboundsFromContext(ctx)
+	if direct {
+		if len(outbounds) == 0 {
+			return nil
+		}
+		last := outbounds[len(outbounds)-1]
+		if last == nil {
+			return []*session.Outbound{nil}
+		}
+		return []*session.Outbound{{Gateway: last.Gateway}}
+	}
+	frozen := make([]*session.Outbound, len(outbounds))
+	for i, ob := range outbounds {
+		if ob == nil {
+			continue
+		}
+		copy := *ob
+		frozen[i] = &copy
+	}
+	return frozen
 }
 
 func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (*grpc.ClientConn, error) {
+	pooled := grpcClientPooled(ctx, streamSettings)
+	key := dialerConf{Destination: dest, MemoryStreamConfig: streamSettings}
+	owner := streamSettings.Owner
 	globalDialerAccess.Lock()
 	defer globalDialerAccess.Unlock()
+	if owner != nil && owner.Err() != nil {
+		return nil, owner.Err()
+	}
 
-	if globalDialerMap == nil {
+	if pooled && globalDialerMap == nil {
 		globalDialerMap = make(map[dialerConf]*grpc.ClientConn)
 	}
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 	grpcSettings := streamSettings.ProtocolSettings.(*Config)
 
-	if client, found := globalDialerMap[dialerConf{dest, streamSettings}]; found && client.GetState() != connectivity.Shutdown {
-		return client, nil
+	if pooled {
+		if client, found := globalDialerMap[key]; found && client.GetState() != connectivity.Shutdown {
+			return client, nil
+		}
 	}
 
+	route := frozenOutbounds(ctx, streamSettings.SocketSettings == nil || streamSettings.SocketSettings.DialerProxy == "")
 	dialOptions := []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff: backoff.Config{
@@ -119,8 +181,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 			}
 			address := net.ParseAddress(rawHost)
 
-			gctx = c.ContextWithID(gctx, c.IDFromContext(ctx))
-			gctx = session.ContextWithOutbounds(gctx, session.OutboundsFromContext(ctx))
+			gctx = session.ContextWithOutbounds(gctx, route)
 			gctx = session.ContextWithTimeoutOnly(gctx, true)
 
 			var c net.Conn
@@ -197,7 +258,24 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
 		setUserAgent(conn, userAgent)
 		conn.Connect()
 	}
-	globalDialerMap[dialerConf{dest, streamSettings}] = conn
+	if err != nil {
+		return nil, err
+	}
+	if owner != nil && owner.Err() != nil {
+		_ = conn.Close()
+		return nil, owner.Err()
+	}
+	if pooled {
+		globalDialerMap[key] = conn
+		context.AfterFunc(owner, func() {
+			globalDialerAccess.Lock()
+			if globalDialerMap[key] == conn {
+				delete(globalDialerMap, key)
+			}
+			globalDialerAccess.Unlock()
+			_ = conn.Close()
+		})
+	}
 	return conn, err
 }
 

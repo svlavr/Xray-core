@@ -1,0 +1,60 @@
+name: UDP source controls (macOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: Isolated source-copy repetitions (1..5)
+        required: false
+        default: '2'
+      iterations:
+        description: SOCKS associations per repetition (1..64)
+        required: false
+        default: '20'
+      ports:
+        description: Held native and standard UDP sockets (1..512)
+        required: false
+        default: '256'
+      attribution:
+        description: Isolated OFF I/O attribution and equal-port kernel mechanism check
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  udp-controls:
+    if: github.repository == 'svlavr/Xray-core' && github.ref == 'refs/heads/codex/xray-unified'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+      - name: Compare official, fork OFF and fork ON
+        shell: bash
+        env:
+          CONTROL_REPEAT: ${{ inputs.repeat || '2' }}
+          CONTROL_ITERATIONS: ${{ inputs.iterations || '20' }}
+          CONTROL_PORTS: ${{ inputs.ports || '256' }}
+          CONTROL_ATTRIBUTION: ${{ inputs.attribution || 'false' }}
+        run: |
+          go version
+          python3 --version
+          if [ "$(ulimit -n)" -lt 4096 ]; then ulimit -n 4096 || true; fi
+          extra=()
+          if [ "$CONTROL_ATTRIBUTION" = "true" ]; then extra=(--mode off --attribution); fi
+          python3 .github/diagnostics/run_udp_controls.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --output "$RUNNER_TEMP/udp-controls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --fork "$GITHUB_SHA" \
+            --repeat "$CONTROL_REPEAT" \
+            --iterations "$CONTROL_ITERATIONS" \
+            --ports "$CONTROL_PORTS" \
+            "${extra[@]}"

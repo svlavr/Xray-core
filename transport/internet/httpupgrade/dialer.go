@@ -60,6 +60,12 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
 		return nil, err
 	}
 
+	defer func() {
+		if pconn != nil {
+			pconn.Close()
+		}
+	}()
+
 	var conn net.Conn
 	var requestURL url.URL
 	tConfig := tls.ConfigFromStreamSettings(streamSettings)
@@ -127,6 +133,7 @@ func dialhttpUpgrade(ctx context.Context, dest net.Destination, streamSettings *
 		}
 	}
 
+	pconn = nil
 	return connRF, nil
 }
 

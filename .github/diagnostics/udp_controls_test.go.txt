@@ -1,0 +1,371 @@
+package udp_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"reflect"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/xtls/xray-core/app/dispatcher"
+	"github.com/xtls/xray-core/app/proxyman"
+	_ "github.com/xtls/xray-core/app/proxyman/inbound"
+	_ "github.com/xtls/xray-core/app/proxyman/outbound"
+	appstats "github.com/xtls/xray-core/app/stats"
+	"github.com/xtls/xray-core/common/buf"
+	cnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/core"
+	fs "github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/proxy/socks"
+	"github.com/xtls/xray-core/transport/internet"
+)
+
+func controlMode(t *testing.T) string {
+	t.Helper()
+	mode := os.Getenv("XRAY_CONTROL_MODE")
+	if mode != "official" && mode != "off" && mode != "on" {
+		t.Fatalf("CONTROL_META invalid mode=%q", mode)
+	}
+	return mode
+}
+
+func controlCount(t *testing.T, name string, fallback, maximum int) int {
+	t.Helper()
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 || n > maximum {
+		t.Fatalf("CONTROL_META invalid %s=%q, permitted 1..%d", name, value, maximum)
+	}
+	return n
+}
+
+func nilValue(value reflect.Value) bool {
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func checkInspection(t *testing.T, manager any, mode string) {
+	t.Helper()
+	value := reflect.ValueOf(manager)
+	enable := value.MethodByName("EnableInspection")
+	observation := value.MethodByName("Observation")
+	if mode == "official" {
+		t.Logf("CONTROL_META mode=%s enable-method=%t observation-method=%t", mode, enable.IsValid(), observation.IsValid())
+		return
+	}
+	if !enable.IsValid() || !observation.IsValid() || enable.Type().NumIn() != 1 || enable.Type().NumOut() != 2 || observation.Type().NumIn() != 0 || observation.Type().NumOut() != 1 {
+		t.Fatalf("CONTROL_META mode=%s fork inspection signature absent", mode)
+	}
+	if mode == "on" {
+		result := enable.Call([]reflect.Value{reflect.Zero(enable.Type().In(0))})
+		if !nilValue(result[1]) || nilValue(result[0]) {
+			t.Fatalf("CONTROL_META mode=on EnableInspection result=%v error=%v", result[0], result[1])
+		}
+	}
+	state := observation.Call(nil)[0]
+	wantPresent := mode == "on"
+	if nilValue(state) == wantPresent {
+		t.Fatalf("CONTROL_META mode=%s observation-present=%t want=%t", mode, !nilValue(state), wantPresent)
+	}
+	t.Logf("CONTROL_META mode=%s enable-method=true observation-present=%t", mode, !nilValue(state))
+}
+
+type echoOwner struct {
+	conn *net.UDPConn
+	done chan struct{}
+	mask byte
+}
+
+func startEcho(t *testing.T, mask byte) (*echoOwner, cnet.Destination) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := &echoOwner{conn: conn, done: make(chan struct{}), mask: mask}
+	go func() {
+		defer close(owner.done)
+		packet := make([]byte, 8192)
+		for {
+			n, peer, err := conn.ReadFromUDP(packet)
+			if os.Getenv("XRAY_CONTROL_ATTRIBUTION") == "1" {
+				t.Logf("CONTROL_TRACE echo-read local=%v peer=%v n=%d err=%v", conn.LocalAddr(), peer, n, err)
+			}
+			if err != nil {
+				return
+			}
+			response := append([]byte(nil), packet[:n]...)
+			for i := range response {
+				response[i] ^= mask
+			}
+			written, writeErr := conn.WriteToUDP(response, peer)
+			if os.Getenv("XRAY_CONTROL_ATTRIBUTION") == "1" {
+				t.Logf("CONTROL_TRACE echo-write local=%v peer=%v n=%d err=%v", conn.LocalAddr(), peer, written, writeErr)
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = conn.Close()
+		select {
+		case <-owner.done:
+		case <-time.After(3 * time.Second):
+			t.Error("CONTROL_ECHO worker did not stop")
+		}
+	})
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	return owner, cnet.UDPDestination(cnet.LocalHostIP, cnet.Port(port))
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	return port
+}
+
+func startCore(t *testing.T, mode string) (string, *core.Instance) {
+	t.Helper()
+	port := freeTCPPort(t)
+	instance, err := core.New(&core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&appstats.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
+			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+			serial.ToTypedMessage(&dispatcher.Config{}),
+		},
+		Outbound: []*core.OutboundHandlerConfig{{Tag: "control-direct", ProxySettings: serial.ToTypedMessage(&freedom.Config{})}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := instance.Close(); err != nil {
+			t.Errorf("CONTROL_CORE close: %v", err)
+		}
+	})
+	manager := instance.GetFeature(fs.ManagerType())
+	if manager == nil {
+		t.Fatal("CONTROL_META stats manager absent")
+	}
+	checkInspection(t, manager, mode)
+	if err := core.AddInboundHandler(instance, &core.InboundHandlerConfig{
+		Tag: "control-socks",
+		ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+			Listen:   cnet.NewIPOrDomain(cnet.LocalHostIP),
+			PortList: &cnet.PortList{Range: []*cnet.PortRange{cnet.SinglePortRange(cnet.Port(port))}},
+		}),
+		ProxySettings: serial.ToTypedMessage(&socks.ServerConfig{AuthType: socks.AuthType_NO_AUTH, UdpEnabled: true}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "official" {
+		state := reflect.ValueOf(manager).MethodByName("Observation").Call(nil)[0]
+		if nilValue(state) == (mode == "on") {
+			t.Fatalf("CONTROL_META post-start mode=%s observation-present=%t", mode, !nilValue(state))
+		}
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), instance
+}
+
+type association struct {
+	control net.Conn
+	client  *net.UDPConn
+	relay   *net.UDPAddr
+}
+
+func openAssociation(address string) (*association, error) {
+	control, err := net.DialTimeout("tcp", address, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+	response, err := socks.ClientHandshake(&protocol.RequestHeader{Command: protocol.RequestCommandUDP}, control, control)
+	if err != nil {
+		_ = control.Close()
+		return nil, err
+	}
+	_ = control.SetDeadline(time.Time{})
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		_ = control.Close()
+		return nil, err
+	}
+	return &association{control: control, client: client, relay: &net.UDPAddr{IP: response.Address.IP(), Port: int(response.Port)}}, nil
+}
+
+func (a *association) Close() {
+	_ = a.client.Close()
+	_ = a.control.Close()
+}
+
+func (a *association) exchange(mode string, iteration int, dest cnet.Destination, payload []byte, mask byte) error {
+	request, err := socks.EncodeUDPPacket(&protocol.RequestHeader{Address: dest.Address, Port: dest.Port}, payload)
+	if err != nil {
+		return fmt.Errorf("CONTROL_PACKET encode mode=%s iteration=%d dest=%v: %w", mode, iteration, dest, err)
+	}
+	defer request.Release()
+	_ = a.client.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := a.client.WriteToUDP(request.Bytes(), a.relay); err != nil {
+		return fmt.Errorf("CONTROL_PACKET send mode=%s iteration=%d local=%v relay=%v dest=%v: %w", mode, iteration, a.client.LocalAddr(), a.relay, dest, err)
+	}
+	if os.Getenv("XRAY_CONTROL_ATTRIBUTION") == "1" {
+		fmt.Printf("CONTROL_TRACE client-send iteration=%d local=%v relay=%v dest=%v\n", iteration, a.client.LocalAddr(), a.relay, dest)
+	}
+	response := buf.New()
+	defer response.Release()
+	n, sender, err := a.client.ReadFromUDP(response.Extend(buf.Size))
+	if err != nil {
+		return fmt.Errorf("CONTROL_PACKET receive mode=%s iteration=%d n=%d sender=%v local=%v relay=%v dest=%v: %w", mode, iteration, n, sender, a.client.LocalAddr(), a.relay, dest, err)
+	}
+	response.Resize(0, int32(n))
+	wire := append([]byte(nil), response.Bytes()[:min(n, 16)]...)
+	header, err := socks.DecodeUDPPacket(response)
+	if err != nil {
+		return fmt.Errorf("CONTROL_PACKET decode mode=%s iteration=%d n=%d sender=%v local=%v relay=%v dest=%v wire=%x: %w", mode, iteration, n, sender, a.client.LocalAddr(), a.relay, dest, wire, err)
+	}
+	want := append([]byte(nil), payload...)
+	for i := range want {
+		want[i] ^= mask
+	}
+	if header.Destination() != dest || !bytes.Equal(response.Bytes(), want) {
+		return fmt.Errorf("CONTROL_PACKET mismatch mode=%s iteration=%d n=%d sender=%v local=%v relay=%v dest=%v decoded=%v wire=%x got=%x want=%x", mode, iteration, n, sender, a.client.LocalAddr(), a.relay, dest, header.Destination(), wire, response.Bytes(), want)
+	}
+	return nil
+}
+
+func TestControlSOCKSUDP(t *testing.T) {
+	mode := controlMode(t)
+	iterations := controlCount(t, "XRAY_CONTROL_ITERATIONS", 20, 64)
+	_, first := startEcho(t, 0x19)
+	_, second := startEcho(t, 0x37)
+	address, _ := startCore(t, mode)
+	firstAssociation, err := openAssociation(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := firstAssociation.exchange(mode, -1, first, []byte("first destination"), 0x19); err != nil {
+		firstAssociation.Close()
+		t.Fatal(err)
+	}
+	if err := firstAssociation.exchange(mode, -1, second, []byte("second destination"), 0x37); err != nil {
+		firstAssociation.Close()
+		t.Fatal(err)
+	}
+	firstAssociation.Close()
+	jobs := make(chan int)
+	results := make(chan error, iterations)
+	var workers sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for iteration := range jobs {
+				a, err := openAssociation(address)
+				if err == nil {
+					payload := []byte(fmt.Sprintf("association-%d", iteration))
+					err = a.exchange(mode, iteration, first, payload, 0x19)
+					if err == nil {
+						err = a.exchange(mode, iteration, second, payload, 0x37)
+					}
+					a.Close()
+				}
+				results <- err
+			}
+		}()
+	}
+	for i := 0; i < iterations; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	workers.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	t.Logf("CONTROL_META mode=%s associations=%d destinations=2 workers=4", mode, iterations+1)
+}
+
+func TestControlUDPPortAllocation(t *testing.T) {
+	mode := controlMode(t)
+	count := controlCount(t, "XRAY_CONTROL_PORTS", 256, 512)
+	var system, standard []net.PacketConn
+	defer func() {
+		// Keep exact tuples even after an early assertion, before releasing the
+		// sockets. Other test binaries may hold wildcard sockets on these ports.
+		for name, sockets := range map[string][]net.PacketConn{"system": system, "standard": standard} {
+			tuples := make([]string, 0, len(sockets))
+			for _, conn := range sockets {
+				tuples = append(tuples, conn.LocalAddr().Network()+":"+conn.LocalAddr().String())
+			}
+			t.Logf("CONTROL_PORT_BINDINGS mode=%s kind=%s tuples=%v", mode, name, tuples)
+		}
+		for _, conn := range standard {
+			_ = conn.Close()
+		}
+		for _, conn := range system {
+			_ = conn.Close()
+		}
+	}()
+	seenSystem, seenStandard := make(map[string]int), make(map[string]int)
+	systemPorts, standardPorts := make(map[int]string), make(map[int]string)
+	for i := 0; i < count; i++ {
+		conn, err := internet.ListenSystemPacket(context.Background(), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, nil)
+		if err != nil {
+			t.Fatalf("CONTROL_PORT mode=%s system index=%d held=%d err=%v", mode, i, len(system), err)
+		}
+		system = append(system, conn)
+		tuple := conn.LocalAddr().Network() + ":" + conn.LocalAddr().String()
+		if earlier, exists := seenSystem[tuple]; exists {
+			t.Fatalf("CONTROL_PORT duplicate system tuple=%s first=%d second=%d", tuple, earlier, i)
+		}
+		seenSystem[tuple] = i
+		port := conn.LocalAddr().(*net.UDPAddr).Port
+		if earlier, exists := systemPorts[port]; exists && earlier != tuple {
+			t.Logf("CONTROL_PORT same-port distinct-system-bind port=%d earlier=%s current=%s", port, earlier, tuple)
+		}
+		systemPorts[port] = tuple
+		plain, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("CONTROL_PORT mode=%s standard index=%d held=%d err=%v", mode, i, len(standard), err)
+		}
+		standard = append(standard, plain)
+		plainTuple := plain.LocalAddr().Network() + ":" + plain.LocalAddr().String()
+		if earlier, exists := seenStandard[plainTuple]; exists {
+			t.Fatalf("CONTROL_PORT duplicate standard tuple=%s first=%d second=%d", plainTuple, earlier, i)
+		}
+		seenStandard[plainTuple] = i
+		plainPort := plain.LocalAddr().(*net.UDPAddr).Port
+		if earlier, exists := standardPorts[plainPort]; exists && earlier != plainTuple {
+			t.Logf("CONTROL_PORT same-port distinct-standard-bind port=%d earlier=%s current=%s", plainPort, earlier, plainTuple)
+		}
+		standardPorts[plainPort] = plainTuple
+		if prior, exists := systemPorts[plainPort]; exists {
+			t.Logf("CONTROL_PORT cross-cohort-port-overlap port=%d system=%s standard=%s", plainPort, prior, plainTuple)
+		}
+	}
+	t.Logf("CONTROL_PORT mode=%s held-system=%d held-standard=%d unique-system=%d unique-standard=%d", mode, len(system), len(standard), len(seenSystem), len(seenStandard))
+}

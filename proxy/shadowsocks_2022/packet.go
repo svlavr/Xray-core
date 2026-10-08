@@ -22,7 +22,7 @@ type UDPCodec struct {
 	blockCipher  cipher.Block
 	blockCiphers []cipher.Block
 	chachaCipher cipher.AEAD
-	sessions     *UDPSessionManager
+	sessions     *UDPSessionManager[uint64]
 }
 
 type (
@@ -74,11 +74,11 @@ func NewUDPServerCodec(method *CipherMethod, psk []byte, sessionTimeout time.Dur
 	if err != nil {
 		return nil, err
 	}
-	c.sessions = NewUDPSessionManager(sessionTimeout)
+	c.sessions = NewUDPSessionManager[uint64](sessionTimeout)
 	return c, nil
 }
 
-func (c *UDPCodec) Sessions() *UDPSessionManager {
+func (c *UDPCodec) Sessions() *UDPSessionManager[uint64] {
 	return c.sessions
 }
 
@@ -216,7 +216,9 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 		packetID := binary.BigEndian.Uint64(plain[8:16])
 
 		sessionItem := c.sessions.GetOrCreate(sessionID)
-		if !sessionItem.CheckPacketID(packetID) {
+		sessionItem.Lock()
+		defer sessionItem.Unlock()
+		if !sessionItem.Window.Check(packetID) {
 			return DecodedUDPPacket{}, ErrPacketIdNotUnique
 		}
 
@@ -229,7 +231,7 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 			return DecodedUDPPacket{}, ErrBadHeaderType
 		}
 
-		sessionItem.AddPacketID(packetID)
+		sessionItem.Window.Add(packetID)
 		return decoded, nil
 	}
 
@@ -240,14 +242,15 @@ func (c *UDPCodec) DecodePacket(data []byte) (DecodedUDPPacket, error) {
 	packetID := binary.BigEndian.Uint64(rawHeader[8:16])
 
 	sessionItem := c.sessions.GetOrCreate(sessionID)
-	if !sessionItem.CheckPacketID(packetID) {
-		return DecodedUDPPacket{}, ErrPacketIdNotUnique
-	}
-
 	return sessionItem.DecryptAESPayload(c.method, c.psk, sessionID, packetID, rawHeader[:], data[16:])
 }
 
 func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, sessionID, packetID uint64, rawHeader, bodyCipher []byte) (DecodedUDPPacket, error) {
+	s.Lock()
+	defer s.Unlock()
+	if !s.Window.Check(packetID) {
+		return DecodedUDPPacket{}, ErrPacketIdNotUnique
+	}
 	bodyAead := s.clientBodyCipher
 	isNewCipher := false
 	if bodyAead == nil {
@@ -275,7 +278,7 @@ func (s *ServerUDPSession) DecryptAESPayload(method *CipherMethod, psk []byte, s
 		return DecodedUDPPacket{}, ErrBadHeaderType
 	}
 
-	s.AddPacketID(packetID)
+	s.Window.Add(packetID)
 
 	if isNewCipher {
 		s.clientBodyCipher = bodyAead
@@ -388,7 +391,11 @@ func (s *ServerUDPSession) EncodeServerPacket(method *CipherMethod, clientSessio
 }
 
 func (c *UDPCodec) EncodeServerPacket(clientSessionID uint64, dest net.Destination, payload []byte) ([]byte, error) {
-	return c.sessions.EncodeServerPacket(c.method, c.psk, clientSessionID, dest, payload)
+	s := c.sessions.GetOrCreate(clientSessionID)
+	if err := s.EnsureServerState(c.method, c.psk); err != nil {
+		return nil, err
+	}
+	return s.EncodeServerPacket(c.method, clientSessionID, dest, payload)
 }
 
 type serverSessionState struct {
@@ -728,7 +735,10 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			buf.ReleaseMulti(mb)
 			return err
 		}
-		_, writeErr := w.Writer.Write(pktBuf.Bytes())
+		n, writeErr := w.Writer.Write(pktBuf.Bytes())
+		if writeErr == nil && n != int(pktBuf.Len()) {
+			writeErr = io.ErrShortWrite
+		}
 		pktBuf.Release()
 		if writeErr != nil {
 			buf.ReleaseMulti(mb)

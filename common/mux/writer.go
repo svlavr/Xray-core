@@ -1,13 +1,61 @@
 package mux
 
 import (
+	"sync"
+
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/stats"
 )
+
+// The optional router serializes each native carrier frame operation while
+// retaining child-local decoded accounting.
+type frameWriter struct {
+	sync.Mutex
+	writer buf.Writer
+}
+
+func newFrameWriter(writer buf.Writer) *frameWriter {
+	return &frameWriter{writer: writer}
+}
+
+func (o *frameWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	o.Lock()
+	defer o.Unlock()
+	return o.writer.WriteMultiBuffer(mb)
+}
+
+func (o *frameWriter) Close() error {
+	// Serialize a buffered carrier flush with normal frame writes.
+	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
+		o.Lock()
+		defer o.Unlock()
+	}
+	return common.Close(o.writer)
+}
+
+func (o *frameWriter) Interrupt() {
+	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
+		o.Close()
+		return
+	}
+	// Pipe interruption must remain able to unblock a capacity-waiting frame.
+	common.Interrupt(o.writer)
+}
+
+func (o *frameWriter) writeFrame(mb buf.MultiBuffer, payload int32, flow stats.Exchange) error {
+	o.Lock()
+	defer o.Unlock()
+	err := o.writer.WriteMultiBuffer(mb)
+	if err == nil && payload > 0 {
+		flow.AddDownlink(uint64(payload))
+	}
+	return err
+}
 
 type Writer struct {
 	dest         net.Destination
@@ -18,6 +66,7 @@ type Writer struct {
 	transferType protocol.TransferType
 	globalID     [8]byte
 	inbound      *session.Inbound
+	receipt      stats.Exchange
 }
 
 func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, globalID [8]byte, inbound *session.Inbound) *Writer {
@@ -68,7 +117,7 @@ func (w *Writer) writeMetaOnly() error {
 	return w.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 }
 
-func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
+func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer, receipt stats.Exchange) error {
 	frame := buf.New()
 	if len(data) == 1 {
 		frame.UDP = data[0].UDP
@@ -83,6 +132,9 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	mb2 := make(buf.MultiBuffer, 0, len(data)+1)
 	mb2 = append(mb2, frame)
 	mb2 = append(mb2, data...)
+	if output, ok := writer.(*frameWriter); ok && receipt != nil {
+		return output.writeFrame(mb2, data.Len(), receipt)
+	}
 	return writer.WriteMultiBuffer(mb2)
 }
 
@@ -90,7 +142,7 @@ func (w *Writer) writeData(mb buf.MultiBuffer) error {
 	meta := w.getNextFrameMeta()
 	meta.Option.Set(OptionData)
 
-	return writeMetaWithFrame(w.writer, meta, mb)
+	return writeMetaWithFrame(w.writer, meta, mb, w.receipt)
 }
 
 // WriteMultiBuffer implements buf.Writer.

@@ -149,7 +149,14 @@ func (m *udpManager) close(uc *udpConn) {
 	if !uc.closed {
 		uc.closed = true
 		uc.queue.close()
-		delete(m.m, uc.src.NetAddr())
+		for {
+			if _, ok := uc.queue.pop(); !ok {
+				break
+			}
+		} // a retired owner must not retain its pending packets
+		if m.m[uc.src.NetAddr()] == uc {
+			delete(m.m, uc.src.NetAddr())
+		}
 	}
 }
 
@@ -237,7 +244,12 @@ func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			return nil, io.EOF
 		}
 
-		b := buf.New()
+		var b *buf.Buffer
+		if len(q.p) > buf.Size {
+			b = buf.NewWithSize(int32(len(q.p)))
+		} else {
+			b = buf.New()
+		}
 		if _, err := b.Write(q.p); err != nil {
 			errors.LogErrorInner(context.Background(), err, "drop packet to ", q.dest, " with size ", len(q.p))
 			b.Release()

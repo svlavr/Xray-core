@@ -1,6 +1,7 @@
 package pipe
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -35,7 +36,6 @@ type pipe struct {
 	readSignal  *signal.Notifier
 	writeSignal *signal.Notifier
 	done        *done.Instance
-	errChan     chan error
 	option      pipeOption
 	state       state
 }
@@ -75,9 +75,12 @@ func (p *pipe) getState(forRead bool) error {
 	}
 }
 
-func (p *pipe) readMultiBufferInternal() (buf.MultiBuffer, error) {
+func (p *pipe) readMultiBufferInternal(ctx context.Context) (buf.MultiBuffer, error) {
 	p.Lock()
 	defer p.Unlock()
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 
 	if err := p.getState(true); err != nil {
 		return nil, err
@@ -89,8 +92,16 @@ func (p *pipe) readMultiBufferInternal() (buf.MultiBuffer, error) {
 }
 
 func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	return p.readMultiBuffer(nil)
+}
+
+func (p *pipe) readMultiBuffer(ctx context.Context) (buf.MultiBuffer, error) {
+	var canceled <-chan struct{}
+	if ctx != nil {
+		canceled = ctx.Done()
+	}
 	for {
-		data, err := p.readMultiBufferInternal()
+		data, err := p.readMultiBufferInternal(ctx)
 		if data != nil || err != nil {
 			p.writeSignal.Signal()
 			return data, err
@@ -99,8 +110,8 @@ func (p *pipe) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		select {
 		case <-p.readSignal.Wait():
 		case <-p.done.Wait():
-		case err = <-p.errChan:
-			return nil, err
+		case <-canceled:
+			return nil, ctx.Err()
 		}
 	}
 }
@@ -110,7 +121,7 @@ func (p *pipe) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) 
 	defer timer.Stop()
 
 	for {
-		data, err := p.readMultiBufferInternal()
+		data, err := p.readMultiBufferInternal(nil)
 		if data != nil || err != nil {
 			p.writeSignal.Signal()
 			return data, err
@@ -125,9 +136,12 @@ func (p *pipe) ReadMultiBufferTimeout(d time.Duration) (buf.MultiBuffer, error) 
 	}
 }
 
-func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
+func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer, ctx context.Context) error {
 	p.Lock()
 	defer p.Unlock()
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	if err := p.getState(false); err != nil {
 		return err
@@ -142,12 +156,20 @@ func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
 }
 
 func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	return p.writeMultiBuffer(mb, nil)
+}
+
+func (p *pipe) writeMultiBuffer(mb buf.MultiBuffer, ctx context.Context) error {
 	if mb.IsEmpty() {
 		return nil
 	}
+	var canceled <-chan struct{}
+	if ctx != nil {
+		canceled = ctx.Done()
+	}
 
 	for {
-		err := p.writeMultiBufferInternal(mb)
+		err := p.writeMultiBufferInternal(mb, ctx)
 		if err == nil {
 			p.readSignal.Signal()
 			return nil
@@ -164,6 +186,9 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			case <-p.done.Wait():
 				buf.ReleaseMulti(mb)
 				return io.ErrClosedPipe
+			case <-canceled:
+				buf.ReleaseMulti(mb)
+				return ctx.Err()
 			}
 		}
 

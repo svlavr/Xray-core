@@ -194,14 +194,21 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 		user = sessionInbound.User
 	}
 
-	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+	cursor, observed := link.Reader.(*buf.InspectionReader)
+	if !observed {
+		link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+	}
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, _ := statsManager.GetOrRegisterCounter(name); c != nil {
-				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
+				if observed {
+					cursor.SetCounter(c)
+				} else {
+					link.Reader.(*buf.TimeoutWrapperReader).Counter = c
+				}
 			}
 		}
 		if p.Stats.UserDownlink {
@@ -283,15 +290,32 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	}
 
 	sniffingRequest := content.SniffingRequest
+	observation := session.LogicalObservationFromContext(ctx)
+	if observation != nil && !observation.ReturnedLink.CompareAndSwap(true, false) {
+		observation = nil
+	}
 	inbound, outbound := d.getLink(ctx)
-	if !sniffingRequest.Enabled {
-		go d.routedDispatch(ctx, outbound, destination)
-	} else {
-		go func() {
-			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
+	var cursor *buf.InspectionReader
+	if observation != nil {
+		lower := outbound.Reader
+		cursor = buf.NewInspectionReader(lower, observation.Exchange, func() { common.Interrupt(lower) })
+		cursor.InputAlreadyObserved = !observation.InputAtExecution
+		if observation.InputAtExecution && destination.Network == net.Network_UDP {
+			cursor.PacketDestination = destination
+		}
+		outbound.Reader = cursor
+	}
+	go func() {
+		if observation != nil {
+			defer cursor.Interrupt()
+		}
+		if sniffingRequest.Enabled {
+			var cReader sniffCursor = cursor
+			if cursor == nil {
+				cached := &cachedReader{reader: outbound.Reader.(*pipe.Reader)}
+				outbound.Reader = cached
+				cReader = cached
 			}
-			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 			if err == nil {
 				content.Protocol = result.Protocol()
@@ -314,9 +338,9 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 					ob.Target = destination
 				}
 			}
-			d.routedDispatch(ctx, outbound, destination)
-		}()
-	}
+		}
+		d.routedDispatch(ctx, outbound, destination)
+	}()
 	return inbound, nil
 }
 
@@ -343,10 +367,14 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if !sniffingRequest.Enabled {
 		d.routedDispatch(ctx, outbound, destination)
 	} else {
-		cReader := &cachedReader{
-			reader: outbound.Reader.(buf.TimeoutReader),
+		var cReader sniffCursor
+		if cursor, ok := outbound.Reader.(*buf.InspectionReader); ok {
+			cReader = cursor
+		} else {
+			cached := &cachedReader{reader: outbound.Reader.(buf.TimeoutReader)}
+			outbound.Reader = cached
+			cReader = cached
 		}
-		outbound.Reader = cReader
 		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 		if err == nil {
 			content.Protocol = result.Protocol()
@@ -375,7 +403,15 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	return nil
 }
 
-func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
+type sniffCursor interface {
+	Cache(*buf.Buffer, time.Duration) error
+}
+
+type inspectionCarrierHandler interface {
+	IsInspectionCarrier(context.Context) bool
+}
+
+func sniffer(ctx context.Context, cReader sniffCursor, metadataOnly bool, network net.Network) (SniffResult, error) {
 	payload := buf.NewWithSize(32767)
 	defer payload.Release()
 
@@ -436,6 +472,17 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	ob := outbounds[len(outbounds)-1]
 
 	var handler outbound.Handler
+	observation := session.LogicalObservationFromContext(ctx)
+	// Only the admitted endpoint binds P1 facts. Returned-link continuations and
+	// physical detours need their own P2 owner integration.
+	if _, ok := link.Reader.(*buf.InspectionReader); !ok {
+		observation = nil
+	}
+	reject := func() {
+		if observation != nil {
+			observation.Exchange.Unassign()
+		}
+	}
 
 	routingLink := routing_session.AsRoutingContext(ctx)
 	inTag := routingLink.GetInboundTag()
@@ -448,6 +495,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			handler = h
 		} else {
 			errors.LogError(ctx, "non existing tag for platform initialized detour: ", forcedOutboundTag)
+			reject()
 			common.Close(link.Writer)
 			common.Interrupt(link.Reader)
 			return
@@ -465,6 +513,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 				handler = h
 			} else {
 				errors.LogWarning(ctx, "non existing outTag: ", outTag)
+				reject()
 				common.Close(link.Writer)
 				common.Interrupt(link.Reader)
 				return // DO NOT CHANGE: the traffic shouldn't be processed by default outbound if the specified outbound tag doesn't exist (yet), e.g., VLESS Reverse Proxy
@@ -480,13 +529,26 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 
 	if handler == nil {
 		errors.LogInfo(ctx, "default outbound handler not exist")
+		reject()
 		common.Close(link.Writer)
 		common.Interrupt(link.Reader)
 		return
 	}
 
+	if observation != nil {
+		if carrier, ok := handler.(inspectionCarrierHandler); ok && carrier.IsInspectionCarrier(ctx) && observation.Exchange.ExcludeCarrier() {
+			observation = nil
+		}
+	}
+	if observation != nil {
+		observation.Exchange.Route(stats.OutboundRef{Tag: handler.Tag()})
+	}
 	ob.Tag = handler.Tag()
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
+		// Publication may be asynchronous. A recursive route must not mutate
+		// the message already being formatted for an earlier selection.
+		accessCopy := *accessMessage
+		accessMessage = &accessCopy
 		if tag := handler.Tag(); tag != "" {
 			if inTag == "" {
 				accessMessage.Detour = tag

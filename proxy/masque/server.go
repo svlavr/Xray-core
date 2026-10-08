@@ -522,6 +522,7 @@ func (s *Server) handleConnection(conn net.Conn, dest net.Destination) {
 		User:          t.user,
 	}
 	ctx = session.ContextWithInbound(ctx, &inbound)
+	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUser)
 	ctx = session.ContextWithContent(ctx, &session.Content{
 		SniffingRequest: s.sniffing,
 	})

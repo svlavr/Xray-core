@@ -58,6 +58,7 @@ type Handler struct {
 	tag             string
 	senderSettings  *proxyman.SenderConfig
 	streamSettings  *internet.MemoryStreamConfig
+	cancelTransport context.CancelFunc
 	proxyConfig     proto.Message
 	proxy           proxy.Outbound
 	mux             *mux.ClientManager
@@ -166,6 +167,11 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 	}
 
 	h.proxy = proxyHandler
+	if h.streamSettings != nil {
+		owner, cancel := context.WithCancel(context.Background())
+		h.streamSettings.Owner = owner
+		h.cancelTransport = cancel
+	}
 	return h, nil
 }
 
@@ -184,7 +190,7 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
 			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
 		}
-		ips, err := internet.LookupForIP(ob.Target.Address.Domain(), strategy, nil)
+		ips, err := internet.LookupForIPContext(ctx, ob.Target.Address.Domain(), strategy, nil)
 		if err != nil {
 			errors.LogInfoInner(ctx, err, "failed to resolve ip for target ", ob.Target.Address.Domain())
 			if h.senderSettings.TargetStrategy.ForceIP() {
@@ -329,6 +335,9 @@ func (h *Handler) Start() error {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
+	if h.cancelTransport != nil {
+		h.cancelTransport()
+	}
 	common.Close(h.mux)
 	common.Close(h.proxy)
 	return nil

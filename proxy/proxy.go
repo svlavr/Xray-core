@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -102,6 +103,7 @@ type GetOutbound interface {
 // TrafficState is used to track uplink and downlink of one connection
 // It is used by XTLS to determine if switch to raw copy mode, It is used by Vision to calculate padding
 type TrafficState struct {
+	mu                     sync.Mutex // classifier/transform state; never held across socket I/O
 	UserUUID               []byte
 	NumberOfPacketToFilter int
 	EnableXtls             bool
@@ -205,6 +207,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if buffer.IsEmpty() {
 		return buffer, err
 	}
+	w.trafficState.mu.Lock()
+	defer w.trafficState.mu.Unlock()
 
 	var withinPaddingBuffers *bool
 	var remainingContent *int32
@@ -298,6 +302,7 @@ type VisionWriter struct {
 	// internal
 	writeOnceUserUUID  []byte
 	directWriteCounter stats.Counter
+	receipt            stats.Exchange
 
 	testseed []uint32
 }
@@ -321,6 +326,11 @@ func NewVisionWriter(writer buf.Writer, trafficState *TrafficState, isUplink boo
 }
 
 func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	var payload uint64
+	if w.receipt != nil {
+		payload = uint64(mb.Len())
+	}
+	w.trafficState.mu.Lock()
 	var isPadding *bool
 	var switchToDirectCopy *bool
 	var spliceReadyInbound *session.Inbound
@@ -357,7 +367,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 	if *isPadding {
 		if len(mb) == 1 && mb[0] == nil {
-			mb[0] = XtlsPadding(nil, CommandPaddingContinue, &w.writeOnceUserUUID, true, w.ctx, w.testseed) // we do a long padding to hide vless header
+			mb[0] = XtlsPadding(nil, CommandPaddingContinue, &w.writeOnceUserUUID, true, w.ctx, w.testseed) // hide the VLESS header
 		} else {
 			isComplete := IsCompleteRecord(mb)
 			mb = ReshapeMultiBuffer(w.ctx, mb)
@@ -394,8 +404,12 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 	}
+	w.trafficState.mu.Unlock()
 	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
 		return err
+	}
+	if w.receipt != nil && payload != 0 {
+		w.receipt.AddDownlink(payload)
 	}
 	if spliceReadyInbound != nil && spliceReadyInbound.CanSpliceCopy == 2 {
 		// Enable splice only after this write has completed to avoid racing
@@ -404,6 +418,17 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	}
 	return nil
 }
+
+// WithWriterReceipt binds the decoded Vision operation while preserving the
+// native transform and raw-transition writer order.
+func (w *VisionWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
+	w.receipt = flow
+	return w
+}
+
+// WriterReceipt allows the native raw handoff to retain the same payload sink.
+// CopyRawConnIfExist separately checks that the native transition is ready.
+func (w *VisionWriter) WriterReceipt() stats.Exchange { return w.receipt }
 
 // IsCompleteRecord Is complete tls data record
 func IsCompleteRecord(buffer buf.MultiBuffer) bool {
@@ -772,6 +797,21 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
+			receipt := endpointWriterReceipt(writer)
+			if receipt != nil {
+				rawReceipt := rawCopyReceipt{exchange: receipt, readCounter: readCounter, writeCounter: writeCounter}
+				if statWriter != nil {
+					rawReceipt.userCounter = statWriter.Counter
+				}
+				handled, err := copySpliceProgress(tc, readerConn, &rawReceipt)
+				if !handled {
+					return readV(ctx, reader, writer, timer, readCounter)
+				}
+				if err != nil && errors.Cause(err) != io.EOF {
+					return err
+				}
+				return nil
+			}
 			w, err := tc.ReadFrom(readerConn)
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats
@@ -814,6 +854,16 @@ func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer sign
 	return nil
 }
 
+func endpointWriterReceipt(writer buf.Writer) stats.Exchange {
+	for {
+		wrapped, ok := writer.(*dispatcher.SizeStatWriter)
+		if !ok {
+			return buf.WriterReceipt(writer)
+		}
+		writer = wrapped.Writer
+	}
+}
+
 func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
 	iConn := stat.TryUnwrapStatsConn(conn)
 	iConn = finalmask.UnwrapTcpMask(iConn)
@@ -821,4 +871,28 @@ func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
 	_, ok2 := iConn.(*net.TCPConn)
 	_, ok3 := iConn.(*internet.UnixConnWrapper)
 	return ok1 || ok2 || ok3
+}
+
+// rawCopyReceipt is the bounded set of existing sinks updated for every
+// positive destination-pump result. Callers must not repeat a final addition.
+type rawCopyReceipt struct {
+	exchange     stats.Exchange
+	readCounter  stats.Counter
+	writeCounter stats.Counter
+	userCounter  stats.Counter
+}
+
+func (r *rawCopyReceipt) add(n int64) {
+	if r.exchange != nil {
+		r.exchange.AddDownlink(uint64(n))
+	}
+	if r.readCounter != nil {
+		r.readCounter.Add(n)
+	}
+	if r.writeCounter != nil {
+		r.writeCounter.Add(n)
+	}
+	if r.userCounter != nil {
+		r.userCounter.Add(n)
+	}
 }

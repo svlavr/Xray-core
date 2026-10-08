@@ -140,6 +140,11 @@ func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x50
 }
 
 func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destination) (net.Conn, error) {
+	defer func() {
+		if c != nil {
+			c.Close()
+		}
+	}()
 	localAddr := c.LocalAddr().String()
 	uConn := &UConn{
 		Config: config,
@@ -207,6 +212,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 	}
 	if !uConn.Verified {
 		errors.LogError(ctx, "REALITY: received real certificate (potential MITM or redirection)")
+		c = nil // The spider owns the established connection.
 		go func() {
 			client := &http.Client{
 				Transport: &http2.Transport{
@@ -298,6 +304,7 @@ func UClient(c net.Conn, config *Config, ctx context.Context, dest net.Destinati
 		time.Sleep(time.Duration(crypto.RandBetween(config.SpiderY[8], config.SpiderY[9])) * time.Millisecond) // return
 		return nil, errors.New("REALITY: processed invalid connection")
 	}
+	c = nil
 	return uConn, nil
 }
 
