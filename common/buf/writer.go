@@ -21,10 +21,17 @@ type BufferToBytesWriter struct {
 
 // Write implements io.Writer and records the native scalar write result when observed.
 func (w *BufferToBytesWriter) Write(payload []byte) (int, error) {
+	var n int
+	var err error
 	if w.receipt == nil {
-		return w.Writer.Write(payload)
+		n, err = w.Writer.Write(payload)
+	} else {
+		n, err = WriteBytesWithReceipt(w.Writer, payload, w.receipt)
 	}
-	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
+	if w.counter != nil && n > 0 {
+		w.counter.Add(int64(n))
+	}
+	return n, err
 }
 
 // WriteMultiBuffer implements Writer. This method takes ownership of the given buffer.
@@ -37,7 +44,7 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) (err error) {
 	}
 
 	if len(mb) == 1 {
-		return WriteAllBytes(w, mb[0].Bytes(), w.counter)
+		return WriteAllBytes(w, mb[0].Bytes(), nil)
 	}
 
 	if cap(w.cache) < len(mb) {

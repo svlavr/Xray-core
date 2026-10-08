@@ -89,11 +89,14 @@ jobs:
         run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
       - name: Vet Measurement and VMess
         run: go vet -mod=readonly ./measurement ./proxy/vmess/...
+      - name: Isolated SOCKS datagram boundary repeat
+        if: runner.os == 'Linux'
+        run: go test -mod=readonly -race -timeout 5m -count=10 -p 1 -run '^TestAdditionalProtocolMeasurements$/^socks$/^(packet-boundary|ipv6)$' ./measurement
       - name: Test
         shell: bash
         run: |
           set -euo pipefail
-          go test -mod=readonly -timeout 1h -v ./... 2>&1 | tee "$RUNNER_TEMP/measurement-profiles.log"
+          go test -mod=readonly -p 1 -timeout 1h -v ./... 2>&1 | tee "$RUNNER_TEMP/measurement-profiles.log"
       - name: Require all Measurement profile cells
         if: ${{ !cancelled() }}
         shell: bash
@@ -179,6 +182,22 @@ jobs:
           go test -mod=readonly -race -timeout 1h -count=2
           -run '^TestStageBDoHPooledSiblingCancellation$'
           ./app/dns
+      - name: Native scalar counter regression and pre-fix negative control
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 https://github.com/svlavr/Xray-core.git c9a691a3d477a85168f8a1519444b88f258d4cd6
+          git show c9a691a3d477a85168f8a1519444b88f258d4cd6:common/buf/writer.go > "$RUNNER_TEMP/native-writer-before.go"
+          python -c 'import json, os; from pathlib import Path; p=Path(os.environ["RUNNER_TEMP"]); (p/"native-before.json").write_text(json.dumps({"Replace": {str(Path("common/buf/writer.go").resolve()): str(p/"native-writer-before.go")}}))'
+          set +e
+          go test -mod=readonly -race -timeout 5m -count=1 -overlay "$RUNNER_TEMP/native-before.json" -run '^TestNativeCounterWriterScalarResult$' ./common/buf > "$RUNNER_TEMP/native-before.log" 2>&1
+          before_status=$?
+          set -e
+          cat "$RUNNER_TEMP/native-before.log"
+          test "$before_status" -ne 0
+          grep -q 'native accepted bytes: lower=6 counter=0 want=6' "$RUNNER_TEMP/native-before.log"
+          go test -mod=readonly -race -timeout 5m -count=3 -run '^TestNativeCounterWriter' ./common/buf
       - name: Smoke test API, packet accounting and capture benchmarks
         if: ${{ !cancelled() }}
         shell: bash
