@@ -47,6 +47,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           go mod verify
+      - name: Verify combined coverage gate negative controls
+        if: ${{ !cancelled() }}
+        run: python -m unittest discover -s .github/ci -p 'test_check_b7_coverage.py'
 
   upstream-tests:
     if: github.repository == 'svlavr/Xray-core'
@@ -95,6 +98,10 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: python .github/ci/check_measurement_coverage.py "$RUNNER_TEMP/measurement-profiles.log"
+      - name: Require concurrent USER and Measurement B7 cells
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: python .github/ci/check_b7_coverage.py "$RUNNER_TEMP/measurement-profiles.log"
       - name: Darwin UDP ownership and dual-stack regressions
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         run: go test -mod=readonly -race -timeout 10m -count=2 -run '^TestSystemUDP' ./transport/internet
@@ -204,6 +211,13 @@ jobs:
         run: >-
           go test -mod=readonly -race -timeout 1h -count=1
           ./measurement ./proxy/hysteria ./transport/internet/hysteria ./transport/internet/tls
+      - name: Repeat combined USER and Measurement races
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=readonly -race -v -timeout 30m -count=2 -run '^TestB7' ./measurement 2>&1 | tee "$RUNNER_TEMP/b7-races.log"
+          python .github/ci/check_b7_coverage.py "$RUNNER_TEMP/b7-races.log" --repetitions 2
       - name: Complete native Measurement companion races
         if: ${{ !cancelled() }}
         shell: bash

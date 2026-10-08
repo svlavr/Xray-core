@@ -70,10 +70,21 @@ func instance(t testing.TB, apps ...*serial.TypedMessage) *core.Instance {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if b7Enabled {
+		view, err := core.EnableFlowInspection(v, b7ObservationOptions)
+		if err != nil {
+			v.Close()
+			t.Fatal(err)
+		}
+		b7Views.Store(v, view)
+	}
 	if err := v.Start(); err != nil {
+		b7Views.Delete(v)
+		v.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		b7Views.Delete(v)
 		if err := v.Close(); err != nil {
 			t.Error(err)
 		}

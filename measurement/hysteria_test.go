@@ -440,6 +440,7 @@ type protocolDispatchWitness struct {
 }
 
 func (h *protocolDispatchWitness) Dispatch(ctx context.Context, link *transport.Link) {
+	b7RememberOrdinary(ctx)
 	if session.TrafficOriginFromContext(ctx) == session.TrafficOriginControlledMeasurement {
 		h.counter.Add(1)
 	}
@@ -510,6 +511,9 @@ func testProtocolMeasurementsAt(t *testing.T, e *measurement.Executor, v *core.I
 	t.Helper()
 	if v != nil {
 		testProtocolWorkingNode(t, e, v, tunnelHost, exactUDP)
+	}
+	if b7Enabled {
+		return
 	}
 	if carrierDials != nil {
 		return

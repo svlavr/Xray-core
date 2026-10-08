@@ -64,10 +64,12 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 		defer cancel()
 		var connections []net.Conn
+		var connectionRoutes []measurement.Route
 		var destinations []xnet.Destination
 		var globalIDs [][8]byte
 		var remoteEntries []*mux.XUDP
 		var echoTimes []time.Duration
+		var b7 *b7OrdinaryFacts
 		defer func() {
 			for _, c := range connections {
 				c.Close()
@@ -133,6 +135,7 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 				t.Fatalf("ordinary connection%d stalled", index)
 			}
 			echoTimes = append(echoTimes, time.Since(started))
+			b7.receipt(connectionRoutes[index], len(payload))
 			if id := globalIDs[index]; id != [8]byte{} {
 				mux.XUDPManager.Lock()
 				entry := mux.XUDPManager.Map[id]
@@ -152,6 +155,7 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 			for index := range connections {
 				exchangeOrdinary(t, index)
 			}
+			b7.check(t, false)
 		}
 		for _, route := range routes {
 			r := request(cold, route.Kind)
@@ -165,6 +169,7 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 			}
 		}
 		cold.Close()
+		b7 = b7BeginOrdinary(t, v, exactUDP)
 		if carrierDials != nil {
 			carrierDials.mu.Lock()
 			carrierDials.uploads = make(map[string]map[string]int)
@@ -181,6 +186,7 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 				}
 				var c net.Conn
 				var err error
+				var source xnet.Destination
 				dest, parseErr := xnet.ParseDestination(network + ":" + addr)
 				if parseErr != nil {
 					t.Fatal(parseErr)
@@ -193,6 +199,10 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 						dest.Address = xnet.ParseAddress(tunnelHost)
 					}
 					ordinary := session.ContextWithTrafficOrigin(session.SetForcedOutboundTagToContext(ctx, route.Tag), session.TrafficOriginUser)
+					if b7 != nil {
+						source = xnet.Destination{Network: dest.Network, Address: xnet.LocalHostIP, Port: xnet.Port(40000 + len(connections))}
+						ordinary = session.ContextWithInbound(ordinary, &session.Inbound{Name: "socks", Source: source})
+					}
 					if carrierDials != nil && network == "udp" {
 						sender, err := v.GetFeature(outbound.ManagerType()).(outbound.Manager).GetHandler(route.Tag).SenderSettings().GetInstance()
 						if err != nil {
@@ -211,11 +221,16 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 						}
 					}
 					c, err = core.Dial(ordinary, v, dest)
+					if inbound := session.InboundFromContext(ordinary); inbound != nil {
+						source = inbound.Source
+					}
 				}
 				if err != nil {
 					t.Fatal(err)
 				}
 				connections = append(connections, c)
+				b7.endpoint(route, dest, source)
+				connectionRoutes = append(connectionRoutes, route)
 				destinations = append(destinations, dest)
 				globalIDs = append(globalIDs, globalID)
 				remoteEntries = append(remoteEntries, nil)
@@ -265,6 +280,13 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 						t.Fatal("UDP did not reach peer")
 					}
 					pulse(t)
+					if b7 != nil && route.Kind == measurement.ExactOutbound {
+						dest, err := xnet.ParseDestination("udp:" + r.Destination.String())
+						if err != nil {
+							t.Fatal(err)
+						}
+						b7.checkLive(t, fsB7Expected(dest, route.Tag))
+					}
 					if mode == "cancel" {
 						cancel()
 					} else {
@@ -316,6 +338,10 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 						request.URL = protocolFixtureURL(request.URL, route, tunnelHost)
 						ctx, cancel := context.WithCancel(ctx)
 						defer cancel()
+						if b7 != nil && wave == 0 && route.Kind == measurement.ExactOutbound && route.Tag == "exact" && mode == "success" {
+							ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginUser)
+							ctx = session.ContextWithLogicalObservation(ctx, b7InheritedOrdinary(t))
+						}
 						done := make(chan struct{})
 						var receipt measurement.HTTPSReceipt
 						var err error
@@ -328,6 +354,9 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 							t.Fatal("exchange did not reach peer")
 						}
 						pulse(t)
+						if b7 != nil && route.Kind == measurement.ExactOutbound {
+							b7.checkLive(t, fsB7Expected(b7HTTPDestination(request.URL), route.Tag))
+						}
 						if mode == "cancel" {
 							cancel()
 						} else {
@@ -379,6 +408,7 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 		if len(accepted) != 3 {
 			t.Fatal("ordinary TCP sessions were replaced")
 		}
+		b7.finish(t, connections)
 	})
 }
 
@@ -551,6 +581,9 @@ func (xmuxFixtureConn) IsClosed() bool { return false }
 // random payload. Writer acceptance alone does not establish peer delivery.
 func testProtocolPacketBoundary(t *testing.T, e *measurement.Executor, tunnelHost string, limit int, aboveReachesPeer bool) {
 	t.Helper()
+	if b7Enabled {
+		return
+	}
 	if carrierDials != nil {
 		return
 	}
