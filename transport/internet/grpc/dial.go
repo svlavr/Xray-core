@@ -69,14 +69,19 @@ func dialgRPC(ctx context.Context, dest net.Destination, streamSettings *interne
 	}
 	if grpcSettings.MultiMode {
 		errors.LogDebug(ctx, "using gRPC multi mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunMultiStreamName()+"`")
-		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(ctx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
-		if err != nil {
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		closeStream := func() {
+			cancelStream()
 			if closeClient != nil {
 				closeClient()
 			}
+		}
+		grpcService, err := client.(encoding.GRPCServiceClientX).TunMultiCustomName(streamCtx, grpcSettings.getServiceName(), grpcSettings.getTunMultiStreamName())
+		if err != nil {
+			closeStream()
 			return nil, errors.New("Cannot dial gRPC").Base(err)
 		}
-		return encoding.NewMultiHunkConn(grpcService, closeClient, nil), nil
+		return encoding.NewMultiHunkConn(grpcService, closeStream, nil), nil
 	}
 
 	errors.LogDebug(ctx, "using gRPC tun mode service name: `"+grpcSettings.getServiceName()+"` stream name: `"+grpcSettings.getTunStreamName()+"`")

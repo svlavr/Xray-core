@@ -143,7 +143,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}, sessionPolicy.Timeouts.ConnectionIdle)
 
-	if request.Command == protocol.RequestCommandUDP && h.cone && request.Port != 53 && request.Port != 443 {
+	// Controlled UDP needs source-bearing responses on this invocation only.
+	requirePacketSource := session.TrafficOriginFromContext(ctx) == session.TrafficOriginControlledMeasurement && session.UDPPacketSourceRequired(ctx)
+	if request.Command == protocol.RequestCommandUDP && ((h.cone && request.Port != 53 && request.Port != 443) || requirePacketSource) {
 		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")
 		request.Port = net.Port(666)

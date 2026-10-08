@@ -111,7 +111,11 @@ func (h *MultiHunkReaderWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 func (h *MultiHunkReaderWriter) Close() error {
 	if h.cancel != nil {
+		h.done.Close()
+		// Native cancellation releases Send/Recv without racing CloseSend against
+		// a concurrent Send. It ends this RPC, not its cached client channel.
 		h.cancel()
+		return nil
 	}
 	if sc, match := h.hc.(StreamCloser); match {
 		return sc.CloseSend()

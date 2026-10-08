@@ -80,8 +80,21 @@ jobs:
       - name: Restore and verify geodat
         shell: pwsh
         run: ./.github/build/prepare-assets.ps1
+      - name: Enable native ICMP for runner group
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
+      - name: Vet Measurement and VMess
+        run: go vet -mod=readonly ./measurement ./proxy/vmess/...
       - name: Test
-        run: go test -mod=readonly -timeout 1h -v ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=readonly -timeout 1h -v ./... 2>&1 | tee "$RUNNER_TEMP/measurement-profiles.log"
+      - name: Require all Measurement profile cells
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: python .github/ci/check_measurement_coverage.py "$RUNNER_TEMP/measurement-profiles.log"
       - name: Darwin UDP ownership and dual-stack regressions
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         run: go test -mod=readonly -race -timeout 10m -count=2 -run '^TestSystemUDP' ./transport/internet
@@ -107,6 +120,10 @@ jobs:
       - name: Restore and verify geodat
         shell: pwsh
         run: ./.github/build/prepare-assets.ps1
+      - name: Enable native ICMP for runner group
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
       - name: Race test
         run: go test -mod=readonly -race -timeout 1h ./...
 
@@ -131,6 +148,10 @@ jobs:
       - name: Restore and verify geodat
         shell: pwsh
         run: ./.github/build/prepare-assets.ps1
+      - name: Enable native ICMP for runner group
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
       - name: Repeat control, statistics and DNS ownership regressions
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
@@ -178,3 +199,17 @@ jobs:
           ./common/mux ./proxy ./proxy/hysteria ./proxy/shadowsocks_2022 ./proxy/trojan
           ./proxy/vmess/encoding ./transport/internet ./transport/internet/grpc/...
           ./transport/internet/hysteria ./transport/internet/websocket ./transport/internet/splithttp
+      - name: Complete Measurement operation and profile races
+        if: ${{ !cancelled() }}
+        run: >-
+          go test -mod=readonly -race -timeout 1h -count=1
+          ./measurement ./proxy/hysteria ./transport/internet/hysteria ./transport/internet/tls
+      - name: Complete native Measurement companion races
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=readonly -race -timeout 1h -count=1 -p 1 -run '^TestMeasurement' ./transport/internet/websocket ./common/mux ./transport/internet/grpc/encoding ./proxy
+          go test -mod=readonly -race -timeout 1h -count=1 -p 1 -run '^TestMeasurementPacket' ./proxy/trojan ./proxy/shadowsocks_2022
+          go test -mod=readonly -race -timeout 3m -count=1 -run '^TestSystemUDP' ./transport/internet
+          go test -mod=readonly -race -timeout 10m -count=2 -run '^(TestGRPCMultiMode|TestMultiHunk|TestMeasurementInheritedObservation)' ./transport/internet/grpc/... ./measurement

@@ -1,0 +1,38 @@
+name: CI / Network Diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  network-diagnostics:
+    if: github.repository == 'svlavr/Xray-core' && github.ref == 'refs/heads/codex/xray-unified'
+    name: Network Diagnostics / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-latest, go: '1.27.0' }
+          - { name: Windows, os: windows-latest, go: '1.27.0' }
+          - { name: macOS, os: macos-latest, go: '1.27.1' }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Record bounded native UDP and ECH observations
+        env:
+          XRAY_NETWORK_DIAGNOSTICS: '1'
+        run: go test -mod=readonly -v -count=1 -timeout 5m -run '^TestNetworkDiagnostics$' ./measurement
+      - name: Repeat original missing-reply cases without changing assertions
+        if: ${{ !cancelled() }}
+        run: go test -mod=readonly -v -count=50 -timeout 3m -run '^(TestUDPEchoWrongAddressAndVisibleOversizedEmptyPackets|TestSenderMUXProfileMeasurements)$/^persistent-xudp$/^working-node$/^UDP$/^1-$/^malformed$' ./measurement
+      - name: Validate native Darwin UDP allocation and packet compatibility
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        env:
+          XRAY_NATIVE_UDP_DIAGNOSTICS: '1'
+        run: go test -mod=readonly -race -v -count=1 -timeout 3m -run '^TestSystemUDP' ./transport/internet
