@@ -49,8 +49,11 @@ func TestTrojanPacketWriteErrorsAndBufferRelease(t *testing.T) {
 				mb = append(mb, second)
 			}
 			err := writer.WriteMultiBuffer(mb)
-			if (mode == "full-error" || mode == "encode-error") != (err != nil) {
+			if err == nil {
 				t.Fatalf("native error behavior changed: %v", err)
+			}
+			if mode == "second-short-nil" && !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("short packet write did not preserve its error: %v", err)
 			}
 			for _, b := range mb {
 				if !b.IsEmpty() {

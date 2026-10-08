@@ -266,7 +266,9 @@ func (c *Config) getCustomCA(owner *RandCarrier) *certificateSet[*Certificate] {
 		}
 		index := set.append(cloneCertificateConfig(entry))
 		setupOcspTicker(owner, entry, func(isReloaded, _ bool) {
-			if isReloaded {
+			// Separate file replacements can expose an incomplete or mismatched
+			// pair. Keep the last valid authority until both files form a pair.
+			if isReloaded && parseCertificateEntry(entry) != nil {
 				set.replace(index, cloneCertificateConfig(entry))
 			}
 		})

@@ -174,7 +174,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: >-
           go test -mod=readonly -race -timeout 15m -count=2
-          -run '^(TestMeasurement|TestGRPC|TestResponseCommand|TestXHTTPManager|TestMaxConnections|TestCMaxReuseTimes|TestMaxConcurrency|TestDefault$|TestSystemUDP)'
+          -run '^(TestMeasurement|TestTrojanPacket|TestGRPC|TestResponseCommand|TestXHTTPManager|TestMaxConnections|TestCMaxReuseTimes|TestMaxConcurrency|TestDefault$|TestSystemUDP)'
           ./common/mux ./proxy ./proxy/hysteria ./proxy/shadowsocks_2022 ./proxy/trojan
           ./proxy/vmess/encoding ./transport/internet ./transport/internet/grpc/...
           ./transport/internet/hysteria ./transport/internet/websocket ./transport/internet/splithttp

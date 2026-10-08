@@ -354,6 +354,30 @@ func TestCertificateAuthorityReloadKeepsSharedInputAndIssuedFacts(t *testing.T) 
 		t.Fatal(err)
 	}
 	oldIssuer := bytes.Clone(old.Leaf.RawIssuer)
+	for _, mode := range []string{"incomplete-certificate", "mismatched-key"} {
+		certificate := []byte("incomplete CA replacement")
+		if mode == "mismatched-key" {
+			certificate, _ = nextCA.ToPEM()
+		}
+		if err := os.WriteFile(entry.CertificatePath, certificate, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Keep each invalid replacement across the native one-second reload.
+		// Fresh handshakes must continue to use the last complete authority.
+		deadline := time.Now().Add(1200 * time.Millisecond)
+		for attempt := 0; time.Now().Before(deadline); attempt++ {
+			for _, c := range native {
+				state, err := reloadHandshake(c, fmt.Sprintf("%s-%d.invalid", mode, attempt), gotls.VersionTLS13)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(state.PeerCertificates[0].RawIssuer, oldIssuer) {
+					t.Fatal("invalid replacement displaced the last valid authority")
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 	write(nextCA)
 	expected, err := x509.ParseCertificate(nextCA.Certificate)
 	if err != nil {
