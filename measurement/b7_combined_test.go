@@ -34,6 +34,7 @@ var (
 	b7Views              sync.Map // *core.Instance -> fs.FlowInspection
 	b7UserMu             sync.Mutex
 	b7UserObservation    *session.LogicalObservation
+	b7UserRuntime        fs.RuntimeID
 )
 
 func b7View(v *core.Instance) fs.FlowInspection {
@@ -52,7 +53,8 @@ func b7RememberOrdinary(ctx context.Context) {
 		return
 	}
 	b7UserMu.Lock()
-	if b7UserObservation == nil {
+	ref := observation.Exchange.Ref()
+	if b7UserObservation == nil && ref.Runtime == b7UserRuntime && ref.ID != 0 {
 		b7UserObservation = observation
 	}
 	b7UserMu.Unlock()
@@ -64,6 +66,9 @@ func b7InheritedOrdinary(t *testing.T) *session.LogicalObservation {
 	defer b7UserMu.Unlock()
 	if b7UserObservation == nil {
 		t.Fatal("native USER dispatch did not retain its real endpoint observation")
+	}
+	if ref := b7UserObservation.Exchange.Ref(); ref.Runtime != b7UserRuntime || ref.ID == 0 {
+		t.Fatal("inherited USER observation belongs to another runtime")
 	}
 	return b7UserObservation
 }
@@ -101,6 +106,7 @@ func b7BeginOrdinary(t *testing.T, v *core.Instance, exactUDP bool) *b7OrdinaryF
 	}
 	b7UserMu.Lock()
 	b7UserObservation = nil
+	b7UserRuntime = view.Runtime()
 	b7UserMu.Unlock()
 	b := &b7OrdinaryFacts{view: view, tags: make(map[string]fs.ClientTotals), capture: capture, lastAt: totals.At, minLiveUser: 2, nativeManager: v.GetFeature(fs.ManagerType()).(fs.Manager), nativeStart: make(map[string]int64)}
 	if exactUDP {
