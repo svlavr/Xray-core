@@ -106,3 +106,19 @@ jobs:
         run: ./.github/build/prepare-assets.ps1
       - name: Race test
         run: go test -mod=readonly -race -timeout 1h ./...
+
+  fork-regression-tests:
+    if: github.repository == 'svlavr/Xray-core'
+    name: Fork Regression Tests
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: TLS certificate publication and lifecycle races
+        run: go test -mod=readonly -race -timeout 5m -count=2 ./transport/internet/tls
+      - name: Native outbound tag-cache functionality
+        run: go test -mod=readonly -timeout 2m -count=1 -run '^TestTagsCache$' ./app/proxyman/outbound

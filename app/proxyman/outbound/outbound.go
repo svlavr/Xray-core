@@ -105,7 +105,6 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 	defer m.access.Unlock()
 
 	m.tagsCache = &sync.Map{}
-
 	if m.defaultHandler == nil {
 		m.defaultHandler = handler
 	}
@@ -150,8 +149,10 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 	m.access.RLock()
 	defer m.access.RUnlock()
 
-	response := make([]outbound.Handler, len(m.untaggedHandlers))
-	copy(response, m.untaggedHandlers)
+	response := make([]outbound.Handler, 0, len(m.untaggedHandlers)+len(m.taggedHandler))
+	for _, e := range m.untaggedHandlers {
+		response = append(response, e)
+	}
 
 	for _, v := range m.taggedHandler {
 		response = append(response, v)
@@ -163,12 +164,11 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 // Select implements outbound.HandlerSelector.
 func (m *Manager) Select(selectors []string) []string {
 	key := strings.Join(selectors, ",")
+	m.access.RLock()
+	defer m.access.RUnlock()
 	if cache, ok := m.tagsCache.Load(key); ok {
 		return cache.([]string)
 	}
-
-	m.access.RLock()
-	defer m.access.RUnlock()
 
 	tags := make([]string, 0, len(selectors))
 

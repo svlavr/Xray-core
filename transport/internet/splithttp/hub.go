@@ -435,6 +435,7 @@ type Listener struct {
 	h3server   *http3.Server
 	listener   net.Listener
 	h3listener http3.QUICListener
+	tlsConfig  *gotls.Config
 	config     *Config
 	addConn    internet.ConnHandler
 	isH3       bool
@@ -460,6 +461,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		socketSettings: streamSettings.SocketSettings,
 	}
 	tlsConfig := getTLSConfig(streamSettings)
+	l.tlsConfig = tlsConfig
 	l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
 
 	var err error
@@ -472,6 +474,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			pktConn, err = internet.ListenSystemPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings.SocketSettings)
 		}
 		if err != nil {
+			tls.CloseConfig(l.tlsConfig)
 			return nil, errors.New("failed to listen UDP for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 
@@ -502,6 +505,9 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 
 		l.h3listener, err = tr.ListenEarly(tlsConfig, quicConfig)
 		if err != nil {
+			_ = tr.Close()
+			_ = pktConn.Close()
+			tls.CloseConfig(l.tlsConfig)
 			return nil, errors.New("failed to listen QUIC for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 		l.h3listener = &QListener{
@@ -535,6 +541,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			l.listener, err = internet.ListenSystem(ctx, addr, streamSettings.SocketSettings)
 		}
 		if err != nil {
+			tls.CloseConfig(l.tlsConfig)
 			return nil, errors.New("failed to listen ", addr.Network(), " for XHTTP on ", address, ":", port).Base(err)
 		}
 		errors.LogInfo(ctx, "listening ", addr.Network(), " for XHTTP on ", address, ":", port)
@@ -542,10 +549,8 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 
 	// tcp/unix (h1/h2)
 	if l.listener != nil {
-		if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
-			if tlsConfig := config.GetTLSConfig(); tlsConfig != nil {
-				l.listener = gotls.NewListener(l.listener, tlsConfig)
-			}
+		if tls.ConfigFromStreamSettings(streamSettings) != nil {
+			l.listener = gotls.NewListener(l.listener, tlsConfig)
 		}
 		if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
 			l.listener = goreality.NewListener(l.listener, config.GetREALITYConfig())
@@ -586,6 +591,7 @@ func (ln *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
+	defer tls.CloseConfig(ln.tlsConfig)
 	if ln.h3server != nil {
 		return ln.h3server.Close()
 	} else if ln.listener != nil {

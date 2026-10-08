@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	gotls "crypto/tls"
 	"time"
 
 	goreality "github.com/xtls/reality"
@@ -24,6 +25,7 @@ type Listener struct {
 	local                net.Addr
 	config               *Config
 	trustedXForwardedFor []string
+	tlsConfig            *gotls.Config
 
 	s *grpc.Server
 }
@@ -44,6 +46,7 @@ func (l Listener) TunMulti(server encoding.GRPCService_TunMultiServer) error {
 
 func (l Listener) Close() error {
 	l.s.Stop()
+	tls.CloseConfig(l.tlsConfig)
 	return nil
 }
 
@@ -85,7 +88,8 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 	var s *grpc.Server
 	if config != nil {
 		// gRPC server may silently ignore TLS errors
-		options = append(options, grpc.Creds(credentials.NewTLS(config.GetTLSConfig(tls.WithNextProto("h2")))))
+		listener.tlsConfig = config.GetTLSConfig(tls.WithNextProto("h2"))
+		options = append(options, grpc.Creds(credentials.NewTLS(listener.tlsConfig)))
 	}
 	if grpcSettings.IdleTimeout > 0 || grpcSettings.HealthCheckTimeout > 0 {
 		options = append(options, grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -102,6 +106,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 	}
 
 	go func() {
+		defer tls.CloseConfig(listener.tlsConfig)
 		var streamListener net.Listener
 		var err error
 		var addr net.Addr
@@ -117,6 +122,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 		}
 		if err != nil {
 			errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
+			_ = listener.Close()
 			return
 		}
 
