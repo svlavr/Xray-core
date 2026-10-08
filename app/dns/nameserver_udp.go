@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	go_errors "errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,7 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// ClassicNameServer implemented traditional UDP DNS.
+// ClassicNameServer uses the native shared UDP ray for its configured server.
 type ClassicNameServer struct {
 	sync.RWMutex
 	cacheController *CacheController
@@ -33,134 +34,151 @@ type ClassicNameServer struct {
 
 type udpDnsRequest struct {
 	dnsRequest
-	ctx context.Context
+	ctx  context.Context
+	stop func() bool // guarded by ClassicNameServer lock
 }
 
-// NewClassicNameServer creates udp server object for remote resolving.
 func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *ClassicNameServer {
-	// default to 53 if unspecific
 	if address.Port == 0 {
 		address.Port = net.Port(53)
 	}
-
 	s := &ClassicNameServer{
 		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
-		address:         &address,
-		requests:        make(map[uint16]*udpDnsRequest),
-		clientIP:        clientIP,
+		address:         &address, requests: make(map[uint16]*udpDnsRequest), clientIP: clientIP,
 	}
-	s.requestsCleanup = &task.Periodic{
-		Interval: time.Minute,
-		Execute:  s.RequestsCleanup,
-	}
+	s.requestsCleanup = &task.Periodic{Interval: time.Second, Execute: s.RequestsCleanup}
 	s.udpServer = udp.NewDispatcher(dispatcher, s.HandleResponse)
-
 	errors.LogInfo(context.Background(), "DNS: created UDP client initialized for ", address.NetAddr())
 	return s
 }
 
-// Name implements Server.
-func (s *ClassicNameServer) Name() string {
-	return s.cacheController.name
+func (s *ClassicNameServer) Name() string         { return s.cacheController.name }
+func (s *ClassicNameServer) IsDisableCache() bool { return s.cacheController.disableCache }
+
+func (s *ClassicNameServer) forgetRequest(req *udpDnsRequest) {
+	s.Lock()
+	if s.requests[req.msg.ID] == req {
+		delete(s.requests, req.msg.ID)
+	}
+	s.Unlock()
 }
 
-// IsDisableCache implements Server.
-func (s *ClassicNameServer) IsDisableCache() bool {
-	return s.cacheController.disableCache
-}
-
-// RequestsCleanup clears expired items from cache
 func (s *ClassicNameServer) RequestsCleanup() error {
 	now := time.Now()
 	s.Lock()
 	defer s.Unlock()
-
 	if len(s.requests) == 0 {
 		return errors.New(s.Name(), " nothing to do. stopping...")
 	}
-
 	for id, req := range s.requests {
 		if req.expire.Before(now) {
 			delete(s.requests, id)
+			if req.stop != nil {
+				req.stop()
+			}
 		}
 	}
-
-	if len(s.requests) == 0 {
-		s.requests = make(map[uint16]*udpDnsRequest)
-	}
-
 	return nil
 }
 
-// HandleResponse handles udp response packet from remote DNS server.
 func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_proto.Packet) {
 	payload := packet.Payload
+	var questionParser dnsmessage.Parser
+	_, questionErr := questionParser.Start(payload.Bytes())
+	var question dnsmessage.Question
+	if questionErr == nil {
+		question, questionErr = questionParser.Question()
+	}
+	// Native resolvers also accept replies which omit the question section.
+	// Validate an echoed question when present without requiring a new wire form.
+	hasQuestion := questionErr == nil
+	if questionErr == dnsmessage.ErrSectionDone {
+		questionErr = nil
+	}
 	ipRec, err := parseResponse(payload.Bytes())
 	payload.Release()
-	if err != nil {
-		errors.LogErrorInner(ctx, err, s.Name(), " fail to parse responded DNS udp")
+	if err != nil || questionErr != nil {
+		errors.LogErrorInner(ctx, go_errors.Join(err, questionErr), s.Name(), " fail to parse responded DNS udp")
 		return
 	}
-
 	s.Lock()
-	id := ipRec.ReqID
-	req, ok := s.requests[id]
-	if ok {
-		// remove the pending request
-		delete(s.requests, id)
+	req := s.requests[ipRec.ReqID]
+	if req != nil && hasQuestion && (!strings.EqualFold(question.Name.String(), req.domain) || question.Type != req.reqType) {
+		req = nil
 	}
-	s.Unlock()
-	if !ok {
-		errors.LogErrorInner(ctx, err, s.Name(), " cannot find the pending request")
-		return
-	}
-
-	// if truncated, retry with EDNS0 option(udp payload size: 1350)
-	if ipRec.RawHeader.Truncated {
-		// if already has EDNS0 option, no need to retry
-		if len(req.msg.Additionals) == 0 {
-			// copy necessary meta data from original request
-			// and add EDNS0 option
-			opt := new(dnsmessage.Resource)
-			common.Must(opt.Header.SetEDNS0(1350, 0xfe00, true))
-			opt.Body = &dnsmessage.OPTResource{}
-			newMsg := *req.msg
-			newReq := *req
-			newMsg.Additionals = append(newMsg.Additionals, *opt)
-			newMsg.ID = s.newReqID()
-			newReq.msg = &newMsg
-			s.addPendingRequest(&newReq)
-			b, _ := dns.PackMessage(newReq.msg)
-			s.udpServer.Dispatch(toDnsContext(newReq.ctx, s.address.String()), *s.address, b)
-			return
+	if req != nil {
+		delete(s.requests, ipRec.ReqID)
+		if req.stop != nil {
+			req.stop()
 		}
 	}
-
+	s.Unlock()
+	if req == nil {
+		errors.LogError(ctx, s.Name(), " cannot find the pending request")
+		return
+	}
+	if req.ctx.Err() != nil {
+		return
+	}
+	if ipRec.RawHeader.Truncated && len(req.msg.Additionals) == 0 {
+		opt := new(dnsmessage.Resource)
+		common.Must(opt.Header.SetEDNS0(1350, 0xfe00, true))
+		opt.Body = &dnsmessage.OPTResource{}
+		newMsg := *req.msg
+		newMsg.Additionals = append(newMsg.Additionals, *opt)
+		newMsg.ID = s.newReqID()
+		retry := &udpDnsRequest{dnsRequest: req.dnsRequest, ctx: req.ctx}
+		retry.msg = &newMsg
+		b, err := dns.PackMessage(retry.msg)
+		if err != nil {
+			errors.LogErrorInner(ctx, err, "failed to pack DNS retry")
+			return
+		}
+		if err := s.addPendingRequest(retry); err != nil {
+			b.Release()
+			errors.LogErrorInner(ctx, err, "failed to admit DNS retry")
+			return
+		}
+		s.udpServer.Dispatch(s.dispatchContext(retry.ctx), *s.address, b)
+		return
+	}
 	s.cacheController.updateRecord(&req.dnsRequest, ipRec)
 }
 
-func (s *ClassicNameServer) newReqID() uint16 {
-	return uint16(atomic.AddUint32(&s.reqID, 1))
-}
+func (s *ClassicNameServer) newReqID() uint16 { return uint16(atomic.AddUint32(&s.reqID, 1)) }
 
-func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) {
+func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) error {
 	s.Lock()
-	id := req.msg.ID
-	req.expire = time.Now().Add(time.Second * 8)
-	s.requests[id] = req
+	if err := s.cacheController.ctx.Err(); err != nil {
+		s.Unlock()
+		return err
+	}
+	if err := req.ctx.Err(); err != nil {
+		s.Unlock()
+		return err
+	}
+	if s.requests[req.msg.ID] != nil {
+		s.Unlock()
+		return errors.New("DNS request ID already pending: ", req.msg.ID)
+	}
+	req.expire = time.Now().Add(8 * time.Second)
+	s.requests[req.msg.ID] = req
+	req.stop = context.AfterFunc(req.ctx, func() { s.forgetRequest(req) })
 	s.Unlock()
-	common.Must(s.requestsCleanup.Start())
+	s.cacheController.startCleanup(s.requestsCleanup)
+	return nil
 }
 
-// getCacheController implements CachedNameserver.
-func (s *ClassicNameServer) getCacheController() *CacheController {
-	return s.cacheController
+func (s *ClassicNameServer) getCacheController() *CacheController { return s.cacheController }
+
+func (s *ClassicNameServer) dispatchContext(ctx context.Context) context.Context {
+	// The shared ray carries the initial routing metadata but belongs to this
+	// nameserver. Canceling one request must not terminate sibling requests.
+	return toDnsContext(ctx, s.cacheController.ctx, s.address.String())
 }
 
-// sendQuery implements CachedNameserver.
 func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
 	errors.LogInfo(ctx, s.Name(), " querying DNS for: ", fqdn)
-
 	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, 0))
 	if err != nil {
 		errors.LogErrorInner(ctx, err, "failed to build dns query for ", fqdn)
@@ -174,26 +192,43 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 		}
 		return
 	}
-
 	for _, req := range reqs {
-		udpReq := &udpDnsRequest{
-			dnsRequest: *req,
-			ctx:        ctx,
-		}
-		s.addPendingRequest(udpReq)
 		b, err := dns.PackMessage(req.msg)
 		if err != nil {
 			errors.LogErrorInner(ctx, err, "failed to pack dns query")
 			if noResponseErrCh != nil {
 				noResponseErrCh <- err
 			}
-			return
+			continue
 		}
-		s.udpServer.Dispatch(toDnsContext(ctx, s.address.String()), *s.address, b)
+		pending := &udpDnsRequest{dnsRequest: *req, ctx: ctx}
+		if err := s.addPendingRequest(pending); err != nil {
+			b.Release()
+			if noResponseErrCh != nil {
+				noResponseErrCh <- err
+			}
+			continue
+		}
+		s.udpServer.Dispatch(s.dispatchContext(ctx), *s.address, b)
 	}
 }
 
-// QueryIP implements Server.
+func (s *ClassicNameServer) Close() error {
+	s.cacheController.cancel()
+	s.Lock()
+	for id, req := range s.requests {
+		delete(s.requests, id)
+		if req.stop != nil {
+			req.stop()
+		}
+	}
+	s.Unlock()
+	s.cacheController.stopCleanup(s.requestsCleanup)
+	s.udpServer.RemoveRay()
+	s.cacheController.Close()
+	return nil
+}
+
 func (s *ClassicNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
 }

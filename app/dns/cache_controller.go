@@ -7,9 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/common/task"
 	dns_feature "github.com/xtls/xray-core/features/dns"
 
@@ -34,27 +32,69 @@ type CacheController struct {
 	dirtyips map[string]*record
 
 	sync.RWMutex
-	pub           *pubsub.Service
+	subs          map[string][]*cacheSubscriber
+	cleanupMu     sync.Mutex // serializes synchronous periodic Start with Close
 	cacheCleanup  *task.Periodic
 	highWatermark int
 	requestGroup  singleflight.Group
+	workers       sync.WaitGroup
+	ctx           context.Context
+	cancel        context.CancelFunc
+}
+
+type cacheSubscriber struct {
+	buffer chan *IPRecord
+	owner  *CacheController
+	key    string
+}
+
+func (s *cacheSubscriber) close() {
+	s.owner.Lock()
+	defer s.owner.Unlock()
+	group := s.owner.subs[s.key]
+	for i, candidate := range group {
+		if candidate == s {
+			group = append(group[:i], group[i+1:]...)
+			break
+		}
+	}
+	if len(group) == 0 {
+		delete(s.owner.subs, s.key)
+	} else {
+		s.owner.subs[s.key] = group
+	}
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
+	ctx, cancel := context.WithCancel(context.Background())
 	c := &CacheController{
 		name:            name,
 		disableCache:    disableCache,
 		serveStale:      serveStale,
 		serveExpiredTTL: -int32(serveExpiredTTL),
 		ips:             make(map[string]*record),
-		pub:             pubsub.NewService(),
+		subs:            make(map[string][]*cacheSubscriber),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
-	c.cacheCleanup = &task.Periodic{
-		Interval: 300 * time.Second,
-		Execute:  c.CacheCleanup,
-	}
+	c.cacheCleanup = &task.Periodic{Interval: 300 * time.Second, Execute: c.CacheCleanup}
 	return c
+}
+
+func (c *CacheController) startCleanup(periodic *task.Periodic) {
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+	if c.ctx.Err() == nil {
+		// Both cleanup callbacks return an error only when there is no work.
+		_ = periodic.Start()
+	}
+}
+
+func (c *CacheController) stopCleanup(periodic *task.Periodic) {
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+	_ = periodic.Close()
 }
 
 // CacheCleanup clears expired items from cache
@@ -68,6 +108,19 @@ func (c *CacheController) CacheCleanup() error {
 	}
 	c.writeAndShrink(expiredKeys)
 	return nil
+}
+
+func (c *CacheController) startPull(ctx context.Context, s CachedNameserver, fqdn string, option dns_feature.IPOption) {
+	c.Lock()
+	if c.ctx.Err() != nil {
+		c.Unlock()
+		return
+	}
+	c.workers.Add(1)
+	c.Unlock()
+	// Keep query metadata while the cache owner controls refresh cancellation.
+	ctx = &dnsRequestContext{Context: context.WithoutCancel(ctx), caller: c.ctx}
+	go func() { defer c.workers.Done(); pull(ctx, s, fqdn, option) }()
 }
 
 func (c *CacheController) collectExpiredKeys() ([]string, error) {
@@ -103,6 +156,9 @@ func (c *CacheController) collectExpiredKeys() ([]string, error) {
 func (c *CacheController) writeAndShrink(expiredKeys []string) {
 	c.Lock()
 	defer c.Unlock()
+	if c.ctx.Err() != nil {
+		return
+	}
 
 	// double check to prevent upper call multiple cleanup tasks
 	if c.dirtyips != nil {
@@ -165,7 +221,11 @@ func (c *CacheController) writeAndShrink(expiredKeys []string) {
 		c.dirtyips = c.ips
 		c.ips = make(map[string]*record, int(float64(lenAfter)*1.1))
 		c.highWatermark = lenAfter
-		go c.migrate()
+		c.workers.Add(1)
+		go func() {
+			defer c.workers.Done()
+			c.migrate()
+		}()
 	}
 }
 
@@ -243,13 +303,16 @@ func (c *CacheController) flush(batch []migrationEntry) {
 }
 
 func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
+	if c.ctx.Err() != nil {
+		return
+	}
 	rtt := time.Since(req.start)
 
 	switch req.reqType {
 	case dnsmessage.TypeA:
-		c.pub.Publish(req.domain+"4", rep)
+		c.publish(req.domain+"4", rep)
 	case dnsmessage.TypeAAAA:
-		c.pub.Publish(req.domain+"6", rep)
+		c.publish(req.domain+"6", rep)
 	}
 
 	if c.disableCache {
@@ -297,14 +360,14 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	if pubRecord != nil {
 		_, ttl, err := pubRecord.getIPs()
 		if ttl > 0 && !go_errors.Is(err, errRecordNotFound) {
-			c.pub.Publish(req.domain+pubSuffix, pubRecord)
+			c.publish(req.domain+pubSuffix, pubRecord)
 		}
 	}
 
 	errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt, ", lock: ", lockWait)
 
 	if !c.serveStale || c.serveExpiredTTL != 0 {
-		common.Must(c.cacheCleanup.Start())
+		c.startCleanup(c.cacheCleanup)
 	}
 }
 
@@ -319,22 +382,54 @@ func (c *CacheController) findRecords(domain string) *record {
 	return rec
 }
 
-func (c *CacheController) registerSubscribers(domain string, option dns_feature.IPOption) (sub4 *pubsub.Subscriber, sub6 *pubsub.Subscriber) {
+func (c *CacheController) subscribe(key string) *cacheSubscriber {
+	sub := &cacheSubscriber{buffer: make(chan *IPRecord, 16), owner: c, key: key}
+	c.Lock()
+	if c.ctx.Err() != nil {
+		c.Unlock()
+		return sub
+	}
+	c.subs[key] = append(c.subs[key], sub)
+	c.Unlock()
+	return sub
+}
+
+func (c *CacheController) publish(key string, record *IPRecord) {
+	c.RLock()
+	defer c.RUnlock()
+	for _, sub := range c.subs[key] {
+		select {
+		case sub.buffer <- record:
+		default:
+		}
+	}
+}
+
+func (c *CacheController) registerSubscribers(domain string, option dns_feature.IPOption) (sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
 	// ipv4 and ipv6 belong to different subscription groups
 	if option.IPv4Enable {
-		sub4 = c.pub.Subscribe(domain + "4")
+		sub4 = c.subscribe(domain + "4")
 	}
 	if option.IPv6Enable {
-		sub6 = c.pub.Subscribe(domain + "6")
+		sub6 = c.subscribe(domain + "6")
 	}
 	return
 }
 
-func closeSubscribers(sub4 *pubsub.Subscriber, sub6 *pubsub.Subscriber) {
+func closeSubscribers(sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
 	if sub4 != nil {
-		sub4.Close()
+		sub4.close()
 	}
 	if sub6 != nil {
-		sub6.Close()
+		sub6.close()
 	}
+}
+
+func (c *CacheController) Close() {
+	c.cancel()
+	c.stopCleanup(c.cacheCleanup)
+	c.Lock()
+	c.subs = nil
+	c.Unlock()
+	c.workers.Wait()
 }

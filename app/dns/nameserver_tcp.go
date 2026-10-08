@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	go_errors "errors"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -25,7 +28,9 @@ type TCPNameServer struct {
 	destination     *net.Destination
 	reqID           uint32
 	dial            func(context.Context) (net.Conn, error)
+	routed          bool
 	clientIP        net.IP
+	workers         sync.WaitGroup // admission is guarded by cacheController's lock
 }
 
 // NewTCPNameServer creates DNS over TCP server object for remote resolving.
@@ -40,15 +45,34 @@ func NewTCPNameServer(
 		return nil, err
 	}
 
+	s.routed = true
 	s.dial = func(ctx context.Context) (net.Conn, error) {
-		link, err := dispatcher.Dispatch(toDnsContext(ctx, s.destination.String()), *s.destination)
+		link, err := dispatcher.Dispatch(ctx, *s.destination)
+		cc := common.ChainedClosable{}
+		if link != nil {
+			if closer, ok := link.Writer.(common.Closable); ok {
+				cc = append(cc, closer)
+			}
+			if closer, ok := link.Reader.(common.Closable); ok {
+				cc = append(cc, closer)
+			}
+		}
+		if ctx.Err() != nil {
+			_ = cc.Close()
+			return nil, ctx.Err()
+		}
 		if err != nil {
+			_ = cc.Close()
 			return nil, err
+		}
+		if link == nil {
+			return nil, go_errors.New("DNS dispatcher returned no link")
 		}
 
 		return cnc.NewConnection(
 			cnc.ConnectionInputMulti(link.Writer),
 			cnc.ConnectionOutputMulti(link.Reader),
+			cnc.ConnectionOnClose(cc),
 		), nil
 	}
 
@@ -135,12 +159,22 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		go func(r *dnsRequest) {
-			dnsCtx := ctx
-
-			if inbound := session.InboundFromContext(ctx); inbound != nil {
-				dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
+		s.cacheController.Lock()
+		if s.cacheController.ctx.Err() != nil {
+			s.cacheController.Unlock()
+			if noResponseErrCh != nil {
+				noResponseErrCh <- context.Canceled
 			}
+			continue
+		}
+		s.workers.Add(1)
+		s.cacheController.Unlock()
+		go func(r *dnsRequest, ctx context.Context) {
+			defer s.workers.Done()
+			workCtx, cancelWork := context.WithCancel(ctx)
+			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
+			defer func() { stop(); cancelWork() }()
+			dnsCtx := workCtx
 
 			dnsCtx = session.ContextWithContent(dnsCtx, &session.Content{
 				Protocol:       "dns",
@@ -159,17 +193,56 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 				}
 				return
 			}
+			defer b.Release()
 
+			if s.routed {
+				dnsCtx = toDnsContext(dnsCtx, dnsCtx, s.destination.String())
+			}
+
+			if err := s.cacheController.ctx.Err(); err != nil {
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
 			conn, err := s.dial(dnsCtx)
 			if err != nil {
+				if conn != nil {
+					_ = conn.Close()
+				}
 				errors.LogErrorInner(ctx, err, "failed to dial namesever")
 				if noResponseErrCh != nil {
 					noResponseErrCh <- err
 				}
 				return
 			}
-			defer conn.Close()
+			ioCanceled := make(chan struct{})
+			stopIO := context.AfterFunc(dnsCtx, func() {
+				_ = conn.Close()
+				close(ioCanceled)
+			})
+			defer func() {
+				if stopIO() {
+					_ = conn.Close()
+				} else {
+					<-ioCanceled
+				}
+			}()
+			if err := dnsCtx.Err(); err != nil {
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			if err := s.cacheController.ctx.Err(); err != nil {
+				if noResponseErrCh != nil {
+					noResponseErrCh <- err
+				}
+				return
+			}
+			_ = conn.SetDeadline(deadline)
 			dnsReqBuf := buf.New()
+			defer dnsReqBuf.Release()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "binary write failed")
@@ -237,8 +310,17 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			}
 
 			s.cacheController.updateRecord(r, rec)
-		}(req)
+		}(req, ctx)
 	}
+}
+
+func (s *TCPNameServer) Close() error {
+	s.cacheController.cancel()
+	// Cache Close takes the admission lock before this Wait, so no worker can
+	// be added after the barrier. Each admitted worker closes its own connection.
+	s.cacheController.Close()
+	s.workers.Wait()
+	return nil
 }
 
 // QueryIP implements Server.

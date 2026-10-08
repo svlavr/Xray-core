@@ -257,8 +257,10 @@ L:
 }
 
 // toDnsContext create a new background context with parent inbound, session and dns log
-func toDnsContext(ctx context.Context, addr string) context.Context {
+func toDnsContext(ctx, caller context.Context, addr string) context.Context {
 	dnsCtx := core.ToBackgroundDetachedContext(ctx)
+	dnsCtx = &dnsRequestContext{Context: dnsCtx, caller: caller}
+	dnsCtx = session.ContextWithTrafficOrigin(dnsCtx, session.TrafficOriginInternal)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
 	}
@@ -271,3 +273,14 @@ func toDnsContext(ctx context.Context, addr string) context.Context {
 	})
 	return dnsCtx
 }
+
+// dnsRequestContext keeps core/session values from the detached transport
+// context while the actual query controls routed transport cancellation.
+type dnsRequestContext struct {
+	context.Context
+	caller context.Context
+}
+
+func (c *dnsRequestContext) Deadline() (time.Time, bool) { return c.caller.Deadline() }
+func (c *dnsRequestContext) Done() <-chan struct{}       { return c.caller.Done() }
+func (c *dnsRequestContext) Err() error                  { return c.caller.Err() }

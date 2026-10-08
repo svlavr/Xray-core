@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	go_errors "errors"
+	stdnet "net"
 	"net/url"
 	"sync"
 	"time"
@@ -33,6 +35,8 @@ type QUICNameServer struct {
 	destination     *net.Destination
 	connection      *quic.Conn
 	clientIP        net.IP
+	transport       *quic.Transport
+	workers         sync.WaitGroup
 }
 
 // NewQUICNameServer creates DNS-over-QUIC client object for local resolving
@@ -100,15 +104,20 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 	}
 
 	for _, req := range reqs {
-		go func(r *dnsRequest) {
+		if !s.beginWork() {
+			if noResponseErrCh != nil {
+				noResponseErrCh <- context.Canceled
+			}
+			continue
+		}
+		go func(r *dnsRequest, ctx context.Context) {
+			defer s.workers.Done()
+			workCtx, cancelWork := context.WithCancel(ctx)
+			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
+			defer func() { stop(); cancelWork() }()
 			// generate new context for each req, using same context
 			// may cause reqs all aborted if any one encounter an error
-			dnsCtx := ctx
-
-			// reserve internal dns server requested Inbound
-			if inbound := session.InboundFromContext(ctx); inbound != nil {
-				dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
-			}
+			dnsCtx := workCtx
 
 			dnsCtx = session.ContextWithContent(dnsCtx, &session.Content{
 				Protocol:       "quic",
@@ -127,8 +136,10 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
+			defer b.Release()
 
 			dnsReqBuf := buf.New()
+			defer dnsReqBuf.Release()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "binary write failed")
@@ -155,6 +166,20 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				}
 				return
 			}
+			_ = conn.SetDeadline(deadline)
+			ioCanceled := make(chan struct{})
+			stopIO := context.AfterFunc(dnsCtx, func() {
+				conn.CancelRead(0)
+				conn.CancelWrite(0)
+				close(ioCanceled)
+			})
+			defer func() {
+				if !stopIO() {
+					<-ioCanceled
+				}
+				conn.CancelRead(0)
+				conn.CancelWrite(0)
+			}()
 
 			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
@@ -205,13 +230,23 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 				return
 			}
 			s.cacheController.updateRecord(r, rec)
-		}(req)
+		}(req, ctx)
 	}
 }
 
 // QueryIP implements Server.
 func (s *QUICNameServer) QueryIP(ctx context.Context, domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	return queryIP(ctx, s, domain, option)
+}
+
+func (s *QUICNameServer) beginWork() bool {
+	s.Lock()
+	defer s.Unlock()
+	if s.cacheController.ctx.Err() != nil {
+		return false
+	}
+	s.workers.Add(1)
+	return true
 }
 
 func isActive(s *quic.Conn) bool {
@@ -223,32 +258,29 @@ func isActive(s *quic.Conn) bool {
 	}
 }
 
-func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
-	var conn *quic.Conn
-	s.RLock()
-	conn = s.connection
+func (s *QUICNameServer) getConnection(ctx context.Context) (*quic.Conn, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.cacheController.ctx.Err() != nil {
+		return nil, context.Canceled
+	}
+	conn := s.connection
 	if conn != nil && isActive(conn) {
-		s.RUnlock()
 		return conn, nil
 	}
 	if conn != nil {
-		// we're recreating the connection, let's create a new one
 		_ = conn.CloseWithError(0, "")
 	}
-	s.RUnlock()
-
-	s.Lock()
-	defer s.Unlock()
 
 	var err error
-	conn, err = s.openConnection()
+	conn, err = s.openConnection(ctx)
 	if err != nil {
 		// This does not look too nice, but QUIC (or maybe quic-go)
 		// doesn't seem stable enough.
 		// Maybe retransmissions aren't fully implemented in quic-go?
 		// Anyways, the simple solution is to make a second try when
 		// it fails to open the QUIC connection.
-		conn, err = s.openConnection()
+		conn, err = s.openConnection(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -257,13 +289,33 @@ func (s *QUICNameServer) getConnection() (*quic.Conn, error) {
 	return conn, nil
 }
 
-func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
+func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error) {
 	tlsConfig := tls.Config{}
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout: handshakeTimeout,
 	}
 	tlsConfig.ServerName = s.destination.Address.String()
-	conn, err := quic.DialAddr(context.Background(), s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	remote := &stdnet.UDPAddr{Port: int(s.destination.Port)}
+	if s.destination.Address.Family().IsIP() {
+		remote.IP = stdnet.IP(s.destination.Address.IP())
+	} else {
+		addresses, err := stdnet.DefaultResolver.LookupIP(ctx, "ip", s.destination.Address.Domain())
+		if err != nil {
+			return nil, err
+		}
+		if len(addresses) == 0 {
+			return nil, dns_feature.ErrEmptyResponse
+		}
+		remote.IP = selectQUICRemoteIP(addresses)
+	}
+	if s.transport == nil {
+		packetConn, err := stdnet.ListenUDP("udp", nil)
+		if err != nil {
+			return nil, err
+		}
+		s.transport = &quic.Transport{Conn: packetConn}
+	}
+	conn, err := s.transport.Dial(ctx, remote, tlsConfig.GetTLSConfig(tls.WithClient(), tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
 	log.Record(&log.AccessMessage{
 		From:   "DNS",
 		To:     s.destination,
@@ -277,12 +329,54 @@ func (s *QUICNameServer) openConnection() (*quic.Conn, error) {
 	return conn, nil
 }
 
+func selectQUICRemoteIP(addresses []stdnet.IP) stdnet.IP {
+	for _, address := range addresses {
+		if ipv4 := address.To4(); ipv4 != nil {
+			return ipv4
+		}
+	}
+	if len(addresses) != 0 {
+		return addresses[0]
+	}
+	return nil
+}
+
 func (s *QUICNameServer) openStream(ctx context.Context) (*quic.Stream, error) {
-	conn, err := s.getConnection()
+	conn, err := s.getConnection(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// open a new stream
 	return conn.OpenStreamSync(ctx)
+}
+
+func (s *QUICNameServer) Close() error {
+	s.cacheController.cancel()
+	s.Lock()
+	conn, transport := s.connection, s.transport
+	s.Unlock()
+	var closeErr error
+	if conn != nil {
+		_ = conn.CloseWithError(0, "DNS resolver closed")
+		s.Lock()
+		if s.connection == conn {
+			s.connection = nil
+		}
+		s.Unlock()
+	}
+	if transport != nil {
+		_ = transport.Close()
+		if err := transport.Conn.Close(); err != nil && !go_errors.Is(err, stdnet.ErrClosed) {
+			closeErr = err
+		}
+		s.Lock()
+		if s.transport == transport {
+			s.transport = nil
+		}
+		s.Unlock()
+	}
+	s.cacheController.Close()
+	s.workers.Wait()
+	return closeErr
 }

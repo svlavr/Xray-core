@@ -13,7 +13,12 @@ type Context struct {
 	Inbound  *session.Inbound
 	Outbound *session.Outbound
 	Content  *session.Content
+	origin   context.Context
 }
+
+// OriginatingContext is an optional adapter used by context-aware routing
+// helpers. It intentionally does not extend the stable routing.Context API.
+func (ctx *Context) OriginatingContext() context.Context { return ctx.origin }
 
 // GetInboundTag implements routing.Context.
 func (ctx *Context) GetInboundTag() string {
@@ -159,5 +164,6 @@ func AsRoutingContext(ctx context.Context) routing.Context {
 		Inbound:  session.InboundFromContext(ctx),
 		Outbound: ob,
 		Content:  session.ContentFromContext(ctx),
+		origin:   ctx,
 	}
 }

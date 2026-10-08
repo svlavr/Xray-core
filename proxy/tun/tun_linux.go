@@ -43,8 +43,9 @@ type LinuxTun struct {
 	routeMonitorStop   chan struct{}
 	routeMonitorOnce   sync.Once
 
-	systemDNSSet   bool
-	systemDNSDirty bool
+	systemDNSSet     bool
+	systemDNSDirty   bool
+	systemDNSRelease func()
 }
 
 // resolvectlRunner runs a resolvectl command. Overridable for tests.
@@ -215,15 +216,31 @@ func (t *LinuxTun) ConfigureSystemDNS(ctx context.Context, inboundTag string) er
 	if iface == "" {
 		return errors.New("interface not available")
 	}
+	// A real core context supplies the DNS owner. Hold its lease before the
+	// routing probe and OS commands so Apply cannot publish a local resolver
+	// between verification and takeover. Existing context-free probe tests keep
+	// using the routing stub without constructing a core.
+	if t.systemDNSRelease == nil {
+		if instance := core.FromContext(ctx); instance != nil {
+			if feature, ok := instance.GetFeature(feature_dns.ClientType()).(*appdns.DNS); ok {
+				release, err := feature.AcquireSystemDNS()
+				if err != nil {
+					return err
+				}
+				t.systemDNSRelease = release
+			}
+		}
+	}
 
 	if err := verifyDNSRouting(ctx, inboundTag, source.String(), address.String()); err != nil {
+		t.releaseSystemDNSGuard()
 		return errors.New("no DNS path at ", address.String(), ":53").Base(err)
 	}
 
 	// Applied as a sequence with rollback: a half-configured resolver would be
 	// worse than none at all.
 	if err := runResolvectl("dns", iface, address.String()); err != nil {
-		return errors.New("resolvectl dns failed").Base(err)
+		return t.rollbackSystemDNS(iface, errors.New("resolvectl dns failed").Base(err))
 	}
 	if err := runResolvectl("domain", iface, "~."); err != nil {
 		return t.rollbackSystemDNS(iface, errors.New("resolvectl domain failed").Base(err))
@@ -248,7 +265,15 @@ func (t *LinuxTun) rollbackSystemDNS(iface string, cause error) error {
 		// why the revert was attempted.
 		return errors.New("revert failed, per-link DNS settings may remain").Base(errors.Combine(err, cause))
 	}
+	t.releaseSystemDNSGuard()
 	return cause
+}
+
+func (t *LinuxTun) releaseSystemDNSGuard() {
+	if t.systemDNSRelease != nil {
+		t.systemDNSRelease()
+		t.systemDNSRelease = nil
+	}
 }
 
 // revertSystemDNS issues the revert and keeps the dirty flag in step with the
@@ -260,6 +285,7 @@ func (t *LinuxTun) revertSystemDNS() error {
 		return err
 	}
 	t.systemDNSSet = false
+	t.releaseSystemDNSGuard()
 	return nil
 }
 
@@ -274,6 +300,7 @@ func (t *LinuxTun) unsetSystemDNS() {
 		// The link is gone, and its per-link settings went with it.
 		t.systemDNSSet = false
 		t.systemDNSDirty = false
+		t.releaseSystemDNSGuard()
 		return
 	}
 
@@ -458,6 +485,15 @@ func (t *LinuxTun) Close() error {
 		_ = netlink.LinkSetDown(t.tunLink)
 	}
 	_ = unix.Close(t.tunFd)
+	// Failed revert no longer owns DNS once the original link is gone.
+	if t.systemDNSRelease != nil && t.tunLink != nil && t.tunLink.Attrs().Index > 0 {
+		if _, err := netlink.LinkByIndex(t.tunLink.Attrs().Index); err != nil {
+			if _, absent := err.(netlink.LinkNotFoundError); absent {
+				t.systemDNSSet, t.systemDNSDirty = false, false
+				t.releaseSystemDNSGuard()
+			}
+		}
+	}
 
 	return nil
 }

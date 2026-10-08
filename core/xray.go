@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	go_errors "errors"
 	"reflect"
 	"sync"
 
@@ -368,11 +369,13 @@ func (s *Instance) AddFeature(feature features.Feature) error {
 	s.pendingOptionalResolutions = pendingOptional
 	s.resolveLock.Unlock()
 
-	var err error
+	var errs []error
 	for _, r := range availableResolution {
-		err = r.callbackResolution(s.features) // only return the last error for now
+		if err := r.callbackResolution(s.features); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return err
+	return go_errors.Join(errs...)
 }
 
 // GetFeature returns a feature of the given type, or nil if such feature is not registered.

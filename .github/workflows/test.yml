@@ -122,3 +122,21 @@ jobs:
         run: go test -mod=readonly -race -timeout 5m -count=2 ./transport/internet/tls
       - name: Native outbound tag-cache functionality
         run: go test -mod=readonly -timeout 2m -count=1 -run '^TestTagsCache$' ./app/proxyman/outbound
+      - name: DNS ownership and context races
+        if: ${{ !cancelled() }}
+        run: go test -mod=readonly -race -timeout 10m -count=2 ./app/dns ./features/dns/... ./features/routing/...
+      - name: Deferred native feature errors and originating DNS context
+        if: ${{ !cancelled() }}
+        run: |
+          go test -mod=readonly -race -timeout 5m -count=2 -run '^TestFeatureResolution' ./core
+          go test -mod=readonly -race -timeout 5m -count=2 ./transport/internet
+      - name: Legacy HTTP2 DNS sibling cancellation
+        if: ${{ !cancelled() }}
+        env:
+          GODEBUG: http2legacy=1
+        run: go test -mod=readonly -race -timeout 5m -count=2 -run '^TestStageBDoHPooledSiblingCancellation$' ./app/dns
+      - name: Same-key DNS cancellation and UDP rejected-payload ownership
+        if: ${{ !cancelled() }}
+        run: |
+          go test -mod=readonly -race -timeout 5m -count=20 -run '^TestCachedFetch' ./app/dns
+          go test -mod=readonly -race -timeout 5m -count=2 -run '^TestUDPDispatcherReleasesUndispatchedPayload$' ./transport/internet/udp

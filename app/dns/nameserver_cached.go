@@ -8,7 +8,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/features/dns"
 )
 
@@ -35,7 +34,7 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 				if cache.serveStale && (cache.serveExpiredTTL == 0 || cache.serveExpiredTTL < ttl) {
 					errors.LogDebugInner(ctx, err, cache.name, " cache OPTIMISTE ", fqdn, " -> ", ips)
 					log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheOptimiste, Elapsed: 0, Error: err})
-					go pull(ctx, s, fqdn, option)
+					cache.startPull(ctx, s, fqdn, option)
 					return ips, 1, err
 				}
 			}
@@ -48,13 +47,14 @@ func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.
 }
 
 func pull(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) {
-	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+	nctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
 	fetch(nctx, s, fqdn, option)
 }
 
 func fetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) ([]net.IP, uint32, error) {
+	cache := s.getCacheController()
 	key := fqdn
 	switch {
 	case option.IPv4Enable && option.IPv6Enable:
@@ -65,18 +65,58 @@ func fetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOp
 		key = key + "6"
 	}
 
-	v, _, _ := s.getCacheController().requestGroup.Do(key, func() (any, error) {
-		return doFetch(ctx, s, fqdn, option), nil
-	})
-	ret := v.(result)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		if err := cache.ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 
-	return ret.ips, ret.ttl, ret.error
+		ch := cache.requestGroup.DoChan(key, func() (any, error) {
+			// DoChan starts this function asynchronously. Admit its work under the
+			// same lock as Close so Wait cannot miss a late fetch.
+			cache.Lock()
+			if cache.ctx.Err() != nil {
+				cache.Unlock()
+				return result{error: context.Canceled}, nil
+			}
+			cache.workers.Add(1)
+			cache.Unlock()
+			defer cache.workers.Done()
+
+			if err := ctx.Err(); err != nil {
+				return result{error: err, leaderCanceled: true}, nil
+			}
+			return doFetch(ctx, s, fqdn, option), nil
+		})
+
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		case <-cache.ctx.Done():
+			return nil, 0, cache.ctx.Err()
+		case shared := <-ch:
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			if err := cache.ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			ret := shared.Val.(result)
+			if ret.leaderCanceled {
+				continue
+			}
+			return ret.ips, ret.ttl, ret.error
+		}
+	}
 }
 
 type result struct {
 	ips []net.IP
 	ttl uint32
 	error
+	leaderCanceled bool
 }
 
 func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) result {
@@ -84,18 +124,29 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 	defer closeSubscribers(sub4, sub6)
 
 	noResponseErrCh := make(chan error, 2)
-	onEvent := func(sub *pubsub.Subscriber) (*IPRecord, error) {
+	leaderCanceled := false
+	onEvent := func(sub *cacheSubscriber) (*IPRecord, error) {
 		if sub == nil {
 			return nil, nil
 		}
+		if err := ctx.Err(); err != nil {
+			leaderCanceled = true
+			return nil, err
+		}
 		select {
 		case <-ctx.Done():
+			leaderCanceled = true
 			return nil, ctx.Err()
 		case err := <-noResponseErrCh:
+			if ctx.Err() != nil {
+				leaderCanceled = true
+			}
 			return nil, err
-		case msg := <-sub.Wait():
-			sub.Close()
-			return msg.(*IPRecord), nil // should panic
+		case <-sub.owner.ctx.Done():
+			return nil, context.Canceled
+		case msg := <-sub.buffer:
+			sub.close()
+			return msg, nil
 		}
 	}
 
@@ -124,7 +175,7 @@ func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IP
 	}
 
 	log.Record(&log.DNSLog{Server: s.getCacheController().name, Domain: fqdn, Result: ips, Status: log.DNSQueried, Elapsed: time.Since(start), Error: err})
-	return result{ips, rTTL, err}
+	return result{ips: ips, ttl: rTTL, error: err, leaderCanceled: leaderCanceled && len(ips) == 0}
 }
 
 func merge(option dns.IPOption, rec4 *IPRecord, rec6 *IPRecord, errs ...error) ([]net.IP, int32, error) {

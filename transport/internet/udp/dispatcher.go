@@ -112,6 +112,7 @@ func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, 
 	conn, err := v.getInboundRay(ctx, destination)
 	if err != nil {
 		errors.LogInfoInner(ctx, err, "failed to get inbound")
+		payload.Release()
 		return
 	}
 	outputStream := conn.link.Writer
@@ -121,6 +122,8 @@ func (v *Dispatcher) Dispatch(ctx context.Context, destination net.Destination, 
 			conn.Close()
 			return
 		}
+	} else {
+		payload.Release()
 	}
 }
 
