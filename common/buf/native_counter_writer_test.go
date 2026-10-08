@@ -122,7 +122,13 @@ func TestNativeCounterWriterBatchOnce(t *testing.T) {
 				writer, counter, view := nativeCounterWriter(t, sink, inspected)
 				var mb buf.MultiBuffer
 				for _, payload := range tc.payloads {
-					mb = append(mb, buf.FromBytes([]byte(payload)))
+					b := buf.New()
+					if n, err := b.Write([]byte(payload)); err != nil || n != len(payload) {
+						b.Release()
+						buf.ReleaseMulti(mb)
+						t.Fatalf("managed fixture payload: %d %v", n, err)
+					}
+					mb = append(mb, b)
 				}
 				if err := writer.WriteMultiBuffer(mb); err != tc.err {
 					t.Fatalf("native batch error changed: %v", err)
