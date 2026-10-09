@@ -1280,8 +1280,13 @@ func testProtocolTransferFailures(t *testing.T, e *measurement.Executor, route m
 						}
 					}
 				}), host, true, tunnelHost)
-				defer s.Close()
-				defer close(release)
+				defer func() {
+					// Bound peer teardown without treating it as client cancellation proof.
+					// A canceled chunked upload can leave an unread body to drain.
+					s.CloseClientConnections()
+					close(release)
+					s.Close()
+				}()
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				done := make(chan struct{})
