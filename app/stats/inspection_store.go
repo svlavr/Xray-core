@@ -299,12 +299,12 @@ func (s *inspectionStore) close() {
 type inspectionFlow struct {
 	store              *inspectionStore
 	stop               func() error
-	stopRequested      bool
 	mu                 sync.Mutex
 	record             featurestats.FlowRecord
-	provenanceConflict bool
 	observationID      uint64
 	nextRayID          uint64
+	stopRequested      bool
+	provenanceConflict bool
 	published          bool
 	excluded           bool
 	admitted           bool // Prepared TCP carriers remain private.
@@ -313,10 +313,10 @@ type inspectionFlow struct {
 type inspectionExchange struct {
 	*inspectionFlow
 	bucket           *aggregateCell
-	bound            bool // Selection can bind without a public tag bucket.
 	rayID            uint64
 	rayDestination   xnet.Destination
 	selectedOutbound featurestats.OutboundRef
+	bound            bool // Selection can bind without a public tag bucket.
 	selected         bool
 }
 
