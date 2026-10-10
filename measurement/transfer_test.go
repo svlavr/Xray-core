@@ -505,3 +505,133 @@ func TestTransferUnknownLengthCapAndPartialUploadResponse(t *testing.T) {
 		t.Fatalf("partial response: %+v %v", upload, err)
 	}
 }
+
+func TestDownloadRequestedDigestOnPartialExit(t *testing.T) {
+	prefix := []byte("prefix")
+	partial := sha256.Sum256(prefix)
+	for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
+		routeName := "direct"
+		if kind == measurement.ExactOutbound {
+			routeName = "exact"
+		}
+		for _, mode := range []string{"truncated", "timeout", "capped", "cancel", "pre-cancel", "no-digest", "raw-status"} {
+			t.Run(routeName+"/"+mode, func(t *testing.T) {
+				entered := make(chan struct{})
+				s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/sibling" {
+						io.WriteString(w, "sibling")
+						return
+					}
+					if mode == "no-digest" || mode == "raw-status" {
+						w.Header().Set("Content-Length", "6")
+					} else {
+						w.Header().Set("Content-Length", "100")
+					}
+					if mode == "raw-status" {
+						w.WriteHeader(503)
+					}
+					w.Write(prefix)
+					w.(http.Flusher).Flush()
+					close(entered)
+					if mode == "timeout" || mode == "cancel" {
+						<-r.Context().Done()
+					}
+				}))
+				defer s.Close()
+				e := executor(t, instance(t))
+				req := downloadRequest(s, kind)
+				req.ExpectedSHA256 = &partial
+				if mode == "timeout" {
+					req.TransferTimeout = 80 * time.Millisecond
+				}
+				if mode == "cancel" {
+					req.TransferTimeout = 5 * time.Second
+				}
+				if mode == "capped" {
+					req.HTTPS.MaxBodyBytes = 3
+				}
+				if mode == "no-digest" {
+					req.ExpectedSHA256 = nil
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if mode == "pre-cancel" {
+					cancel()
+				}
+				var got measurement.DownloadReceipt
+				var err error
+				if mode == "cancel" {
+					done := make(chan struct{})
+					go func() { got, err = e.Download(ctx, req); close(done) }()
+					select {
+					case <-entered:
+					case <-time.After(2 * time.Second):
+						t.Fatal("peer not entered")
+					}
+					sibling := request(s, kind)
+					sibling.URL += "/sibling"
+					if _, siblingErr := e.HTTPS(context.Background(), sibling); siblingErr != nil {
+						t.Fatal(siblingErr)
+					}
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(2 * time.Second):
+						t.Fatal("cancel did not join")
+					}
+				} else {
+					got, err = e.Download(ctx, req)
+				}
+				switch mode {
+				case "truncated":
+					if !errors.Is(err, io.ErrUnexpectedEOF) || got.PayloadBytes != 6 {
+						t.Fatalf("truncated %+v %v", got, err)
+					}
+				case "timeout":
+					if !errors.Is(err, measurement.ErrTransferTimeout) || got.PayloadBytes != 6 {
+						t.Fatalf("timeout %+v %v", got, err)
+					}
+				case "capped":
+					if !errors.Is(err, measurement.ErrIntegrityIncomplete) || got.PayloadBytes != 3 || !got.ByteLimitReached {
+						t.Fatalf("cap %+v %v", got, err)
+					}
+				case "cancel":
+					if !errors.Is(err, context.Canceled) || errors.Is(err, measurement.ErrTransferTimeout) {
+						t.Fatalf("cancel %+v %v", got, err)
+					}
+					t.Logf("cancellation bytes=%d response=%t digest=%t", got.PayloadBytes, got.DeclaredLength != nil, got.SHA256 != nil)
+				case "pre-cancel":
+					if !errors.Is(err, context.Canceled) || got.DeclaredLength != nil {
+						t.Fatalf("pre-cancel %+v %v", got, err)
+					}
+				case "no-digest":
+					if err != nil || !got.HTTPS.BodyComplete || got.SHA256 != nil || got.IntegrityVerified {
+						t.Fatalf("unrequested %+v %v", got, err)
+					}
+					return
+				case "raw-status":
+					if err != nil || got.HTTPS.StatusCode != 503 || !got.HTTPS.BodyComplete || !got.IntegrityVerified {
+						t.Fatalf("raw status %+v %v", got, err)
+					}
+				}
+				// Cancellation may win before response admission; preserve that honest boundary.
+				if got.DeclaredLength == nil {
+					if mode != "cancel" && mode != "pre-cancel" || got.SHA256 != nil || got.ActiveElapsed != nil || got.PayloadBytes != 0 || got.HTTPS.BodyComplete || got.IntegrityVerified {
+						t.Fatalf("before response %+v", got)
+					}
+					return
+				}
+				if got.PayloadBytes < 0 || got.PayloadBytes > 6 {
+					t.Fatal(got.PayloadBytes)
+				}
+				want := sha256.Sum256(prefix[:got.PayloadBytes])
+				if got.SHA256 == nil || *got.SHA256 != want || got.ActiveElapsed == nil {
+					t.Fatalf("partial digest %+v %v", got, err)
+				}
+				if mode != "raw-status" && (got.HTTPS.BodyComplete || got.IntegrityVerified) {
+					t.Fatalf("false completion %+v", got)
+				}
+			})
+		}
+	}
+}

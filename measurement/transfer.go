@@ -68,8 +68,16 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 		}
 		defer func() {
 			if digest != nil {
-				sum := [sha256.Size]byte(digest.Sum(nil))
+				var sum [sha256.Size]byte
+				sum = [sha256.Size]byte(digest.Sum(sum[:0]))
 				result.SHA256 = &sum
+				if err == nil && receipt.BodyComplete {
+					if sum != *expected {
+						err = ErrDigestMismatch
+					} else {
+						result.IntegrityVerified = true
+					}
+				}
 			}
 			elapsed := time.Since(started)
 			result.ActiveElapsed = &elapsed
@@ -103,14 +111,8 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 			// Fixed Content-Length framing is complete at its exact boundary.
 			receipt.BodyComplete = true
 		}
-		if expected != nil {
-			if !receipt.BodyComplete {
-				return ErrIntegrityIncomplete
-			}
-			if [sha256.Size]byte(digest.Sum(nil)) != *expected {
-				return ErrDigestMismatch
-			}
-			result.IntegrityVerified = true
+		if expected != nil && !receipt.BodyComplete {
+			return ErrIntegrityIncomplete
 		}
 		return nil
 	})
