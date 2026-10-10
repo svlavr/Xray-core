@@ -219,6 +219,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: |
+          set -euo pipefail
           go test -mod=readonly ./app/stats ./core -run '^$' \
             -bench '^(BenchmarkControlStatsP5TCPExchange|BenchmarkInspectionPacketInput|BenchmarkInspectionCapturePacketInput)$' \
             -benchtime=100x -count=1 -timeout=2m 2>&1 | tee "$RUNNER_TEMP/control-stats-bench.log"
@@ -244,9 +245,11 @@ jobs:
           ./transport/internet/hysteria ./transport/internet/websocket ./transport/internet/splithttp
       - name: Complete Measurement operation and profile races
         if: ${{ !cancelled() }}
-        run: >-
-          go test -mod=readonly -race -timeout 1h -count=1
-          ./measurement ./proxy/hysteria ./transport/internet/hysteria ./transport/internet/tls
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=readonly -race -v -timeout 1h -count=1 ./measurement ./proxy/hysteria ./transport/internet/hysteria ./transport/internet/tls 2>&1 | tee "$RUNNER_TEMP/measurement-races.log"
+          python .github/ci/check_measurement_coverage.py "$RUNNER_TEMP/measurement-races.log"
       - name: Repeat combined USER and Measurement races
         if: ${{ !cancelled() }}
         shell: bash
