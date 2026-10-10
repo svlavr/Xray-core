@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -161,17 +162,51 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 	return response
 }
 
+// Multiple-selector keys use a separate dynamic type from scalar selector keys.
+// Length framing preserves arbitrary selector contents and element boundaries.
+type selectorListKey string
+
+func encodedSelectorList(selectors []string) string {
+	size := 0
+	for _, selector := range selectors {
+		size += len(selector) + 2 // At least one decimal digit and a colon.
+		for length := len(selector); length >= 10; length /= 10 {
+			size++
+		}
+	}
+	var key strings.Builder
+	key.Grow(size)
+	var digits [20]byte
+	for _, selector := range selectors {
+		key.Write(strconv.AppendInt(digits[:0], int64(len(selector)), 10))
+		key.WriteByte(':')
+		key.WriteString(selector)
+	}
+	return key.String()
+}
+
 // Select implements outbound.HandlerSelector.
 func (m *Manager) Select(selectors []string) []string {
-	key := strings.Join(selectors, ",")
+	key := ""
+	if len(selectors) == 1 {
+		key = selectors[0]
+	} else if len(selectors) > 1 {
+		key = encodedSelectorList(selectors)
+	}
 	m.access.RLock()
 	defer m.access.RUnlock()
-	if cache, ok := m.tagsCache.Load(key); ok {
+	if len(selectors) == 0 {
+		return []string{}
+	}
+	if len(selectors) == 1 {
+		if cache, ok := m.tagsCache.Load(key); ok {
+			return cache.([]string)
+		}
+	} else if cache, ok := m.tagsCache.Load(selectorListKey(key)); ok {
 		return cache.([]string)
 	}
 
 	tags := make([]string, 0, len(selectors))
-
 	for tag := range m.taggedHandler {
 		for _, selector := range selectors {
 			if strings.HasPrefix(tag, selector) {
@@ -180,10 +215,12 @@ func (m *Manager) Select(selectors []string) []string {
 			}
 		}
 	}
-
 	sort.Strings(tags)
-	m.tagsCache.Store(key, tags)
-
+	if len(selectors) == 1 {
+		m.tagsCache.Store(key, tags)
+	} else {
+		m.tagsCache.Store(selectorListKey(key), tags)
+	}
 	return tags
 }
 
