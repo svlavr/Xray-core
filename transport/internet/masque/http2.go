@@ -369,22 +369,84 @@ func (c *http2ClientConn) abortStream(err error, reset bool) {
 func (c *http2ClientConn) keepAlive(period time.Duration) {
 	ticker := time.NewTicker(max(period/3, time.Second))
 	defer ticker.Stop()
+	timer := time.NewTimer(http2PingTimeout)
+	timer.Stop()
+	defer timer.Stop()
+	var timeout <-chan time.Time
+	var written <-chan error
+	var pingFrame int64
+	var writeStarted time.Time
 	for {
+		var err error
 		select {
 		case <-c.done:
 			return
+		case err = <-written:
+		case <-timeout:
+			if written == nil {
+				if c.lastFrame.Load() != pingFrame {
+					timeout = nil
+					continue
+				}
+				c.fail(errHTTP2IdleTimeout)
+				return
+			}
+			select {
+			case err = <-written:
+			default:
+				// Give the initial write 15s, then retain the existing
+				// frame-idle allowance while that one write is pending.
+				remaining := max(http2PingTimeout-time.Since(writeStarted),
+					period+http2PingTimeout-time.Since(time.Unix(0, c.lastFrame.Load())))
+				if remaining <= 0 {
+					c.fail(errHTTP2IdleTimeout)
+					return
+				}
+				timer.Reset(remaining)
+				continue
+			}
 		case <-ticker.C:
+			if written != nil {
+				continue
+			}
+			lastFrame := c.lastFrame.Load()
+			if timeout != nil {
+				if lastFrame == pingFrame {
+					continue
+				}
+				timer.Stop()
+				timeout = nil
+			}
+			idle := time.Since(time.Unix(0, lastFrame))
+			if idle < period {
+				continue
+			}
+			pingFrame = lastFrame
+			writeStarted = time.Now()
+			result := make(chan error, 1)
+			written = result
+			go func() {
+				result <- c.write(func(fr *http2.Framer) error {
+					return fr.WritePing(false, [8]byte{})
+				})
+			}()
+			timer.Reset(max(http2PingTimeout, period+http2PingTimeout-idle))
+			timeout = timer.C
+			continue
 		}
-		idle := time.Since(time.Unix(0, c.lastFrame.Load()))
-		if idle >= period+http2PingTimeout {
-			c.fail(errHTTP2IdleTimeout)
+		written = nil
+		if err != nil {
+			c.fail(err)
 			return
 		}
-		if idle >= period {
-			go c.write(func(fr *http2.Framer) error {
-				return fr.WritePing(false, [8]byte{})
-			})
+		if c.lastFrame.Load() != pingFrame {
+			timer.Stop()
+			timeout = nil
+			continue
 		}
+		// A successful physical flush starts a fresh full receive window.
+		// Later inbound frames release this wait on the next normal tick.
+		timer.Reset(http2PingTimeout)
 	}
 }
 

@@ -79,9 +79,20 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 }
 
 func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when locking
+	return m.getXmuxClient(ctx, true)
+}
+
+// GetExistingXmuxClient selects an eligible client without creating a connection.
+// The caller must hold the same lock as for GetXmuxClient; selection consumes one reuse.
+func (m *XmuxManager) GetExistingXmuxClient(ctx context.Context) *XmuxClient {
+	return m.getXmuxClient(ctx, false)
+}
+
+func (m *XmuxManager) getXmuxClient(ctx context.Context, allowCreation bool) *XmuxClient {
 	for i := 0; i < len(m.xmuxClients); {
 		xmuxClient := m.xmuxClients[i]
-		if xmuxClient.XmuxConn.IsClosed() ||
+		if (!allowCreation && xmuxClient.NotUsed.Load()) ||
+			xmuxClient.XmuxConn.IsClosed() ||
 			xmuxClient.leftUsage == 0 ||
 			xmuxClient.LeftRequests.Load() <= 0 ||
 			(xmuxClient.UnreusableAt != time.Time{} && time.Now().After(xmuxClient.UnreusableAt)) {
@@ -99,11 +110,14 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 	}
 
 	if len(m.xmuxClients) == 0 {
+		if !allowCreation {
+			return nil
+		}
 		errors.LogDebug(ctx, "XMUX: creating xmuxClient because xmuxClients is empty")
 		return m.newXmuxClient()
 	}
 
-	if m.connections > 0 && len(m.xmuxClients) < int(m.connections) {
+	if allowCreation && m.connections > 0 && len(m.xmuxClients) < int(m.connections) {
 		errors.LogDebug(ctx, "XMUX: creating xmuxClient because maxConnections was not hit, xmuxClients = ", len(m.xmuxClients))
 		return m.newXmuxClient()
 	}
@@ -120,6 +134,9 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 	}
 
 	if len(xmuxClients) == 0 {
+		if !allowCreation {
+			return nil
+		}
 		errors.LogDebug(ctx, "XMUX: creating xmuxClient because maxConcurrency was hit, xmuxClients = ", len(m.xmuxClients))
 		return m.newXmuxClient()
 	}
