@@ -25,8 +25,10 @@ func TestInspectionNativeSelectorCacheIdentity(t *testing.T) {
 		selectors []string
 		want      []string
 	}{
-		{"none", nil, []string{}}, {"all", []string{""}, []string{"1:a1:b-x", "a,b-x", "b-x"}},
-		{"comma-literal", []string{"a,b"}, []string{"a,b-x"}}, {"two-prefixes", []string{"a", "b"}, []string{"a,b-x", "b-x"}},
+		{"none", nil, []string{}},
+		{"all", []string{""}, []string{"1:a1:b-x", "a,b-x", "b-x"}},
+		{"comma-literal", []string{"a,b"}, []string{"a,b-x"}},
+		{"two-prefixes", []string{"a", "b"}, []string{"a,b-x", "b-x"}},
 		{"framed-scalar", []string{"1:a1:b"}, []string{"1:a1:b-x"}},
 	}
 	for round := 0; round < 3; round++ {
