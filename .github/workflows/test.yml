@@ -179,7 +179,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test -mod=readonly -race -v -timeout 10m -count=2 -p 1 ./app/dns ./app/router ./common/lua ./common/geodata ./common/log ./common/platform ./infra/conf ./features/dns/localdns ./features/routing/dns
+          go test -mod=readonly -race -v -timeout 10m -count=2 -p 1 ./app/dns ./app/router ./common/lua ./common/geodata ./common/log ./infra/conf ./features/dns/localdns ./features/routing/dns
+          # The original asset-location test retains a process environment change.
+          for repetition in 1 2; do
+            go test -mod=readonly -race -v -timeout 10m -count=1 -p 1 ./common/platform
+          done
           go test -mod=readonly -race -v -timeout 10m -count=2 -p 1 ./transport/internet/hysteria
           go test -mod=readonly -race -v -timeout 10m -count=2 -p 1 -run '^(TestU2|TestInstance)' ./core ./common/mux
       - name: Upstream SOCKS UDP, XDNS and MASQUE integration races
