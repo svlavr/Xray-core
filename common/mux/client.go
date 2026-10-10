@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/xudp"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
@@ -131,12 +132,19 @@ type ClientWorkerFactory interface {
 }
 
 type DialingWorkerFactory struct {
+	// Context carries only instance ownership into the shared carrier.
+	// Create detaches caller cancellation and all other context values.
+	Context  context.Context
 	Proxy    proxy.Outbound
 	Dialer   internet.Dialer
 	Strategy ClientStrategy
 }
 
 func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
+	base := context.Background()
+	if f.Context != nil && core.FromContext(f.Context) != nil {
+		base = core.ToBackgroundDetachedContext(f.Context)
+	}
 	opts := []pipe.Option{pipe.WithSizeLimit(64 * 1024)}
 	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
@@ -153,7 +161,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		outbounds := []*session.Outbound{{
 			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
 		}}
-		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
+		ctx := session.ContextWithOutbounds(base, outbounds)
 		ctx, cancel := context.WithCancel(ctx)
 
 		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {

@@ -259,6 +259,9 @@ L:
 // toDnsContext create a new background context with parent inbound, session and dns log
 func toDnsContext(ctx, caller context.Context, addr string) context.Context {
 	dnsCtx := core.ToBackgroundDetachedContext(ctx)
+	if binding, ok := ctx.Value(resolverContextKey{}).(resolverBinding); ok {
+		dnsCtx = context.WithValue(dnsCtx, resolverContextKey{}, binding)
+	}
 	dnsCtx = &dnsRequestContext{Context: dnsCtx, caller: caller}
 	dnsCtx = session.ContextWithTrafficOrigin(dnsCtx, session.TrafficOriginInternal)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {

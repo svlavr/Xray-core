@@ -127,7 +127,7 @@ func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
 func EnableFlowInspection(instance *Instance, options stats.ObservationOptions) (stats.FlowInspection, error) {
 	instance.statusLock.Lock()
 	defer instance.statusLock.Unlock()
-	if instance.running {
+	if instance.IsRunning() {
 		return nil, fmt.Errorf("inspection enablement is too late")
 	}
 	feature := instance.GetFeature(stats.ManagerType())

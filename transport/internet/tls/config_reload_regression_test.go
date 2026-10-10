@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,63 @@ import (
 
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 )
+
+func TestTransportRootSelectionAndIsolation(t *testing.T) {
+	ca, _ := cert.MustGenerate(nil, cert.Authority(true), cert.KeyUsage(x509.KeyUsageCertSign))
+	leaf, _ := cert.MustGenerate(ca, cert.CommonName("fixture.invalid"), cert.DNSNames("fixture.invalid"))
+	parsed, err := x509.ParseCertificate(leaf.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := ParseCertificate(ca)
+	root.Usage = Certificate_AUTHORITY_VERIFY
+	for _, useSystem := range []bool{false, true} {
+		for _, customOnly := range []bool{false, true} {
+			config := &Config{UseSystemCa: useSystem, DisableSystemRoot: customOnly, Certificate: []*Certificate{root}}
+			pool, err := config.getCertPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := parsed.Verify(x509.VerifyOptions{Roots: pool, DNSName: "fixture.invalid"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := parsed.Verify(x509.VerifyOptions{Roots: pool, DNSName: "wrong.invalid"}); err == nil {
+				t.Fatal("wrong name trusted")
+			}
+			if customOnly && len(pool.Subjects()) != 1 {
+				t.Fatal("custom-only pool includes other roots")
+			}
+			// A custom addition must not mutate either process-wide cached pool.
+			fresh, err := (&Config{UseSystemCa: useSystem}).getCertPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.GOOS == "windows" && useSystem && fresh != nil {
+				t.Fatal("Windows system verifier lost")
+			}
+			if !useSystem && (fresh == nil || !fresh.Equal(bundleCertPool())) {
+				t.Fatal("default bundle lost")
+			}
+			if _, err := parsed.Verify(x509.VerifyOptions{Roots: fresh, DNSName: "fixture.invalid"}); err == nil {
+				t.Fatal("custom root leaked into default pool")
+			}
+		}
+	}
+	for _, system := range []bool{false, true} {
+		pool, err := (&Config{UseSystemCa: system, DisableSystemRoot: true}).getCertPool()
+		if err != nil || pool == nil || len(pool.Subjects()) != 0 {
+			t.Fatalf("empty isolated pool: %v", err)
+		}
+		config := (&Config{UseSystemCa: system, Certificate: []*Certificate{{Certificate: []byte("invalid PEM"), Usage: Certificate_AUTHORITY_VERIFY}}}).GetTLSConfig(WithClient())
+		CloseConfig(config)
+		if config.RootCAs == nil || len(config.RootCAs.Subjects()) != 0 {
+			t.Fatal("invalid configured root silently selected other trust")
+		}
+		if config.Rand.(*RandCarrier).RootCAs != config.RootCAs {
+			t.Fatal("name verifier uses different trust after invalid root")
+		}
+	}
+}
 
 func reloadHandshake(config *gotls.Config, name string, version uint16) (gotls.ConnectionState, error) {
 	server, client := net.Pipe()

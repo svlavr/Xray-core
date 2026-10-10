@@ -30,6 +30,7 @@ type Server interface {
 
 // Client is the interface for DNS client.
 type Client struct {
+	id            string
 	server        Server
 	skipFallback  bool
 	expectedIPs   geodata.IPMatcher
@@ -139,7 +140,7 @@ func newClient(
 	dispatcher routing.Dispatcher,
 	fake dns.FakeDNSEngine,
 ) (*Client, error) {
-	client := &Client{}
+	client := &Client{id: ns.Id}
 	// Create a new server for each client for now
 	server, err := newServer(ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP, fake)
 	if err != nil {

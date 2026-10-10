@@ -36,6 +36,9 @@ type DNS struct {
 	strictSelection        bool
 	queries                sync.WaitGroup
 	runtime                *dnsRuntime
+	scriptMu               sync.RWMutex
+	script                 *scriptEngine
+	scriptPath             string
 }
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher.
@@ -226,6 +229,7 @@ func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
+		scriptPath:             config.Script,
 	}, nil
 }
 
@@ -236,12 +240,18 @@ func (*DNS) Type() interface{} {
 
 // Start implements common.Runnable.
 func (s *DNS) Start() error {
-	return nil
+	if s.runtime == nil {
+		return s.startNativeScript()
+	}
+	return s.startRuntime()
 }
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
 	if s.runtime == nil {
+		if engine := s.getScript(); engine != nil {
+			engine.close()
+		}
 		return nil
 	}
 	rt := s.runtime
@@ -255,6 +265,12 @@ func (s *DNS) Close() error {
 	current, closing := rt.current, rt.closing
 	rt.mu.Unlock()
 	var errs []error
+	if current != nil {
+		current.startClose()
+	}
+	if closing != nil {
+		closing.startClose()
+	}
 	if current != nil {
 		errs = append(errs, current.closeOwned())
 	}
@@ -311,7 +327,7 @@ func (s *DNS) MayUseSystemResolver() bool {
 	if rt.current == nil || rt.current.ctx.Err() != nil {
 		return true
 	}
-	return resolverMayUseSystem(rt.current.resolver)
+	return resolverMayUseSystem(rt.current.resolver) || (rt.closing != nil && resolverMayUseSystem(rt.closing.resolver))
 }
 
 func resolverMayUseSystem(s *DNS) bool {
@@ -368,13 +384,19 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
+	if s.runtime == nil {
+		return s.lookupIP(ctx, domain, option)
+	}
 	rt := s.runtime
 	rt.mu.Lock()
-	if rt.current == nil || rt.current.ctx.Err() != nil {
+	owner := resolverFromContext(ctx, rt)
+	if owner == nil {
+		owner = rt.current
+	}
+	if owner == nil || owner.ctx.Err() != nil {
 		rt.mu.Unlock()
 		return nil, 0, context.Canceled
 	}
-	owner := rt.current
 	owner.resolver.queries.Add(1)
 	rt.mu.Unlock()
 	defer owner.resolver.queries.Done()
@@ -389,6 +411,7 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 	if content := session.ContentFromContext(ctx); content != nil {
 		base = session.ContextWithContent(base, content)
 	}
+	base = bindResolverContext(base, rt, owner)
 	queryCtx, cancel := context.WithCancel(base)
 	stopCaller := context.AfterFunc(ctx, cancel)
 	stopOwner := context.AfterFunc(owner.ctx, cancel)
@@ -442,6 +465,9 @@ func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) 
 	}
 
 	// Name servers lookup
+	if engine := s.getScript(); engine != nil {
+		return engine.queryContext(ctx, domain, option)
+	}
 	if s.enableParallelQuery {
 		return s.parallelQuery(ctx, domain, option)
 	} else {
