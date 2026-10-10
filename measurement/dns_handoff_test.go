@@ -33,7 +33,7 @@ func TestDNSResponseHandoffPreservesCancellationAndWireFacts(t *testing.T) {
 			queued := append([]byte(nil), tc.wire...)
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			message, err := parseDNSResponse(ctx, queued, query)
+			message, err := parseDNSResponse(ctx, queued, query, DNSUDP)
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("queued DNS result hid cancellation: %v", err)
 			}

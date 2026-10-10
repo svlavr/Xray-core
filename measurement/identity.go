@@ -22,7 +22,9 @@ type IdentityRequest struct {
 	Family AddressFamily // Zero accepts the family actually reported.
 }
 
-// Country values are endpoint declarations. The caller interprets them;
+// Address/family and country values are parsed endpoint declarations, not an
+// independent observation of the route's public egress or Internet health.
+// The caller interprets them;
 // the executor does not impose another reflector/version/freshness protocol.
 type IdentityReceipt struct {
 	HTTPS         HTTPSReceipt

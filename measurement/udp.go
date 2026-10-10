@@ -33,16 +33,18 @@ type UDPEchoRequest struct {
 	MaxReplies  int           // Caller-selected limit, including invalid datagrams.
 }
 
-// UDPSendRecord retains actual attempted writes only. WriterBytes is the native
-// return count, also on error; it is NOT a physical-send or remote-acceptance
-// certificate. A reply can precede WriteReturned, especially on a logical pipe.
+// UDPSendRecord retains attempted writes. WriterBytes is the writer's returned
+// count when WriterBytesObserved is true; otherwise it is only the supplied
+// length for an error-only multibuffer writer, including on error. Neither is a
+// physical-send or remote-acceptance certificate. Replies can precede return.
 type UDPSendRecord struct {
-	Sequence      uint32
-	Scheduled     time.Duration // Absolute schedule from train start, after open.
-	WriteStarted  time.Duration // Offset from operation admission.
-	WriteReturned *time.Duration
-	WriterBytes   int
-	Error         error
+	Sequence            uint32
+	Scheduled           time.Duration // Absolute schedule from train start, after open.
+	WriteStarted        time.Duration // Offset from operation admission.
+	WriteReturned       *time.Duration
+	WriterBytes         int
+	WriterBytesObserved bool
+	Error               error
 }
 
 type UDPReplyIssue uint8
@@ -222,13 +224,14 @@ func runUDPTrain(ctx context.Context, conn net.Conn, r UDPEchoRequest, payload [
 			binary.BigEndian.PutUint32(wire[20:24], uint32(i))
 			// Only the sender writes Sends until its completion notification.
 			receipt.Sends = append(receipt.Sends, UDPSendRecord{Sequence: uint32(i), Scheduled: scheduled, WriteStarted: time.Since(started)})
-			n, err := writeUDPPacket(conn, wire)
+			n, observed, err := writeUDPPacket(conn, wire)
 			if err == nil && n != len(wire) {
 				err = io.ErrShortWrite
 			}
 			elapsed := time.Since(started)
 			record := &receipt.Sends[i]
 			record.WriteReturned, record.WriterBytes, record.Error = &elapsed, n, err
+			record.WriterBytesObserved = observed
 			if err != nil {
 				sent <- err
 				return
@@ -335,11 +338,12 @@ stop:
 
 // Preserve one datagram per native buffer even when a caller chooses a payload
 // larger than buf.Size. cnc.Connection.Write otherwise splits it into buffers.
-func writeUDPPacket(conn net.Conn, packet []byte) (int, error) {
+func writeUDPPacket(conn net.Conn, packet []byte) (int, bool, error) {
 	if writer, ok := conn.(buf.Writer); ok {
 		b := buf.NewWithSize(int32(len(packet)))
 		_, _ = b.Write(packet)
-		return len(packet), writer.WriteMultiBuffer(buf.MultiBuffer{b})
+		return len(packet), false, writer.WriteMultiBuffer(buf.MultiBuffer{b})
 	}
-	return conn.Write(packet)
+	n, err := conn.Write(packet)
+	return n, true, err
 }

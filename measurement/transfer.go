@@ -28,12 +28,12 @@ type DownloadRequest struct {
 	// HTTPS.MaxBodyBytes is the caller-selected streamed payload ceiling.
 	HTTPS           HTTPSRequest
 	TransferTimeout time.Duration
-	ExpectedSHA256  *[sha256.Size]byte // Validated only after complete HTTP framing.
+	ExpectedSHA256  *[sha256.Size]byte // Compared after native HTTP body completion.
 }
 
 type DownloadReceipt struct {
 	// HTTPS.Body is nil: no download payload is retained. HTTPS.BodyComplete
-	// describes framing completion; PayloadBytes counts the consumed stream.
+	// describes native body-reader completion; PayloadBytes counts the consumed stream.
 	HTTPS             HTTPSReceipt
 	DeclaredLength    *int64 // -1 means no declared length; absent before response.
 	PayloadBytes      int64
@@ -58,7 +58,7 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 	defer cancel(nil)
 	result.HTTPS, resultErr = e.exchangeHTTP(phaseCtx, request.HTTPS, http.MethodGet, nil, nil, func(ctx context.Context, response *http.Response, receipt *HTTPSReceipt) (err error) {
 		length := response.ContentLength
-		result.DeclaredLength = &length
+		result.DeclaredLength = receipt.ContentLength
 		started := time.Now()
 		timer := time.AfterFunc(request.TransferTimeout, func() { cancel(ErrTransferTimeout) })
 		defer timer.Stop()
@@ -97,6 +97,7 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 					_, _ = digest.Write(buffer[:n])
 				}
 				result.PayloadBytes += int64(n)
+				result.ByteLimitReached = result.PayloadBytes == request.HTTPS.MaxBodyBytes
 			}
 			if readErr != nil {
 				if readErr == io.EOF {
@@ -106,7 +107,6 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 				return readErr
 			}
 		}
-		result.ByteLimitReached = result.PayloadBytes == request.HTTPS.MaxBodyBytes
 		if result.ByteLimitReached && length == result.PayloadBytes {
 			// Fixed Content-Length framing is complete at its exact boundary.
 			receipt.BodyComplete = true

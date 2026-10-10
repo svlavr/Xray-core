@@ -24,7 +24,7 @@ import (
 
 var (
 	ErrDNSResponse = errors.New("invalid or mismatched DNS response")
-	ErrDNSLimit    = errors.New("DNS response exceeds request limit")
+	ErrDNSLimit    = errors.New("DNS response exceeds allowed limit")
 )
 
 type DNSTransport uint8
@@ -57,7 +57,8 @@ type DNSRequest struct {
 }
 
 // DNSReceipt retains bounded raw wire, including partial/invalid responses.
-// Message is present only after complete framing and matching ID/question checks.
+// Message follows complete framing and matching ID/available-question checks.
+// Stream transports permit an omitted question; UDP still requires an echo.
 // RCODE and TC/AD are observed facts; no fallback, health or DNSSEC verdict exists.
 // WrittenBytes is logical DNS payload writer acceptance, excluding TCP framing.
 type DNSReceipt struct {
@@ -141,7 +142,7 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 				return readErr
 			}
 			var err error
-			receipt.Message, err = parseDNSResponse(ctx, r.Body, query)
+			receipt.Message, err = parseDNSResponse(ctx, r.Body, query, request.Transport)
 			return err
 		})
 		receipt.Wire, receipt.ResponseComplete = r.Body, r.BodyComplete
@@ -188,7 +189,7 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 	if err := exchangeDNSWire(conn, wire, request, &receipt); err != nil {
 		return receipt, errors.Join(err, ctx.Err())
 	}
-	receipt.Message, resultErr = parseDNSResponse(ctx, receipt.Wire, query)
+	receipt.Message, resultErr = parseDNSResponse(ctx, receipt.Wire, query, request.Transport)
 	return receipt, resultErr
 }
 
@@ -272,15 +273,24 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 	return err
 }
 
-func parseDNSResponse(ctx context.Context, wire []byte, query *dns.Msg) (response *dns.Msg, resultErr error) {
+func parseDNSResponse(ctx context.Context, wire []byte, query *dns.Msg, transport DNSTransport) (response *dns.Msg, resultErr error) {
 	// Linearize completion before our caller's deferred cancellation. A result
 	// queued by the wire worker must not hide cancellation at final handoff.
 	defer func() { resultErr = errors.Join(resultErr, ctx.Err()) }()
+	if len(wire) > dns.MaxMsgSize {
+		return nil, errors.Join(ErrDNSResponse, ErrDNSLimit)
+	}
 	msg := new(dns.Msg)
 	if err := msg.Unpack(wire); err != nil {
 		return nil, errors.Join(ErrDNSResponse, err)
 	}
-	if msg.Id != query.Id || !msg.Response || msg.Opcode != dns.OpcodeQuery || len(msg.Question) != 1 || !strings.EqualFold(msg.Question[0].Name, query.Question[0].Name) || msg.Question[0].Qtype != query.Question[0].Qtype || msg.Question[0].Qclass != dns.ClassINET {
+	if msg.Id != query.Id || !msg.Response || msg.Opcode != dns.OpcodeQuery {
+		return nil, ErrDNSResponse
+	}
+	if len(msg.Question) == 0 && (transport == DNSTCP || transport == DNSDoT || transport == DNSDoH) {
+		return msg, nil
+	}
+	if len(msg.Question) != 1 || !strings.EqualFold(msg.Question[0].Name, query.Question[0].Name) || msg.Question[0].Qtype != query.Question[0].Qtype || msg.Question[0].Qclass != dns.ClassINET {
 		return nil, ErrDNSResponse
 	}
 	return msg, nil

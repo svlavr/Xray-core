@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,16 +36,19 @@ type HTTPSRequest struct {
 	RootCAs        *x509.CertPool
 }
 
-// HTTPSReceipt contains raw endpoint facts. BodyBytes counts decoded HTTP payload retained in Body, not TLS/wire bytes.
+// HTTPSReceipt retains endpoint facts. BodyBytes is transfer-decoded payload,
+// retaining content coding (for example gzip), not TLS/wire byte counts.
 // Timing pointers are absent unless independently observed. FirstByteElapsed
 // starts at operation admission, including open, TLS and request transmission.
 // Elapsed ends after HTTP consumption or failure, excluding cleanup and slot wait.
 type HTTPSReceipt struct {
 	StatusCode       int
 	Header           http.Header
+	ContentLength    *int64   // Native response length; -1 unknown, nil before response.
+	TransferEncoding []string // Native framing metadata, removed from Header by net/http.
 	Body             []byte
 	BodyBytes        int64
-	BodyComplete     bool
+	BodyComplete     bool // Native body-reader completion; not content or authenticated-closure proof.
 	Elapsed          time.Duration
 	EndpointTLS      *time.Duration
 	FirstByteElapsed *time.Duration
@@ -224,6 +228,9 @@ func (e *Executor) exchange(ctx context.Context, request HTTPSRequest, method st
 	}
 	responseBody = response.Body
 	receipt.StatusCode, receipt.Header = response.StatusCode, response.Header.Clone()
+	length := response.ContentLength
+	receipt.ContentLength = &length
+	receipt.TransferEncoding = slices.Clone(response.TransferEncoding)
 	if consume == nil {
 		err = readHTTPSBody(response, &receipt, request.MaxBodyBytes)
 	} else {

@@ -50,6 +50,58 @@ shapes. The exported request/receipt comments define each byte and timing
 boundary, including header/body budgets and native limits. The package does not
 calculate rates, scores, loss percentages, percentiles or node-selection policy.
 
+## Interpreting observations
+
+Read the returned error and receipt together. A completed operation, a received
+protocol response and a response satisfying the caller's expected resource are
+different observations. A nil error is not an unrestricted-Internet verdict.
+
+- HTTP status 500, a redirect or a captive-portal page can be a complete response
+  with no operation error. Redirects are not followed. The caller checks expected
+  status, marker, content and endpoint identity. HEAD observes headers without a
+  GET body; an advertised Content-Length does not count as received bytes.
+- `ContentLength` and `TransferEncoding` retain native HTTP response framing.
+  A nil length means no response was observed; -1 means native unknown length.
+  `BodyComplete` means native body-reader completion. Go may accept TCP EOF for a
+  close-delimited TLS response without an authenticated TLS close notification;
+  completion alone does not prove content integrity. Counts exclude transfer
+  framing but retain content coding such as gzip; they are not wire byte counts.
+- `FirstByteElapsed` starts at admission and may observe an informational HTTP
+  response before final headers. `EndpointTLS` records a handshake attempt,
+  including a failed attempt, and can include lower proxy setup. Absent fields
+  represent unobserved phases. Download read/hash and Upload writer-active times
+  do not independently measure network capacity or remote delivered goodput.
+- Download retains consumed bytes, the cap fact and any requested prefix digest
+  even when that same read returns an error. Integrity requires native completion
+  and the caller's expected digest. Upload writer counts and matching endpoint ACK
+  declarations remain separate; neither certifies durable server storage.
+- A matched DNS REFUSED, SERVFAIL or NOERROR/no-data response is a decoded answer,
+  not automatically a transport error or a useful-resolution verdict. TCP, DoT
+  and DoH permit omitted Question fields; present questions must match, and UDP
+  requires a matching question echo. A complete oversized DNS message retains its
+  wire facts but returns `ErrDNSResponse` and `ErrDNSLimit`, with no decoded
+  `Message`. The AD flag is observed resolver output, not local DNSSEC validation.
+- `UDPSendRecord.WriterBytesObserved` distinguishes a native returned byte count
+  from the supplied length of an error-only multibuffer writer. Inspect the write
+  error in both cases. A timed-out Echo does not prove packet filtering. Current
+  ICMP observes matched Echo replies; ICMP control errors are not retained as
+  separate correlated receipts. UDP source rejection precedes payload correlation.
+- `OutboundError` is first-observed native feedback at receipt finalization;
+  nil does not certify all asynchronous native work finished without error.
+  Identity address/family/country fields are endpoint declarations, and finite
+  series preserve failed samples without an automatic best-of-two estimate.
+
+Bind observations to the caller's endpoint, route, source version, run and network
+context before comparing them. DIRECT uses the current system network path; if
+that path traverses a VPN it is not a physical underlay control. A node-port TCP
+connect, a resource HTTP exchange through a node, and a second VPN node test have
+different endpoints and routes. Attributing a timeout requires suitable matched
+controls; an error string alone cannot identify the responsible actor.
+
+Receipt fields added here are typed Go source APIs, not a stable binary layout or
+wire schema. External adapters must rebuild and preserve the new fields when
+they need these facts; historical receipts do not acquire them retroactively.
+
 ## Example
 
 The numbers below are example caller budgets, not built-in limits.
