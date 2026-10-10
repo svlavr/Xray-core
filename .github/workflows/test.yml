@@ -174,6 +174,11 @@ jobs:
           ./common/buf ./common/crypto ./common/mux ./common/session
           ./features/dns/... ./features/routing/... ./app/proxyman/inbound
           ./proxy/shadowsocks_2022 ./transport/pipe ./transport/internet ./transport/internet/udp
+      - name: Upstream SOCKS UDP, XDNS and MASQUE integration races
+        if: ${{ !cancelled() }}
+        run: >-
+          go test -mod=readonly -race -timeout 10m -count=2 -p 1
+          ./proxy/socks ./transport/internet/finalmask/xdns ./transport/internet/masque/...
       - name: Test legacy HTTP2 pool ownership
         if: ${{ !cancelled() }}
         env:

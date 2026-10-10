@@ -17,6 +17,7 @@ import (
 	protocoludp "github.com/xtls/xray-core/common/protocol/udp"
 	"github.com/xtls/xray-core/common/session"
 	fs "github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type responseResultConn struct {
@@ -51,20 +52,28 @@ func TestSOCKSUDPResponseReceipts(t *testing.T) {
 			}
 			want := uint64(payload.Len())
 			var calls int
+			var encoded int64
 			conn := responseResultConn{write: func(p []byte) (int, error) {
 				calls++
+				encoded = int64(len(p))
 				switch mode {
 				case "full-error":
 					return len(p), errors.New("error after full datagram")
 				case "partial-error":
+					encoded--
 					return len(p) - 1, errors.New("short framed datagram")
 				case "zero-error":
+					encoded = 0
 					return 0, errors.New("no accepted datagram")
 				default:
 					return len(p), nil
 				}
 			}}
-			writeUDPResponse(ctx, conn, &protocoludp.Packet{Payload: payload})
+			counter := new(appstats.Counter)
+			writeUDPResponse(ctx, &stat.CounterConnection{Connection: conn, WriteCounter: counter}, &protocoludp.Packet{Payload: payload})
+			if got := counter.Value(); got != encoded {
+				t.Fatalf("native encoded count: %d, want actual write result %d", got, encoded)
+			}
 			if !payload.IsEmpty() {
 				t.Fatal("response did not release input")
 			}
