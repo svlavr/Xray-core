@@ -241,6 +241,8 @@ func TestUDPReplyClassificationRetainsHeaderFactsAndPrecedence(t *testing.T) {
 		sequence    uint32
 	}{
 		{"wrong-source-short", netip.MustParseAddrPort("127.0.0.2:9"), func(p []byte) []byte { return p[:3] }, UDPReplyWrongSource, false, 0},
+		{"wrong-source-header", netip.MustParseAddrPort("127.0.0.2:9"), func(p []byte) []byte { return p }, UDPReplyWrongSource, true, 0},
+		{"wrong-source-unsent-header", netip.MustParseAddrPort("127.0.0.2:9"), func(p []byte) []byte { binary.BigEndian.PutUint32(p[20:24], 3); return p }, UDPReplyWrongSource, true, 3},
 		{"short", destination, func(p []byte) []byte { return p[:23] }, UDPReplyMalformed, false, 0},
 		{"wrong-magic", destination, func(p []byte) []byte { p[0] ^= 1; return p }, UDPReplyMalformed, false, 0},
 		{"wrong-nonce", destination, func(p []byte) []byte { p[4] ^= 1; return p }, UDPReplyWrongNonce, false, 0},

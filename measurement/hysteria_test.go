@@ -972,6 +972,10 @@ func testProtocolRawMethodsAt(t *testing.T, e *measurement.Executor, counters [2
 						if err != nil || got.Address.String() != "192.0.2.1" {
 							t.Fatalf("identity: %+v, %v", got, err)
 						}
+					} else if path == "/identity-wrong-family" {
+						if !errors.Is(err, measurement.ErrIdentityResponse) || got.Address.String() != "192.0.2.1" || got.Family != measurement.IPv4 {
+							t.Fatalf("family mismatch lost raw identity: %+v, %v", got, err)
+						}
 					} else if !errors.Is(err, measurement.ErrIdentityResponse) || got.Address.IsValid() {
 						t.Fatalf("invalid identity: %+v, %v", got, err)
 					}

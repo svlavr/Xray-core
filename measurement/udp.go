@@ -154,8 +154,6 @@ func observeUDPReply(receipt *UDPEchoReceipt, packet []byte, source netip.AddrPo
 		return ErrUDPReplyLimit
 	}
 	switch {
-	case source != r.Destination:
-		v.Issue = UDPReplyWrongSource
 	case len(packet) < 24 || !bytes.Equal(packet[:4], payload[:4]):
 		v.Issue = UDPReplyMalformed
 	case !bytes.Equal(packet[4:20], payload[4:20]):
@@ -164,9 +162,12 @@ func observeUDPReply(receipt *UDPEchoReceipt, packet []byte, source netip.AddrPo
 		seq := binary.BigEndian.Uint32(packet[20:24])
 		v.Sequence = &seq
 		// The matching header already checked the immutable nonce and magic.
-		if len(packet) != len(payload) || !bytes.Equal(packet[24:], payload[24:]) {
+		if source == r.Destination && (len(packet) != len(payload) || !bytes.Equal(packet[24:], payload[24:])) {
 			v.Issue = UDPReplyMalformed
 		}
+	}
+	if source != r.Destination {
+		v.Issue = UDPReplyWrongSource
 	}
 	receipt.Replies = append(receipt.Replies, v)
 	return nil
@@ -177,7 +178,7 @@ func finalizeUDPReplies(receipt *UDPEchoReceipt, r UDPEchoRequest) {
 	matched := make(map[uint32]bool)
 	for i := range receipt.Replies {
 		v := &receipt.Replies[i]
-		if v.Sequence == nil {
+		if v.Sequence == nil || v.Issue == UDPReplyWrongSource {
 			continue
 		}
 		seq := *v.Sequence

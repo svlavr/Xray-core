@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -227,10 +226,11 @@ func (e *Executor) exchange(ctx context.Context, request HTTPSRequest, method st
 		return receipt, err
 	}
 	responseBody = response.Body
-	receipt.StatusCode, receipt.Header = response.StatusCode, response.Header.Clone()
+	// This exchange owns the response; transfer its metadata without another copy.
+	receipt.StatusCode, receipt.Header = response.StatusCode, response.Header
 	length := response.ContentLength
 	receipt.ContentLength = &length
-	receipt.TransferEncoding = slices.Clone(response.TransferEncoding)
+	receipt.TransferEncoding = response.TransferEncoding
 	if consume == nil {
 		err = readHTTPSBody(response, &receipt, request.MaxBodyBytes)
 	} else {

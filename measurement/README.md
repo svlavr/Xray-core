@@ -5,6 +5,12 @@ It starts no background probe, registers no Xray feature and adds no network API
 Use an existing configured, started `*core.Instance` for exact outbound routes.
 `New(nil, limit)` supports independent DIRECT operations without an instance.
 
+For a simple delay check, call `HTTP` once with `HEAD` and an HTTP/HTTPS URL.
+`MaxBodyBytes=0` is valid for HEAD. The returned status, timing and error are raw
+observations; no expected status, body hash, nonce or upload ACK is required.
+GET is available when response bytes are needed. Repeats, warming and a series
+are explicit caller choices, never mandatory parts of a single operation.
+
 Construct an executor with a positive concurrency limit chosen by the caller.
 Requests supply their own time and byte budgets; queue waiting uses the request
 timeout. Cancel operations and wait for their calls to return before closing
@@ -75,17 +81,30 @@ different observations. A nil error is not an unrestricted-Internet verdict.
   even when that same read returns an error. Integrity requires native completion
   and the caller's expected digest. Upload writer counts and matching endpoint ACK
   declarations remain separate; neither certifies durable server storage.
+  Hashing is disabled unless `ExpectedSHA256` or `RequireAcknowledgment` is
+  selected. The Upload ACK is an optional endpoint-specific JSON contract, not
+  a prerequisite for ordinary upload. Generated/accepted counts, accepted-prefix
+  digest and active time are snapshots at return; they do not join asynchronous
+  native writers. Endpoint-declared counts such as Cloudflare's
+  `Cf-Meta-Upload-Bytes` are already retained in `Header` for caller interpretation.
 - A matched DNS REFUSED, SERVFAIL or NOERROR/no-data response is a decoded answer,
   not automatically a transport error or a useful-resolution verdict. TCP, DoT
   and DoH permit omitted Question fields; present questions must match, and UDP
   requires a matching question echo. A complete oversized DNS message retains its
   wire facts but returns `ErrDNSResponse` and `ErrDNSLimit`, with no decoded
   `Message`. The AD flag is observed resolver output, not local DNSSEC validation.
+  Short framed stream replies retain their received bytes before parsing fails.
+  Wrong-source UDP replies retain native read completion independently of their
+  correlation error; completion alone does not make the reply a valid answer.
 - `UDPSendRecord.WriterBytesObserved` distinguishes a native returned byte count
   from the supplied length of an error-only multibuffer writer. Inspect the write
   error in both cases. A timed-out Echo does not prove packet filtering. Current
   ICMP observes matched Echo replies; ICMP control errors are not retained as
-  separate correlated receipts. UDP source rejection precedes payload correlation.
+  separate correlated receipts. Wrong-source classification remains independent
+  of any matching header facts.
+  A matching UDP header sequence may be retained with a wrong-source issue; it
+  does not imply a valid Echo, RTT or duplicate. A parsed identity declaration
+  likewise remains available alongside status/family or HTTP-read errors.
 - `OutboundError` is first-observed native feedback at receipt finalization;
   nil does not certify all asynchronous native work finished without error.
   Identity address/family/country fields are endpoint declarations, and finite
@@ -112,10 +131,10 @@ func probe(ctx context.Context, instance *core.Instance, url string) (measuremen
     if err != nil {
         return measurement.HTTPReceipt{}, err
     }
-    return executor.HTTP(ctx, http.MethodGet, measurement.HTTPRequest{
+    return executor.HTTP(ctx, http.MethodHead, measurement.HTTPRequest{
         Route: measurement.Route{Kind: measurement.ExactOutbound, Tag: "proxy"},
         URL: url, Timeout: 3 * time.Second,
-        MaxBodyBytes: 4096, MaxHeaderBytes: 8192,
+        MaxBodyBytes: 0, MaxHeaderBytes: 8192,
     })
 }
 ```

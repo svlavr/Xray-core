@@ -2,6 +2,7 @@ package measurement_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -50,11 +51,15 @@ func TestIdentityUsesNativeJSONWithoutReceiptCertificates(t *testing.T) {
 	if err != nil || identity.Address.String() != "192.0.2.7" || identity.Country != "zz" {
 		t.Fatalf("ordinary JSON: %+v %v", identity, err)
 	}
-	for _, body := range []string{`{"ip":"invalid"}`, `{"ip":"2001:db8::7"}`, `{"ip":7}`, `{"ip":"192.0.2.7"}{}`} {
+	for _, body := range []string{`{"ip":"invalid"}`, `{"ip":7}`, `{"ip":"192.0.2.7"}{}`} {
 		response.Body = []byte(body)
 		if got, err := measurement.IdentityFromHTTPS(response, measurement.IPv4); err == nil || got.Address.IsValid() {
 			t.Fatalf("invalid identity: %+v %v", got, err)
 		}
+	}
+	response.Body = []byte(`{"ip":"2001:db8::7"}`)
+	if got, err := measurement.IdentityFromHTTPS(response, measurement.IPv4); !errors.Is(err, measurement.ErrIdentityResponse) || got.Address.String() != "2001:db8::7" || got.Family != measurement.IPv6 {
+		t.Fatalf("family mismatch erased raw declaration: %+v %v", got, err)
 	}
 }
 

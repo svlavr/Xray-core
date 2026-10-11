@@ -57,7 +57,6 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 	phaseCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	result.HTTPS, resultErr = e.exchangeHTTP(phaseCtx, request.HTTPS, http.MethodGet, nil, nil, func(ctx context.Context, response *http.Response, receipt *HTTPSReceipt) (err error) {
-		length := response.ContentLength
 		result.DeclaredLength = receipt.ContentLength
 		started := time.Now()
 		timer := time.AfterFunc(request.TransferTimeout, func() { cancel(ErrTransferTimeout) })
@@ -106,10 +105,6 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 				}
 				return readErr
 			}
-		}
-		if result.ByteLimitReached && length == result.PayloadBytes {
-			// Fixed Content-Length framing is complete at its exact boundary.
-			receipt.BodyComplete = true
 		}
 		if expected != nil && !receipt.BodyComplete {
 			return ErrIntegrityIncomplete

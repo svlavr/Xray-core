@@ -301,6 +301,30 @@ func TestEgressIdentityIPv4IPv6AndOneExchangeReuse(t *testing.T) {
 	}
 }
 
+func TestIdentityParsedDeclarationSurvivesStatusAndPartialRead(t *testing.T) {
+	body := `{"ip":"192.0.2.7","country":"ZZ"}`
+	e := executor(t, instance(t))
+	for _, mode := range []string{"bad-status", "partial-framing", "bad-status-partial"} {
+		s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if mode != "bad-status" {
+				w.Header().Set("Content-Length", "100")
+			}
+			if mode != "partial-framing" {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			_, _ = io.WriteString(w, body)
+		}))
+		r, err := e.EgressIdentity(context.Background(), identityRequest(s, measurement.Direct, measurement.IPv4))
+		s.Close()
+		if r.Address.String() != "192.0.2.7" || r.Family != measurement.IPv4 || r.Country != "ZZ" || string(r.HTTPS.Body) != body {
+			t.Fatal("parsed facts discarded", mode, r, err)
+		}
+		if mode != "partial-framing" && !errors.Is(err, measurement.ErrIdentityResponse) || mode != "bad-status" && (!errors.Is(err, io.ErrUnexpectedEOF) || r.HTTPS.BodyComplete) {
+			t.Fatal("error/completion lost", mode, r, err)
+		}
+	}
+}
+
 func TestEgressIdentityCancellationAndNoFallback(t *testing.T) {
 	entered := make(chan struct{})
 	ended := make(chan struct{})

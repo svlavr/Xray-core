@@ -36,23 +36,18 @@ type IdentityReceipt struct {
 
 func (e *Executor) EgressIdentity(ctx context.Context, request IdentityRequest) (result IdentityReceipt, resultErr error) {
 	result.HTTPS, resultErr = e.exchangeHTTP(ctx, request.HTTPS, http.MethodGet, nil, nil, func(_ context.Context, response *http.Response, receipt *HTTPSReceipt) error {
-		if err := readHTTPSBody(response, receipt, request.HTTPS.MaxBodyBytes); err != nil {
-			return err
-		}
+		readErr := readHTTPSBody(response, receipt, request.HTTPS.MaxBodyBytes)
 		var err error
 		result, err = IdentityFromHTTPS(*receipt, request.Family)
-		return err
+		return errors.Join(readErr, err)
 	})
 	return result, resultErr
 }
 
-// IdentityFromHTTPS reuses a completed exchange whose transport error the caller
+// IdentityFromHTTPS reuses an exchange whose transport error the caller
 // already handled. TLS timing and duplicate byte counts are not trust flags.
 func IdentityFromHTTPS(response HTTPSReceipt, expected AddressFamily) (result IdentityReceipt, err error) {
 	result.HTTPS = response
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return result, ErrIdentityResponse
-	}
 	var body struct {
 		IP            string `json:"ip"`
 		Country       string `json:"country"`
@@ -70,10 +65,11 @@ func IdentityFromHTTPS(response HTTPSReceipt, expected AddressFamily) (result Id
 	if address.Is4() {
 		family = IPv4
 	}
-	if expected != 0 && family != expected {
-		return result, ErrIdentityResponse
-	}
 	result.Address, result.Family = address, family
 	result.Country, result.CountrySource = body.Country, body.CountrySource
+	// Qualification failure must not erase a declaration that was parsed.
+	if response.StatusCode < 200 || response.StatusCode >= 300 || expected != 0 && family != expected {
+		return result, ErrIdentityResponse
+	}
 	return result, nil
 }

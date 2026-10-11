@@ -209,6 +209,7 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 		}
 		var packet []byte
 		var readErr error
+		var sourceErr error
 		if pc, ok := conn.(net.PacketConn); ok {
 			packet = make([]byte, 65536)
 			n, addr, err := pc.ReadFrom(packet)
@@ -216,7 +217,7 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 			readErr = err
 			source, ok := addr.(*net.UDPAddr)
 			if !ok || netip.AddrPortFrom(source.AddrPort().Addr().Unmap(), source.AddrPort().Port()) != request.Resolver {
-				readErr = errors.Join(readErr, ErrDNSResponse)
+				sourceErr = ErrDNSResponse
 			}
 		} else if reader, ok := conn.(buf.Reader); ok {
 			mb, err := reader.ReadMultiBuffer()
@@ -226,7 +227,7 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 				b := mb[0]
 				packet = b.Bytes()
 				if b.UDP == nil || b.UDP.Address.String() != request.Resolver.Addr().String() || uint16(b.UDP.Port) != request.Resolver.Port() {
-					readErr = errors.Join(readErr, ErrDNSResponse)
+					sourceErr = ErrDNSResponse
 				}
 			}
 		} else {
@@ -238,7 +239,7 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 		} else {
 			receipt.ResponseComplete = readErr == nil
 		}
-		return readErr
+		return errors.Join(readErr, sourceErr)
 	}
 	frame := make([]byte, len(wire)+2)
 	binary.BigEndian.PutUint16(frame, uint16(len(wire)))
@@ -262,9 +263,6 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 	size := int(binary.BigEndian.Uint16(prefix[:]))
 	if size > request.MaxResponseBytes {
 		return ErrDNSLimit
-	}
-	if size < 12 {
-		return ErrDNSResponse
 	}
 	receipt.Wire = make([]byte, size)
 	n, err := io.ReadFull(conn, receipt.Wire)
