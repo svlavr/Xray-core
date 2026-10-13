@@ -13,16 +13,12 @@ import (
 	"github.com/xtls/xray-core/proxy"
 )
 
-type packet struct {
-	data []byte
-	dest *net.Destination
-}
-
 // sub-handler specifically for udp connections under main handler
 type udpConnectionHandler struct {
 	sync.RWMutex
 
 	udpConns map[net.Destination]*udpConn
+	closed   bool
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -40,17 +36,22 @@ func newUdpConnectionHandler(handleConnection func(conn net.Conn, dest net.Desti
 
 // HandlePacket handles UDP packets coming from tun, to forward to the dispatcher
 // this custom handler support FullCone NAT of returning packets, binding connection only by the source addr:port
-func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data []byte) {
+func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destination, data *buf.Buffer) {
+	data.UDP = &dst
+
 	u.RLock()
+	if u.closed {
+		u.RUnlock()
+		data.Release()
+		return
+	}
 	conn, found := u.udpConns[src]
 	if found {
 		select {
-		case conn.egress <- &packet{
-			data: data,
-			dest: &dst,
-		}:
+		case conn.egress <- data:
 		default:
-			errors.LogDebug(context.Background(), "drop udp with size ", len(data), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full")
+			errors.LogDebug(context.Background(), "drop udp with size ", data.Len(), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full")
+			data.Release()
 		}
 		u.RUnlock()
 		return
@@ -59,10 +60,14 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	u.Lock()
 	defer u.Unlock()
+	if u.closed {
+		data.Release()
+		return
+	}
 
 	conn, found = u.udpConns[src]
 	if !found {
-		egress := make(chan *packet, 1024)
+		egress := make(chan *buf.Buffer, 1024)
 		conn = &udpConn{handler: u, egress: egress, src: src, dst: dst}
 		u.udpConns[src] = conn
 
@@ -71,12 +76,10 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	// send packet data to the egress channel, if it has buffer, or discard
 	select {
-	case conn.egress <- &packet{
-		data: data,
-		dest: &dst,
-	}:
+	case conn.egress <- data:
 	default:
-		errors.LogDebug(context.Background(), "drop udp with size ", len(data), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full 2")
+		errors.LogDebug(context.Background(), "drop udp with size ", data.Len(), " to ", dst.NetAddr(), " original ", conn.dst.NetAddr(), " > queue full 2")
+		data.Release()
 	}
 }
 
@@ -86,54 +89,55 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	if u.udpConns[conn.src] == conn {
 		delete(u.udpConns, conn.src)
 		close(conn.egress)
-		for range conn.egress {
-		} // release unconsumed packet storage at retirement
+		for b := range conn.egress {
+			b.Release()
+		}
 	}
 	u.Unlock()
+}
+
+// Close seals UDP admission and releases packets whose reader has not taken custody.
+func (u *udpConnectionHandler) Close() error {
+	u.Lock()
+	defer u.Unlock()
+	u.closed = true
+	for src, conn := range u.udpConns {
+		delete(u.udpConns, src)
+		close(conn.egress)
+		for b := range conn.egress {
+			b.Release()
+		}
+	}
+	return nil
 }
 
 // udp connection abstraction
 type udpConn struct {
 	handler *udpConnectionHandler
 
-	egress  chan *packet
+	egress  chan *buf.Buffer
 	src     net.Destination
 	dst     net.Destination
 	receipt stats.Exchange
 }
 
 func (c *udpConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	for {
-		e, ok := <-c.egress
-		if !ok {
-			return nil, io.EOF
-		}
-
-		var b *buf.Buffer
-		if len(e.data) > buf.Size {
-			b = buf.NewWithSize(int32(len(e.data)))
-		} else {
-			b = buf.New()
-		}
-		if _, err := b.Write(e.data); err != nil {
-			errors.LogErrorInner(context.Background(), err, "drop packet to ", e.dest, " with size ", len(e.data))
-			b.Release()
-			continue
-		}
-		b.UDP = e.dest
-
-		return buf.MultiBuffer{b}, nil
+	b, ok := <-c.egress
+	if !ok {
+		return nil, io.EOF
 	}
+	return buf.MultiBuffer{b}, nil
 }
 
 // Read packets from the connection
 func (c *udpConn) Read(p []byte) (int, error) {
-	e, ok := <-c.egress
+	b, ok := <-c.egress
 	if !ok {
 		return 0, io.EOF
 	}
-	n := copy(p, e.data)
-	if n != len(e.data) {
+	defer b.Release()
+	n := copy(p, b.Bytes())
+	if n != int(b.Len()) {
 		return 0, io.ErrShortBuffer
 	}
 	return n, nil
@@ -150,9 +154,7 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 		err := c.handler.writePacket(b.Bytes(), dst, c.src)
-		if c.receipt != nil {
-			proxy.RecordPacketOutcome(c.receipt, uint64(b.Len()), err == nil)
-		}
+		proxy.RecordPacketOutcome(c.receipt, uint64(b.Len()), err == nil)
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
@@ -166,6 +168,7 @@ func (c *udpConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 func (c *udpConn) Write(p []byte) (int, error) {
 	// sending packets back mean sending payload with source/destination reversed
 	err := c.handler.writePacket(p, c.dst, c.src)
+	proxy.RecordPacketOutcome(c.receipt, uint64(len(p)), err == nil)
 	if err != nil {
 		return 0, err
 	}
@@ -182,6 +185,10 @@ func (c *udpConn) Close() error {
 func (c *udpConn) WithWriterReceipt(receipt stats.Exchange) buf.Writer {
 	c.receipt = receipt
 	return c
+}
+
+func (c *udpConn) WriterReceipt() stats.Exchange {
+	return c.receipt
 }
 
 func (c *udpConn) LocalAddr() net.Addr {

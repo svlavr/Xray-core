@@ -279,12 +279,6 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	return c.udpSM.udp()
 }
 
-func (c *client) clean(force bool) {
-	<-c.access.Wait()
-	defer c.access.Signal()
-	c.cleanLocked(force)
-}
-
 // cleanLocked requires the existing client admission token.
 func (c *client) cleanLocked(force bool) {
 	if force {

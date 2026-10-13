@@ -83,7 +83,7 @@ func BenchmarkInspectionPacketInput(b *testing.B) {
 func BenchmarkInspectionAdmission(b *testing.B) {
 	for _, kind := range []string{"tcp", "udp", "udp_leg", "cap_refused"} {
 		b.Run(kind, func(b *testing.B) {
-			s := newInspectionStore(fs.RuntimeID{}, normalizeObservationOptions(fs.ObservationOptions{MaxLive: 1, MaxTerminals: 64}))
+			s := newInspectionStore(fs.RuntimeID{}, normalizeObservationOptions(fs.ObservationOptions{MaxLive: 1}))
 			b.Cleanup(s.close)
 			if kind == "cap_refused" {
 				s.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
@@ -107,59 +107,6 @@ func BenchmarkInspectionAdmission(b *testing.B) {
 					receipt.Finish()
 				}
 				root.Finish()
-			}
-		})
-	}
-}
-
-// drain256 includes both producer and reusable consumer work. full measures
-// incoming fact loss on a primed queue; it is not a no-loss capture result.
-func BenchmarkInspectionCapturePacketInput(b *testing.B) {
-	destination := xnet.UDPDestination(xnet.LocalHostIP, 53)
-	for _, mode := range []string{"off", "drain256", "full"} {
-		b.Run(mode, func(b *testing.B) {
-			s := newInspectionStore(fs.RuntimeID{}, normalizeObservationOptions(fs.ObservationOptions{}))
-			b.Cleanup(s.close)
-			flow := s.Begin(xnet.Network_UDP, fs.TrafficOriginUser, xnet.Destination{}, destination, nil)
-			flow.Route(fs.OutboundRef{Tag: "capture"})
-			var capture fs.ObservationCapture
-			storage := make([]fs.FlowObservation, 0, 256)
-			if mode != "off" {
-				var err error
-				capture, err = s.CaptureObservations(256)
-				if err != nil {
-					b.Fatal(err)
-				}
-				storage = capture.ReadInto(storage).Rows
-				if mode == "full" {
-					for range 256 {
-						flow.PacketDestination(destination)
-					}
-				}
-			}
-			var receipts uint64
-			b.ReportAllocs()
-			b.ResetTimer()
-			for b.Loop() {
-				flow.RecordPacketInput(destination, 1200)
-				receipts++
-				if mode == "drain256" && receipts%256 == 0 {
-					batch := capture.ReadInto(storage)
-					storage = batch.Rows
-					if batch.Dropped != 0 || len(batch.Rows) != 256 {
-						b.Fatalf("draining capture: rows=%d dropped=%d", len(batch.Rows), batch.Dropped)
-					}
-				}
-			}
-			totals, err := s.ReadTotals()
-			if err != nil || totals.User != (fs.ClientTotals{Uplink: receipts * 1200}) || len(totals.Rows) != 1 || totals.Rows[0].Uplink != 0 {
-				b.Fatalf("general/selected receipt boundary: %+v err=%v", totals, err)
-			}
-			if capture != nil {
-				batch := capture.ReadInto(storage)
-				if (mode == "full" && batch.Dropped != receipts) || (mode == "drain256" && batch.Dropped != 0) {
-					b.Fatalf("capture loss: mode=%s receipts=%d dropped=%d", mode, receipts, batch.Dropped)
-				}
 			}
 		})
 	}
@@ -274,7 +221,7 @@ func BenchmarkInspectionLiveFirstShrink(b *testing.B) {
 // Report post-GC live heap while only late UDP legs retain ended roots.
 // The measurement deliberately has no platform-dependent byte assertion.
 func TestInspectionLateLegRetainedHeap(t *testing.T) {
-	s := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1, MaxTerminals: 1})
+	s := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1})
 	const count = 100000
 	legs := make([]fs.Exchange, count)
 	runtime.GC()
@@ -308,9 +255,11 @@ func TestInspectionFinishRetriesRegistration(t *testing.T) {
 	waiting.AddSelectedUplink(7)
 	first.Finish()
 	waiting.Finish()
-	terminals, _ := s.ReadTerminals()
-	if len(terminals.Rows) != 2 || waiting.Ref().ID == 0 || terminals.Rows[1].Flow.Uplink != 7 {
-		t.Fatalf("final binding opportunity lost: %+v", terminals)
+	if live, err := s.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 || waiting.Ref().ID == 0 {
+		t.Fatalf("final classification did not release capacity: %+v %v", live, err)
+	}
+	if got, err := s.ReadTotals(); err != nil || got.User.Uplink != 7 {
+		t.Fatalf("final USER bytes: %+v %v", got, err)
 	}
 }
 
@@ -322,10 +271,13 @@ func TestInspectionFinishRootLegRace(t *testing.T) {
 	workers.Go(func() { root.Finish() })
 	workers.Go(func() { leg.AddUplink(3); leg.Finish() })
 	workers.Wait()
-	terminal, _ := s.ReadTerminals()
-	totals, _ := s.ReadTotals()
-	if len(terminal.Rows) != 1 || totals.User.Uplink != 3 || len(totals.Rows) != 0 {
-		t.Fatalf("root/leg completion lost facts: %+v %+v", terminal, totals)
+
+	totals, err := s.ReadTotals()
+	if err != nil || totals.User.Uplink != 3 || len(totals.Rows) != 0 {
+		t.Fatalf("root/leg completion lost facts: %+v %v", totals, err)
+	}
+	if live, err := s.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("finished root remained live: %+v %v", live, err)
 	}
 }
 

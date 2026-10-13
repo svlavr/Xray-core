@@ -199,11 +199,8 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 						dest.Address = xnet.ParseAddress(tunnelHost)
 					}
 					ordinary := session.ContextWithTrafficOrigin(session.SetForcedOutboundTagToContext(ctx, route.Tag), session.TrafficOriginUser)
-					if b7 != nil {
-						source = xnet.Destination{Network: dest.Network, Address: xnet.LocalHostIP, Port: xnet.Port(40000 + len(connections))}
-						ordinary = session.ContextWithInbound(ordinary, &session.Inbound{Name: "socks", Source: source})
-					}
-					if carrierDials != nil && network == "udp" {
+
+					if b7 == nil && carrierDials != nil && network == "udp" {
 						sender, err := v.GetFeature(outbound.ManagerType()).(outbound.Manager).GetHandler(route.Tag).SenderSettings().GetInstance()
 						if err != nil {
 							t.Fatal(err)
@@ -220,9 +217,26 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 							}
 						}
 					}
-					c, err = core.Dial(ordinary, v, dest)
-					if inbound := session.InboundFromContext(ordinary); inbound != nil {
-						source = inbound.Source
+					if b7 != nil {
+						c, source = nativeIngressDial(t, ordinary, v, dest)
+						if carrierDials != nil && network == "udp" {
+							sender, settingsErr := v.GetFeature(outbound.ManagerType()).(outbound.Manager).GetHandler(route.Tag).SenderSettings().GetInstance()
+							if settingsErr != nil {
+								t.Fatal(settingsErr)
+							}
+							if settings := sender.(*proxyman.SenderConfig).MultiplexSettings; settings != nil && settings.XudpConcurrency > 0 {
+								identity := session.ContextWithInbound(context.WithValue(ordinary, "cone", true), &session.Inbound{Name: "socks", Source: xnet.DestinationFromAddr(c.LocalAddr())})
+								globalID = xudp.GetGlobalID(identity)
+								if globalID == [8]byte{} {
+									t.Fatal("native UDP fixture has no XUDP source identity")
+								}
+							}
+						}
+					} else {
+						c, err = core.Dial(ordinary, v, dest)
+						if inbound := session.InboundFromContext(ordinary); inbound != nil {
+							source = inbound.Source
+						}
 					}
 				}
 				if err != nil {
@@ -281,11 +295,7 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 					}
 					pulse(t)
 					if b7 != nil && route.Kind == measurement.ExactOutbound {
-						dest, err := xnet.ParseDestination("udp:" + r.Destination.String())
-						if err != nil {
-							t.Fatal(err)
-						}
-						b7.checkLive(t, fsB7Expected(dest, route.Tag))
+						b7.checkLive(t)
 					}
 					if mode == "cancel" {
 						cancel()
@@ -355,7 +365,7 @@ func testProtocolWorkingNode(t *testing.T, e *measurement.Executor, v *core.Inst
 						}
 						pulse(t)
 						if b7 != nil && route.Kind == measurement.ExactOutbound {
-							b7.checkLive(t, fsB7Expected(b7HTTPDestination(request.URL), route.Tag))
+							b7.checkLive(t)
 						}
 						if mode == "cancel" {
 							cancel()

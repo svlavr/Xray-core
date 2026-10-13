@@ -8,8 +8,8 @@ Use an existing configured, started `*core.Instance` for exact outbound routes.
 For a simple delay check, call `HTTP` once with `HEAD` and an HTTP/HTTPS URL.
 `MaxBodyBytes=0` is valid for HEAD. The returned status, timing and error are raw
 observations; no expected status, body hash, nonce or upload ACK is required.
-GET is available when response bytes are needed. Repeats, warming and a series
-are explicit caller choices, never mandatory parts of a single operation.
+GET is available when response bytes are needed. Repeats and warming belong to
+the caller, outside the module.
 
 Construct an executor with a positive concurrency limit chosen by the caller.
 Requests supply their own time and byte budgets; queue waiting uses the request
@@ -34,8 +34,8 @@ the instance. There is no executor shutdown goroutine or separate core process.
 
 - `HTTP`: HEAD or GET over HTTP/HTTPS, with bounded response facts.
 - `HTTPS`: one HTTPS GET; no redirects, automatic retries, decompression or reuse.
-- `Download`, `Upload`: bounded payload transfer; requested integrity or explicit
-  upload acknowledgment remains separate from local writer acceptance.
+- `Download`, `Upload`: bounded payload transfer with raw consumed/generated
+  bytes, local writer acceptance and phase times.
 - `UDPEcho`: finite nonce/sequence train with source, duplicate, malformed, late
   and missing-reply facts. Packet/source support depends on native framing.
 - `DNSQuery`: one explicit numeric resolver using UDP, TCP, DoT or DoH; no shared
@@ -48,8 +48,6 @@ the instance. There is no executor shutdown goroutine or separate core process.
 - `EgressIdentity`: bounded reflector JSON with validated IP/family and optional
   country declarations. `IdentityFromHTTPS` reuses an existing exchange after
   its transport error has been handled; declarations are not independent proof.
-- `RunSeries`: a caller-selected finite count/worker budget, retaining each
-  invoked attempt's typed receipt and error. Failures are not replaced by retries.
 
 Use `errors.Is(err, measurement.ErrUnsupported)` for unsupported execution
 shapes. The exported request/receipt comments define each byte and timing
@@ -75,18 +73,15 @@ different observations. A nil error is not an unrestricted-Internet verdict.
 - `FirstByteElapsed` starts at admission and may observe an informational HTTP
   response before final headers. `EndpointTLS` records a handshake attempt,
   including a failed attempt, and can include lower proxy setup. Absent fields
-  represent unobserved phases. Download read/hash and Upload writer-active times
+  represent unobserved phases. Download read and Upload writer-active times
   do not independently measure network capacity or remote delivered goodput.
-- Download retains consumed bytes, the cap fact and any requested prefix digest
-  even when that same read returns an error. Integrity requires native completion
-  and the caller's expected digest. Upload writer counts and matching endpoint ACK
-  declarations remain separate; neither certifies durable server storage.
-  Hashing is disabled unless `ExpectedSHA256` or `RequireAcknowledgment` is
-  selected. The Upload ACK is an optional endpoint-specific JSON contract, not
-  a prerequisite for ordinary upload. Generated/accepted counts, accepted-prefix
-  digest and active time are snapshots at return; they do not join asynchronous
-  native writers. Endpoint-declared counts such as Cloudflare's
-  `Cf-Meta-Upload-Bytes` are already retained in `Header` for caller interpretation.
+- Download retains consumed bytes and the cap fact even when that same read
+  returns an error. Upload retains generated and locally writer-accepted counts
+  and active time as snapshots at return; they do not join asynchronous native
+  writers or certify remote delivery/storage. Caller query parameters are passed
+  unchanged. Endpoint-declared counts such as Cloudflare's `Cf-Meta-Upload-Bytes`
+  remain in `Header` for caller interpretation. Expected-content checks, hashes,
+  acknowledgment protocols and scheduling belong to the caller.
 - A matched DNS REFUSED, SERVFAIL or NOERROR/no-data response is a decoded answer,
   not automatically a transport error or a useful-resolution verdict. TCP, DoT
   and DoH permit omitted Question fields; present questions must match, and UDP
@@ -107,8 +102,7 @@ different observations. A nil error is not an unrestricted-Internet verdict.
   likewise remains available alongside status/family or HTTP-read errors.
 - `OutboundError` is first-observed native feedback at receipt finalization;
   nil does not certify all asynchronous native work finished without error.
-  Identity address/family/country fields are endpoint declarations, and finite
-  series preserve failed samples without an automatic best-of-two estimate.
+  Identity address/family/country fields are endpoint declarations.
 
 Bind observations to the caller's endpoint, route, source version, run and network
 context before comparing them. DIRECT uses the current system network path; if
@@ -148,7 +142,6 @@ Endpoint TLS uses system roots unless the request provides `RootCAs`.
 Package tests cover native protocol profiles, operation errors/cancellation,
 packet limits, ordinary-traffic continuity and shared carriers. Run
 `go test -mod=readonly ./measurement` in a suitable host environment; native
-ICMP and network profiles need their platform capabilities. Optional external
-network diagnostics are explicitly enabled and are not normal health probes.
-Source/host tests do not by themselves qualify Android bindings, devices,
+ICMP and network profiles need their platform capabilities. Source/host tests do
+not by themselves qualify Android bindings, devices,
 live networks, product policy or a release.

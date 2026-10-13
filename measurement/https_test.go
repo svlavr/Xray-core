@@ -25,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/app/proxyman"
 	_ "github.com/xtls/xray-core/app/proxyman/inbound"
 	native "github.com/xtls/xray-core/app/proxyman/outbound"
+	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/app/stats"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -64,6 +65,9 @@ func instance(t testing.TB, apps ...*serial.TypedMessage) *core.Instance {
 			serial.ToTypedMessage(&policy.Config{Level: map[uint32]*policy.Policy{0: {Stats: &policy.Policy_Stats{UserUplink: true, UserDownlink: true}}}, System: &policy.SystemPolicy{Stats: &policy.SystemPolicy_Stats{OutboundUplink: true, OutboundDownlink: true}}}),
 		},
 		Outbound: []*core.OutboundHandlerConfig{config("trap", true), config("exact", false)},
+	}
+	if b7Enabled {
+		c.App = append(c.App, serial.ToTypedMessage(&router.Config{}))
 	}
 	c.App = append(c.App, apps...)
 	v, err := core.New(c)

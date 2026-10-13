@@ -200,10 +200,6 @@ func TestFlowInspectionMasqueNativeServer(t *testing.T) {
 				if err != nil || len(live.Rows) != 0 {
 					t.Fatalf("dedicated server rows: %+v %v", live, err)
 				}
-				ended, err := serverView.ReadTerminals()
-				if err != nil || len(ended.Rows) != 0 {
-					t.Fatalf("dedicated server ended rows: %+v %v", ended, err)
-				}
 			})
 		}
 	}

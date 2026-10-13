@@ -34,16 +34,6 @@ type inspectionEndWriter struct{ err error }
 
 func (w inspectionEndWriter) Write(p []byte) (int, error) { return 0, w.err }
 
-func inspectionTerminal(t *testing.T, flow fs.Exchange, view fs.FlowInspection) fs.TerminalRecord {
-	t.Helper()
-	flow.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
-		t.Fatalf("terminal page: %+v %v", page, err)
-	}
-	return page.Rows[0]
-}
-
 func inspectionActivityTimer(t *testing.T) *signal.ActivityTimer {
 	t.Helper()
 	timer := signal.CancelAfterInactivity(context.Background(), func() {}, time.Hour)
@@ -66,8 +56,9 @@ func TestInspectionXtlsReadNativeResults(t *testing.T) {
 			if (test.err == io.EOF) != (err == nil) {
 				t.Fatalf("XtlsRead error = %v", err)
 			}
-			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink != 0 {
-				t.Fatalf("read result invented bytes: %+v", got)
+			flow.Finish()
+			if got, err := view.ReadTotals(); err != nil || got.User.Downlink != 0 {
+				t.Fatalf("read invented bytes: %+v %v", got, err)
 			}
 		})
 	}
@@ -81,8 +72,9 @@ func TestInspectionXtlsReadWriterCauseAndLocalStop(t *testing.T) {
 		if err == nil {
 			t.Fatal("writer failure was lost")
 		}
-		if got := inspectionTerminal(t, flow, view); got.Flow.Downlink != 0 {
-			t.Fatalf("failed opaque write invented bytes: %+v", got)
+		flow.Finish()
+		if got, err := view.ReadTotals(); err != nil || got.User.Downlink != 0 {
+			t.Fatalf("failed writer invented bytes: %+v %v", got, err)
 		}
 	})
 
@@ -95,7 +87,6 @@ func TestInspectionXtlsReadWriterCauseAndLocalStop(t *testing.T) {
 		if err := XtlsRead(&inspectionEndReader{err: io.ErrUnexpectedEOF}, buf.NewWriter(io.Discard), inspectionActivityTimer(t), nil, proxy.NewTrafficState(nil), false, context.Background()); err == nil {
 			t.Fatal("source failure was lost")
 		}
-		inspectionTerminal(t, flow, view)
 	})
 }
 
@@ -141,8 +132,9 @@ func TestInspectionXtlsReadRawFallbackResults(t *testing.T) {
 			if (test.writerErr == nil) != (err == nil) {
 				t.Fatalf("raw fallback error = %v", err)
 			}
-			if got := inspectionTerminal(t, flow, view); got.Flow.Downlink != test.wantBytes {
-				t.Fatalf("raw fallback counted bytes: %+v want %d", got, test.wantBytes)
+			flow.Finish()
+			if got, err := view.ReadTotals(); err != nil || got.User.Downlink != test.wantBytes {
+				t.Fatalf("raw fallback bytes: %+v %v want %d", got, err, test.wantBytes)
 			}
 		})
 	}

@@ -127,10 +127,7 @@ func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.H
 	ur, uw := pipe.New(pipe.OptionsFromContext(ctx)...)
 	dr, dw := pipe.New(pipe.OptionsFromContext(ctx)...)
 
-	go func() {
-		detached := context.WithoutCancel(ctx)
-		h.Dispatch(detached, &transport.Link{Reader: ur, Writer: dw})
-	}()
+	go h.Dispatch(context.WithoutCancel(ctx), &transport.Link{Reader: ur, Writer: dw})
 	var readerOpt cnc.ConnectionOption
 	if dst.Network == net.Network_TCP {
 		readerOpt = cnc.ConnectionOutputMulti(dr)

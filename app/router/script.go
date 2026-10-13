@@ -18,6 +18,7 @@ import (
 const scriptExecutionTimeout = 6 * time.Second
 
 type scriptEngine struct {
+	program   *xlua.Program
 	pool      *xlua.Pool
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -25,14 +26,18 @@ type scriptEngine struct {
 	ownerKey  *lua.LUserData
 }
 
-func newScriptEngine(path string, router *Router) (*scriptEngine, error) {
-	program, err := xlua.CompileFile(path)
+func newScriptEngine(script string) (*scriptEngine, error) {
+	program, err := xlua.Compile(script)
 	if err != nil {
 		return nil, err
 	}
 
+	return &scriptEngine{program: program}, nil
+}
+
+func (e *scriptEngine) start(router *Router) error {
 	engineCtx, cancel := context.WithCancel(router.ctx)
-	e := &scriptEngine{ctx: engineCtx, cancel: cancel, dnsClient: router, ownerKey: &lua.LUserData{}}
+	e.ctx, e.cancel, e.dnsClient, e.ownerKey = engineCtx, cancel, router, &lua.LUserData{}
 	factory := func(ctx context.Context) (state *lua.LState, err error) {
 		ctx, stop := e.joinContext(ctx)
 		defer stop()
@@ -40,7 +45,7 @@ func newScriptEngine(path string, router *Router) (*scriptEngine, error) {
 			ctx, cancel := context.WithTimeout(ctx, scriptExecutionTimeout*20)
 			defer cancel()
 			var createErr error
-			state, createErr = program.NewState(ctx, func(L *lua.LState) {
+			state, createErr = e.program.NewState(ctx, func(L *lua.LState) {
 				geodata.RegisterLua(L)
 				log.RegisterLua(L)
 				router.RegisterLua(L)
@@ -61,17 +66,21 @@ func newScriptEngine(path string, router *Router) (*scriptEngine, error) {
 	pool, err := xlua.NewPool(engineCtx, scriptExecutionTimeout, factory)
 	if err != nil {
 		cancel()
-		return nil, err
+		return err
 	}
 
-	errors.LogInfo(router.ctx, "routing script initialized from ", path)
+	errors.LogInfo(router.ctx, "routing script initialized")
 	e.pool = pool
-	return e, nil
+	return nil
 }
 
 func (e *scriptEngine) close() {
-	e.cancel()
-	e.pool.Close()
+	if e.cancel != nil {
+		e.cancel()
+	}
+	if e.pool != nil {
+		e.pool.Close()
+	}
 }
 
 func (e *scriptEngine) joinContext(ctx context.Context) (context.Context, func()) {

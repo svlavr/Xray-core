@@ -117,6 +117,20 @@ func TestInspectionDokodemoNativeFakeUDP(t *testing.T) {
 		observed := <-dispatcher.entered
 		if enabled {
 			ref := session.LogicalObservationFromContext(observed).Exchange.Ref()
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				live, err := view.ReadLiveInto(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(live.Rows) == 1 && live.Rows[0].Ref == ref && live.Rows[0].Destination == target && live.Rows[0].Uplink == 7 && live.Rows[0].Downlink == 16 {
+					break
+				}
+				if !time.Now().Before(deadline) {
+					t.Fatalf("native FakeUDP live facts: %+v", live)
+				}
+				time.Sleep(time.Millisecond)
+			}
 			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
 			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("stop: %+v %v", outcomes, err)
@@ -135,13 +149,8 @@ func TestInspectionDokodemoNativeFakeUDP(t *testing.T) {
 			t.Fatal("Process did not finish")
 		}
 		if enabled {
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 {
-				t.Fatalf("terminal: %+v %v", page, err)
-			}
-			f := page.Rows[0].Flow
-			if f.Uplink != 7 || f.Downlink != 16 || f.Destination != target {
-				t.Fatalf("native facts: %+v", f)
+			if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+				t.Fatalf("FakeUDP association remained live: %+v %v", live, err)
 			}
 		}
 		// Both primary and per-destination FakeUDP handles must be retired by Process.

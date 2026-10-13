@@ -69,10 +69,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 							return true
 						})
 						inspectionClosePacketCallback(t, view, ref)
-						inspectionWait(t, func() bool {
-							page, _ := view.ReadTerminals()
-							return len(page.Rows) == 1 && page.Rows[0].Flow.Downlink == 0
-						})
+
 						assertNoDedicatedServerInspection(t, remote)
 						return
 					}
@@ -112,16 +109,10 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						t.Fatalf("packet destinations: %+v", first)
 					}
 					inspectionClosePacketCallback(t, view, first.Ref)
-					inspectionWait(t, func() bool {
-						page, _ := view.ReadTerminals()
-						return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink == uint64(len(payload)+len(extra))
-					})
+
 					inspectionSOCKSPacket(t, sibling, siblingRelay, secondDest, extra, 0x37)
 					inspectionClosePacketCallback(t, view, other.Ref)
-					inspectionWait(t, func() bool {
-						page, _ := view.ReadTerminals()
-						return len(page.Rows) == 2
-					})
+
 					_, replacement, replacementRelay := inspectionSOCKSAssociation(t, address)
 					inspectionSOCKSPacket(t, replacement, replacementRelay, firstDest, payload, 0x19)
 					var replacementRef fs.FlowRef
@@ -139,10 +130,7 @@ func TestFlowInspectionP2BPacketCallbacks(t *testing.T) {
 						t.Fatal("new association reused a stopped reference")
 					}
 					inspectionClosePacketCallback(t, view, replacementRef)
-					inspectionWait(t, func() bool {
-						page, _ := view.ReadTerminals()
-						return len(page.Rows) == 3
-					})
+
 					inspectionOutboundTotals(t, view, outbound.Tag, uint64(3*len(payload)+2*len(extra)))
 					assertNoDedicatedServerInspection(t, remote)
 				})

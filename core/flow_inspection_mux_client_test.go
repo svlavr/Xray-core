@@ -69,10 +69,7 @@ func TestFlowInspectionMuxClientUDP(t *testing.T) {
 			if err != nil || outcomes[0] != nil {
 				t.Fatalf("close: %+v %v", outcomes, err)
 			}
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref
-			})
+
 			inspectionOutboundTotals(t, view, outbound.Tag, uint64(len(payload)))
 		})
 	}

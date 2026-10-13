@@ -3,7 +3,9 @@ package dns
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -156,7 +158,7 @@ func TestDNSPreparationAllNativeKinds(t *testing.T) {
 		t.Run(tc.address, func(t *testing.T) {
 			config := &Config{NameServer: []*NameServer{preparationServer(tc.address, "prepared")}}
 			// No core in this context: a deferred RequireFeatures call would panic.
-			first, err := buildDNS(context.Background(), proto.Clone(config).(*Config), dispatcher, fake)
+			first, err := buildDNS(context.Background(), proto.Clone(config).(*Config), dispatcher, fake, nil)
 			if err != nil || first == nil || len(first.clients) != 1 {
 				t.Fatalf("build %s: %v %v", tc.address, first, err)
 			}
@@ -182,7 +184,7 @@ func TestDNSPreparationAllNativeKinds(t *testing.T) {
 				}
 			}
 			if cached, ok := server.(CachedNameserver); ok {
-				second, err := buildDNS(context.Background(), proto.Clone(config).(*Config), dispatcher, fake)
+				second, err := buildDNS(context.Background(), proto.Clone(config).(*Config), dispatcher, fake, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -247,7 +249,7 @@ func TestDNSPreparationFailuresPublishNothing(t *testing.T) {
 			config := &Config{NameServer: []*NameServer{preparationServer("localhost", "first"), preparationServer("tcp://127.0.0.1", "second")}}
 			alter(config)
 			dispatcher := new(preparationDispatcher)
-			candidate, err := buildDNS(context.Background(), config, dispatcher, nil)
+			candidate, err := buildDNS(context.Background(), config, dispatcher, nil, nil)
 			if err == nil || candidate != nil || dispatcher.calls.Load() != 0 {
 				t.Fatalf("failed candidate escaped: %v %v calls=%d", candidate, err, dispatcher.calls.Load())
 			}
@@ -319,5 +321,54 @@ func TestDNSApplyUsesOwningCoreReadyFakeDNS(t *testing.T) {
 	server := feature.runtime.current.resolver.clients[0].server.(*FakeDNSServer)
 	if server.fakeDNSEngine != fake {
 		t.Fatal("applied resolver did not use its owning core's ready FakeDNS")
+	}
+}
+
+// A deferred dispatcher must not defer reading the caller's script file.
+func TestDNSPreparationDeferredScriptSnapshot(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		t.Run(fmt.Sprint("remove=", remove), func(t *testing.T) {
+			path := m3DNSFile(t, `function HandleDNSQuery() return nil, nil, "compiled" end`)
+			instance, err := core.New(&core.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer instance.Close()
+			config := &Config{Script: path, NameServer: []*NameServer{preparationServer("tcp://127.0.0.1:53", "snapshot")}}
+			object, err := core.CreateObject(instance, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := object.(*DNS)
+			defer server.Close()
+			if server.runtime != nil {
+				t.Fatal("dispatcher dependency unexpectedly resolved")
+			}
+			config.Script = "missing-after-construction.lua"
+			if remove {
+				err = os.Remove(path)
+			} else {
+				err = os.WriteFile(path, []byte(`error("mutated")`), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			dispatcher := new(preparationDispatcher)
+			if err := instance.AddFeature(dispatcher); err != nil {
+				t.Fatal(err)
+			}
+			if server.runtime == nil || server.runtime.current.resolver.getScript() != nil {
+				t.Fatal("dependency resolution activated Lua")
+			}
+			if err := server.Start(); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := server.LookupIP("snapshot.example", fdns.IPOption{IPv4Enable: true}); err == nil || !strings.Contains(err.Error(), "compiled") {
+				t.Fatalf("snapshot query error = %v, want compiled", err)
+			}
+			if dispatcher.calls.Load() != 0 {
+				t.Fatal("script snapshot query dispatched upstream")
+			}
+		})
 	}
 }

@@ -15,7 +15,7 @@ import (
 	"github.com/xtls/xray-core/measurement"
 )
 
-func TestOrdinaryTransferDoesNotAddACKWork(t *testing.T) {
+func TestOrdinaryTransferPreservesCallerQuery(t *testing.T) {
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "nonce=caller&resource=fixed" {
 			t.Error("ordinary transfer changed caller query")
@@ -32,14 +32,13 @@ func TestOrdinaryTransferDoesNotAddACKWork(t *testing.T) {
 		d.HTTPS.URL += "?nonce=caller&resource=fixed"
 		d.HTTPS.MaxBodyBytes = 70 << 20 // Former engine ceiling no longer applies.
 		download, err := e.Download(context.Background(), d)
-		if err != nil || download.PayloadBytes != 8 || download.SHA256 != nil || download.IntegrityVerified {
+		if err != nil || download.PayloadBytes != 8 {
 			t.Fatalf("ordinary download: %+v %v", download, err)
 		}
 		u := uploadRequest(s, route)
 		u.HTTPS.URL += "?nonce=caller&resource=fixed"
-		u.RequireAcknowledgment = false
 		upload, err := e.Upload(context.Background(), u)
-		if err != nil || upload.GeneratedBytes != u.PayloadBytes || upload.WriterAcceptedBytes != u.PayloadBytes || upload.Nonce != "" || upload.WriterAcceptedSHA256 != nil || upload.Acknowledgment != nil {
+		if err != nil || upload.GeneratedBytes != u.PayloadBytes || upload.WriterAcceptedBytes != u.PayloadBytes {
 			t.Fatalf("ordinary upload: %+v %v", upload, err)
 		}
 	}

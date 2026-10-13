@@ -14,13 +14,13 @@ import (
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 	routing_dns "github.com/xtls/xray-core/features/routing/dns"
+	"google.golang.org/protobuf/proto"
 )
 
 // Router is an implementation of routing.Router.
 type Router struct {
 	domainStrategy Config_DomainStrategy
 	rules          atomic.Pointer[[]*Rule]
-	scriptPath     string
 	script         *scriptEngine
 	balancers      atomic.Pointer[map[string]*Balancer]
 	dns            dns.Client
@@ -41,12 +41,37 @@ type Route struct {
 
 // Init initializes the Router.
 func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher) error {
+	script := r.script
+	if config.Script != "" {
+		var err error
+		script, err = prepareScript(config.Script)
+		if err != nil {
+			return err
+		}
+	}
+	return r.initWithScript(ctx, config, d, ohm, dispatcher, script)
+}
+
+func prepareScript(script string) (*scriptEngine, error) {
+	if script == "" {
+		return nil, nil
+	}
+	engine, err := newScriptEngine(script)
+	if err != nil {
+		return nil, errors.New("failed to prepare routing script").Base(err)
+	}
+	return engine, nil
+}
+
+// initWithScript binds ready dependencies to already prepared script bytecode.
+func (r *Router) initWithScript(ctx context.Context, config *Config, d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher, script *scriptEngine) error {
 	r.domainStrategy = config.DomainStrategy
-	r.scriptPath = config.Script
 	r.dns = d
 	r.ctx = ctx
 	r.ohm = ohm
 	r.dispatcher = dispatcher
+
+	r.script = script
 
 	r.rules.Store(new([]*Rule))
 	r.balancers.Store(&map[string]*Balancer{})
@@ -55,7 +80,7 @@ func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm out
 
 // PickRoute implements routing.Router.
 func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
-	if r.script != nil {
+	if r.script != nil && r.script.pool != nil {
 		return r.script.pickRoute(ctx)
 	}
 
@@ -228,12 +253,10 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 
 // Start implements common.Runnable.
 func (r *Router) Start() error {
-	if r.scriptPath != "" {
-		engine, err := newScriptEngine(r.scriptPath, r)
-		if err != nil {
+	if r.script != nil {
+		if err := r.script.start(r); err != nil {
 			return errors.New("failed to initialize routing script").Base(err)
 		}
-		r.script = engine
 	}
 	return nil
 }
@@ -279,9 +302,14 @@ func (r *Route) GetRuleTag() string {
 
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		snapshot := proto.Clone(config.(*Config)).(*Config)
+		script, err := prepareScript(snapshot.Script)
+		if err != nil {
+			return nil, err
+		}
 		r := new(Router)
 		if err := core.RequireFeatures(ctx, func(d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher) error {
-			return r.Init(ctx, config.(*Config), d, ohm, dispatcher)
+			return r.initWithScript(ctx, snapshot, d, ohm, dispatcher, script)
 		}); err != nil {
 			return nil, err
 		}

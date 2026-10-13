@@ -174,23 +174,7 @@ func TestFlowInspectionSOCKS(t *testing.T) {
 			if err != nil || out[0] != nil {
 				t.Fatalf("close %+v %v", out, err)
 			}
-			var terminal fs.TerminalRecord
-			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals()
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, r := range page.Rows {
-					if r.Flow.Ref == selected.Ref {
-						terminal = r
-						return true
-					}
-				}
-				return false
-			})
-			if terminal.Flow.Uplink != uint64(len(payload)) || terminal.Flow.Downlink != uint64(len(payload)) {
-				t.Fatalf("final receipt: %+v", terminal)
-			}
+
 			out, err = view.CloseFlows(context.Background(), []fs.FlowRef{selected.Ref})
 			if err != nil || out[0] != nil {
 				t.Fatalf("repeat close %+v %v", out, err)
@@ -230,22 +214,14 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 	instance, view, address := inspectionCore(t, true, false)
 	destination := startOutboundStatsTCPServer(t)
 	manager := instance.GetFeature(fout.ManagerType()).(fout.Manager)
-	var tags []string
 	for i := 0; i < 2; i++ {
 		c := inspectionSOCKS(t, address, destination, []byte("short"))
-		c.Close()
 		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals()
-			if len(page.Rows) != i+1 {
-				return false
-			}
-			row := page.Rows[i]
-			if row.Flow.Uplink != 5 || row.Flow.Downlink != 5 {
-				t.Fatalf("short final: %+v", row)
-			}
-			tags = append(tags, row.Flow.Outbound.Tag)
-			return true
+			live, err := view.ReadLiveInto(nil)
+			return err == nil && len(live.Rows) == 1 && live.Rows[0].Outbound.Tag == "direct" && live.Rows[0].Uplink == 5 && live.Rows[0].Downlink == 5
 		})
+		c.Close()
+		inspectionWait(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 		if i == 0 {
 			old := manager.GetHandler("direct")
 			if err := manager.RemoveHandler(context.Background(), "direct"); err != nil {
@@ -256,9 +232,6 @@ func TestFlowInspectionTagReuseAndShortExchange(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-	}
-	if tags[0] != "direct" || tags[1] != "direct" {
-		t.Fatalf("reused tag changed: %v", tags)
 	}
 	totals, err := view.ReadTotals()
 	if err != nil {
@@ -290,20 +263,21 @@ func TestFlowInspectionRejectedSniffAndDisabled(t *testing.T) {
 	destination := cnet.TCPDestination(cnet.LocalHostIP, 1)
 	c := inspectionSOCKS(t, address, destination, nil)
 	request := []byte("GET / HTTP/1.1\r\nHost: p1.invalid\r\n\r\n")
-	c.Write(request)
-	var final fs.TerminalRecord
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 {
-			return false
-		}
-		final = page.Rows[0]
-		return true
-	})
-	if final.Flow.Uplink != uint64(len(request)) || final.Flow.Outbound.Tag != "" {
-		t.Fatalf("rejected receipt: %+v", final)
+	if _, err := c.Write(request); err != nil {
+		t.Fatal(err)
 	}
+	if n, err := c.Read(make([]byte, 1)); n != 0 || err == nil {
+		t.Fatalf("rejected sniff native completion: %d %v", n, err)
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatalf("rejected sniff timed out: %v", err)
+	}
+	inspectionWait(t, func() bool {
+		totals, err := view.ReadTotals()
+		return err == nil && totals.User.Uplink == uint64(len(request))
+	})
 	totals, _ := view.ReadTotals()
+	inspectionByteTotals(t, view, "", fs.ClientTotals{Uplink: uint64(len(request))}, fs.ClientTotals{})
+	inspectionWait(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 	known := totals.User.Uplink
 	if len(totals.Rows) != 0 {
 		t.Fatal("failed route credited outbound")
@@ -405,26 +379,33 @@ func TestFlowInspectionForcedSelection(t *testing.T) {
 				}
 			}
 			if tag == "direct" {
+				var ref fs.FlowRef
+				inspectionWait(t, func() bool {
+					live, err := view.ReadLiveInto(nil)
+					if err != nil || len(live.Rows) != 1 {
+						return false
+					}
+					row := live.Rows[0]
+					if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
+						return false
+					}
+					if row.Ref.ID == 0 || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != tag || row.Destination != destination {
+						t.Fatalf("forced selection: %+v", row)
+					}
+					ref = row.Ref
+					return true
+				})
+				inspectionByteTotals(t, view, tag, fs.ClientTotals{Uplink: uint64(len(payload)), Downlink: uint64(len(payload))}, fs.ClientTotals{Uplink: uint64(len(payload)), Downlink: uint64(len(payload))})
 				conn.Close()
-			}
-			var final fs.TerminalRecord
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				if len(page.Rows) != 1 {
-					return false
+				inspectionLiveAbsent(t, view, ref)
+			} else {
+				if n, err := conn.Read(make([]byte, 1)); n != 0 || err == nil {
+					t.Fatalf("forced rejection completion: %d %v", n, err)
+				} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+					t.Fatalf("forced rejection timed out: %v", err)
 				}
-				final = page.Rows[0]
-				return true
-			})
-			if final.Flow.Uplink != uint64(len(payload)) {
-				t.Fatalf("sniff credit: %+v", final)
-			}
-			if tag == "direct" {
-				if final.Flow.Outbound.Tag == "" {
-					t.Fatalf("forced selection: %+v", final)
-				}
-			} else if final.Flow.Outbound.Tag != "" {
-				t.Fatalf("missing forced selection: %+v", final)
+				inspectionByteTotals(t, view, "", fs.ClientTotals{Uplink: uint64(len(payload))}, fs.ClientTotals{})
+				inspectionWait(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 			}
 		})
 	}
@@ -462,18 +443,7 @@ func TestFlowInspectionForwardingAttribution(t *testing.T) {
 	payload := []byte("GET / HTTP/1.1\r\nHost: forwarding.invalid\r\n\r\n")
 	conn := inspectionSOCKS(t, address, destination, payload)
 	conn.Close()
-	var final fs.TerminalRecord
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 {
-			return false
-		}
-		final = page.Rows[0]
-		return true
-	})
-	if final.Flow.Outbound.Tag != "forward" || final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != uint64(len(payload)) {
-		t.Fatalf("forwarded flow: %+v", final)
-	}
+
 	totals, _ := view.ReadTotals()
 	var up, down uint64
 	for _, row := range totals.Rows {
@@ -516,18 +486,10 @@ func TestFlowInspectionSelectedOwnerNeedsNoConfirmation(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.Close()
-	var ended fs.FlowRecord
 	inspectionWait(t, func() bool {
-		snapshot, _ := view.ReadTerminals()
-		if len(snapshot.Rows) != 1 {
-			return false
-		}
-		ended = snapshot.Rows[0].Flow
-		return ended.Uplink == uint64(len(payload))
+		totals, err := view.ReadTotals()
+		return err == nil && totals.User.Uplink == uint64(len(payload))
 	})
-	if ended.Outbound.Tag != "unclaimed" || ended.Outbound.Tag == "" || ended.Uplink != uint64(len(payload)) {
-		t.Fatalf("unclaimed owner snapshot: %+v", ended)
-	}
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {
@@ -543,4 +505,44 @@ func TestFlowInspectionSelectedOwnerNeedsNoConfirmation(t *testing.T) {
 	if known != 0 || totals.User.Uplink != uint64(len(payload)) {
 		t.Fatalf("selected known %d", known)
 	}
+}
+
+func inspectionByteTotals(t *testing.T, view fs.FlowInspection, tag string, user, selected fs.ClientTotals) {
+	t.Helper()
+	inspectionWait(t, func() bool {
+		totals, err := view.ReadTotals()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if totals.User != user {
+			return false
+		}
+		var sum fs.ClientTotals
+		found := false
+		for _, row := range totals.Rows {
+			if row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != tag || tag == "" {
+				t.Fatalf("unexpected byte attribution: %+v", totals)
+			}
+			found = true
+			sum.Uplink += row.Uplink
+			sum.Downlink += row.Downlink
+		}
+		return sum == selected && (tag == "" || found)
+	})
+}
+
+func inspectionLiveAbsent(t *testing.T, view fs.FlowInspection, ref fs.FlowRef) {
+	t.Helper()
+	inspectionWait(t, func() bool {
+		live, err := view.ReadLiveInto(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range live.Rows {
+			if row.Ref == ref {
+				return false
+			}
+		}
+		return true
+	})
 }

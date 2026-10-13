@@ -22,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	transmasque "github.com/xtls/xray-core/transport/internet/masque"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -122,14 +123,11 @@ func TestInspectionMasqueTCPClaimBeforeTunnelFailure(t *testing.T) {
 	if err := client.Process(ctx, link, inspectionFailDialer{}); err == nil {
 		t.Fatal("failed tunnel establishment succeeded")
 	}
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != flow.Ref() || live.Rows[0].Outbound.Tag != "masque-test" || live.Rows[0].Destination != target {
+		t.Fatalf("failed tunnel logical claim: %+v %v", live, err)
+	}
 	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
-		t.Fatalf("terminal: %+v %v", page, err)
-	}
-	if page.Rows[0].Flow.Outbound.Tag != "masque-test" || page.Rows[0].Flow.Destination != target {
-		t.Fatalf("logical MASQUE route: %+v", page.Rows[0].Flow)
-	}
 }
 
 func TestInspectionMasqueFirstRequestStopDuringEstablishment(t *testing.T) {
@@ -177,10 +175,7 @@ func TestInspectionMasqueFirstRequestStopDuringEstablishment(t *testing.T) {
 		t.Fatalf("first request exact stop: %+v %v", outcomes, err)
 	}
 	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Ref != observation.Exchange.Ref() {
-		t.Fatalf("first request terminal: %+v %v", page, err)
-	}
+
 	if carrierCtx.Err() != nil {
 		t.Fatalf("request stop canceled shared tunnel establishment: %v", carrierCtx.Err())
 	}
@@ -206,9 +201,9 @@ func TestInspectionMasqueStopVirtualAssociation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { client.tunnel.Store(nil); dev.Close() })
-	shared := &tunnel{dev: dev, tnet: tnet, done: make(chan struct{})}
-	client.tunnel.Store(shared)
+	shared := &tunnel{dev: dev, tnet: tnet, done: make(chan struct{}), onClose: client.removeTunnel}
+	client.tunnels[shared] = struct{}{}
+	client.xmux = splithttp.NewXmuxManager(nil, func() splithttp.XmuxConn { return shared })
 	manager := new(appstats.Manager)
 	view, err := manager.EnableInspection(fs.ObservationOptions{})
 	if err != nil {
@@ -263,5 +258,73 @@ func TestInspectionMasqueStopVirtualAssociation(t *testing.T) {
 	case <-shared.done:
 		t.Fatal("flow stop closed shared tunnel")
 	default:
+	}
+	if running := client.xmux.GetExistingXmuxClient(context.Background()).Running.Load(); running != 0 {
+		t.Fatalf("stopped virtual association retained %d running flows", running)
+	}
+}
+
+type inspectionCaptureDialer struct {
+	inspectionDialer
+	ctx context.Context
+}
+
+func (d *inspectionCaptureDialer) Dial(ctx context.Context, _ net.Destination) (stat.Connection, error) {
+	d.ctx = ctx
+	return nil, io.ErrClosedPipe
+}
+
+func TestInspectionMasqueCurrentAdmissionCarrierMetadata(t *testing.T) {
+	client, instance := newInspectionClient(t)
+	var previous *session.Outbound
+	for _, gateway := range []net.Address{net.ParseAddress("127.0.0.2"), net.ParseAddress("127.0.0.3")} {
+		request := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Gateway: gateway}})
+		dialer := new(inspectionCaptureDialer)
+		client.lastErrAt = time.Time{}
+		if _, _, err := client.getTunnel(request, dialer); err == nil {
+			t.Fatal("failed carrier establishment succeeded")
+		}
+		if dialer.ctx == nil {
+			t.Fatal("carrier did not use the current admission dialer")
+		}
+		carrier := session.OutboundsFromContext(dialer.ctx)[0]
+		if carrier == previous || carrier.Gateway != gateway || carrier.Target != client.server.Destination || carrier.Tag != "masque-test" {
+			t.Fatalf("carrier retained previous admission metadata: %+v", carrier)
+		}
+		if core.FromContext(dialer.ctx) != instance || session.FullHandlerFromContext(dialer.ctx).Tag() != "masque-test" ||
+			session.TrafficOriginFromContext(dialer.ctx) != session.TrafficOriginInternal ||
+			session.LogicalObservationFromContext(dialer.ctx) != nil || session.InboundFromContext(dialer.ctx) != nil {
+			t.Fatal("carrier retained logical identity or lost instance/handler identity")
+		}
+		previous = carrier
+	}
+}
+
+func TestInspectionMasqueCanceledAdmissionReleasesXmux(t *testing.T) {
+	for _, target := range []net.Destination{
+		net.TCPDestination(net.ParseAddress("10.232.79.1"), 443),
+		net.UDPDestination(net.ParseAddress("10.232.79.1"), 443),
+		net.TCPDestination(net.DomainAddress("v1.mux.cool"), 443),
+		net.TCPDestination(net.DomainAddress("v1.rvs.cool"), 443),
+	} {
+		t.Run(target.String(), func(t *testing.T) {
+			client, _ := newInspectionClient(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
+			shared := &tunnel{done: make(chan struct{}), onClose: client.removeTunnel}
+			client.tunnels[shared] = struct{}{}
+			client.xmux = splithttp.NewXmuxManager(nil, func() splithttp.XmuxConn {
+				cancel()
+				return shared
+			})
+			if err := client.Process(ctx, &transport.Link{}, inspectionDialer{}); err != context.Canceled {
+				t.Fatalf("post-establishment cancellation: %v", err)
+			}
+			xmuxClient := client.xmux.GetExistingXmuxClient(context.Background())
+			if xmuxClient == nil || xmuxClient.Running.Load() != 0 || shared.IsClosed() {
+				t.Fatal("canceled logical flow leaked its admission or closed the shared carrier")
+			}
+		})
 	}
 }

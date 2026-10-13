@@ -21,10 +21,10 @@ func TestInspectionUDPStaleClosePreservesReplacement(t *testing.T) {
 	u := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) { created <- c.(*udpConn) }, func([]byte, net.Destination, net.Destination) error { return nil })
 	src := net.UDPDestination(net.LocalHostIP, 1234)
 	dst := net.UDPDestination(net.LocalHostIP, 53)
-	u.HandlePacket(src, dst, []byte("old"))
+	u.HandlePacket(src, dst, buf.FromBytes([]byte("old")))
 	old := <-created
 	old.Close()
-	u.HandlePacket(src, dst, []byte("replacement"))
+	u.HandlePacket(src, dst, buf.FromBytes([]byte("replacement")))
 	next := <-created
 	defer next.Close()
 	old.Close()
@@ -49,8 +49,11 @@ func TestInspectionUDPScalarWritePreservesError(t *testing.T) {
 func TestInspectionUDPLargePacketAndDestination(t *testing.T) {
 	destination := net.UDPDestination(net.LocalHostIP, 5353)
 	payload := bytes.Repeat([]byte{0x5a}, buf.Size+73)
-	queue := make(chan *packet, 1)
-	queue <- &packet{data: payload, dest: &destination}
+	queue := make(chan *buf.Buffer, 1)
+	b := buf.NewWithSize(int32(len(payload)))
+	b.Write(payload)
+	b.UDP = &destination
+	queue <- b
 	close(queue)
 	c := &udpConn{egress: queue}
 	mb, err := c.ReadMultiBuffer()
@@ -111,25 +114,19 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 		t.Fatal("native write did not start")
 	}
 	flow.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 2 {
-		t.Errorf("owner-end write snapshot: %+v %v", page, err)
-	}
+
 	close(release)
 	if err := <-done; !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
-		t.Fatalf("terminal: %+v %v", page, err)
+
+	if calls != 2 {
+		t.Fatalf("failed UDP batch attempted %d packets, want 2", calls)
 	}
 	if withCounter && counter.Value() != 2 {
 		t.Fatalf("counter: %d", counter.Value())
 	}
-	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact != 2 {
-		t.Fatalf("native partial result: calls=%d fact=%+v", calls, fact)
-	}
+
 	totals, _ := view.ReadTotals()
 	var found bool
 	for _, row := range totals.Rows {
@@ -186,8 +183,10 @@ func TestInspectionTUNHandlerEnabledAndDisabled(t *testing.T) {
 			var reply string
 			if udp {
 				destination.Network = net.Network_UDP
-				queue := make(chan *packet, 1)
-				queue <- &packet{data: []byte("uplink"), dest: &destination}
+				queue := make(chan *buf.Buffer, 1)
+				b := buf.FromBytes([]byte("uplink"))
+				b.UDP = &destination
+				queue <- b
 				native := newUdpConnectionHandler(nil, func(p []byte, _, _ net.Destination) error { reply = string(p); return nil })
 				uc := &udpConn{handler: native, src: net.UDPDestination(net.LocalHostIP, 1234), dst: destination, egress: queue}
 				native.udpConns[uc.src] = uc
@@ -201,13 +200,9 @@ func TestInspectionTUNHandlerEnabledAndDisabled(t *testing.T) {
 				t.Fatal(reply)
 			}
 			if enabled {
-				page, err := view.ReadTerminals()
-				if err != nil || len(page.Rows) != 1 {
-					t.Fatalf("terminal: %+v %v", page, err)
-				}
-				f := page.Rows[0].Flow
-				if f.Origin != fs.TrafficOriginUser || f.Uplink != 6 || f.Downlink != 8 || f.Outbound.Tag != "direct" {
-					t.Fatalf("endpoint: %+v", f)
+				totals, err := view.ReadTotals()
+				if err != nil || totals.User != (fs.ClientTotals{Uplink: 6, Downlink: 8}) || len(totals.Rows) != 1 || totals.Rows[0].Outbound.Tag != "direct" || totals.Rows[0].Uplink != 6 || totals.Rows[0].Downlink != 8 {
+					t.Fatalf("decoded TUN USER totals: %+v %v", totals, err)
 				}
 			}
 		}
@@ -227,9 +222,9 @@ func TestInspectionTUNStopKeepsSiblingAssociation(t *testing.T) {
 	native := newUdpConnectionHandler(func(c net.Conn, d net.Destination) { handler.HandleConnection(c, d); finished <- struct{}{} }, func([]byte, net.Destination, net.Destination) error { return nil })
 	destination := net.UDPDestination(net.LocalHostIP, 53)
 	first, second := net.UDPDestination(net.LocalHostIP, 1234), net.UDPDestination(net.LocalHostIP, 1235)
-	native.HandlePacket(first, destination, []byte("first"))
+	native.HandlePacket(first, destination, buf.FromBytes([]byte("first")))
 	ctx1 := <-dispatcher.entered
-	native.HandlePacket(second, destination, []byte("second"))
+	native.HandlePacket(second, destination, buf.FromBytes([]byte("second")))
 	ctx2 := <-dispatcher.entered
 	ref1 := session.LogicalObservationFromContext(ctx1).Exchange.Ref()
 	ref2 := session.LogicalObservationFromContext(ctx2).Exchange.Ref()
@@ -249,7 +244,7 @@ func TestInspectionTUNStopKeepsSiblingAssociation(t *testing.T) {
 	if old || sibling == nil || ctx2.Err() != nil {
 		t.Fatal("exact stop affected sibling")
 	}
-	native.HandlePacket(second, destination, []byte("still alive"))
+	native.HandlePacket(second, destination, buf.FromBytes([]byte("still alive")))
 	for _, want := range []string{"second", "still alive"} {
 		mb, err := sibling.ReadMultiBuffer()
 		got := mb.String()
@@ -298,21 +293,14 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 		close(release)
 		t.Fatalf("stop: %+v %v", outcomes, err)
 	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != uint64(len("head")) {
-		t.Errorf("owner-end batch snapshot: %+v %v", page, err)
-	}
+
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
-		t.Fatalf("terminal: %+v %v", page, err)
-	}
-	fact := page.Rows[0].Flow.Downlink
-	if calls != 3 || counter.Value() != int64(len("headtail")) || fact != uint64(len("head")) {
-		t.Fatalf("late native batch: native=%d counter=%d fact=%+v", calls, counter.Value(), fact)
+
+	if calls != 3 || counter.Value() != int64(len("headtail")) {
+		t.Fatalf("native packet calls/counter: %d/%d", calls, counter.Value())
 	}
 	totals, _ := view.ReadTotals()
 	var known uint64

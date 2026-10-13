@@ -122,7 +122,7 @@ func inspectionVLESSReceiverSettings(t *testing.T, enabled, sniff bool, xorMode,
 	return remote, view, outbound
 }
 
-func inspectionVLESSResponseServer(t *testing.T, response []byte, reset bool) (*core.OutboundHandlerConfig, <-chan error) {
+func inspectionVLESSResponseServer(t *testing.T, response []byte, reset bool) (*core.OutboundHandlerConfig, <-chan error, <-chan struct{}, chan<- struct{}) {
 	t.Helper()
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -130,6 +130,8 @@ func inspectionVLESSResponseServer(t *testing.T, response []byte, reset bool) (*
 	}
 	t.Cleanup(func() { listener.Close() })
 	done := make(chan error, 1)
+	ready, release := make(chan struct{}), make(chan struct{}, 1)
+	t.Cleanup(func() { close(release) })
 	go func() {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
@@ -146,6 +148,8 @@ func inspectionVLESSResponseServer(t *testing.T, response []byte, reset bool) (*
 			done <- err
 			return
 		}
+		close(ready)
+		<-release
 		if reset && len(response) == 0 {
 			if err = conn.SetLinger(0); err != nil {
 				done <- err
@@ -174,7 +178,7 @@ func inspectionVLESSResponseServer(t *testing.T, response []byte, reset bool) (*
 	account := &protocol.User{Account: serial.ToTypedMessage(&vless.Account{Id: id.String()})}
 	return &core.OutboundHandlerConfig{Tag: "vless-proxy", ProxySettings: serial.ToTypedMessage(&vlessout.Config{
 		Vnext: &protocol.ServerEndpoint{Address: cnet.NewIPOrDomain(cnet.LocalHostIP), Port: uint32(listener.Addr().(*net.TCPAddr).Port), User: account},
-	})}, done
+	})}, done, ready, release
 }
 
 func inspectionHysteriaConfig(t *testing.T) *core.OutboundHandlerConfig {
@@ -280,9 +284,23 @@ func TestFlowInspectionP2GVLESSResponseEnding(t *testing.T) {
 		{name: "reset-header", reset: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			outbound, serverDone := inspectionVLESSResponseServer(t, test.response, test.reset)
+			outbound, serverDone, ready, release := inspectionVLESSResponseServer(t, test.response, test.reset)
 			_, view, address := inspectionTCPOutboundThrough(t, true, outbound)
 			client := inspectionSOCKS(t, address, cnet.TCPDestination(cnet.LocalHostIP, 80), nil)
+			select {
+			case <-ready:
+			case <-time.After(3 * time.Second):
+				t.Fatal("VLESS native request did not reach remote")
+			}
+			live, err := view.ReadLiveInto(nil)
+			if err != nil || len(live.Rows) != 1 {
+				t.Fatalf("VLESS pending owner: %+v %v", live, err)
+			}
+			row := live.Rows[0]
+			if row.Ref.ID == 0 || row.Outbound.Tag != outbound.Tag || row.Origin != fs.TrafficOriginUser || row.Uplink != 0 || row.Downlink != 0 {
+				t.Fatalf("VLESS framing credited: %+v", row)
+			}
+			release <- struct{}{}
 			if err := <-serverDone; err != nil {
 				t.Fatal(err)
 			}
@@ -290,18 +308,13 @@ func TestFlowInspectionP2GVLESSResponseEnding(t *testing.T) {
 				_ = tcpClient.CloseWrite()
 			}
 			_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
-			_, _ = client.Read(make([]byte, 1))
-			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals()
-				if err != nil || len(page.Rows) != 1 {
-					return false
-				}
-				row := page.Rows[0]
-				if row.Flow.Outbound.Tag != outbound.Tag || row.Flow.Outbound.Tag == "" || row.Flow.Downlink != 0 {
-					t.Fatalf("response ending facts: %+v", row)
-				}
-				return true
-			})
+			if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
+				t.Fatalf("VLESS response ending: %d %v", n, err)
+			} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				t.Fatalf("VLESS ending timed out: %v", err)
+			}
+			inspectionLiveAbsent(t, view, row.Ref)
+			inspectionByteTotals(t, view, outbound.Tag, fs.ClientTotals{}, fs.ClientTotals{})
 		})
 	}
 }

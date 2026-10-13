@@ -116,14 +116,11 @@ func preconnectStopAcceptance(t *testing.T, target cnet.Destination, flow string
 	finish()
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals()
+		live, err := view.ReadLiveInto(nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(page.Rows) == 1 {
-			if page.Rows[0].Flow.Ref != ref {
-				t.Fatalf("preconnect terminal: %+v", page.Rows[0])
-			}
+		if len(live.Rows) == 0 {
 			return
 		}
 		time.Sleep(time.Millisecond)

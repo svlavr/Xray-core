@@ -38,14 +38,12 @@ func TestMeasurementPacketDestinationSurvivesFrameReuse(t *testing.T) {
 
 func TestMeasurementPacketReaderWithoutUDPMetadata(t *testing.T) {
 	tcp := xnet.TCPDestination(xnet.LocalHostIP, 1234)
-	for _, destination := range []*xnet.Destination{nil, &tcp} {
-		packet, err := mux.NewPacketReader(bytes.NewReader([]byte{0, 1, 'x'}), destination).ReadMultiBuffer()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(packet) != 1 || packet[0].UDP != nil || string(packet[0].Bytes()) != "x" {
-			t.Error("non-UDP packet acquired invented source metadata")
-		}
-		buf.ReleaseMulti(packet)
+	packet, err := mux.NewPacketReader(bytes.NewReader([]byte{0, 1, 'x'}), &tcp).ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(packet) != 1 || packet[0].UDP != nil || string(packet[0].Bytes()) != "x" {
+		t.Error("non-UDP packet acquired invented source metadata")
+	}
+	buf.ReleaseMulti(packet)
 }

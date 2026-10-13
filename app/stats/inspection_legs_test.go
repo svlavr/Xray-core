@@ -27,25 +27,22 @@ func TestInspectionRayAttributionAndCompletion(t *testing.T) {
 	b.PacketDestination(newDest)
 	a.AddDownlink(7)
 	b.AddDownlink(9)
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != root.Ref() || live.Rows[0].Uplink != 8 || live.Rows[0].Downlink != 18 || live.Rows[0].Outbound.Tag != "new" || live.Rows[0].Destination != newDest {
+		t.Fatalf("live association facts: %+v %v", live, err)
+	}
 	out, err := s.CloseFlows(context.Background(), []fs.FlowRef{root.Ref()})
 	if err != nil || out[0] != nil || root.NewLeg() != nil {
 		t.Fatalf("association stop did not seal future work: %+v %v", out, err)
 	}
 	a.Finish()
 	b.Finish()
-	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 {
-		t.Fatalf("association terminal count: %d", len(page.Rows))
-	}
+
 	a.AddUplink(13)
 	a.AddSelectedUplink(13)
 	a.Finish()
 	root.Finish()
-	page, _ = s.ReadTerminals()
-	f := page.Rows[0].Flow
-	if f.Ref != root.Ref() || f.Uplink != 8 || f.Downlink != 18 || f.Outbound.Tag != "new" || f.Destination != newDest {
-		t.Fatalf("association facts: %+v", f)
-	}
+
 	totals, _ := s.ReadTotals()
 	if totals.User != (fs.ClientTotals{Uplink: 21, Downlink: 18}) || len(totals.Rows) != 2 {
 		t.Fatalf("inactive root duplicated general bytes: %+v", totals)
@@ -110,18 +107,15 @@ func TestInspectionFinishedRayLateFactsReachLiveRoot(t *testing.T) {
 	leg.AddUplink(9)
 
 	leg.AddSelectedUplink(9)
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != 9 {
+		t.Fatalf("live association facts: %+v %v", live, err)
+	}
 	root.Finish()
 
-	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 9 {
-		t.Fatalf("late leg facts missing from root snapshot: %+v", page)
-	}
 	leg.AddUplink(4)
 	leg.AddSelectedUplink(4)
-	pageAgain, _ := s.ReadTerminals()
-	if pageAgain.Rows[0].Flow.Uplink != 9 {
-		t.Fatalf("terminal snapshot changed after root finish: %+v", pageAgain)
-	}
+
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Outbound.Tag == "tag-7" && row.Uplink == 13 {
@@ -140,12 +134,12 @@ func TestInspectionSelectedRayKeepsTagWithoutConsumption(t *testing.T) {
 	leg.Unassign()
 
 	leg.Finish()
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Tag != "selected-only" {
+		t.Fatalf("live association facts: %+v %v", live, err)
+	}
 	root.Finish()
 
-	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "selected-only" {
-		t.Fatalf("selected route label changed: %+v", page)
-	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Origin == fs.TrafficOriginUser && row.Outbound.Tag == "selected-only" && row.Uplink == 0 && totals.User.Uplink == 5 {
@@ -165,20 +159,17 @@ func TestInspectionPendingOrdinaryRouteAfterOwnerEnd(t *testing.T) {
 	leg.AddDownlink(13)
 	leg.PacketDestination(destination)
 	leg.Finish()
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != 11 || live.Rows[0].Downlink != 13 || live.Rows[0].Destination != destination {
+		t.Fatalf("live association facts: %+v %v", live, err)
+	}
 	root.Finish()
 
-	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 11 || page.Rows[0].Flow.Downlink != 13 || page.Rows[0].Flow.Destination != destination {
-		t.Fatalf("pre-classification terminal: %+v", page)
-	}
 	leg.Route(fs.OutboundRef{Tag: "ordinary"})
 	leg.AddUplink(17)
 
 	leg.AddSelectedUplink(17)
-	again, _ := s.ReadTerminals()
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink != 11 || again.Rows[0].Flow.Downlink != 13 {
-		t.Fatalf("late route changed immutable terminal: %+v", again)
-	}
+
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Outbound.Tag == "ordinary" {
@@ -201,18 +192,14 @@ func TestInspectionSelectedRayOwnerEndKeepsLateTotals(t *testing.T) {
 	leg.PacketDestination(destination)
 	leg.Route(fs.OutboundRef{Tag: "selected-ray"})
 	leg.Finish()
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != 23 || live.Rows[0].Destination != destination || live.Rows[0].Outbound.Tag != "selected-ray" {
+		t.Fatalf("live association facts: %+v %v", live, err)
+	}
 	root.Finish()
 
-	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 23 || page.Rows[0].Flow.Destination != destination || page.Rows[0].Flow.Outbound.Tag != "selected-ray" {
-		t.Fatalf("selected owner-end lower bound: %+v", page)
-	}
 	leg.AddDownlink(29)
 
-	again, _ := s.ReadTerminals()
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Outbound.Tag != "selected-ray" || again.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("late receipt changed immutable terminal: %+v", again)
-	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Outbound.Tag == "selected-ray" {
@@ -234,12 +221,12 @@ func TestInspectionEarlyFinishedRaySelectionDoesNotCreditInput(t *testing.T) {
 	leg.Finish()
 	leg.Route(fs.OutboundRef{Tag: "selected-ray"})
 
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Tag != "selected-ray" || live.Rows[0].Uplink != 19 {
+		t.Fatalf("live association facts: %+v %v", live, err)
+	}
 	root.Finish()
 
-	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "selected-ray" || page.Rows[0].Flow.Uplink != 19 {
-		t.Fatalf("selected ray terminal: %+v", page)
-	}
 	totals, _ := s.ReadTotals()
 	for _, row := range totals.Rows {
 		if row.Origin == fs.TrafficOriginUser && row.Outbound.Tag == "selected-ray" && row.Uplink == 0 {
@@ -258,10 +245,9 @@ func TestInspectionTCPDoesNotCreatePacketLeg(t *testing.T) {
 	root.AddUplink(23)
 	root.AddSelectedUplink(23)
 	root.AddDownlink(43)
-	root.Finish()
-
-	page, _ := s.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Kind != xnet.Network_TCP || page.Rows[0].Flow.Uplink != 23 || page.Rows[0].Flow.Downlink != 43 {
-		t.Fatalf("TCP root: %+v", page)
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Kind != xnet.Network_TCP || live.Rows[0].Uplink != 23 || live.Rows[0].Downlink != 43 {
+		t.Fatalf("live association facts: %+v %v", live, err)
 	}
+	root.Finish()
 }

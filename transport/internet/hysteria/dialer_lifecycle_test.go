@@ -23,6 +23,12 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
+func cleanClientForTest(c *client, force bool) {
+	<-c.access.Wait()
+	defer c.access.Signal()
+	c.cleanLocked(force)
+}
+
 func TestU2ClientAuthFailure(t *testing.T) {
 	for _, failure := range []string{"cancel", "reject"} {
 		t.Run(failure, func(t *testing.T) { testClientAuthFailure(t, failure == "reject") })
@@ -155,7 +161,7 @@ func testClientAuthFailure(t *testing.T, reject bool) {
 		t.Fatal(err)
 	}
 	defer next.Close()
-	defer c.clean(true)
+	defer cleanClientForTest(c, true)
 	connected := c.conn
 	canceledCtx, cancelDial := context.WithCancel(context.Background())
 	cancelDial()
@@ -165,11 +171,11 @@ func testClientAuthFailure(t *testing.T, reject bool) {
 	if !errors.Is(err, context.Canceled) || c.conn != connected {
 		t.Fatalf("canceled dial on a ready client: %v", err)
 	}
-	c.clean(false)
+	cleanClientForTest(c, false)
 	if c.conn != connected {
 		t.Fatal("normal cleanup closed the live replacement connection")
 	}
-	c.clean(true)
+	cleanClientForTest(c, true)
 	select {
 	case <-connected.Context().Done():
 	default:

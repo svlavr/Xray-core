@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
@@ -52,6 +53,36 @@ func (e *udpConnEntry) writePacket(packet []byte) (int, error) {
 		return writer.WriteTo(packet, peer)
 	}
 	return conn.Write(packet)
+}
+
+// writeResponses keeps decoded batch custody with the association; callers
+// supply only their authenticated packet encoder.
+func (e *udpConnEntry) writeResponses(fallback net.Destination, encode func(net.Destination, []byte) ([]byte, error)) {
+	defer e.Close()
+	for {
+		mb, err := e.link.Reader.ReadMultiBuffer()
+		if err != nil {
+			buf.ReleaseMulti(mb)
+			return
+		}
+		e.timer.Update()
+		for index, b := range mb {
+			dest := fallback
+			if b.UDP != nil {
+				dest = *b.UDP
+			}
+			packet, err := encode(dest, b.Bytes())
+			b.Release()
+			if err != nil {
+				continue
+			}
+			n, err := e.writePacket(packet)
+			if err != nil || n != len(packet) {
+				buf.ReleaseMulti(mb[index+1:])
+				return
+			}
+		}
+	}
 }
 
 func (e *udpConnEntry) isClosed() bool {

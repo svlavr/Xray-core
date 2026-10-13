@@ -19,7 +19,7 @@ import (
 // socket capacity. Network forwarding/fast paths have separate core tests.
 func TestInspectionLargeTableConcurrentUpdatesAndControl(t *testing.T) {
 	const live = 50000
-	store := testInspectionStore(t, fs.ObservationOptions{MaxLive: live, MaxTerminals: 1024})
+	store := testInspectionStore(t, fs.ObservationOptions{MaxLive: live})
 	flows := make([]fs.Exchange, live)
 	refs := make([]fs.FlowRef, live)
 	stops := make([]atomic.Uint32, live)
@@ -135,7 +135,7 @@ func BenchmarkInspectionLargeTablePolling(b *testing.B) {
 }
 
 func TestInspectionHighChurnIdentityAndBoundedRetention(t *testing.T) {
-	store := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1, MaxTerminals: 64})
+	store := testInspectionStore(t, fs.ObservationOptions{MaxLive: 1})
 	var previous uint64
 	start := time.Now()
 	for i := 0; i < 100000; i++ {
@@ -150,11 +150,15 @@ func TestInspectionHighChurnIdentityAndBoundedRetention(t *testing.T) {
 		flow.AddSelectedUplink(1)
 		flow.Finish()
 	}
-	page, err := store.ReadLiveInto(nil)
-	ended, endErr := store.ReadTerminals()
-	if err != nil || endErr != nil || len(page.Rows) != 0 || len(ended.Rows) != 64 {
-		t.Fatalf("unbounded churn retention live=%d ended=%d: %v %v", len(page.Rows), len(ended.Rows), err, endErr)
+	live, err := store.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 0 {
+		t.Fatalf("churn retained live exchanges: %+v %v", live, err)
 	}
+	totals, err := store.ReadTotals()
+	if err != nil || totals.User.Uplink != 100000 {
+		t.Fatalf("churn USER bytes: %+v %v", totals, err)
+	}
+
 	t.Logf("100000 logical register/route/credit/finish operations: %s; no physical-connection rate claim", time.Since(start))
 }
 
@@ -203,10 +207,7 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 		if row := findTotal(t, totals.Rows, "direct", fs.TrafficOriginUser); row.Downlink != 8 {
 			t.Fatalf("late total: %+v", row)
 		}
-		terminal, err := store.ReadTerminals()
-		if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Downlink != 3 {
-			t.Fatalf("terminal changed: %+v %v", terminal, err)
-		}
+
 		runtime.KeepAlive(exchange)
 		runtime.KeepAlive(store)
 	})
@@ -244,62 +245,6 @@ func TestInspectionAcceptanceReleasedStopReferences(t *testing.T) {
 			t.Fatalf("leg ending removed root stop: %+v %v", outcomes, err)
 		}
 	})
-}
-
-func TestInspectionAcceptanceIndependentSlowReaders(t *testing.T) {
-	store := testInspectionStore(t, fs.ObservationOptions{MaxTerminals: 2})
-	add := func(n int) {
-		e := store.Begin(xnet.Network_TCP, fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
-		e.Route(fs.OutboundRef{Tag: "original"})
-		e.AddUplink(uint64(n))
-		e.AddSelectedUplink(uint64(n))
-		e.Finish()
-	}
-	add(1)
-	slow, err := store.ReadTerminals()
-	if err != nil {
-		t.Fatal(err)
-	}
-	savedRef := slow.Rows[0].Flow.Ref
-	var wg sync.WaitGroup
-	for reader := 0; reader < 3; reader++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var rows []fs.FlowRecord
-			for i := 0; i < 100; i++ {
-				page, err := store.ReadTerminals()
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				for j := range page.Rows {
-					if page.Rows[j].Flow.Outbound.Tag != "original" {
-						t.Error("another reader mutated store")
-					}
-					page.Rows[j].Flow.Outbound.Tag = "reader mutation"
-				}
-				live, _ := store.ReadLiveInto(rows)
-				rows = live.Rows
-				_, _ = store.ReadTotals()
-			}
-		}()
-	}
-	for i := 2; i <= 101; i++ {
-		add(i)
-	}
-	wg.Wait()
-	if len(slow.Rows) != 1 || slow.Rows[0].Flow.Ref != savedRef || slow.Rows[0].Flow.Uplink != 1 || slow.Rows[0].Flow.Outbound.Tag != "original" {
-		t.Fatal("retained reader snapshot changed")
-	}
-	fresh, err := store.ReadTerminals()
-	if err != nil || len(fresh.Rows) != 2 {
-		t.Fatalf("fresh bounded view: %+v %v", fresh, err)
-	}
-	outcomes, err := store.CloseFlows(context.Background(), []fs.FlowRef{savedRef, fresh.Rows[0].Flow.Ref})
-	if err != nil || outcomes[0] != nil || outcomes[1] != nil {
-		t.Fatalf("retention close outcomes: %+v %v", outcomes, err)
-	}
 }
 
 func TestInspectionAcceptanceStopRequestedIsVisible(t *testing.T) {
@@ -342,7 +287,7 @@ func TestInspectionAcceptanceDefaultCapRetainedHeap(t *testing.T) {
 	if store.limits != defaultObservationOptions {
 		t.Fatalf("effective defaults: %+v", store.limits)
 	}
-	for i := 0; i < int(store.limits.MaxTerminals); i++ {
+	for i := 0; i < int(store.limits.MaxBuckets); i++ {
 		e := acceptanceFillMetadata(store, uint64(i+1), i)
 		if len(e.record.Outbound.Tag) != 300 || !e.record.Destination.IsValid() {
 			t.Fatalf("latest bounded metadata missing: %+v", e.record)
@@ -350,13 +295,13 @@ func TestInspectionAcceptanceDefaultCapRetainedHeap(t *testing.T) {
 		e.Finish()
 	}
 	for i := 0; i < int(store.limits.MaxLive); i++ {
-		acceptanceFillMetadata(store, uint64(i+1), i+int(store.limits.MaxTerminals))
+		acceptanceFillMetadata(store, uint64(i+1), i+int(store.limits.MaxBuckets))
 	}
-	if len(store.live) != 256 || len(store.terminals) != 1024 || len(store.buckets) != 1024 {
-		t.Fatalf("store sizes: %d %d %d", len(store.live), len(store.terminals), len(store.buckets))
+	if len(store.live) != 256 || len(store.buckets) != 1024 {
+		t.Fatalf("store sizes: %d %d", len(store.live), len(store.buckets))
 	}
 	runtime.GC()
 	runtime.ReadMemStats(&after)
-	t.Logf("default-cap store retained HeapAlloc delta=%d bytes; live=%d terminals=%d attributed-buckets=%d; caller copies/native connections/DNS caches excluded", int64(after.HeapAlloc)-int64(before.HeapAlloc), len(store.live), len(store.terminals), len(store.buckets))
+	t.Logf("default-cap store retained HeapAlloc delta=%d bytes; live=%d attributed-buckets=%d; caller copies/native connections/DNS caches excluded", int64(after.HeapAlloc)-int64(before.HeapAlloc), len(store.live), len(store.buckets))
 	runtime.KeepAlive(store)
 }

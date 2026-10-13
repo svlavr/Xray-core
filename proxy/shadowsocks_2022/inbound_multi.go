@@ -325,11 +325,7 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 
 			// Authenticate every identity header against the current user map.
 			// A cached replay/cipher session never grants continuing membership.
-			var decryptedHash [AESBlockSize]byte
-			i.udpMasterCipher.Decrypt(decryptedHash[:], packetBytes[AESBlockSize:2*AESBlockSize])
-			for index := range decryptedHash {
-				decryptedHash[index] ^= rawHeader[index]
-			}
+			decryptedHash := DecryptUDPEIH(i.udpMasterCipher, rawHeader[:], packetBytes[AESBlockSize:2*AESBlockSize])
 			i.RLock()
 			currentUser, ok := i.usersByHash.Load(decryptedHash)
 			var userPSK []byte
@@ -405,32 +401,10 @@ func (i *MultiUserInbound) processUDP(ctx context.Context, conn stat.Connection,
 						udpConns.CompareAndDelete(association, entry)
 						continue
 					}
-					go func(key multiUDPKey, uPSK []byte, d net.Destination, cEntry *udpConnEntry) {
-						defer cEntry.Close()
-						for {
-							resMb, err := cEntry.link.Reader.ReadMultiBuffer()
-							if err != nil {
-								return
-							}
-							cEntry.timer.Update()
-							for _, rb := range resMb {
-								responseDest := d
-								if rb.UDP != nil {
-									responseDest = *rb.UDP
-								}
-
-								encPacket, err := i.encodeServerUDPPacket(key, uPSK, responseDest, rb.Bytes())
-								rb.Release()
-								if err != nil {
-									continue
-								}
-								n, writeErr := cEntry.writePacket(encPacket)
-								if writeErr != nil || n != len(encPacket) {
-									return
-								}
-							}
-						}
-					}(association, userPSK, dest, entry)
+					key, psk := association, userPSK
+					go entry.writeResponses(dest, func(dest net.Destination, payload []byte) ([]byte, error) {
+						return i.encodeServerUDPPacket(key, psk, dest, payload)
+					})
 				}
 			}
 

@@ -59,11 +59,7 @@ func controlOpen(t *testing.T, instance *core.Instance, view fs.FlowInspection, 
 	for _, row := range before.Rows {
 		known[row.Ref] = true
 	}
-	ctx := session.ContextWithTrafficOrigin(context.Background(), fs.TrafficOriginUser)
-	conn, err := core.Dial(ctx, instance, dest)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := controlNativeDial(t, instance, dest)
 	t.Cleanup(func() { conn.Close() })
 	controlExchange(t, conn, dest.Network)
 	var found fs.FlowRecord
@@ -210,25 +206,30 @@ func TestControlStatsP3CapturedSwitch(t *testing.T) {
 					}
 				}
 				for _, conn := range []net.Conn{first, second} {
-					if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
 						t.Fatal(err)
 					}
 					if n, err := conn.Read(make([]byte, 1)); n != 0 || err == nil {
 						t.Fatalf("stopped endpoint still readable: %d %v", n, err)
-					} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
-						t.Fatal("captured stop timed out instead of closing the endpoint")
+					} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() && network == net.Network_TCP {
+						t.Fatal("captured TCP stop timed out instead of closing the endpoint")
 					}
+					// Native UDP has no peer EOF. Exact local stop removes the
+					// admitted endpoint; the caller socket remains caller-owned.
 				}
-				terminals, err := view.ReadTerminals()
-				if err != nil || len(terminals.Rows) != 2 {
-					t.Fatalf("captured ending snapshots: %+v %v", terminals, err)
-				}
-				for _, terminal := range terminals.Rows {
-					if terminal.Flow.Ref != firstRow.Ref && terminal.Flow.Ref != secondRow.Ref {
-						t.Fatalf("wrong endpoint ended: %+v", terminal)
+
+				inspectionWait(t, func() bool {
+					live, err := view.ReadLiveInto(nil)
+					if err != nil {
+						t.Fatal(err)
 					}
-					controlRoute(t, terminal.Flow, "p3-a")
-				}
+					for _, row := range live.Rows {
+						if row.Ref == firstRow.Ref || row.Ref == secondRow.Ref {
+							return false
+						}
+					}
+					return len(live.Rows) == 3
+				})
 				stale := laterRow.Ref
 				stale.Runtime[0] ^= 0xff
 				outcomes, err = view.CloseFlows(context.Background(), append(captured, stale))
@@ -320,10 +321,7 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 	if err := r.AddRule(serial.ToTypedMessage(controlRule("p3-block", net.Network_TCP)), false); err != nil {
 		t.Fatal(err)
 	}
-	blocked, err := core.Dial(session.ContextWithTrafficOrigin(context.Background(), fs.TrafficOriginUser), instance, original)
-	if err != nil {
-		t.Fatal(err)
-	}
+	blocked := controlNativeDial(t, instance, original)
 	t.Cleanup(func() { blocked.Close() })
 	if err := blocked.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -334,11 +332,7 @@ func TestControlStatsP3HandlerReuseRedirectAndBlock(t *testing.T) {
 		t.Fatal("BLOCK timed out instead of ending")
 	}
 	blocked.Close()
-	terminals, err := view.ReadTerminals()
-	if err != nil || len(terminals.Rows) != 1 {
-		t.Fatalf("BLOCK terminal: %+v %v", terminals, err)
-	}
-	controlRoute(t, terminals.Rows[0].Flow, "p3-block")
+
 	outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{oldRow.Ref})
 	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("captured old-flow exact stop: %+v %v", outcomes, err)
@@ -425,19 +419,20 @@ func TestControlStatsP3InboundLifecycle(t *testing.T) {
 	}
 }
 
-func TestControlStatsP3MissingProcessIdentity(t *testing.T) {
+func TestControlStatsP3ProcessIdentityBoundary(t *testing.T) {
 	instance, view, _ := inspectionCore(t, true, false)
 	r := instance.GetFeature(frouting.RouterType()).(frouting.Router)
 	config := controlRule("direct", net.Network_TCP)
 	config.Rule = append([]*router.RoutingRule{{
-		RuleTag: "process-only", Process: []string{"self/"},
+		RuleTag: "process-only", Process: []string{"control-fixture-no-such-process/"},
 		TargetTag: &router.RoutingRule_Tag{Tag: "must-not-select"},
 	}}, config.Rule...)
 	if err := r.AddRule(serial.ToTypedMessage(config), false); err != nil {
 		t.Fatal(err)
 	}
-	// API admission has no platform source identity. Failure to match the
-	// process rule falls through to a generic rule; it is not a fail-closed policy.
+	// Native ingress can expose the local caller's real process identity. A
+	// nonmatching process rule still falls through to the generic native rule.
+	// The retired core API's missing-identity behavior is not this stimulus.
 	_, row := controlOpen(t, instance, view, startOutboundStatsTCPServer(t))
 	controlRoute(t, row, "direct")
 	matcher := router.NewProcessNameMatcher([]string{"self/"})

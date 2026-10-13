@@ -65,20 +65,6 @@ func TestFlowInspectionRawProgressLinux(t *testing.T) {
 			if err != nil || outcome[0] != nil {
 				t.Fatalf("close: %+v %v", outcome, err)
 			}
-			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if len(page.Rows) != 1 {
-					return false
-				}
-				final := page.Rows[0]
-				if final.Flow.Downlink != uint64(len(first)+len(second)) {
-					t.Fatalf("raw final: %+v", final)
-				}
-				return true
-			})
 		})
 	}
 }

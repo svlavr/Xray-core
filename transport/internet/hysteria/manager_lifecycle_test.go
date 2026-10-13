@@ -48,7 +48,7 @@ func u2Carrier(t *testing.T) (*client, *quic.Conn) {
 	t.Cleanup(func() { _ = peer.CloseWithError(0, "fixture cleanup") })
 	c := &client{access: semaphore.New(1), conn: qc, tr: tr, pktConn: pc, udpSM: &udpSessionManager{conn: qc, m: make(map[uint32]*InterConn), next: 1}}
 	go c.udpSM.run()
-	t.Cleanup(func() { c.clean(true) })
+	t.Cleanup(func() { cleanClientForTest(c, true) })
 	return c, peer
 }
 
@@ -165,7 +165,7 @@ func TestU2ManagerExactReplacement(t *testing.T) {
 	if m.m[key] != replacement || !old.forced {
 		t.Fatal("stale cleanup removed replacement or failed to mark old client")
 	}
-	old.clean(true) // Forced null cleanup is repeatable.
+	cleanClientForTest(old, true) // Forced null cleanup is repeatable.
 	for _, udp := range []bool{false, true} {
 		var err error
 		if udp {
@@ -194,7 +194,7 @@ func TestU2ClientResetAndForcedSessions(t *testing.T) {
 			return false
 		}
 	})
-	c.clean(false)
+	cleanClientForTest(c, false)
 	if c.forced || c.conn != nil || c.tr != nil || c.pktConn != nil || c.udpSM != nil {
 		t.Fatal("ordinary reset became terminal or retained resources")
 	}
@@ -202,7 +202,7 @@ func TestU2ClientResetAndForcedSessions(t *testing.T) {
 	if _, err := child.Read(make([]byte, 16)); err != io.EOF {
 		t.Fatalf("reset UDP session: %v", err)
 	}
-	c.clean(true)
+	cleanClientForTest(c, true)
 	if !c.forced {
 		t.Fatal("null client was not marked terminal")
 	}
@@ -326,5 +326,5 @@ func TestU2SilentHandshakeTwoAssociations(t *testing.T) {
 	if c.conn != nil || c.tr != nil || c.pktConn != nil || c.udpSM != nil {
 		t.Fatal("canceled handshake published resources")
 	}
-	c.clean(true)
+	cleanClientForTest(c, true)
 }

@@ -19,7 +19,7 @@ PROFILES = [
     "TestAdditionalProtocolMeasurements/" + p for p in (
         "ss-aes128", "ss-aes256", "ss-chacha20", "ss-xchacha20", "socks", "http")
 ] + [
-    "TestHysteriaMeasurementSeriesAndUDPCancellation",
+    "TestHysteriaMeasurementUDPCancellation",
     "TestFreedomProtocolMeasurements", "TestWireGuardProtocolMeasurements",
 ]
 

@@ -174,18 +174,6 @@ func TestFlowInspectionSuppliedUDPLifecycle(t *testing.T) {
 	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("exact UDP stop: %+v %v", outcomes, err)
 	}
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, row := range page.Rows {
-			if row.Flow.Ref == selected.Ref {
-				return true
-			}
-		}
-		return false
-	})
 
 	replacementPayload := []byte("same source after exact stop")
 	inspectionUDPExchange(t, first, inbound, replacementPayload, mask)
@@ -347,8 +335,4 @@ func inspectionUDPBatchThrough(t *testing.T, instance *core.Instance, view fs.Fl
 	case <-time.After(5 * time.Second):
 		t.Fatal("batch endpoint did not finish")
 	}
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == uint64(len(got)) && page.Rows[0].Flow.Downlink == uint64(len(got))
-	})
 }

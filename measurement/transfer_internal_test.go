@@ -2,7 +2,6 @@ package measurement
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"io"
 	"testing"
@@ -10,13 +9,11 @@ import (
 )
 
 type partialPayloadWriter struct {
-	n    int
-	err  error
-	data []byte
+	n   int
+	err error
 }
 
 func (w *partialPayloadWriter) Write(p []byte) (int, error) {
-	w.data = append(w.data, p[:w.n]...)
 	return w.n, w.err
 }
 
@@ -24,7 +21,7 @@ func testUploadBody(t *testing.T, size int64) *uploadBody {
 	t.Helper()
 	ctx, cancel := context.WithCancelCause(context.Background())
 	t.Cleanup(func() { cancel(nil) })
-	return &uploadBody{ctx: ctx, cancel: cancel, bytes: size, timeout: time.Second, accepted: sha256.New()}
+	return &uploadBody{ctx: ctx, cancel: cancel, bytes: size, timeout: time.Second}
 }
 
 func TestUploadPartialWriterFacts(t *testing.T) {
@@ -39,9 +36,6 @@ func TestUploadPartialWriterFacts(t *testing.T) {
 		}
 		if n != 17 || !errors.Is(err, wantErr) || b.produced != transferChunk || b.written != 17 {
 			t.Fatalf("partial counts generated=%d accepted=%d n=%d err=%v", b.produced, b.written, n, err)
-		}
-		if [sha256.Size]byte(b.accepted.Sum(nil)) != sha256.Sum256(w.data) {
-			t.Fatal("partial digest is not writer accepted prefix")
 		}
 	}
 }

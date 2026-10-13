@@ -74,24 +74,25 @@ func TestInspectionDNSEndpointTCPReturn(t *testing.T) {
 	if err != nil || response.Rcode != dns.RcodeRefused {
 		t.Fatalf("local DNS response: %+v %v", response, err)
 	}
-	requestBytes, err := query.Pack()
+	requestWire, err := query.Pack()
 	if err != nil {
 		t.Fatal(err)
 	}
-	responseBytes, err := response.Pack()
+	responseWire, err := response.Pack()
 	if err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals()
+		live, err := view.ReadLiveInto(nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(page.Rows) == 1 {
-			flow := page.Rows[0].Flow
-			if flow.Outbound.Tag != "dns-local" || flow.Outbound.Tag == "" || flow.Uplink != uint64(len(requestBytes)+2) || flow.Downlink != uint64(len(responseBytes)+2) {
-				t.Fatalf("source endpoint DNS facts: %+v; message sizes %d/%d", flow, len(requestBytes), len(responseBytes))
+		if len(live.Rows) == 0 {
+			totals, err := view.ReadTotals()
+			want := fs.ClientTotals{Uplink: uint64(len(requestWire) + 2), Downlink: uint64(len(responseWire) + 2)}
+			if err != nil || totals.User != want || len(totals.Rows) != 1 || totals.Rows[0].Outbound.Tag != "dns-local" || totals.Rows[0].Uplink != want.Uplink || totals.Rows[0].Downlink != want.Downlink {
+				t.Fatalf("framed DNS USER/tag totals: %+v %v", totals, err)
 			}
 			return
 		}
@@ -217,6 +218,7 @@ func TestInspectionDNSEndpointUDPBranches(t *testing.T) {
 				}
 			}
 			deadline := time.Now().Add(3 * time.Second)
+			stopped := false
 			var liveStorage221 []fs.FlowRecord
 			for time.Now().Before(deadline) {
 				live, err := view.ReadLiveInto(liveStorage221)
@@ -224,27 +226,24 @@ func TestInspectionDNSEndpointUDPBranches(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if stopped && len(live.Rows) == 0 {
+					return
+				}
 				if len(live.Rows) == 1 {
 					flow := live.Rows[0]
 					// Peer delivery does not join the writer's accounting callback.
 					// Close only after the facts this test checks have been recorded.
 					if flow.Uplink == uint64(len(wire)) && flow.Downlink == uint64(n) {
+						if flow.Outbound.Tag != "dns-out" || flow.Origin != fs.TrafficOriginUser {
+							t.Fatalf("UDP DNS route/origin: %+v", flow)
+						}
+						stopped = true
 						if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref}); err != nil {
 							t.Fatal(err)
 						}
 					}
 				}
-				page, err := view.ReadTerminals()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if len(page.Rows) == 1 {
-					flow := page.Rows[0].Flow
-					if flow.Outbound.Tag != "dns-out" || flow.Uplink != uint64(len(wire)) || flow.Downlink != uint64(n) {
-						t.Fatalf("source endpoint UDP facts: %+v; sizes %d/%d", flow, len(wire), n)
-					}
-					return
-				}
+
 				time.Sleep(time.Millisecond)
 			}
 			t.Fatal("UDP DNS flow did not finish")

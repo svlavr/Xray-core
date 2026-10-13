@@ -2,7 +2,6 @@ package measurement_test
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -48,32 +47,16 @@ func auditRawTLS(t *testing.T, raw string, abrupt bool) *httptest.Server {
 }
 
 func TestAuditDownloadFinalReadErrorRetainsCapFact(t *testing.T) {
-	for _, digest := range []bool{false, true} {
-		t.Run(fmt.Sprint(digest), func(t *testing.T) {
-			s := auditRawTLS(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\naXX", false)
-			e := executor(t, instance(t))
-			q := request(s, measurement.Direct)
-			q.MaxBodyBytes = 1
-			d := measurement.DownloadRequest{HTTPS: q, TransferTimeout: time.Second}
-			sum := sha256.Sum256([]byte("a"))
-			if digest {
-				d.ExpectedSHA256 = &sum
-			}
-			r, err := e.Download(context.Background(), d)
-			t.Logf("payload=%d cap=%t complete=%t verified=%t error=%v", r.PayloadBytes, r.ByteLimitReached, r.HTTPS.BodyComplete, r.IntegrityVerified, err)
-			if err == nil || !strings.Contains(err.Error(), "malformed chunked encoding") {
-				t.Fatalf("fixture did not produce simultaneous positive read and framing failure: %+v %v", r, err)
-			}
-			if r.PayloadBytes != 1 || r.HTTPS.BodyComplete || r.IntegrityVerified {
-				t.Fatalf("partial wire facts lost: %+v", r)
-			}
-			if digest && (r.SHA256 == nil || *r.SHA256 != sum) {
-				t.Fatal("consumed-prefix digest lost")
-			}
-			if !r.ByteLimitReached {
-				t.Error("consumed bytes reached the caller cap, but raw limit fact is false")
-			}
-		})
+	s := auditRawTLS(t, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\naXX", false)
+	e := executor(t, instance(t))
+	q := request(s, measurement.Direct)
+	q.MaxBodyBytes = 1
+	r, err := e.Download(context.Background(), measurement.DownloadRequest{HTTPS: q, TransferTimeout: time.Second})
+	if err == nil || !strings.Contains(err.Error(), "malformed chunked encoding") {
+		t.Fatalf("fixture did not produce simultaneous positive read and framing failure: %+v %v", r, err)
+	}
+	if r.PayloadBytes != 1 || r.HTTPS.BodyComplete || !r.ByteLimitReached {
+		t.Fatalf("partial wire/cap facts lost: %+v", r)
 	}
 }
 

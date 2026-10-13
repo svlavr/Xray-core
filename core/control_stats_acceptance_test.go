@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	applog "github.com/xtls/xray-core/app/log"
@@ -31,6 +32,7 @@ func acceptanceCore(tb testing.TB, enabled bool) (*core.Instance, fs.FlowInspect
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&applog.Config{ErrorLogType: applog.LogType_None, AccessLogType: applog.LogType_None}),
 			serial.ToTypedMessage(&appstats.Config{}),
+			serial.ToTypedMessage(&proxyman.InboundConfig{}),
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 			serial.ToTypedMessage(&dispatcher.Config{}),
 		},
@@ -144,12 +146,10 @@ func acceptanceExchange(tb testing.TB, ctx context.Context, instance *core.Insta
 		tracker = new(acceptanceOutboundError)
 		ctx = session.TrackedConnectionError(ctx, tracker)
 	}
-	conn, err := core.Dial(ctx, instance, dest)
-	if err != nil {
+	conn := controlNativeDialContext(tb, ctx, instance, dest)
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		tb.Fatal(err)
 	}
-	// core.Dial returns a logical connection whose SetDeadline is a no-op.
-	// The test process timeout bounds this fixture; it has no socket deadline.
 	if n, err := conn.Write(payload); err != nil || n != len(payload) {
 		_ = conn.Close()
 		tb.Fatalf("write %d/%d to %v: %v; outbound=%v", n, len(payload), dest, err, tracker.value())
@@ -165,16 +165,12 @@ func acceptanceExchange(tb testing.TB, ctx context.Context, instance *core.Insta
 	return conn
 }
 
-func TestControlStatsAPICaptureBeyondLiveCapacity(t *testing.T) {
+func TestControlStatsNativeTotalsBeyondLiveCapacity(t *testing.T) {
 	destination := acceptanceEcho(t)
 	instance, view := acceptanceCore(t, true)
-	capture, err := view.CaptureObservations(2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = capture.Close() })
+
 	ctx := session.ContextWithTrafficOrigin(context.Background(), fs.TrafficOriginUser)
-	payload := []byte("capture")
+	payload := []byte("capacity")
 	connections := make([]stdnet.Conn, 0, 257)
 	t.Cleanup(func() {
 		for _, conn := range connections {
@@ -184,40 +180,15 @@ func TestControlStatsAPICaptureBeyondLiveCapacity(t *testing.T) {
 	for range 257 {
 		connections = append(connections, acceptanceExchange(t, ctx, instance, destination, payload, make([]byte, len(payload))))
 	}
+	inspectionWait(t, func() bool {
+		totals, err := view.ReadTotals()
+		return err == nil && totals.User == (fs.ClientTotals{Uplink: uint64(257 * len(payload)), Downlink: uint64(257 * len(payload))})
+	})
 	live, err := view.ReadLiveInto(nil)
 	if err != nil || len(live.Rows) != 256 {
 		t.Fatalf("default live capacity: rows=%d err=%v", len(live.Rows), err)
 	}
-	batch := capture.ReadInto(nil)
-	if batch.Dropped != 0 || !batch.ExistingPartial {
-		t.Fatalf("capture coverage: %+v", batch)
-	}
-	endpoints, selected := make(map[uint64]fs.FlowRef), make(map[uint64]bool)
-	for _, row := range batch.Rows {
-		if row.FlowID == 0 || row.Flow.Origin != fs.TrafficOriginUser || row.Flow.Destination != destination {
-			t.Fatalf("endpoint identity: %+v", row)
-		}
-		// Prepared TCP first publishes its endpoint facts with route classification.
-		if row.Kind == fs.ObservationSelection {
-			endpoints[row.FlowID] = row.Flow.Ref
-			selected[row.FlowID] = row.Selected && row.Flow.Outbound.Tag == "direct"
-		}
-	}
-	if len(endpoints) != 257 || len(selected) != 257 {
-		t.Fatalf("capture missed an indexed or unindexed API root: endpoints=%d selections=%d", len(endpoints), len(selected))
-	}
-	var unindexed uint64
-	for id, ref := range endpoints {
-		if !selected[id] {
-			t.Fatalf("missing selection for capture flow %d", id)
-		}
-		if ref.ID == 0 {
-			unindexed++
-		}
-	}
-	if unindexed != 1 {
-		t.Fatalf("capture IDs became public close handles: unindexed=%d", unindexed)
-	}
+
 	refs := make([]fs.FlowRef, 0, len(live.Rows))
 	for _, row := range live.Rows {
 		refs = append(refs, row.Ref)
@@ -243,22 +214,13 @@ func TestControlStatsAPICaptureBeyondLiveCapacity(t *testing.T) {
 	for _, conn := range connections {
 		_ = conn.Close()
 	}
-	ended := capture.ReadInto(batch.Rows)
-	ends := make(map[uint64]bool)
-	for _, row := range ended.Rows {
-		if row.Kind == fs.ObservationEnd {
-			ref, known := endpoints[row.FlowID]
-			if !known || ref != row.Flow.Ref || ends[row.FlowID] {
-				t.Fatalf("unpaired or duplicate API end: %+v", row)
-			}
-			ends[row.FlowID] = true
-		}
-	}
-	if len(ends) != 257 || ended.Dropped != 0 {
-		t.Fatalf("capture end/loss: ends=%d dropped=%d", len(ends), ended.Dropped)
-	}
-	totals, err := view.ReadTotals()
+
 	want := uint64(258 * len(payload))
+	inspectionWait(t, func() bool {
+		totals, err := view.ReadTotals()
+		return err == nil && totals.User == (fs.ClientTotals{Uplink: want, Downlink: want})
+	})
+	totals, err := view.ReadTotals()
 	if err != nil || totals.User != (fs.ClientTotals{Uplink: want, Downlink: want}) {
 		t.Fatalf("capacity-independent general USER bytes: %+v err=%v", totals, err)
 	}
@@ -270,10 +232,30 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 	ctx := context.Background()
 	payload := []byte("direct-Go origin and total facts")
 	origins := []fs.TrafficOrigin{fs.TrafficOriginUnknown, fs.TrafficOriginUser, fs.TrafficOriginInternal, fs.TrafficOriginControlledMeasurement}
-	var connections []stdnet.Conn
+	// Non-USER admission vocabulary is a store contract. USER byte/control
+	// coverage comes from a real native ingress, not a direct API root.
+	store := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation()
+	var roots []fs.Exchange
 	for _, origin := range origins {
-		connections = append(connections, acceptanceExchange(t, session.ContextWithTrafficOrigin(ctx, origin), instance, destination, payload, make([]byte, len(payload))))
+		if origin == fs.TrafficOriginUser {
+			continue
+		}
+		root := store.PrepareTCP(origin, xnet.Destination{}, destination, nil)
+		root.Route(fs.OutboundRef{Tag: "direct"})
+		root.AddUplink(uint64(len(payload)))
+		root.AddDownlink(uint64(len(payload)))
+		roots = append(roots, root)
 	}
+	t.Cleanup(func() {
+		for _, root := range roots {
+			root.Finish()
+		}
+	})
+	connections := []stdnet.Conn{acceptanceExchange(t, ctx, instance, destination, payload, make([]byte, len(payload)))}
+	inspectionWait(t, func() bool {
+		totals, err := view.ReadTotals()
+		return err == nil && totals.User == (fs.ClientTotals{Uplink: uint64(len(payload)), Downlink: uint64(len(payload))})
+	})
 	t.Cleanup(func() {
 		for _, conn := range connections {
 			_ = conn.Close()
@@ -364,8 +346,9 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 	}
 	outcomes, err := view.CloseFlows(ctx, []fs.FlowRef{userRef})
 	if err != nil || outcomes[0] != nil {
-		t.Fatalf("exact API stop: %+v %v", outcomes, err)
+		t.Fatalf("exact native stop: %+v %v", outcomes, err)
 	}
+	inspectionWait(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 3 })
 	remaining, err := view.ReadLiveInto(nil)
 	if err != nil || len(remaining.Rows) != 3 {
 		t.Fatalf("sibling live rows: %+v %v", remaining, err)
@@ -373,15 +356,7 @@ func TestControlStatsP5DirectViewsResetAndNewRuntime(t *testing.T) {
 	for _, conn := range connections {
 		_ = conn.Close()
 	}
-	ended, err := view.ReadTerminals()
-	if err != nil || len(ended.Rows) != 4 {
-		t.Fatalf("terminals: %+v %v", ended, err)
-	}
-	for _, row := range ended.Rows {
-		if row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != uint64(len(payload)) {
-			t.Fatalf("terminal facts: %+v", row)
-		}
-	}
+
 	// Sequential instance construction avoids relying on process-global dialer selection.
 	oldRuntime := view.Runtime()
 	if err := instance.Close(); err != nil {
@@ -422,15 +397,16 @@ func TestControlStatsP5ClosedDirectSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	_, liveErr := view.ReadLiveInto(nil)
-	_, terminalErr := view.ReadTerminals()
-	_, totalErr := view.ReadTotals()
-	_, closeErr := view.CloseFlows(ctx, nil)
-	for _, err := range []error{liveErr, terminalErr, totalErr, closeErr} {
-		if err == nil {
-			t.Fatalf("closed API error: %v", err)
-		}
+	if _, err := view.ReadLiveInto(nil); err == nil {
+		t.Fatal("closed live read succeeded")
 	}
+	if _, err := view.ReadTotals(); err == nil {
+		t.Fatal("closed totals read succeeded")
+	}
+	if _, err := view.CloseFlows(ctx, nil); err == nil {
+		t.Fatal("closed flow control succeeded")
+	}
+
 	if provider.Observation() != nil {
 		t.Fatal("closed provider still admits")
 	}

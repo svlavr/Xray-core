@@ -5,6 +5,7 @@ package tun
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/vishvananda/netlink"
@@ -14,7 +15,106 @@ import (
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/dns/localdns"
 )
+
+type systemDNSLeaseClient struct {
+	featuredns.Client
+	unsafe, noLease    bool
+	acquired, released int
+}
+
+func (c *systemDNSLeaseClient) MayUseSystemResolver() bool { return c.unsafe }
+
+func (c *systemDNSLeaseClient) AcquireSystemDNS() (func(), error) {
+	if c.unsafe {
+		return nil, errors.New("unsafe resolver path")
+	}
+	if c.noLease {
+		return nil, nil
+	}
+	c.acquired++
+	return func() { c.released++ }, nil
+}
+
+func systemDNSClientContext(t *testing.T, client featuredns.Client) context.Context {
+	t.Helper()
+	instance := new(core.Instance)
+	if err := instance.AddFeature(client); err != nil {
+		t.Fatal(err)
+	}
+	return context.WithValue(context.Background(), core.XrayKey(1), instance)
+}
+
+func TestSystemDNSGenericClientAdmission(t *testing.T) {
+	for _, mode := range []string{"safe", "unsafe", "no-lease", "unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			client := &systemDNSLeaseClient{Client: localdns.New(), unsafe: mode == "unsafe", noLease: mode == "no-lease"}
+			var selected featuredns.Client = client
+			if mode == "unknown" {
+				selected = &struct{ featuredns.Client }{Client: localdns.New()}
+			}
+			probes := stubDNSRouting(t, nil)
+			commands := recorder(t, "")
+			tun := optedInTun()
+			err := tun.ConfigureSystemDNS(systemDNSClientContext(t, selected), "tun")
+			if mode != "safe" {
+				if err == nil || len(*probes) != 0 || len(*commands) != 0 || tun.systemDNSRelease != nil {
+					t.Fatalf("unsupported client reached takeover: err=%v probes=%v commands=%v", err, *probes, *commands)
+				}
+				return
+			}
+			if err != nil || client.acquired != 1 || client.released != 0 {
+				t.Fatalf("lease not held through takeover: err=%v client=%+v", err, client)
+			}
+			tun.unsetSystemDNS()
+			tun.unsetSystemDNS()
+			if client.released != 1 {
+				t.Fatalf("release count=%d", client.released)
+			}
+		})
+	}
+}
+
+func TestSystemDNSGenericLeaseFailedRevert(t *testing.T) {
+	client := &systemDNSLeaseClient{Client: localdns.New()}
+	ctx := systemDNSClientContext(t, client)
+	stubDNSRouting(t, nil)
+	commands := recorder(t, "revert")
+	tun := optedInTun()
+	if err := tun.ConfigureSystemDNS(ctx, "tun"); err != nil {
+		t.Fatal(err)
+	}
+	tun.unsetSystemDNS()
+	if !tun.systemDNSDirty || client.released != 0 || tun.systemDNSRelease == nil {
+		t.Fatalf("failed revert lost lease: dirty=%v releases=%d", tun.systemDNSDirty, client.released)
+	}
+	original := resolvectlRunner
+	resolvectlRunner = func(_ string, args ...string) ([]byte, error) { return nil, nil }
+	tun.unsetSystemDNS()
+	resolvectlRunner = original
+	if tun.systemDNSDirty || client.released != 1 || len(*commands) != 4 {
+		t.Fatalf("successful retry did not release: dirty=%v releases=%d commands=%v", tun.systemDNSDirty, client.released, *commands)
+	}
+}
+
+func TestVerifyDNSRoutingGenericClientSafety(t *testing.T) {
+	for _, unsafe := range []bool{false, true} {
+		client := &systemDNSLeaseClient{Client: localdns.New(), unsafe: unsafe}
+		err := verifyDNSRouting(systemDNSClientContext(t, client), "tun", routeTestSource, routeTestDNSAddress)
+		want := "router feature unavailable"
+		if unsafe {
+			want = "system resolver"
+		}
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("unsafe=%v err=%v, want %q", unsafe, err, want)
+		}
+	}
+	unknown := &struct{ featuredns.Client }{Client: localdns.New()}
+	if err := verifyDNSRouting(systemDNSClientContext(t, unknown), "tun", routeTestSource, routeTestDNSAddress); err == nil || !strings.Contains(err.Error(), "safe system DNS takeover") {
+		t.Fatalf("unqualified client accepted: %v", err)
+	}
+}
 
 func TestSystemDNSCloseReleasesOnlyAbsentLink(t *testing.T) {
 	for _, present := range []bool{false, true} {
@@ -34,7 +134,7 @@ func TestSystemDNSCloseReleasesOnlyAbsentLink(t *testing.T) {
 			if err := unix.Pipe(fds[:]); err != nil {
 				t.Fatal(err)
 			}
-			tun.tunFd = fds[0]
+			tun.fdTun = newFdTun(fds[0], 0)
 			defer unix.Close(fds[1])
 			original := resolvectlRunner
 			failRevert := true

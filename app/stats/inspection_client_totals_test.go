@@ -8,13 +8,9 @@ import (
 	fs "github.com/xtls/xray-core/features/stats"
 )
 
-func TestInspectionClientTotalsAdmissionAndCapture(t *testing.T) {
+func TestInspectionClientTotalsAdmissionAndOrigin(t *testing.T) {
 	s := testInspectionStore(t, fs.ObservationOptions{MaxBuckets: 1, MaxLive: 1})
-	c, err := s.CaptureObservations(32)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+
 	for _, origin := range []fs.TrafficOrigin{fs.TrafficOriginUnknown, fs.TrafficOriginInternal, fs.TrafficOriginControlledMeasurement, fs.TrafficOriginUser} {
 		flow := s.Begin(xnet.Network_UDP, origin, xnet.Destination{}, xnet.Destination{}, nil)
 		flow.AddUplink(7)
@@ -24,6 +20,10 @@ func TestInspectionClientTotalsAdmissionAndCapture(t *testing.T) {
 		if origin == fs.TrafficOriginUser && (before.User.Uplink != 7 || len(before.Rows) != 0) {
 			t.Fatalf("pre-route bytes missing: %+v", before)
 		}
+		live, err := s.ReadLiveInto(nil)
+		if err != nil || len(live.Rows) != 1 || live.Rows[0].Origin != origin || live.Rows[0].Uplink != 7 || live.Rows[0].Downlink != 3 {
+			t.Fatalf("origin live facts: %+v %v", live, err)
+		}
 		flow.Route(fs.OutboundRef{Tag: "shared"})
 		flow.Finish()
 	}
@@ -31,16 +31,7 @@ func TestInspectionClientTotalsAdmissionAndCapture(t *testing.T) {
 	if got.User != (fs.ClientTotals{Uplink: 7, Downlink: 3}) || got.BucketsOmitted != 0 || len(got.Rows) != 1 || got.Rows[0].Origin != fs.TrafficOriginUser || got.Rows[0].Uplink != 0 || got.Rows[0].Downlink != 0 {
 		t.Fatalf("origin isolation/capacity: %+v", got)
 	}
-	batch := c.ReadInto(nil)
-	ends := make(map[fs.TrafficOrigin]bool)
-	for _, fact := range batch.Rows {
-		if fact.Kind == fs.ObservationEnd && fact.Flow.Uplink == 7 && fact.Flow.Downlink == 3 {
-			ends[fact.Flow.Origin] = true
-		}
-	}
-	if len(ends) != 4 || batch.Dropped != 0 {
-		t.Fatalf("C1 origin facts lost: %+v", batch)
-	}
+
 }
 
 func TestInspectionClientTotalsPreparedFailureAndCarrier(t *testing.T) {

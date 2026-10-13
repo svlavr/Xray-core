@@ -3,10 +3,8 @@ package measurement_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +15,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,7 +100,7 @@ func hysteriaExecutor(t *testing.T) (*measurement.Executor, *core.Instance, [2]s
 	return executor(t, v), v, counters
 }
 
-func TestHysteriaMeasurementSeriesAndUDPCancellation(t *testing.T) {
+func TestHysteriaMeasurementUDPCancellation(t *testing.T) {
 	e, v, counters := hysteriaExecutor(t)
 	testProtocolMeasurements(t, e, v, counters)
 	// Serialization grows dynamically; the native receive buffer bounds decoded payload.
@@ -369,7 +368,7 @@ func TestVMessUDPCommandSelection(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, port := range []xnet.Port{53, 443, 12345} {
-				for _, origin := range []session.TrafficOrigin{session.TrafficOriginUnknown, session.TrafficOriginUser, session.TrafficOriginControlledMeasurement} {
+				for _, origin := range []session.TrafficOrigin{session.TrafficOriginUnknown, session.TrafficOriginUser, session.TrafficOriginInternal, session.TrafficOriginControlledMeasurement} {
 					for _, source := range []bool{false, true} {
 						t.Run(fmt.Sprintf("port-%d/origin-%d/source-%t", port, origin, source), func(t *testing.T) {
 							ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -394,7 +393,7 @@ func TestVMessUDPCommandSelection(t *testing.T) {
 									t.Fatal(got.err)
 								}
 								want := protocol.RequestCommandUDP
-								if (disabled == "false" && port != 53 && port != 443) || (origin == session.TrafficOriginControlledMeasurement && source) {
+								if (disabled == "false" && port != 53 && port != 443) || ((origin == session.TrafficOriginInternal || origin == session.TrafficOriginControlledMeasurement) && source) {
 									want = protocol.RequestCommandMux
 								}
 								// Mux headers omit the port on wire; 666 is a local codec selector.
@@ -529,12 +528,12 @@ func testProtocolMeasurementsAt(t *testing.T, e *measurement.Executor, v *core.I
 	if v != nil {
 		testProtocolRawMethodsAt(t, e, counters, "127.0.0.1", false, exactUDP, tunnelHost)
 	}
-	t.Run("finite-series", func(t *testing.T) {
+	t.Run("http-operations", func(t *testing.T) {
 		secondWritten := make(chan struct{})
 		cancelEntered := make(chan int, 3)
-		var seriesCalls atomic.Int32
+		var httpCalls atomic.Int32
 		s := directHTTPFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			seriesCalls.Add(1)
+			httpCalls.Add(1)
 			host, _, _ := net.SplitHostPort(r.RemoteAddr)
 			w.Header().Set("X-Peer", host)
 			switch r.URL.Path {
@@ -570,58 +569,74 @@ func testProtocolMeasurementsAt(t *testing.T, e *measurement.Executor, v *core.I
 		}), "127.0.0.1", true, tunnelHost)
 		defer s.Close()
 		defer s.CloseClientConnections()
-		samples, err := measurement.RunSeries(context.Background(), e, 6, 3, func(ctx context.Context, index int) (measurement.HTTPSReceipt, error) {
-			r := request(s, measurement.ExactOutbound)
-			r.URL += fmt.Sprintf("/attempt?index=%d", index)
-			if index%3 == 1 {
-				r.Route.Tag = "second"
-			} else if index%3 == 2 {
-				r.Route = measurement.Route{Kind: measurement.Direct}
-			}
-			if v == nil {
-				r.Route = measurement.Route{Kind: measurement.Direct}
-			}
-			r.URL = protocolFixtureURL(r.URL, r.Route, tunnelHost)
-			return e.HTTPS(ctx, r)
-		})
-		if err != nil || len(samples) != 6 || seriesCalls.Load() != 6 {
-			t.Fatalf("series: %d, %v", len(samples), err)
+		type httpResult struct {
+			receipt measurement.HTTPSReceipt
+			err     error
 		}
-		for index, sample := range samples {
+		var results [6]httpResult
+		var calls sync.WaitGroup
+		for index := range results {
+			calls.Add(1)
+			go func() {
+				defer calls.Done()
+
+				r := request(s, measurement.ExactOutbound)
+				r.URL += fmt.Sprintf("/attempt?index=%d", index)
+				if index%3 == 1 {
+					r.Route.Tag = "second"
+				} else if index%3 == 2 {
+					r.Route = measurement.Route{Kind: measurement.Direct}
+				}
+				if v == nil {
+					r.Route = measurement.Route{Kind: measurement.Direct}
+				}
+				r.URL = protocolFixtureURL(r.URL, r.Route, tunnelHost)
+				results[index].receipt, results[index].err = e.HTTPS(context.Background(), r)
+			}()
+		}
+		calls.Wait()
+		if httpCalls.Load() != 6 {
+			t.Fatal("unexpected operation count", httpCalls.Load())
+		}
+
+		for index, result := range results {
 			want := fmt.Sprintf("attempt-%d", index)
-			validError := sample.Err == nil
+			validError := result.err == nil
 			if index == 1 {
-				validError = errors.Is(sample.Err, io.ErrUnexpectedEOF)
+				validError = errors.Is(result.err, io.ErrUnexpectedEOF)
 			}
 			wantPeer := "127.0.0.1"
-			if !validError || sample.Index != index || string(sample.Receipt.Body) != want || sample.Receipt.Header.Get("X-Attempt") != fmt.Sprint(index) || sample.Receipt.Header.Get("X-Peer") != wantPeer || sample.Receipt.BodyBytes != int64(len(want)) || sample.Receipt.StatusCode != 200 || sample.Receipt.BodyComplete != (index != 1) || sample.Receipt.Elapsed < 0 || sample.Receipt.FirstByteElapsed == nil || *sample.Receipt.FirstByteElapsed > sample.Receipt.Elapsed {
-				t.Fatalf("sample: %+v", sample)
+			if !validError || string(result.receipt.Body) != want || result.receipt.Header.Get("X-Attempt") != fmt.Sprint(index) || result.receipt.Header.Get("X-Peer") != wantPeer || result.receipt.BodyBytes != int64(len(want)) || result.receipt.StatusCode != 200 || result.receipt.BodyComplete != (index != 1) || result.receipt.Elapsed < 0 || result.receipt.FirstByteElapsed == nil || *result.receipt.FirstByteElapsed > result.receipt.Elapsed {
+				t.Fatalf("HTTP operation: %+v", result)
 			}
 		}
-		t.Run("series-cancellation", func(t *testing.T) {
+		t.Run("concurrent-http-cancellation", func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			type result struct {
-				samples []measurement.Sample[measurement.HTTPSReceipt]
-				err     error
-			}
-			returned := make(chan result, 1)
+			var canceled [3]httpResult
+			returned := make(chan struct{})
 			go func() {
-				samples, err := measurement.RunSeries(ctx, e, 3, 3, func(ctx context.Context, index int) (measurement.HTTPSReceipt, error) {
-					r := request(s, measurement.ExactOutbound)
-					r.URL += fmt.Sprintf("/canceled?index=%d", index)
-					if index == 1 {
-						r.Route.Tag = "second"
-					} else if index == 2 {
-						r.Route = measurement.Route{Kind: measurement.Direct}
-					}
-					if v == nil {
-						r.Route = measurement.Route{Kind: measurement.Direct}
-					}
-					r.URL = protocolFixtureURL(r.URL, r.Route, tunnelHost)
-					return e.HTTPS(ctx, r)
-				})
-				returned <- result{samples, err}
+				var calls sync.WaitGroup
+				for index := range canceled {
+					calls.Add(1)
+					go func() {
+						defer calls.Done()
+						r := request(s, measurement.ExactOutbound)
+						r.URL += fmt.Sprintf("/canceled?index=%d", index)
+						if index == 1 {
+							r.Route.Tag = "second"
+						} else if index == 2 {
+							r.Route = measurement.Route{Kind: measurement.Direct}
+						}
+						if v == nil {
+							r.Route = measurement.Route{Kind: measurement.Direct}
+						}
+						r.URL = protocolFixtureURL(r.URL, r.Route, tunnelHost)
+						canceled[index].receipt, canceled[index].err = e.HTTPS(ctx, r)
+					}()
+				}
+				calls.Wait()
+				close(returned)
 			}()
 			for range 3 {
 				select {
@@ -629,37 +644,34 @@ func testProtocolMeasurementsAt(t *testing.T, e *measurement.Executor, v *core.I
 				case <-time.After(3 * time.Second):
 					cancel()
 					<-returned
-					t.Fatal("parallel series did not reach all peers")
+					t.Fatal("concurrent HTTP operations did not reach all peers")
 				}
 			}
 			cancel()
 			select {
-			case got := <-returned:
-				if !errors.Is(got.err, context.Canceled) || len(got.samples) != 3 {
-					t.Fatalf("canceled series: %+v", got)
-				}
-				for index, sample := range got.samples {
-					r := sample.Receipt
+			case <-returned:
+				for index, result := range canceled {
+					r := result.receipt
 					want := "canceled-" + fmt.Sprint(index)
 					// Cancellation can precede HTTP header/body handoff. Absent raw
 					// facts remain absent; any observed prefix must belong to this attempt.
-					if sample.Index != index || !errors.Is(sample.Err, context.Canceled) || r.BodyComplete || r.BodyBytes != int64(len(r.Body)) || !bytes.HasPrefix([]byte(want), r.Body) || (r.Header != nil && (r.Header.Get("X-Attempt") != fmt.Sprint(index) || r.Header.Get("X-Peer") != "127.0.0.1")) {
-						t.Fatalf("canceled attempt facts: %+v", sample)
+					if !errors.Is(result.err, context.Canceled) || r.BodyComplete || r.BodyBytes != int64(len(r.Body)) || !bytes.HasPrefix([]byte(want), r.Body) || (r.Header != nil && (r.Header.Get("X-Attempt") != fmt.Sprint(index) || r.Header.Get("X-Peer") != "127.0.0.1")) {
+						t.Fatalf("canceled attempt facts: %+v", result)
 					}
 				}
 			case <-time.After(3 * time.Second):
-				t.Fatal("canceled series did not join")
+				t.Fatal("canceled HTTP operations did not join")
 			}
 		})
 		t.Run("missing-tag-no-fallback", func(t *testing.T) {
-			before := seriesCalls.Load()
+			before := httpCalls.Load()
 			r := request(s, measurement.ExactOutbound)
 			r.Route.Tag = "missing-c1-tag"
 			r.URL = protocolFixtureURL(r.URL, r.Route, tunnelHost)
 			if got, err := e.HTTPS(context.Background(), r); err == nil || got.StatusCode != 0 || got.BodyComplete || len(got.Body) != 0 {
 				t.Fatalf("missing tag receipt: %+v, %v", got, err)
 			}
-			if seriesCalls.Load() != before {
+			if httpCalls.Load() != before {
 				t.Fatal("missing tag reached peer through fallback")
 			}
 		})
@@ -840,29 +852,25 @@ func testProtocolRawMethodsAt(t *testing.T, e *measurement.Executor, counters [2
 			for j := range payload {
 				payload[j] = byte(j)
 			}
-			digest := sha256.Sum256(payload)
 			handle := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				checkSource(r.RemoteAddr)
 				w.Header().Set("X-Peer", wantSource)
 				switch r.URL.Path {
-				case "/upload", "/upload-raw", "/upload-bad", "/upload-malformed":
+				case "/upload", "/upload-json", "/upload-malformed":
 					if r.Method != http.MethodPost {
 						t.Error("upload method")
 					}
 					var observed bytes.Buffer
 					r.Body = io.NopCloser(io.TeeReader(r.Body, &observed))
-					if r.URL.Path == "/upload" {
-						acknowledge(w, r)
-					} else {
-						_, _ = io.Copy(io.Discard, r.Body)
-						if r.URL.Path == "/upload-raw" {
-							_, _ = io.WriteString(w, "raw")
-						} else if r.URL.Path == "/upload-malformed" {
-							_, _ = io.WriteString(w, "{")
-						} else {
-							_ = json.NewEncoder(w).Encode(map[string]any{"nonce": "wrong", "bytes": len(payload), "sha256": hex.EncodeToString(digest[:])})
-						}
+					_, _ = io.Copy(io.Discard, r.Body)
+					switch r.URL.Path {
+					case "/upload":
+						_, _ = io.WriteString(w, "raw")
+					case "/upload-malformed":
+						_, _ = io.WriteString(w, "{")
+					default:
+						_ = json.NewEncoder(w).Encode(map[string]any{"result": "raw"})
 					}
 					if !bytes.Equal(observed.Bytes(), payload) {
 						t.Errorf("peer upload payload: got %d bytes", observed.Len())
@@ -982,25 +990,17 @@ func testProtocolRawMethodsAt(t *testing.T, e *measurement.Executor, counters [2
 					checkHTTP(t, got.HTTPS, nil, string(got.HTTPS.Body), true)
 				})
 			}
-			for _, hash := range []bool{false, true} {
-				one(fmt.Sprintf("Download/hash-%t", hash), func(t *testing.T) {
-					r := downloadRequest(s, route.Kind)
-					r.HTTPS.Route = route
-					r.HTTPS.URL = protocolFixtureURL(r.HTTPS.URL, route, tunnelHost)
-					r.HTTPS.URL += "/download"
-					if hash {
-						r.ExpectedSHA256 = &digest
-					}
-					got, err := e.Download(context.Background(), r)
-					if err != nil || got.PayloadBytes != int64(len(payload)) || got.DeclaredLength == nil || *got.DeclaredLength != int64(len(payload)) || got.ActiveElapsed == nil || got.IntegrityVerified != hash || (got.SHA256 != nil) != hash {
-						t.Fatalf("download facts: %+v, %v", got, err)
-					}
-					if hash && *got.SHA256 != digest {
-						t.Fatal("download digest")
-					}
-					checkHTTP(t, got.HTTPS, nil, "", true) // Stream bytes remain in PayloadBytes, never HTTPS.Body.
-				})
-			}
+			one("Download", func(t *testing.T) {
+				r := downloadRequest(s, route.Kind)
+				r.HTTPS.Route = route
+				r.HTTPS.URL = protocolFixtureURL(r.HTTPS.URL, route, tunnelHost)
+				r.HTTPS.URL += "/download"
+				got, err := e.Download(context.Background(), r)
+				if err != nil || got.PayloadBytes != int64(len(payload)) || got.DeclaredLength == nil || *got.DeclaredLength != int64(len(payload)) || got.ActiveElapsed == nil {
+					t.Fatalf("download facts: %+v, %v", got, err)
+				}
+				checkHTTP(t, got.HTTPS, nil, "", true) // Stream bytes remain in PayloadBytes, never HTTPS.Body.
+			})
 			one("Download/partial", func(t *testing.T) {
 				r := downloadRequest(s, route.Kind)
 				r.HTTPS.Route = route
@@ -1011,31 +1011,24 @@ func testProtocolRawMethodsAt(t *testing.T, e *measurement.Executor, counters [2
 					t.Fatalf("partial download: %+v, %v", got, err)
 				}
 			})
-			for _, path := range []string{"/upload", "/upload-raw", "/upload-bad", "/upload-malformed"} {
+			for _, path := range []string{"/upload", "/upload-json", "/upload-malformed"} {
 				one("Upload"+path, func(t *testing.T) {
 					r := uploadRequest(s, route.Kind)
 					r.HTTPS.Route = route
 					r.HTTPS.URL = protocolFixtureURL(r.HTTPS.URL, route, tunnelHost)
 					r.HTTPS.URL += path
-					r.RequireAcknowledgment = path != "/upload-raw"
 					got, err := e.Upload(context.Background(), r)
-					if got.GeneratedBytes != r.PayloadBytes || got.WriterAcceptedBytes != r.PayloadBytes || got.ActiveElapsed == nil {
+					if err != nil || got.GeneratedBytes != r.PayloadBytes || got.WriterAcceptedBytes != r.PayloadBytes || got.ActiveElapsed == nil {
 						t.Fatalf("upload counts: %+v, %v", got, err)
 					}
-					if path == "/upload-bad" || path == "/upload-malformed" {
-						if !errors.Is(err, measurement.ErrUploadACK) || got.Acknowledgment != nil {
-							t.Fatalf("invalid ACK: %+v, %v", got, err)
-						}
-					} else if err != nil {
-						t.Fatal(err)
+					wantBody := "raw"
+					if path == "/upload-malformed" {
+						wantBody = "{"
 					}
-					if path == "/upload" && (got.Acknowledgment == nil || got.Acknowledgment.Bytes != r.PayloadBytes || got.Acknowledgment.SHA256 != digest) {
-						t.Fatalf("ACK: %+v", got)
+					if path == "/upload-json" {
+						wantBody = "{\"result\":\"raw\"}\n"
 					}
-					if path == "/upload-raw" && (got.Acknowledgment != nil || got.WriterAcceptedSHA256 != nil || got.Nonce != "") {
-						t.Fatalf("optional ACK work: %+v", got)
-					}
-					checkHTTP(t, got.HTTPS, nil, string(got.HTTPS.Body), true)
+					checkHTTP(t, got.HTTPS, err, wantBody, true)
 				})
 			}
 			for _, transport := range []measurement.DNSTransport{measurement.DNSUDP, measurement.DNSTCP, measurement.DNSDoT, measurement.DNSDoH} {
@@ -1339,7 +1332,7 @@ func testProtocolTransferFailures(t *testing.T, e *measurement.Executor, route m
 					if download.HTTPS.BodyComplete || download.PayloadBytes < 0 || download.PayloadBytes > 6 || (!canceled && (!errors.Is(resultErr, io.ErrUnexpectedEOF) || download.PayloadBytes != 6)) {
 						t.Fatalf("partial download facts: %+v, %v", download, resultErr)
 					}
-				} else if peerBytes.Load() != 4096 || upload.WriterAcceptedBytes <= 0 || upload.WriterAcceptedBytes > upload.GeneratedBytes || upload.GeneratedBytes > 32<<20 || upload.Acknowledgment != nil || upload.HTTPS.BodyComplete {
+				} else if peerBytes.Load() != 4096 || upload.WriterAcceptedBytes <= 0 || upload.WriterAcceptedBytes > upload.GeneratedBytes || upload.GeneratedBytes > 32<<20 || upload.HTTPS.BodyComplete {
 					t.Fatalf("partial upload facts: %+v, %v peer prefix=%d", upload, resultErr, peerBytes.Load())
 				}
 			})

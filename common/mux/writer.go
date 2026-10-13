@@ -47,16 +47,6 @@ func (o *frameWriter) Interrupt() {
 	common.Interrupt(o.writer)
 }
 
-func (o *frameWriter) writeFrame(mb buf.MultiBuffer, payload int32, flow stats.Exchange) error {
-	o.Lock()
-	defer o.Unlock()
-	err := o.writer.WriteMultiBuffer(mb)
-	if err == nil && payload > 0 {
-		flow.AddDownlink(uint64(payload))
-	}
-	return err
-}
-
 type Writer struct {
 	dest         net.Destination
 	writer       buf.Writer
@@ -132,10 +122,12 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	mb2 := make(buf.MultiBuffer, 0, len(data)+1)
 	mb2 = append(mb2, frame)
 	mb2 = append(mb2, data...)
-	if output, ok := writer.(*frameWriter); ok && receipt != nil {
-		return output.writeFrame(mb2, data.Len(), receipt)
+	payload := data.Len()
+	err := writer.WriteMultiBuffer(mb2)
+	if err == nil && receipt != nil && payload > 0 {
+		receipt.AddDownlink(uint64(payload))
 	}
-	return writer.WriteMultiBuffer(mb2)
+	return err
 }
 
 func (w *Writer) writeData(mb buf.MultiBuffer) error {

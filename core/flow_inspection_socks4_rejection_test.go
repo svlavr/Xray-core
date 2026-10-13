@@ -35,10 +35,8 @@ func TestFlowInspectionSOCKS4RejectedCommandHasNoAdmission(t *testing.T) {
 	if _, err := io.Copy(io.Discard, conn); err != nil {
 		t.Fatal(err)
 	}
-	live, liveErr := view.ReadLiveInto(nil)
-	page, err := view.ReadTerminals()
-	if liveErr != nil || err != nil || len(live.Rows) != 0 || len(page.Rows) != 0 {
-		t.Fatalf("SOCKS4 rejection admitted a flow: live=%+v ended=%+v errors=%v/%v", live.Rows, page.Rows, liveErr, err)
+	if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("unexpected live admission: %+v %v", live, err)
 	}
 
 	incomplete, err := net.DialTimeout("tcp", address, 3*time.Second)
@@ -56,10 +54,6 @@ func TestFlowInspectionSOCKS4RejectedCommandHasNoAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	incomplete.Close()
-	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 0 {
-		t.Fatalf("incomplete SOCKS4 header admitted a flow: %+v %v", page.Rows, err)
-	}
 }
 
 func TestFlowInspectionSOCKS4AuthBeforeTargetNoAdmission(t *testing.T) {
@@ -93,8 +87,7 @@ func TestFlowInspectionSOCKS4AuthBeforeTargetNoAdmission(t *testing.T) {
 	if _, err := io.Copy(io.Discard, conn); err != nil {
 		t.Fatal(err)
 	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 0 {
-		t.Fatalf("pre-target auth created logical admission: %+v %v", page.Rows, err)
+	if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("authentication created live admission: %+v %v", live, err)
 	}
 }

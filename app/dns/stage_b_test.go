@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	go_errors "errors"
+	"github.com/apernet/quic-go"
 	"io"
 	stdnet "net"
 	"net/http"
@@ -12,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apernet/quic-go"
 	mdns "github.com/miekg/dns"
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
@@ -475,6 +475,71 @@ func TestStageBReplacementAndFeatureCloseShareRetirement(t *testing.T) {
 	}
 }
 
+func TestStageBCloseFirstRetirementCompletesPendingSlot(t *testing.T) {
+	currentRelease, pendingRelease := make(chan struct{}), make(chan struct{})
+	current := &stageBBlockingServer{closeBlock: currentRelease, closeEntered: make(chan struct{}, 1)}
+	closeFailure := go_errors.New("pending resource close failed")
+	pending := &stageBBlockingServer{closeBlock: pendingRelease, closeEntered: make(chan struct{}, 1), closeErrs: []error{closeFailure}}
+	feature := stageBManualFeature(t, current)
+	rt := feature.runtime
+	owner := newResolverOwner(&DNS{clients: []*Client{{server: pending}}})
+	owner.initDone = make(chan struct{})
+	rt.closing = owner
+	t.Cleanup(func() {
+		for _, ch := range []chan struct{}{currentRelease, pendingRelease, owner.initDone} {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+		_ = feature.Close()
+	})
+	closed := make(chan error, 1)
+	go func() { closed <- feature.Close() }()
+	m3DNSReceive(t, current.closeEntered)
+	m3DNSReceive(t, pending.closeEntered)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if result := rt.waitRetirement(ctx, owner); !result.Applied || !go_errors.Is(result.Err, context.Canceled) {
+		t.Fatalf("late canceled Apply waiter: %+v", result)
+	}
+	rt.mu.Lock()
+	stillPending := rt.closing == owner
+	rt.mu.Unlock()
+	if !stillPending {
+		t.Fatal("pending owner forgotten before resource/init joins")
+	}
+	// Keep current Close blocked so feature.Close cannot perform final slot reset.
+	close(pendingRelease)
+	select {
+	case <-owner.closeDone:
+		t.Fatal("pending close passed unfinished initialization")
+	default:
+	}
+	close(owner.initDone)
+	m3DNSReceive(t, owner.closeDone)
+	rt.mu.Lock()
+	stillPending = rt.closing == owner
+	rt.mu.Unlock()
+	if stillPending {
+		t.Fatal("owner completion did not clear its pending slot")
+	}
+	if result := rt.waitRetirement(context.Background(), owner); !result.Applied || !go_errors.Is(result.Err, closeFailure) {
+		t.Fatalf("shared terminal Apply error: %+v", result)
+	}
+	close(currentRelease)
+	if err := m3DNSReceive(t, closed); !go_errors.Is(err, closeFailure) {
+		t.Fatalf("feature Close lost shared pending error: %v", err)
+	}
+	pending.mu.Lock()
+	closes := pending.closes
+	pending.mu.Unlock()
+	if closes != 1 {
+		t.Fatalf("pending resource close calls=%d", closes)
+	}
+}
+
 type stageBUDPDispatcher struct {
 	routing.Dispatcher
 	dispatches    atomic.Int32
@@ -794,15 +859,8 @@ func TestStageBDNSNoInternalRowsOffOn(t *testing.T) {
 			stageBLookup(t, client, "fact.test", net.IP{192, 0, 2, 90})
 			if enabled {
 				live, err := inspection.ReadLiveInto(nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				terminal, err := inspection.ReadTerminals()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if len(live.Rows) != 0 || len(terminal.Rows) != 0 {
-					t.Fatalf("DNS query produced INTERNAL inspection rows: live=%d terminal=%d", len(live.Rows), len(terminal.Rows))
+				if err != nil || len(live.Rows) != 0 {
+					t.Fatalf("INTERNAL DNS produced live rows: %+v %v", live, err)
 				}
 			} else if provider.Observation() != nil {
 				t.Fatal("inspection enabled in OFF mode")

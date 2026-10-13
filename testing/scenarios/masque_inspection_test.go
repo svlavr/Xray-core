@@ -346,16 +346,14 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 	deadline = time.Now().Add(5 * time.Second)
 	var stoppedUDP bool
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals()
+		live, err := view.ReadLiveInto(nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, row := range page.Rows {
-			if row.Flow.Ref == udpRef {
-				if row.Flow.Uplink != uint64(len(udpPayload)) || row.Flow.Downlink != uint64(len(udpPayload)) {
-					t.Fatalf("stopped MASQUE UDP terminal: %+v", row)
-				}
-				stoppedUDP = true
+		stoppedUDP = true
+		for _, row := range live.Rows {
+			if row.Ref == udpRef {
+				stoppedUDP = false
 			}
 		}
 		if stoppedUDP {
@@ -364,7 +362,7 @@ func TestFlowInspectionMasqueLogicalAndSharedTunnel(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if !stoppedUDP {
-		t.Fatal("stopped MASQUE UDP association did not terminalize")
+		t.Fatal("stopped MASQUE UDP association remained live")
 	}
 	replacement, err := stdnet.DialTimeout("udp", udpAddress, 3*time.Second)
 	if err != nil {
@@ -506,23 +504,18 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 	var firstStopped, siblingStillLive bool
 	var liveStorage508 []fs.FlowRecord
 	for time.Now().Before(deadline) {
-		terminals, err := view.ReadTerminals()
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, row := range terminals.Rows {
-			if row.Flow.Ref == firstRef {
-				inspectionMasqueTCPRow(t, row.Flow, tcpTarget, 0)
-				firstStopped = true
-			}
-		}
+
 		live, err := view.ReadLiveInto(liveStorage508)
 		liveStorage508 = live.Rows
 		if err != nil {
 			t.Fatal(err)
 		}
+		firstStopped = true
 		siblingStillLive = false
 		for _, row := range live.Rows {
+			if row.Ref == firstRef {
+				firstStopped = false
+			}
 			if row.Ref == siblingRef {
 				inspectionMasqueTCPRow(t, row, tcpTarget, 0)
 				siblingStillLive = true
@@ -552,6 +545,9 @@ func TestFlowInspectionMasqueFirstStopDuringSuccessfulEstablishment(t *testing.T
 			t.Fatal(err)
 		}
 		for _, row := range live.Rows {
+			if row.Ref == firstRef {
+				firstStopped = false
+			}
 			if row.Ref == siblingRef && row.Uplink == uint64(len(payload)) && row.Downlink == uint64(len(payload)) {
 				inspectionMasqueTCPRow(t, row, tcpTarget, uint64(len(payload)))
 				sources, forwarded, relayErr := gate.Snapshot()

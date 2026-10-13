@@ -273,13 +273,12 @@ func (w *SequentialWriter) Write(payload []byte) (int, error) {
 
 // WriteMultiBuffer implements Writer.
 func (w *SequentialWriter) WriteMultiBuffer(mb MultiBuffer) error {
-	mb, written, err := writeMultiBuffer(w.Writer, mb)
-	ReleaseMulti(mb)
+	writer := w.Writer
 	if w.receipt != nil {
-		if written > 0 {
-			w.receipt.AddDownlink(uint64(written))
-		}
+		writer = w
 	}
+	mb, err := WriteMultiBuffer(writer, mb)
+	ReleaseMulti(mb)
 	return err
 }
 

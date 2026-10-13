@@ -227,10 +227,7 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("exact stream close: %+v %v", outcomes, err)
 	}
-	waitHTTPInspection(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected
-	})
+	waitHTTPInspection(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 1 })
 	select {
 	case <-first.done:
 	case <-time.After(3 * time.Second):
@@ -245,10 +242,7 @@ func TestHTTP2ProcessObservationAndExactStreamStop(t *testing.T) {
 		t.Fatalf("surviving HTTP/2 stream: %q %v", got, err)
 	}
 	second.conn.Close()
-	waitHTTPInspection(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 2
-	})
+	waitHTTPInspection(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 	want := uint64(2*len(payload) + len(extra))
 	totals, err := view.ReadTotals()
 	if err != nil {

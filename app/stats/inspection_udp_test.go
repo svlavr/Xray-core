@@ -35,15 +35,6 @@ func TestInspectionLatestPacketDestinationPreservedAndCopied(t *testing.T) {
 
 	flow.Finish()
 	flow.PacketDestination(third)
-	page, err := store.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Destination.Port != second.Port {
-		t.Fatalf("terminal packet destinations: %+v %v", page, err)
-	}
-	page.Rows[0].Flow.Destination = third
-	pageAgain, err := store.ReadTerminals()
-	if err != nil || pageAgain.Rows[0].Flow.Destination.Port != second.Port {
-		t.Fatalf("terminal snapshot retained caller destination: %+v %v", pageAgain, err)
-	}
 }
 
 func TestInspectionPacketInputLiveAtomic(t *testing.T) {
@@ -119,16 +110,15 @@ func TestInspectionPacketInputFinishAndProvenance(t *testing.T) {
 				workers.Wait()
 				var row featurestats.FlowRecord
 				if fence == "finish" {
-					page, _ := s.ReadTerminals()
-					if len(page.Rows) != 1 {
-						t.Fatal("root terminal missing")
+					page, _ := s.ReadLiveInto(nil)
+					if len(page.Rows) != 0 {
+						t.Fatal("finished root remained live")
 					}
-					row = page.Rows[0].Flow
 				} else {
 					page, _ := s.ReadLiveInto(nil)
 					row = page.Rows[0]
 				}
-				if !((row.Destination == first && row.Uplink == 0) || (row.Destination == last && row.Uplink == 7)) {
+				if fence != "finish" && !((row.Destination == first && row.Uplink == 0) || (row.Destination == last && row.Uplink == 7)) {
 					t.Fatalf("%s split event, leg=%v: %+v", fence, legInput, row)
 				}
 				input.RecordPacketInput(first, 3)
@@ -136,10 +126,6 @@ func TestInspectionPacketInputFinishAndProvenance(t *testing.T) {
 				want := row.Uplink
 				if fence == "finish" {
 					want = 10 // Late bytes still update their original bucket.
-					page, _ := s.ReadTerminals()
-					if page.Rows[0].Flow != row {
-						t.Fatal("late event rewrote root terminal")
-					}
 				}
 				if got := totals.User.Uplink; got != want {
 					t.Fatalf("%s attribution: got %d want %d", fence, got, want)
@@ -232,10 +218,7 @@ func TestInspectionSelectedLegEndBeforePacketReceipt(t *testing.T) {
 	leg.PacketDestination(first)
 	leg.AddUplink(7)
 	leg.AddSelectedUplink(7)
-	page, err := s.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Destination != last || page.Rows[0].Flow.Uplink != 21 {
-		t.Fatalf("late packet changed frozen terminal: %+v %v", page, err)
-	}
+
 	totals, _ := s.ReadTotals()
 	if findTotal(t, totals.Rows, "portal", featurestats.TrafficOriginUser).Uplink != 28 {
 		t.Fatal("late packet totals lost")

@@ -67,11 +67,13 @@ func TestInspectionDNSFallbackCreditsUnadaptedWriter(t *testing.T) {
 	if err := (&dnsproto.TCPWriter{Writer: &endpointReceiptWriter{Writer: writer, receipt: flow}}).WriteMessage(buf.FromBytes([]byte("dns"))); err != nil {
 		t.Fatal(err)
 	}
-	flow.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 5 || lower.bytes != 5 {
-		t.Fatalf("DNS endpoint batch lost on unsupported writer: %+v %v, written=%d", page.Rows, err, lower.bytes)
+	{
+		page, err := view.ReadLiveInto(nil)
+		if err != nil || len(page.Rows) != 1 || page.Rows[0].Downlink != 5 || lower.bytes != 5 {
+			t.Fatalf("DNS endpoint batch lost on unsupported writer: %+v %v, written=%d", page.Rows, err, lower.bytes)
+		}
 	}
+	flow.Finish()
 }
 
 func TestInspectionDNSReturnedRouteBindsTotals(t *testing.T) {
@@ -158,13 +160,14 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 		t.Fatal("local lookup was not started")
 	}
 	ref := observation.Exchange.Ref()
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != ref || live.Rows[0].Uplink != uint64(len(wire)) || live.Rows[0].Downlink != 0 || live.Rows[0].Outbound.Tag != "dns" {
+		t.Fatalf("blocked lookup live facts: %+v %v", live, err)
+	}
 	if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref}); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := view.ReadTerminals()
-	if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Uplink != uint64(len(wire)) || terminal.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("owner-close snapshot: %+v %v", terminal.Rows, err)
-	}
+
 	close(lookup.release)
 	select {
 	case <-done:
@@ -179,16 +182,15 @@ func TestInspectionDNSHijackLateCallbackAfterExactStop(t *testing.T) {
 		}
 		for _, row := range totals.Rows {
 			if row.Outbound.Tag == "dns" {
-				again, err := view.ReadTerminals()
-				if err != nil || len(again.Rows) != 1 || again.Rows[0].Flow.Downlink != 0 {
-					t.Fatalf("late callback rewrote terminal: %+v %v", again.Rows, err)
+				if totals.User != (fs.ClientTotals{Uplink: uint64(len(wire))}) || row.Uplink != uint64(len(wire)) || row.Downlink != 0 {
+					t.Fatalf("stopped late DNS callback totals: %+v", totals)
 				}
 				return
 			}
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("late callback result was not marked incomplete")
+	t.Fatal("late DNS callback totals were not observed")
 }
 
 func TestInspectionDNSWebSocketEndpoint(t *testing.T) {
@@ -270,8 +272,9 @@ func TestInspectionDNSWebSocketEndpoint(t *testing.T) {
 		t.Fatal("DNS owner did not exit after endpoint close")
 	}
 	finish()
-	terminal, err := view.ReadTerminals()
-	if err != nil || len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Uplink != uint64(len(frame)) || terminal.Rows[0].Flow.Downlink != uint64(len(reply)) {
-		t.Fatalf("native WebSocket DNS byte facts: %+v %v", terminal.Rows, err)
+	totals, err := view.ReadTotals()
+	want := fs.ClientTotals{Uplink: uint64(len(frame)), Downlink: uint64(len(reply))}
+	if err != nil || totals.User != want || len(totals.Rows) != 1 || totals.Rows[0].Outbound.Tag != "dns" || totals.Rows[0].Uplink != want.Uplink || totals.Rows[0].Downlink != want.Downlink {
+		t.Fatalf("WebSocket framed DNS totals: %+v %v", totals, err)
 	}
 }

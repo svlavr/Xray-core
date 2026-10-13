@@ -133,16 +133,10 @@ func TestFlowInspectionSOCKSUDPInbound(t *testing.T) {
 			} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 				t.Fatal(err)
 			}
-			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals()
-				return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected.Ref
-			})
+
 			inspectionSOCKSPacket(t, sibling, siblingRelay, secondDest, extra, 0x37)
 			siblingControl.Close()
-			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals()
-				return err == nil && len(page.Rows) == 2
-			})
+
 			totals, err := view.ReadTotals()
 			if err != nil {
 				t.Fatal(err)
@@ -190,10 +184,6 @@ func TestFlowInspectionSOCKSUDPInboundPreFirstPayload(t *testing.T) {
 	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 		t.Fatal(err)
 	}
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		return err == nil && len(page.Rows) == 1 && page.Rows[0].Flow.Ref == association.Ref
-	})
 }
 
 // A decoded rejected request still has one association; native missing-route
@@ -219,10 +209,6 @@ func TestFlowInspectionSOCKSUDPInboundRejected(t *testing.T) {
 			live.Rows[0].Uplink == uint64(len(payload)) && live.Rows[0].Downlink == 0
 	})
 	control.Close()
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Uplink == uint64(len(payload)) && page.Rows[0].Flow.Downlink == 0
-	})
 }
 
 func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
@@ -253,9 +239,4 @@ func TestFlowInspectionSOCKSUDPInboundStopAfterRejection(t *testing.T) {
 	if err != nil || result[0] != nil {
 		t.Fatalf("stop after ray rejection: %+v %v", result, err)
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref &&
-			page.Rows[0].Flow.Uplink == uint64(len(payload)) && page.Rows[0].Flow.Downlink == 0
-	})
 }

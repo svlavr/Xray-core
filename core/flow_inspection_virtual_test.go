@@ -193,18 +193,6 @@ func inspectionWireGuardStop(t *testing.T, view fs.FlowInspection, ref fs.FlowRe
 	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("WireGuard exact stop: %+v %v", outcomes, err)
 	}
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, row := range page.Rows {
-			if row.Flow.Ref == ref {
-				return true
-			}
-		}
-		return false
-	})
 }
 
 func TestFlowInspectionWireGuardDisabled(t *testing.T) {

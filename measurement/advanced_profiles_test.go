@@ -175,7 +175,7 @@ func TestC5SharedCarriers(t *testing.T) {
 	internet.UseAlternativeSystemDialer(carrierDials)
 	t.Run("sender", TestSenderMUXProfileMeasurements)
 	t.Run("transport", TestTransportProfileMeasurements)
-	t.Run("hysteria", TestHysteriaMeasurementSeriesAndUDPCancellation)
+	t.Run("hysteria", TestHysteriaMeasurementUDPCancellation)
 	t.Run("wireguard", TestWireGuardProtocolMeasurements)
 }
 

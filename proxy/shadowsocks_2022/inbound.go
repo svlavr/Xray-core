@@ -213,32 +213,10 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 						b.Release()
 						continue
 					}
-					go func(sessID uint64, dest net.Destination, cEntry *udpConnEntry) {
-						defer cEntry.Close()
-						for {
-							resMb, err := cEntry.link.Reader.ReadMultiBuffer()
-							if err != nil {
-								return
-							}
-							cEntry.timer.Update()
-							for _, rb := range resMb {
-								responseDest := dest
-								if rb.UDP != nil {
-									responseDest = *rb.UDP
-								}
-
-								encPacket, err := i.udpCodec.EncodeServerPacket(sessID, responseDest, rb.Bytes())
-								rb.Release()
-								if err != nil {
-									continue
-								}
-								n, writeErr := cEntry.writePacket(encPacket)
-								if writeErr != nil || n != len(encPacket) {
-									return
-								}
-							}
-						}
-					}(decoded.SessionID, decoded.Destination, entry)
+					sessionID := decoded.SessionID
+					go entry.writeResponses(decoded.Destination, func(dest net.Destination, payload []byte) ([]byte, error) {
+						return i.udpCodec.EncodeServerPacket(sessionID, dest, payload)
+					})
 				}
 			}
 

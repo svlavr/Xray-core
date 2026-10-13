@@ -69,20 +69,31 @@ func TestFlowInspectionP2GHTTPAuthHandshakeExcluded(t *testing.T) {
 		t.Fatalf("authentication response: %+v %v", response, err)
 	}
 	response.Body.Close()
-	live, liveErr := view.ReadLiveInto(nil)
-	terminals, terminalErr := view.ReadTerminals()
-	if liveErr != nil || terminalErr != nil || len(live.Rows) != 0 || len(terminals.Rows) != 0 {
-		t.Fatalf("authentication handshake admitted payload work: live=%+v terminals=%+v errors=%v/%v", live.Rows, terminals.Rows, liveErr, terminalErr)
+	if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("unexpected live admission: %+v %v", live, err)
 	}
 }
 
 func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
+	releases := map[string]chan struct{}{"/one": make(chan struct{}, 1), "/two": make(chan struct{}, 1)}
 	origin := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		body := []byte("origin:" + r.URL.Path)
 		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
-		_, _ = w.Write(body)
+		_, _ = w.Write(body[:len(body)-1])
+		w.(stdhttp.Flusher).Flush()
+		select {
+		case <-releases[r.URL.Path]:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = w.Write(body[len(body)-1:])
 	}))
-	defer origin.Close()
+	t.Cleanup(origin.Close)
+	t.Cleanup(func() {
+		for _, release := range releases {
+			close(release)
+		}
+	})
 
 	view, address := inspectionHTTPInbound(t)
 	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
@@ -91,8 +102,13 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	reader := bufio.NewReader(conn)
+	wire := &inspectionHTTPResponseWire{Conn: conn}
+	reader := bufio.NewReader(wire)
+	destination := cnet.DestinationFromAddr(origin.Listener.Addr())
+	var previous fs.FlowRef
+	var wantTotals fs.ClientTotals
 	for i, path := range []string{"/one", "/two"} {
+		before := wire.read - uint64(reader.Buffered())
 		connection := "keep-alive"
 		if i == 1 {
 			connection = "close"
@@ -104,26 +120,25 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body, err := io.ReadAll(response.Body)
+		prefix := make([]byte, len("origin:"+path)-1)
+		if _, err := io.ReadFull(response.Body, prefix); err != nil {
+			t.Fatal(err)
+		}
+		row := inspectionHTTPActiveRequest(t, view, conn, destination, wire.read-uint64(reader.Buffered())-before)
+		if row.Ref == previous {
+			t.Fatal("keep-alive reused a request reference")
+		}
+		previous = row.Ref
+		wantTotals.Uplink += row.Uplink
+		wantTotals.Downlink += row.Downlink + 1
+		releases[path] <- struct{}{}
+		tail, err := io.ReadAll(response.Body)
+		body := append(prefix, tail...)
 		response.Body.Close()
+		inspectionLiveAbsent(t, view, row.Ref)
+		inspectionByteTotals(t, view, "direct", wantTotals, wantTotals)
 		if err != nil || string(body) != "origin:"+path {
 			t.Fatalf("response %d: %q %v", i, body, err)
-		}
-		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals()
-			return len(page.Rows) == i+1
-		})
-	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 2 {
-		t.Fatalf("HTTP request terminals: %+v %v", page.Rows, err)
-	}
-	if page.Rows[0].Flow.Ref == page.Rows[1].Flow.Ref {
-		t.Fatal("keep-alive requests reused one FlowRef")
-	}
-	for _, row := range page.Rows {
-		if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Tag == "" || row.Flow.Uplink == 0 || row.Flow.Downlink <= uint64(len("origin:/one")) {
-			t.Fatalf("HTTP request receipt: %+v", row)
 		}
 	}
 
@@ -144,11 +159,11 @@ func TestFlowInspectionP2GHTTPKeepAliveAndLocalResponse(t *testing.T) {
 	if _, err := io.Copy(io.Discard, bad); err != nil {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals()
-	live, liveErr := view.ReadLiveInto(nil)
-	if err != nil || liveErr != nil || len(page.Rows) != 2 || len(live.Rows) != 0 {
-		t.Fatalf("HTTP rejection admitted a flow: live=%+v ended=%+v errors=%v/%v", live.Rows, page.Rows, liveErr, err)
+
+	if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("unexpected live admission: %+v %v", live, err)
 	}
+	inspectionByteTotals(t, view, "direct", wantTotals, wantTotals)
 }
 
 func TestFlowInspectionP2GHTTPRequestExactStop(t *testing.T) {
@@ -194,10 +209,7 @@ func TestFlowInspectionP2GHTTPRequestExactStop(t *testing.T) {
 	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 		t.Fatalf("HTTP request stop: %+v %v", outcomes, err)
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref
-	})
+
 	stoppedResponse, err := stdhttp.ReadResponse(reader, nil)
 	if err != nil || stoppedResponse.StatusCode != stdhttp.StatusServiceUnavailable {
 		t.Fatalf("stopped request response: %+v %v", stoppedResponse, err)
@@ -313,20 +325,31 @@ func TestFlowInspectionP2GNaturalEOF(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, remote, outbound := test.receiver(t, true, false)
-			_, view, address := inspectionTCPOutboundThrough(t, true, outbound)
+			_, local, address := inspectionTCPOutboundThrough(t, true, outbound)
 			destination := startOutboundStatsTCPServer(t)
 			payload := bytes.Repeat([]byte("natural-eof"), 128)
 			client := inspectionSOCKS(t, address, destination, payload)
+			var ref fs.FlowRef
+			inspectionWait(t, func() bool {
+				live, err := local.ReadLiveInto(nil)
+				if err != nil || len(live.Rows) != 1 {
+					return false
+				}
+				row := live.Rows[0]
+				if row.Uplink != uint64(len(payload)) || row.Downlink != uint64(len(payload)) {
+					return false
+				}
+				assertDecodedTCPReceiverFacts(t, row, destination, uint64(len(payload)), outbound.Tag)
+				if row.Ref.ID == 0 {
+					t.Fatal("natural EOF owner was not admitted")
+				}
+				ref = row.Ref
+				return true
+			})
 			assertNoDedicatedServerInspection(t, remote)
 			client.Close()
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1
-			})
-			page, _ := view.ReadTerminals()
-			if page.Rows[0].Flow.Uplink != uint64(len(payload)) || page.Rows[0].Flow.Downlink != uint64(len(payload)) {
-				t.Fatalf("natural EOF receipt: %+v", page.Rows[0])
-			}
+			inspectionLiveAbsent(t, local, ref)
+			inspectionByteTotals(t, local, outbound.Tag, fs.ClientTotals{Uplink: uint64(len(payload)), Downlink: uint64(len(payload))}, fs.ClientTotals{Uplink: uint64(len(payload)), Downlink: uint64(len(payload))})
 		})
 	}
 }

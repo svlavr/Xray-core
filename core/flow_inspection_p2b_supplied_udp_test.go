@@ -55,10 +55,7 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 			}
 			inspectionUDPExchange(t, sibling, address, payload, 0x19)
 			inspectionClosePacketCallback(t, view, first.Ref)
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref && page.Rows[0].Flow.Downlink == uint64(len(payload))
-			})
+
 			inspectionUDPExchange(t, sibling, address, extra, 0x19)
 			var other fs.FlowRef
 			var liveStorage63 []fs.FlowRecord
@@ -72,10 +69,7 @@ func inspectionSuppliedUDPReceiverAcceptance(t *testing.T, receiver inspectionSu
 				return true
 			})
 			inspectionClosePacketCallback(t, view, other)
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 2
-			})
+
 			inspectionOutboundTotals(t, view, outbound.Tag, uint64(2*len(payload)+len(extra)))
 			assertNoDedicatedServerInspection(t, remote)
 		})
@@ -107,9 +101,6 @@ func TestFlowInspectionP2BHysteriaPacketDestinations(t *testing.T) {
 		return true
 	})
 	inspectionClosePacketCallback(t, view, ref)
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1
-	})
+
 	inspectionOutboundTotals(t, view, outbound.Tag, uint64(len(payload)+len(extra)))
 }

@@ -102,19 +102,13 @@ func TestFlowInspectionPortalVMessCarrier(t *testing.T) {
 			if err != nil || out[0] != nil {
 				t.Fatalf("stop: %+v %v", out, err)
 			}
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1
-			})
+
 			// A new sibling still traverses the same surviving reverse carrier.
 			c := inspectionSOCKS(t, address, dest, payload)
 			a.Close()
 			b.Close()
 			c.Close()
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 3
-			})
+
 			totals, _ := view.ReadTotals()
 			var up, down uint64
 			for _, r := range totals.Rows {
@@ -211,10 +205,7 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	if err != nil || len(out) != 1 || out[0] != nil {
 		t.Fatalf("stop first UDP child: %+v %v", out, err)
 	}
-	inspectionWait(t, func() bool {
-		page, readErr := view.ReadTerminals()
-		return readErr == nil && len(page.Rows) == 1
-	})
+
 	if bridge.Connections() == 0 {
 		t.Fatal("stopping UDP child closed the reverse carrier")
 	}
@@ -275,10 +266,7 @@ func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
 	}
 	setInspectionRoute(t, client, vmess.Tag)
 	target := cnet.TCPDestination(cnet.DomainAddress("bridge.invalid"), dest.Port)
-	conn, err := core.Dial(context.Background(), client, target)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := controlNativeDial(t, client, target)
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	payload := []byte("GET / HTTP/1.1\r\nHost: ordinary.invalid\r\n\r\n")
@@ -298,8 +286,4 @@ func TestFlowInspectionPortalDomainThroughFreedom(t *testing.T) {
 	})
 	assertNoDedicatedServerInspection(t, remoteView)
 	conn.Close()
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1
-	})
 }

@@ -31,9 +31,8 @@ type OutboundRef struct {
 }
 
 type ObservationOptions struct {
-	MaxLive      uint32
-	MaxTerminals uint32
-	MaxBuckets   uint32
+	MaxLive    uint32
+	MaxBuckets uint32
 }
 
 type FlowRecord struct {
@@ -46,11 +45,6 @@ type FlowRecord struct {
 	Outbound    OutboundRef
 	Uplink      uint64
 	Downlink    uint64
-}
-
-type TerminalRecord struct {
-	Flow  FlowRecord
-	Ended time.Duration
 }
 
 // TotalRecord accumulates USER decoded I/O associated with one selected tag.
@@ -90,69 +84,10 @@ type ClientTotals struct {
 	Downlink uint64
 }
 
-type TerminalSnapshot struct {
-	At          time.Duration
-	Rows        []TerminalRecord
-	Overwritten uint64 // Lifetime rows evicted from this ring; excludes unindexed flows.
-}
-
-// ObservationKind identifies the native fact being transferred, not a network
-// success or a product monitoring/journal state.
-type ObservationKind uint8
-
-const (
-	ObservationExisting ObservationKind = iota
-	ObservationEndpoint
-	ObservationDestination
-	ObservationSelection
-	ObservationEnd
-)
-
-// FlowObservation transfers a detached logical endpoint fact. FlowID is unique
-// within Runtime(), independently of live-index capacity. Flow.Ref may be zero:
-// capture identity is not an exact-close handle. RayID is zero for the root and
-// nonzero for a native UDP ray. Selected and Flow.Outbound refer to this ray;
-// an unselected destination must not inherit another ray's latest tag.
-// Flow counters remain association samples, not per-destination or per-ray bytes.
-type FlowObservation struct {
-	Kind     ObservationKind
-	FlowID   uint64
-	RayID    uint64
-	At       time.Duration
-	Flow     FlowRecord
-	Selected bool
-}
-
-type ObservationBatch struct {
-	Started time.Duration
-	Ended   time.Duration // Capture stop boundary; zero while active.
-	At      time.Duration
-	Stopped bool
-	Dropped uint64 // Cumulative queue overflow, including initial existing rows.
-	// Existing rows are a bounded, independently sampled live baseline. This
-	// handoff never certifies a complete inventory of pre-start active endpoints.
-	ExistingPartial bool
-	Rows            []FlowObservation
-}
-
-// ObservationCapture is one bounded, draining fact handoff. ReadInto invalidates
-// previous aliases of storage, like ReadLiveInto. Readers share one queue, not
-// independent subscriptions. Close ends admission; retained rows/loss remain
-// readable for a final drain. No callbacks, product I/O or goroutines run here.
-type ObservationCapture interface {
-	ReadInto(storage []FlowObservation) ObservationBatch
-	Close() error
-}
-
 // FlowInspection is the optional direct-Go observation and local-control
 // capability implemented by the native statistics manager.
 type FlowInspection interface {
 	Runtime() RuntimeID
-	// CaptureObservations starts the sole optional capture with caller-selected
-	// positive capacity. Existing indexed live rows are sampled independently;
-	// already-active unindexed endpoints appear on their next native fact only.
-	// Pre-start destinations and pre-admission failures are not reconstructed.
-	CaptureObservations(capacity uint32) (ObservationCapture, error)
 	// ReadLiveInto samples the full live inventory into caller-owned storage.
 	// Pass nil for initial storage; retain returned Rows for subsequent reads.
 	// Each reader owns its backing array exclusively. Passing it again invalidates
@@ -163,7 +98,6 @@ type FlowInspection interface {
 	// Readers that retain earlier results must give later calls separate storage.
 	// Rows are sampled separately, not as one atomic cross-row inventory.
 	ReadLiveInto(storage []FlowRecord) (LiveSnapshot, error)
-	ReadTerminals() (TerminalSnapshot, error)
 	ReadTotals() (TotalsSnapshot, error)
 	// CloseFlows returns one error per input ref, in the same order.
 	// Nil includes an already absent or stopped flow; a closed store returns
@@ -189,8 +123,8 @@ type AdmissionStore interface {
 }
 
 // Exchange is the one logical receipt target shared by the endpoint, route and
-// native owner. Root Finish publishes the current snapshot once; later byte
-// facts still update the bound aggregate without changing that snapshot.
+// native owner. Root Finish removes the live entry once; later byte facts still
+// update the bound aggregate.
 type Exchange interface {
 	Ref() FlowRef
 	// ExcludeCarrier suppresses a prepared physical carrier's facts.
@@ -200,7 +134,7 @@ type Exchange interface {
 	// Rebind fences later attribution if a retained endpoint changes runtime or origin.
 	Rebind(RuntimeID, TrafficOrigin)
 	// NewLeg reserves one native UDP ray under this association root.
-	// Legs share the root reference and byte facts, but capture their own route.
+	// Legs share the root reference and byte facts, with independent route binding.
 	// They have no separate observation lifetime; their Finish is a no-op.
 	// Returns nil after stop.
 	NewLeg() Exchange
@@ -213,9 +147,9 @@ type Exchange interface {
 	// PacketDestination records the latest requested packet destination.
 	PacketDestination(net.Destination)
 	// RecordPacketInput commits one decoded packet's destination and uplink
-	// bytes together for live sampling, root Finish and provenance fencing.
+	// bytes together for live sampling and provenance fencing.
 	// Invalid destinations preserve the prior address; zero-byte packets may
-	// still update it. Late bytes update totals without rewriting a terminal.
+	// still update it. Late bytes continue to update totals after root Finish.
 	// Concurrent packets are ordered by commit, not arrival or route completion.
 	RecordPacketInput(net.Destination, uint64)
 	AddUplink(uint64)

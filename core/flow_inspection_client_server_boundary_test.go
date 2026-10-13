@@ -2,6 +2,7 @@ package core_test
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	fout "github.com/xtls/xray-core/features/outbound"
@@ -14,7 +15,7 @@ func inspectionAppClientRejectedReceiver(t *testing.T, receiver inspectionSuppli
 	if err := receiving.GetFeature(fout.ManagerType()).(fout.Manager).RemoveHandler(context.Background(), "direct"); err != nil {
 		t.Fatal(err)
 	}
-	_, view, address := inspectionTCPOutboundThrough(t, true, outbound)
+	_, local, address := inspectionTCPOutboundThrough(t, true, outbound)
 	payload := []byte("GET / HTTP/1.1\r\nHost: rejected.invalid\r\n\r\n")
 	client := inspectionSOCKS(t, address, startOutboundStatsTCPServer(t), nil)
 	if _, err := client.Write(payload); err != nil {
@@ -22,18 +23,12 @@ func inspectionAppClientRejectedReceiver(t *testing.T, receiver inspectionSuppli
 	}
 	if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
 		t.Fatalf("rejected receiver returned %d, %v", n, err)
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatalf("rejected receiver timed out: %v", err)
 	}
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 {
-			return false
-		}
-		row := page.Rows[0].Flow
-		if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Downlink != 0 || row.Uplink > uint64(len(payload)) {
-			t.Fatalf("app rejected flow: %+v", row)
-		}
-		return true
-	})
+
+	inspectionByteTotals(t, local, outbound.Tag, fs.ClientTotals{Uplink: uint64(len(payload))}, fs.ClientTotals{Uplink: uint64(len(payload))})
+	inspectionWait(t, func() bool { live, err := local.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 	assertNoDedicatedServerInspection(t, remote)
 }
 
@@ -43,10 +38,7 @@ func assertNoDedicatedServerInspection(t *testing.T, view fs.FlowInspection) {
 	if err != nil || len(live.Rows) != 0 {
 		t.Fatalf("dedicated server live rows: %+v %v", live, err)
 	}
-	ended, err := view.ReadTerminals()
-	if err != nil || len(ended.Rows) != 0 {
-		t.Fatalf("dedicated server terminal rows: %+v %v", ended, err)
-	}
+
 	totals, err := view.ReadTotals()
 	if err != nil {
 		t.Fatal(err)

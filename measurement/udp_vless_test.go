@@ -14,6 +14,7 @@ import (
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
+	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -26,6 +27,7 @@ import (
 	vlessin "github.com/xtls/xray-core/proxy/vless/inbound"
 	vlessout "github.com/xtls/xray-core/proxy/vless/outbound"
 	"github.com/xtls/xray-core/testing/servers/tcp"
+	"github.com/xtls/xray-core/transport"
 )
 
 type udpCarrierPrefix struct{ bytes []byte }
@@ -264,6 +266,173 @@ func TestUDPEchoVLESSSourcesDedicatedCleanupAndOrdinaryContinuity(t *testing.T) 
 				}
 			case <-time.After(time.Second):
 				t.Fatal("ordinary carrier did not close")
+			}
+		})
+	}
+}
+
+type internalUDPDispatchFacts struct {
+	origin session.TrafficOrigin
+	source bool
+}
+
+type internalUDPDispatchWitness struct {
+	outbound.Handler
+	facts chan internalUDPDispatchFacts
+}
+
+func (h *internalUDPDispatchWitness) Dispatch(ctx context.Context, link *transport.Link) {
+	h.facts <- internalUDPDispatchFacts{session.TrafficOriginFromContext(ctx), session.UDPPacketSourceRequired(ctx)}
+	h.Handler.Dispatch(ctx, link)
+}
+
+func TestVLESSInternalUDPPacketSource(t *testing.T) {
+	for _, disabled := range []string{"false", "true"} {
+		t.Run("cone-disabled-"+disabled, func(t *testing.T) {
+			t.Setenv("xray.cone.disabled", disabled)
+			for _, source := range []bool{false, true} {
+				t.Run("source-"+strconv.FormatBool(source), func(t *testing.T) {
+					_, v, closed := udpVLESSExecutor(t)
+					facts := make(chan internalUDPDispatchFacts, 1)
+					manager := v.GetFeature(outbound.ManagerType()).(outbound.Manager)
+					handler := manager.GetHandler("exact")
+					if err := manager.RemoveHandler(context.Background(), "exact"); err != nil {
+						t.Fatal(err)
+					}
+					if err := manager.AddHandler(context.Background(), &internalUDPDispatchWitness{handler, facts}); err != nil {
+						t.Fatal(err)
+					}
+					other, err := net.ListenPacket("udp4", "127.0.0.1:0")
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { other.Close() })
+					wantMetadata := source || disabled == "false"
+					pc := udpFixture(t, func(pc net.PacketConn, b []byte, a net.Addr) {
+						if wantMetadata {
+							other.WriteTo(b, a)
+						}
+						pc.WriteTo(b, a)
+					})
+					// A service invocation has fresh session objects and no inherited
+					// USER observation. It is INTERNAL, never a Measurement operation.
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+					ctx = session.ContextWithInbound(ctx, &session.Inbound{})
+					ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{}})
+					ctx = session.ContextWithContent(ctx, &session.Content{SkipDNSResolve: true})
+					ctx = session.ContextWithTimeoutOnly(ctx, false)
+					ctx = session.ContextWithLogicalObservation(ctx, nil)
+					ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginInternal)
+					ctx = session.SetForcedOutboundTagToContext(ctx, "exact")
+					if source {
+						ctx = session.ContextWithUDPPacketSource(ctx)
+					}
+					dest, err := xnet.ParseDestination("udp:" + pc.LocalAddr().String())
+					if err != nil {
+						t.Fatal(err)
+					}
+					internal, err := core.Dial(ctx, v, dest)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var closeOnce sync.Once
+					closeInternal := func() { cancel(); closeOnce.Do(func() { internal.Close() }) }
+					t.Cleanup(closeInternal)
+					reader, ok := internal.(buf.Reader)
+					if !ok {
+						t.Fatal("core.Dial does not expose decoded UDP buffers")
+					}
+					type packet struct {
+						payload string
+						source  netip.AddrPort
+					}
+					type result struct {
+						packets []packet
+						err     error
+					}
+					read := make(chan result, 1)
+					readDone := make(chan struct{})
+					wantReplies := 1
+					if wantMetadata {
+						wantReplies = 2
+					}
+					go func() {
+						defer close(readDone)
+						var got result
+						for len(got.packets) < wantReplies {
+							mb, err := reader.ReadMultiBuffer()
+							for _, b := range mb {
+								p := packet{payload: string(b.Bytes())}
+								if b.UDP != nil && b.UDP.Network == xnet.Network_UDP && b.UDP.Address != nil && b.UDP.Address.Family().IsIP() {
+									if ip, ok := netip.AddrFromSlice(b.UDP.Address.IP()); ok {
+										p.source = netip.AddrPortFrom(ip.Unmap(), uint16(b.UDP.Port))
+									}
+								}
+								got.packets = append(got.packets, p)
+							}
+							buf.ReleaseMulti(mb)
+							if err != nil {
+								got.err = err
+								break
+							}
+						}
+						read <- got
+					}()
+					t.Cleanup(func() {
+						closeInternal()
+						select {
+						case <-readDone:
+						case <-time.After(time.Second):
+							t.Error("INTERNAL decoding read did not close")
+						}
+					})
+					const payload = "internal-udp-witness"
+					if _, err := internal.Write([]byte(payload)); err != nil {
+						t.Fatal(err)
+					}
+					select {
+					case got := <-facts:
+						if got.origin != session.TrafficOriginInternal || got.source != source {
+							t.Fatalf("service admission changed: %+v", got)
+						}
+					case <-ctx.Done():
+						t.Fatal("INTERNAL dispatch not observed")
+					}
+					select {
+					case got := <-read:
+						if got.err != nil || len(got.packets) != wantReplies {
+							t.Fatalf("INTERNAL replies: %+v", got)
+						}
+						endpoints := map[netip.AddrPort]bool{}
+						for _, p := range got.packets {
+							if p.payload != payload || p.source.IsValid() != wantMetadata {
+								t.Fatalf("INTERNAL response metadata: %+v want source=%t", p, wantMetadata)
+							}
+							endpoints[p.source] = true
+						}
+						// Two actual UDP sockets witness metadata; the destination
+						// alone cannot stand in for the response's observed source.
+						if wantMetadata && (!endpoints[pc.LocalAddr().(*net.UDPAddr).AddrPort()] || !endpoints[other.LocalAddr().(*net.UDPAddr).AddrPort()]) {
+							t.Fatalf("response endpoints: %+v", endpoints)
+						}
+					case <-ctx.Done():
+						t.Fatal("INTERNAL response did not complete")
+					}
+					closeInternal()
+					if wantMetadata {
+						assertUDPDedicatedCarrier(t, closed)
+					} else {
+						select {
+						case prefix := <-closed:
+							if len(prefix) < 19 || prefix[18] != byte(protocol.RequestCommandUDP) {
+								t.Fatalf("absent source flag changed native codec: %x", prefix)
+							}
+						case <-time.After(time.Second):
+							t.Fatal("INTERNAL native carrier did not close")
+						}
+					}
+				})
 			}
 		})
 	}

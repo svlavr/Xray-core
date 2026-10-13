@@ -89,16 +89,7 @@ func TestFlowInspectionSOCKSOutbound(t *testing.T) {
 			if err != nil || len(out) != 1 || out[0] != nil {
 				t.Fatalf("close: %+v %v", out, err)
 			}
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				if len(page.Rows) != 1 {
-					return false
-				}
-				if page.Rows[0].Flow.Ref != selected {
-					t.Fatalf("wrong stopped exchange: %+v", page.Rows)
-				}
-				return true
-			})
+
 			if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
 				t.Fatalf("stopped endpoint returned %d, %v", n, err)
 			}
@@ -108,10 +99,7 @@ func TestFlowInspectionSOCKSOutbound(t *testing.T) {
 			}
 			inspectionResponse(t, second, extra)
 			second.Close()
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 2
-			})
+
 			want := uint64(2*len(payload) + len(extra))
 			totals, _ := view.ReadTotals()
 			var up, down uint64
@@ -176,16 +164,18 @@ func TestFlowInspectionSOCKSOutboundHandshakeEnding(t *testing.T) {
 			if err != nil || len(live.Rows) != 1 || live.Rows[0].Outbound.Tag != "socks-proxy" {
 				t.Fatalf("handshake owner: %+v %v", live, err)
 			}
-			ref := live.Rows[0].Ref
+			row := live.Rows[0]
+			if row.Ref.ID == 0 || row.Kind != cnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Destination != cnet.TCPDestination(cnet.LocalHostIP, 80) || row.Uplink != uint64(len(payload)) || row.Downlink != 0 {
+				t.Fatalf("pending handshake bytes: %+v", row)
+			}
+			inspectionByteTotals(t, view, "socks-proxy", fs.ClientTotals{Uplink: uint64(len(payload))}, fs.ClientTotals{})
+			ref := row.Ref
 			if stop {
 				out, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref})
 				if err != nil || len(out) != 1 || out[0] != nil {
 					t.Fatalf("handshake stop: %+v %v", out, err)
 				}
-				page, _ := view.ReadTerminals()
-				if len(page.Rows) != 1 {
-					t.Fatalf("owner-close snapshot: %+v", page)
-				}
+
 				live, err := view.ReadLiveInto(nil)
 				if err != nil || len(live.Rows) != 0 {
 					t.Fatalf("owner-close remained live: %+v %v", live, err)
@@ -196,17 +186,13 @@ func TestFlowInspectionSOCKSOutboundHandshakeEnding(t *testing.T) {
 			if _, err := peer.Write([]byte{5, 255}); err != nil {
 				t.Fatal(err)
 			}
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				if len(page.Rows) != 1 {
-					return false
-				}
-				row := page.Rows[0]
-				if row.Flow.Ref != ref || row.Flow.Uplink != uint64(len(payload)) || row.Flow.Downlink != 0 || row.Flow.Outbound.Tag != "socks-proxy" {
-					t.Fatalf("failed handshake receipt: %+v", row)
-				}
-				return true
-			})
+			if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
+				t.Fatalf("rejected handshake native completion: %d %v", n, err)
+			} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				t.Fatalf("handshake did not end: %v", err)
+			}
+			inspectionLiveAbsent(t, view, ref)
+			inspectionByteTotals(t, view, "socks-proxy", fs.ClientTotals{Uplink: uint64(len(payload))}, fs.ClientTotals{})
 		})
 	}
 }

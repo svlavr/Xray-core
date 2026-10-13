@@ -133,7 +133,6 @@ func newBridgeWorker(base context.Context, domain string, tag string, d routing.
 	}
 
 	childCtx := session.ContextWithInbound(base, &session.Inbound{Tag: tag})
-	childCtx = session.ContextWithTrafficOrigin(childCtx, session.TrafficOriginUnknown)
 	worker, err := mux.NewServerWorker(childCtx, w, link)
 	if err != nil {
 		return nil, err

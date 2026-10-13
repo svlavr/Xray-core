@@ -3,7 +3,9 @@ package proxy_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	cnet "github.com/xtls/xray-core/common/net"
 	fs "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 func TestVisionDuplexState(t *testing.T) {
@@ -105,12 +108,115 @@ func TestVisionWriterPayloadPrefixes(t *testing.T) {
 			if (test.limit < 55 || test.fail) && err == nil {
 				t.Fatal("partial lower result lost its error")
 			}
-			flow.Finish()
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != test.known {
-				t.Fatalf("Vision prefix facts: %+v %v", page, err)
+			{
+				page, err := view.ReadLiveInto(nil)
+				if err != nil || len(page.Rows) != 1 || page.Rows[0].Downlink != test.known {
+					t.Fatalf("Vision prefix facts: %+v %v", page, err)
+				}
 			}
+			flow.Finish()
 		})
+	}
+}
+
+type visionRawConn struct {
+	net.Conn
+	writer io.Writer
+}
+
+func (c *visionRawConn) Write(p []byte) (int, error) { return c.writer.Write(p) }
+
+// Raw transition bytes belong to the scalar result, including n > 0 with an
+// error. The framed-only operation tests above retain their own batch meaning.
+func TestVisionWriterRawScalarPrefixes(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		limit int
+		fail  bool
+	}{
+		{"short-prefix-plus-error", 3, false},
+		{"complete", 7, false},
+		{"full-plus-error", 7, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := new(appstats.Manager)
+			view, err := manager.EnableInspection(fs.ObservationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer manager.Close()
+			flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Tag: "direct"})
+			lower := &visionPrefixWriter{limit: test.limit}
+			if test.fail {
+				lower.err = io.ErrClosedPipe
+			}
+			counter := new(appstats.Counter)
+			conn := &stat.CounterConnection{Connection: &visionRawConn{writer: lower}, WriteCounter: counter}
+			state := proxy.NewTrafficState(bytes.Repeat([]byte{0xaa}, 16))
+			state.NumberOfPacketToFilter = 0
+			state.Inbound.IsPadding = false
+			state.Inbound.DownlinkWriterDirectCopy = true
+			writer := proxy.NewVisionWriter(buf.NewWriter(io.Discard), state, false, context.Background(), conn, nil, nil)
+			buf.AttachWriterReceipt(writer, flow)
+			err = writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("payload"))})
+			if (test.fail || test.limit < 7) != errors.Is(err, io.ErrClosedPipe) {
+				t.Fatalf("scalar error=%v", err)
+			}
+			page, err := view.ReadLiveInto(nil)
+			if err != nil || len(page.Rows) != 1 || page.Rows[0].Downlink != uint64(test.limit) {
+				t.Fatalf("raw prefix facts: %+v %v", page, err)
+			}
+			if counter.Value() != int64(test.limit) || string(lower.written) != "payload"[:test.limit] {
+				t.Fatalf("raw native counter=%d bytes=%q", counter.Value(), lower.written)
+			}
+			if buf.WriterReceipt(writer.Writer) != flow {
+				t.Fatal("raw scalar writer did not retain the actual receipt")
+			}
+			flow.Finish()
+		})
+	}
+}
+
+func TestVisionWriterRawScalarFollowupAfterFinish(t *testing.T) {
+	manager := new(appstats.Manager)
+	view, err := manager.EnableInspection(fs.ObservationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	flow := manager.Observation().Begin(cnet.Network_TCP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
+	flow.Route(fs.OutboundRef{Tag: "direct"})
+	lower := &visionRawConn{writer: visionBlockedWriter{make(chan struct{}), make(chan struct{})}}
+	blocked := lower.writer.(visionBlockedWriter)
+	counter := new(appstats.Counter)
+	conn := &stat.CounterConnection{Connection: lower, WriteCounter: counter}
+	state := proxy.NewTrafficState(bytes.Repeat([]byte{0xaa}, 16))
+	state.NumberOfPacketToFilter = 0
+	state.Inbound.IsPadding = false
+	state.Inbound.DownlinkWriterDirectCopy = true
+	writer := proxy.NewVisionWriter(buf.NewWriter(io.Discard), state, false, context.Background(), conn, nil, nil)
+	buf.AttachWriterReceipt(writer, flow)
+	done := make(chan error, 1)
+	go func() { done <- writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("payload"))}) }()
+	<-blocked.entered
+	page, err := view.ReadLiveInto(nil)
+	if err != nil || len(page.Rows) != 1 || page.Rows[0].Downlink != 0 || counter.Value() != 0 {
+		t.Fatalf("blocked raw write was precredited: %+v native=%d err=%v", page, counter.Value(), err)
+	}
+	flow.Finish()
+	close(blocked.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// The next raw batch uses the same bound scalar writer after transition.
+	lower.writer = &visionPrefixWriter{limit: 100}
+	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("followup"))}); err != nil {
+		t.Fatal(err)
+	}
+	totals, err := view.ReadTotals()
+	if err != nil || len(totals.Rows) != 1 || totals.Rows[0].Downlink != 15 || totals.User.Downlink != 15 || counter.Value() != 15 {
+		t.Fatalf("late raw receipt/native counter: %+v native=%d err=%v", totals, counter.Value(), err)
 	}
 }
 
@@ -139,10 +245,7 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 	go func() { writeDone <- writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("request"))}) }()
 	<-lower.entered
 	flow.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("owner-end Vision snapshot: %+v %v", page, err)
-	}
+
 	reader := proxy.NewVisionReader(buf.NewReader(bytes.NewReader([]byte("server banner"))), state, false, context.Background(), nil, nil, nil, nil)
 	readDone := make(chan error, 1)
 	go func() { mb, err := reader.ReadMultiBuffer(); buf.ReleaseMulti(mb); readDone <- err }()
@@ -158,10 +261,7 @@ func TestVisionBlockedWriteKeepsReaderIndependent(t *testing.T) {
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("pending Vision result lost: %+v %v", page, err)
-	}
+
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {

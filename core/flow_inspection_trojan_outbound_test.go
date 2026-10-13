@@ -144,10 +144,7 @@ func inspectionOutboundTCP(t *testing.T, config func(*testing.T) *core.OutboundH
 			if err != nil || len(out) != 1 || out[0] != nil {
 				t.Fatalf("outbound exact stop: %+v %v", out, err)
 			}
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected
-			})
+
 			if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
 				t.Fatalf("stopped outbound endpoint returned %d, %v", n, err)
 			}
@@ -157,10 +154,7 @@ func inspectionOutboundTCP(t *testing.T, config func(*testing.T) *core.OutboundH
 			}
 			inspectionResponse(t, sibling, extra)
 			sibling.Close()
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 2
-			})
+
 			inspectionOutboundTotals(t, view, outbound.Tag, uint64(2*len(payload)+len(extra)))
 		})
 	}
@@ -208,10 +202,7 @@ func inspectionOutboundUDP(t *testing.T, config func(*testing.T) *core.OutboundH
 			if err != nil || len(out) != 1 || out[0] != nil {
 				t.Fatalf("outbound UDP stop: %+v %v", out, err)
 			}
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == selected.Ref
-			})
+
 			inspectionOutboundTotals(t, view, outbound.Tag, uint64(len(payload)))
 		})
 	}
@@ -244,16 +235,10 @@ func inspectionOutboundPreparationFailure(t *testing.T, outbound *core.OutboundH
 	if _, err := client.Write(payload); err != nil {
 		t.Fatal(err)
 	}
+
 	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 {
-			return false
-		}
-		row := page.Rows[0].Flow
-		if row.Outbound.Tag != outbound.Tag || row.Outbound.Tag == "" || row.Uplink != uint64(len(payload)) || row.Downlink != 0 {
-			t.Fatalf("failed preparation lost sniff credit or invented payload: %+v", row)
-		}
-		return true
+		got, err := view.ReadTotals()
+		return err == nil && got.User.Uplink == uint64(len(payload))
 	})
 	totals, err := view.ReadTotals()
 	if err != nil || totals.User.Uplink != uint64(len(payload)) || len(totals.Rows) != 1 ||

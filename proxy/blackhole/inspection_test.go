@@ -53,23 +53,6 @@ func blackholeInspection(t *testing.T, link *transport.Link, network cnet.Networ
 	return ctx, view, finish
 }
 
-func blackholeTerminal(t *testing.T, view fs.FlowInspection) fs.TerminalRecord {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(page.Rows) == 1 {
-			return page.Rows[0]
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("missing terminal after owner release")
-	return fs.TerminalRecord{}
-}
-
 func TestInspectionBlackholePartialResponse(t *testing.T) {
 	link := &transport.Link{Reader: buf.NewReader(strings.NewReader("")), Writer: &buf.SequentialWriter{Writer: inspectionPrefixWriter{}}}
 	ctx, view, finish := blackholeInspection(t, link, cnet.Network_TCP)
@@ -82,11 +65,11 @@ func TestInspectionBlackholePartialResponse(t *testing.T) {
 	if err := handler.Process(ctx, link, nil); err != nil {
 		t.Fatal(err)
 	}
-	finish()
-	terminal := blackholeTerminal(t, view)
-	if terminal.Flow.Downlink != 3 || terminal.Flow.Uplink != 0 || terminal.Flow.Origin != fs.TrafficOriginInternal {
-		t.Fatalf("prefix/error receipt: %+v", terminal)
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Downlink != 3 || live.Rows[0].Uplink != 0 || live.Rows[0].Origin != fs.TrafficOriginInternal {
+		t.Fatalf("prefix/error live receipt: %+v %v", live, err)
 	}
+	finish()
 }
 
 func TestInspectionBlackholePendingReadOwnerEnd(t *testing.T) {
@@ -99,7 +82,7 @@ func TestInspectionBlackholePendingReadOwnerEnd(t *testing.T) {
 		}
 	})
 	link := &transport.Link{Reader: inspectionPendingReader{release: release}, Writer: &buf.SequentialWriter{Writer: io.Discard}}
-	ctx, view, finish := blackholeInspection(t, link, cnet.Network_TCP)
+	ctx, _, finish := blackholeInspection(t, link, cnet.Network_TCP)
 	cursor := link.Reader.(*buf.InspectionReader)
 	mb, err := cursor.ReadMultiBufferTimeout(time.Millisecond)
 	buf.ReleaseMulti(mb)
@@ -114,15 +97,8 @@ func TestInspectionBlackholePendingReadOwnerEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
-		t.Fatalf("owner-end snapshot: %+v %v", page, err)
-	}
+
 	close(release)
-	terminal := blackholeTerminal(t, view)
-	if terminal.Flow.Uplink != 0 {
-		t.Fatalf("abandoned read credited or ending lost: %+v", terminal)
-	}
 }
 
 func TestInspectionBlackholeInheritedContextLeavesEndpointUnchanged(t *testing.T) {
@@ -146,10 +122,7 @@ func TestInspectionBlackholeInheritedContextLeavesEndpointUnchanged(t *testing.T
 			t.Fatalf("claimed an inherited-only endpoint: %+v", live)
 		}
 		finish()
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "block" || page.Rows[0].Flow.Origin != fs.TrafficOriginInternal || page.Rows[0].Flow.Uplink != 0 || page.Rows[0].Flow.Downlink != 0 {
-			t.Fatalf("missing owner snapshot: %+v", page)
-		}
+
 		totals, err := view.ReadTotals()
 		if err != nil {
 			t.Fatal(err)
@@ -183,7 +156,7 @@ func TestInspectionBlackholeUDPDrainOwnerEnd(t *testing.T) {
 		}
 	})
 	link := &transport.Link{Reader: inspectionUDPDrainReader{started, release}, Writer: &buf.SequentialWriter{Writer: io.Discard}}
-	ctx, view, finish := blackholeInspection(t, link, cnet.Network_UDP)
+	ctx, _, finish := blackholeInspection(t, link, cnet.Network_UDP)
 	// The native target-resolution wrapper must not hide the logical cursor.
 	link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: cnet.LocalHostIP}
 	ctx, cancel := context.WithCancel(ctx)
@@ -209,13 +182,6 @@ func TestInspectionBlackholeUDPDrainOwnerEnd(t *testing.T) {
 		t.Fatal("native cancellation waited for the detached drain")
 	}
 	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
-		t.Fatalf("owner-end UDP snapshot: %+v %v", page, err)
-	}
+
 	close(release)
-	terminal := blackholeTerminal(t, view)
-	if terminal.Flow.Kind != cnet.Network_UDP || terminal.Flow.Uplink != 0 || terminal.Flow.Outbound.Tag != "block" {
-		t.Fatalf("UDP drain ending/custody: %+v", terminal)
-	}
 }

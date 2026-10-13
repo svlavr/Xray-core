@@ -109,9 +109,9 @@ func u2TCPExchange(t *testing.T, c net.Conn, payload []byte) {
 	}
 }
 
-func u2APIInstance(t *testing.T, enabled bool, outbound *core.OutboundHandlerConfig) (*core.Instance, fs.FlowInspection, func()) {
+func u2NativeInstance(t *testing.T, enabled bool, outbound *core.OutboundHandlerConfig) (*core.Instance, fs.FlowInspection, func()) {
 	t.Helper()
-	v, err := core.New(&core.Config{App: []*serial.TypedMessage{serial.ToTypedMessage(&appstats.Config{}), serial.ToTypedMessage(&proxyman.OutboundConfig{}), serial.ToTypedMessage(&dispatcher.Config{})}, Outbound: []*core.OutboundHandlerConfig{outbound}})
+	v, err := core.New(&core.Config{App: []*serial.TypedMessage{serial.ToTypedMessage(&appstats.Config{}), serial.ToTypedMessage(&proxyman.InboundConfig{}), serial.ToTypedMessage(&proxyman.OutboundConfig{}), serial.ToTypedMessage(&dispatcher.Config{})}, Outbound: []*core.OutboundHandlerConfig{outbound}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,12 +137,9 @@ func u2APIInstance(t *testing.T, enabled bool, outbound *core.OutboundHandlerCon
 	return v, view, closeInstance
 }
 
-func u2APITCP(t *testing.T, v *core.Instance, destination cnet.Destination, payload []byte) net.Conn {
+func u2NativeTCP(t *testing.T, v *core.Instance, destination cnet.Destination, payload []byte) net.Conn {
 	t.Helper()
-	c, err := core.Dial(inspectionAPIContext(v, fs.TrafficOriginUser), v, destination)
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := controlNativeDial(t, v, destination)
 	t.Cleanup(func() { _ = c.Close() })
 	u2TCPExchange(t, c, payload)
 	return c
@@ -172,17 +169,17 @@ func TestU2HysteriaMuxWireLifecycle(t *testing.T) {
 				var continueSibling, continueIndependent func()
 				var closeOwner, closeIndependent func()
 				if network == "tcp" {
-					v, view, closeOwner = u2APIInstance(t, enabled, config)
+					v, view, closeOwner = u2NativeInstance(t, enabled, config)
 					destination := startOutboundStatsTCPServer(t)
-					first := u2APITCP(t, v, destination, payload)
-					sibling := u2APITCP(t, v, destination, payload)
+					first := u2NativeTCP(t, v, destination, payload)
+					sibling := u2NativeTCP(t, v, destination, payload)
 					continueSibling = func() { u2TCPExchange(t, sibling, extra) }
 					_ = first.Close()
 					if enabled {
 						inspectionWait(t, func() bool { live, _ := view.ReadLiveInto(nil); return len(live.Rows) == 1 })
 					}
-					independent, _, closeIndependent = u2APIInstance(t, false, config)
-					other := u2APITCP(t, independent, destination, payload)
+					independent, _, closeIndependent = u2NativeInstance(t, false, config)
+					other := u2NativeTCP(t, independent, destination, payload)
 					continueIndependent = func() { u2TCPExchange(t, other, extra) }
 				} else {
 					const mask = byte(0x61)

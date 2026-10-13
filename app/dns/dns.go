@@ -12,6 +12,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/geodata"
+	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/utils"
@@ -38,7 +39,7 @@ type DNS struct {
 	runtime                *dnsRuntime
 	scriptMu               sync.RWMutex
 	script                 *scriptEngine
-	scriptPath             string
+	scriptProgram          *xlua.Program
 }
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher.
@@ -50,12 +51,20 @@ type DomainMatcherInfo struct {
 // New creates a new DNS server with given configuration.
 func New(ctx context.Context, config *Config) (*DNS, error) {
 	config = proto.Clone(config).(*Config)
+	var program *xlua.Program
+	if config.Script != "" {
+		var err error
+		program, err = xlua.Compile(config.Script)
+		if err != nil {
+			return nil, errors.New("failed to prepare DNS script").Base(err)
+		}
+	}
 	needsFakeDNS := false
 	for _, ns := range config.NameServer {
 		needsFakeDNS = needsFakeDNS || strings.EqualFold(ns.Address.Address.GetDomain(), "fakedns")
 	}
 	if len(config.NameServer) == 0 {
-		prepared, err := buildDNS(ctx, config, nil, nil)
+		prepared, err := buildDNS(ctx, config, nil, nil, program)
 		if err != nil {
 			return nil, err
 		}
@@ -65,7 +74,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 	}
 	s := &DNS{ctx: ctx}
 	build := func(dispatcher routing.Dispatcher, fake dns.FakeDNSEngine) error {
-		prepared, err := buildDNS(ctx, config, dispatcher, fake)
+		prepared, err := buildDNS(ctx, config, dispatcher, fake, program)
 		if err == nil {
 			s.initRuntime(prepared)
 		}
@@ -87,7 +96,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 
 // buildDNS consumes candidate-owned configuration and already resolved features.
 // It never registers dependency callbacks or starts nameserver I/O or workers.
-func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher, fake dns.FakeDNSEngine) (*DNS, error) {
+func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher, fake dns.FakeDNSEngine, program *xlua.Program) (*DNS, error) {
 	var clientIP net.IP
 	switch len(config.ClientIp) {
 	case 0, net.IPv4len, net.IPv6len:
@@ -229,7 +238,7 @@ func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
-		scriptPath:             config.Script,
+		scriptProgram:          program,
 	}, nil
 }
 
@@ -266,16 +275,16 @@ func (s *DNS) Close() error {
 	rt.mu.Unlock()
 	var errs []error
 	if current != nil {
-		current.startClose()
+		current.startClose(rt)
 	}
 	if closing != nil {
-		closing.startClose()
+		closing.startClose(rt)
 	}
 	if current != nil {
-		errs = append(errs, current.closeOwned())
+		errs = append(errs, current.closeOwned(rt))
 	}
 	if closing != nil {
-		errs = append(errs, closing.closeOwned())
+		errs = append(errs, closing.closeOwned(rt))
 	}
 	rt.mu.Lock()
 	rt.current, rt.closing = nil, nil

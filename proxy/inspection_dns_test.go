@@ -52,11 +52,13 @@ func TestInspectionSourceClaimAfterSniffReplay(t *testing.T) {
 		t.Fatalf("decoded message: %v %v", message, err)
 	}
 	message.Release()
-	root.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(frame)) {
-		t.Fatalf("sniffed source bytes were lost or replayed: %+v %v", page.Rows, err)
+	{
+		page, err := view.ReadLiveInto(nil)
+		if err != nil || len(page.Rows) != 1 || page.Rows[0].Uplink != uint64(len(frame)) {
+			t.Fatalf("sniffed source bytes were lost or replayed: %+v %v", page.Rows, err)
+		}
 	}
+	root.Finish()
 }
 
 func TestInspectionUDPStopBeforeRouteClaim(t *testing.T) {
@@ -80,11 +82,11 @@ func TestInspectionUDPStopBeforeRouteClaim(t *testing.T) {
 		t.Fatalf("pre-claim input: %d %v", mb.Len(), err)
 	}
 	buf.ReleaseMulti(mb)
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != ref || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != 0 || live.Rows[0].Outbound.Tag != "" || live.Rows[0].Destination != destination {
+		t.Fatalf("pending UDP before route claim: %+v %v", live, err)
+	}
 	if _, err := view.CloseFlows(context.Background(), []fs.FlowRef{ref}); err != nil {
 		t.Fatal(err)
-	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len(payload)) {
-		t.Fatalf("pre-claim exact stop lost pending input: %+v %v", page.Rows, err)
 	}
 }

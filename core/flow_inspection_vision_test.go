@@ -227,33 +227,25 @@ func TestFlowInspectionVisionTLS13(t *testing.T) {
 				t.Fatalf("stopped Vision returned %d %v", n, err)
 			}
 			burst(sibling, "sibling after raw stop")
+			inspectionLiveAbsent(t, sending, firstRow.Ref)
+			inspectionWait(t, func() bool {
+				live, err := sending.ReadLiveInto(nil)
+				if err != nil || len(live.Rows) != 1 {
+					return false
+				}
+				row := live.Rows[0]
+				if row.Uplink != siblingWire.written.Load() || row.Downlink != siblingWire.read.Load() {
+					return false
+				}
+				if row.Ref.ID == 0 || row.Ref == firstRow.Ref || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "vision" || row.Destination != destination {
+					t.Fatalf("Vision sibling facts: %+v", row)
+				}
+				return true
+			})
+			want := fs.ClientTotals{Uplink: wire.written.Load() + siblingWire.written.Load(), Downlink: wire.read.Load() + siblingWire.read.Load()}
+			inspectionByteTotals(t, sending, "vision", want, want)
 			siblingWire.Close()
-			for _, view := range []fs.FlowInspection{sending} {
-				inspectionWait(t, func() bool {
-					page, err := view.ReadTerminals()
-					if err != nil || len(page.Rows) != 2 {
-						return false
-					}
-					var up, down uint64
-					for _, row := range page.Rows {
-						up += row.Flow.Uplink
-						down += row.Flow.Downlink
-					}
-					if up != wire.written.Load()+siblingWire.written.Load() || down != wire.read.Load()+siblingWire.read.Load() {
-						t.Fatalf("Vision terminal double count: %d/%d want %d/%d", up, down, wire.written.Load()+siblingWire.written.Load(), wire.read.Load()+siblingWire.read.Load())
-					}
-					totals, _ := view.ReadTotals()
-					var totalUp, totalDown uint64
-					for _, row := range totals.Rows {
-						totalUp += row.Uplink
-						totalDown += row.Downlink
-					}
-					if totalUp != up || totalDown != down {
-						t.Fatal("Vision totals disagree with terminal facts")
-					}
-					return true
-				})
-			}
+			inspectionWait(t, func() bool { live, err := sending.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 		})
 	}
 }

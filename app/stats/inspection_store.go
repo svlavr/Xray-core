@@ -23,17 +23,12 @@ type inspectionStore struct {
 	limits  featurestats.ObservationOptions
 	epoch   time.Time
 
-	mu                  sync.RWMutex
-	live                map[uint64]*inspectionExchange
-	buckets             map[string]*aggregateCell
-	user                aggregateCell
-	bucketsOmitted      uint64
-	terminals           []featurestats.TerminalRecord
-	terminalHead        uint32
-	terminalOverwritten uint64
-	nextID              uint64
-	capture             atomic.Pointer[observationCapture]
-	nextObservation     atomic.Uint64
+	mu             sync.RWMutex
+	live           map[uint64]*inspectionExchange
+	buckets        map[string]*aggregateCell
+	user           aggregateCell
+	bucketsOmitted uint64
+	nextID         uint64
 }
 
 func newInspectionStore(runtime featurestats.RuntimeID, limits featurestats.ObservationOptions) *inspectionStore {
@@ -68,7 +63,6 @@ func (s *inspectionStore) Begin(kind xnet.Network, origin featurestats.TrafficOr
 		e.mu.Lock()
 		e.admitLocked()
 		e.registerLocked()
-		e.observeLocked(featurestats.ObservationEndpoint)
 		e.mu.Unlock()
 	}
 	return flow
@@ -176,25 +170,6 @@ func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
 	}, nil
 }
 
-func (s *inspectionStore) ReadTerminals() (featurestats.TerminalSnapshot, error) {
-	s.mu.RLock()
-	if s.live == nil {
-		s.mu.RUnlock()
-		return featurestats.TerminalSnapshot{}, errors.New("inspection closed")
-	}
-	rows := make([]featurestats.TerminalRecord, 0, len(s.terminals))
-	for i := 0; i < len(s.terminals); i++ {
-		rows = append(rows, s.terminals[(int(s.terminalHead)+i)%len(s.terminals)])
-	}
-	overwritten := s.terminalOverwritten
-	s.mu.RUnlock()
-	return featurestats.TerminalSnapshot{
-		At:          s.elapsed(),
-		Rows:        rows,
-		Overwritten: overwritten,
-	}, nil
-}
-
 func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.FlowRef) ([]error, error) {
 	if s.isClosed() {
 		return nil, errors.New("inspection closed")
@@ -254,29 +229,15 @@ func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin fe
 	return cell
 }
 
-func (s *inspectionStore) publish(exchange *inspectionExchange, terminal featurestats.TerminalRecord) {
-	if terminal.Flow.Ref.ID == 0 {
+func (s *inspectionStore) remove(exchange *inspectionExchange, ref featurestats.FlowRef) {
+	if ref.ID == 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.live[terminal.Flow.Ref.ID] != exchange {
-		return
+	if s.live[ref.ID] == exchange {
+		delete(s.live, ref.ID)
 	}
-	delete(s.live, terminal.Flow.Ref.ID)
-	if uint32(len(s.terminals)) < s.limits.MaxTerminals {
-		if len(s.terminals) == cap(s.terminals) {
-			capacity := min(int(s.limits.MaxTerminals), max(1, 2*cap(s.terminals)))
-			grown := make([]featurestats.TerminalRecord, len(s.terminals), capacity)
-			copy(grown, s.terminals)
-			s.terminals = grown
-		}
-		s.terminals = append(s.terminals, terminal)
-		return
-	}
-	s.terminals[s.terminalHead] = terminal
-	s.terminalHead = (s.terminalHead + 1) % uint32(len(s.terminals))
-	s.terminalOverwritten++
 }
 
 func (s *inspectionStore) close() {
@@ -287,22 +248,16 @@ func (s *inspectionStore) close() {
 	}
 	s.live = nil
 	s.buckets = nil
-	s.terminals = nil
-	s.terminalHead = 0
-	if c := s.capture.Swap(nil); c != nil {
-		c.Close()
-	}
 }
 
 // One association owns the visible values, lifetime and lock. Native rays retain
-// only selection/destination custody; no pending credit or ray lifecycle exists.
+// only route binding; no pending credit or ray lifecycle exists.
 type inspectionFlow struct {
 	store              *inspectionStore
 	stop               func() error
 	mu                 sync.Mutex
 	record             featurestats.FlowRecord
-	observationID      uint64
-	nextRayID          uint64
+	hasLeg             bool
 	stopRequested      bool
 	provenanceConflict bool
 	published          bool
@@ -312,22 +267,19 @@ type inspectionFlow struct {
 
 type inspectionExchange struct {
 	*inspectionFlow
-	bucket           *aggregateCell
-	rayID            uint64
-	rayDestination   xnet.Destination
-	selectedOutbound featurestats.OutboundRef
-	bound            bool // Selection can bind without a public tag bucket.
-	selected         bool
+	bucket *aggregateCell
+	isLeg  bool
+	bound  bool // Selection can bind without a public tag bucket.
 }
 
 func (e *inspectionExchange) NewLeg() featurestats.Exchange {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || e.rayID != 0 || e.record.Kind != xnet.Network_UDP || e.stopRequested || e.published {
+	if e.excluded || e.isLeg || e.record.Kind != xnet.Network_UDP || e.stopRequested || e.published {
 		return nil
 	}
-	e.nextRayID++
-	return &inspectionExchange{inspectionFlow: e.inspectionFlow, rayID: e.nextRayID}
+	e.hasLeg = true
+	return &inspectionExchange{inspectionFlow: e.inspectionFlow, isLeg: true}
 }
 
 func (e *inspectionExchange) Ref() featurestats.FlowRef {
@@ -339,7 +291,7 @@ func (e *inspectionExchange) Ref() featurestats.FlowRef {
 func (e *inspectionExchange) ExcludeCarrier() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.rayID != 0 || e.admitted || e.record.Ref.ID != 0 {
+	if e.isLeg || e.admitted || e.record.Ref.ID != 0 {
 		return false
 	}
 	e.excluded = true
@@ -349,19 +301,18 @@ func (e *inspectionExchange) ExcludeCarrier() bool {
 func (e *inspectionExchange) Route(outbound featurestats.OutboundRef) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || (e.rayID == 0 && e.published) || e.bound {
+	if e.excluded || (!e.isLeg && e.published) || e.bound {
 		return
 	}
 	e.record.Outbound = outbound
-	e.selectedOutbound = outbound
-	e.selected = true
+
 	e.bindLocked(outbound)
 }
 
 func (e *inspectionExchange) Unassign() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.rayID != 0 || !e.published {
+	if e.isLeg || !e.published {
 		e.bindLocked(featurestats.OutboundRef{})
 	}
 }
@@ -370,13 +321,12 @@ func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 	if e.excluded || e.bound {
 		return
 	}
-	if e.rayID == 0 {
+	if !e.isLeg {
 		e.registerLocked()
 		e.admitLocked()
 	}
 	e.bucket = e.store.bucketFor(outbound, e.record.Origin)
 	e.bound = true
-	e.observeLocked(featurestats.ObservationSelection)
 }
 
 // Prepared TCP may still prove to be a carrier. Classify once, then credit its
@@ -399,11 +349,10 @@ func (e *inspectionExchange) SetSource(source xnet.Destination) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.excluded || e.published || e.rayID != 0 || e.record.Source.IsValid() {
+	if e.excluded || e.published || e.isLeg || e.record.Source.IsValid() {
 		return
 	}
 	e.record.Source = source
-	e.observeLocked(featurestats.ObservationEndpoint)
 }
 
 func (e *inspectionExchange) PacketDestination(destination xnet.Destination) {
@@ -411,13 +360,11 @@ func (e *inspectionExchange) PacketDestination(destination xnet.Destination) {
 	defer e.mu.Unlock()
 	// A selected leg may end before the dispatcher records its first packet.
 	// Like late byte receipts, its address still belongs to the shared flow;
-	// root Finish already freezes the visible terminal by copying the record.
-	if e.excluded || (e.rayID == 0 && e.published) || e.provenanceConflict || !destination.IsValid() {
+	// root Finish has already removed the live entry.
+	if e.excluded || (!e.isLeg && e.published) || e.provenanceConflict || !destination.IsValid() {
 		return
 	}
 	e.record.Destination = destination
-	e.rayDestination = destination
-	e.observeLocked(featurestats.ObservationDestination)
 }
 
 func (e *inspectionExchange) AddUplink(value uint64) {
@@ -435,14 +382,10 @@ func (e *inspectionExchange) RecordPacketInput(destination xnet.Destination, val
 	if e.excluded || e.provenanceConflict {
 		return
 	}
-	if (e.rayID != 0 || !e.published) && destination.IsValid() {
+	if (e.isLeg || !e.published) && destination.IsValid() {
 		e.record.Destination = destination
-		e.rayDestination = destination
 	}
 	e.addUplinkLocked(value)
-	if (e.rayID != 0 || !e.published) && destination.IsValid() {
-		e.observeLocked(featurestats.ObservationDestination)
-	}
 }
 
 func (e *inspectionExchange) addUplinkLocked(value uint64) {
@@ -491,15 +434,15 @@ func (e *inspectionExchange) Rebind(runtime featurestats.RuntimeID, origin featu
 }
 
 func (e *inspectionExchange) Finish() {
-	if e.rayID != 0 {
+	if e.isLeg {
 		return
 	}
 	e.mu.Lock()
-	var terminal featurestats.TerminalRecord
-	publish := e.completeLocked(&terminal)
+	remove := e.completeLocked()
+	ref := e.record.Ref
 	e.mu.Unlock()
-	if publish {
-		e.store.publish(e, terminal)
+	if remove {
+		e.store.remove(e, ref)
 	}
 }
 
@@ -516,7 +459,7 @@ func (e *inspectionExchange) requestStop() (func() error, error) {
 	return e.stop, nil
 }
 
-func (e *inspectionExchange) completeLocked(terminal *featurestats.TerminalRecord) bool {
+func (e *inspectionExchange) completeLocked() bool {
 	if e.published {
 		return false
 	}
@@ -525,17 +468,16 @@ func (e *inspectionExchange) completeLocked(terminal *featurestats.TerminalRecor
 		e.stop = nil
 		return false
 	}
-	if !e.bound && e.nextRayID == 0 {
+	if !e.bound && !e.hasLeg {
 		e.bindLocked(featurestats.OutboundRef{})
 	}
 	e.published = true
-	e.observeLocked(featurestats.ObservationEnd)
+
 	// Owner-end disables stop; late byte receipts only need the accounting state.
 	e.stop = nil
 	if e.record.Ref.ID == 0 {
 		return false
 	}
-	*terminal = featurestats.TerminalRecord{Flow: e.record, Ended: e.store.elapsed()}
 	return true
 }
 
@@ -549,17 +491,13 @@ func normalizeOrigin(origin featurestats.TrafficOrigin) featurestats.TrafficOrig
 }
 
 var defaultObservationOptions = featurestats.ObservationOptions{
-	MaxLive:      256,
-	MaxTerminals: 1024,
-	MaxBuckets:   1024,
+	MaxLive:    256,
+	MaxBuckets: 1024,
 }
 
 func normalizeObservationOptions(options featurestats.ObservationOptions) featurestats.ObservationOptions {
 	if options.MaxLive == 0 {
 		options.MaxLive = defaultObservationOptions.MaxLive
-	}
-	if options.MaxTerminals == 0 {
-		options.MaxTerminals = defaultObservationOptions.MaxTerminals
 	}
 	if options.MaxBuckets == 0 {
 		options.MaxBuckets = defaultObservationOptions.MaxBuckets

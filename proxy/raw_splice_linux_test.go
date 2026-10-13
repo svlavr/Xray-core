@@ -7,14 +7,16 @@ import (
 	"errors"
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/app/dispatcher"
+	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type rawSpliceTestCounter struct {
@@ -59,7 +61,6 @@ func (e *rawSpliceTestExchange) AddDownlink(n uint64) {
 
 type rawSpliceResult struct {
 	written int64
-	handled bool
 	err     error
 }
 
@@ -70,16 +71,12 @@ func TestRawSpliceTCPProgressAndCounters(t *testing.T) {
 	readCounter := new(rawSpliceTestCounter)
 	writeCounter := new(rawSpliceTestCounter)
 	userCounter := new(rawSpliceTestCounter)
-	receipt := &rawCopyReceipt{
-		exchange:     exchange,
-		readCounter:  readCounter,
-		writeCounter: writeCounter,
-		userCounter:  userCounter,
-	}
+	ctx, _, timer := rawSpliceContext(t, destinationWriter, 1)
+	writer := rawSpliceObservedWriter(destinationWriter, exchange, writeCounter, userCounter)
 	result := make(chan rawSpliceResult, 1)
 	go func() {
-		handled, err := copySpliceProgress(destinationWriter, sourceReader, receipt)
-		result <- rawSpliceResult{handled: handled, err: err}
+		err := CopyRawConnIfExist(ctx, &stat.CounterConnection{Connection: sourceReader, ReadCounter: readCounter}, destinationWriter, writer, timer, nil)
+		result <- rawSpliceResult{err: err}
 	}()
 
 	first := []byte("progress-before-source-eof")
@@ -126,16 +123,15 @@ func TestRawSpliceTCPProgressAndCounters(t *testing.T) {
 	}
 	completed := waitRawSpliceResult(t, result)
 	want := int64(len(first) + len(second))
-	if !completed.handled || completed.err != nil {
-		t.Fatalf("copy result = %+v, want handled bytes=%d", completed, want)
+	if completed.err != nil {
+		t.Fatalf("copy result = %+v, want bytes=%d", completed, want)
 	}
 	assertRawSpliceReceipts(t, want, exchange, readCounter, writeCounter, userCounter)
 }
 
-func TestRawSpliceUnixAndPipeCleanup(t *testing.T) {
+func TestRawSpliceUnixSourceEOF(t *testing.T) {
 	sourceWriter, sourceReader := newRawUnixPair(t)
 	destinationWriter, destinationReader := newRawTCPPair(t)
-	before := rawSpliceFDCount(t)
 	payload := bytes.Repeat([]byte("unix-stream-"), 8192)
 	writeDone := make(chan error, 1)
 	go func() {
@@ -147,13 +143,13 @@ func TestRawSpliceUnixAndPipeCleanup(t *testing.T) {
 	}()
 
 	exchange := new(rawSpliceTestExchange)
-	counter := new(rawSpliceTestCounter)
+	readCounter, writeCounter, userCounter := new(rawSpliceTestCounter), new(rawSpliceTestCounter), new(rawSpliceTestCounter)
+	ctx, _, timer := rawSpliceContext(t, destinationWriter, 1)
+	writer := rawSpliceObservedWriter(destinationWriter, exchange, writeCounter, userCounter)
 	result := make(chan rawSpliceResult, 1)
 	go func() {
-		handled, err := copySpliceProgress(destinationWriter, sourceReader, &rawCopyReceipt{
-			exchange: exchange, readCounter: counter, writeCounter: counter, userCounter: counter,
-		})
-		result <- rawSpliceResult{handled: handled, err: err}
+		err := CopyRawConnIfExist(ctx, &stat.CounterConnection{Connection: sourceReader, ReadCounter: readCounter}, destinationWriter, writer, timer, nil)
+		result <- rawSpliceResult{err: err}
 	}()
 	if err := destinationReader.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -166,40 +162,10 @@ func TestRawSpliceUnixAndPipeCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	completed := waitRawSpliceResult(t, result)
-	if !completed.handled || completed.err != nil || exchange.downlink.Load() != uint64(len(payload)) || !bytes.Equal(got, payload) {
+	if completed.err != nil || exchange.downlink.Load() != uint64(len(payload)) || !bytes.Equal(got, payload) {
 		t.Fatalf("unix copy result=%+v equal=%v", completed, bytes.Equal(got, payload))
 	}
-	if after := rawSpliceFDCount(t); after != before {
-		t.Fatalf("pipe descriptors leaked: before=%d after=%d", before, after)
-	}
-}
-
-func TestRawSpliceUnsupportedDoesNotConsume(t *testing.T) {
-	source, sourcePeer := net.Pipe()
-	t.Cleanup(func() { source.Close() })
-	t.Cleanup(func() { sourcePeer.Close() })
-	destinationWriter, _ := newRawTCPPair(t)
-	payload := []byte("fallback-owned-prefix")
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := sourcePeer.Write(payload)
-		writeDone <- err
-	}()
-
-	handled, err := copySpliceProgress(destinationWriter, source, &rawCopyReceipt{})
-	if handled || err != nil {
-		t.Fatalf("unsupported result = handled=%v err=%v", handled, err)
-	}
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(source, got); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-writeDone; err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("fallback data changed: %q", got)
-	}
+	assertRawSpliceReceipts(t, int64(len(payload)), exchange, readCounter, writeCounter, userCounter)
 }
 
 func TestRawSpliceDeadlinePreservesPositivePrefix(t *testing.T) {
@@ -224,23 +190,24 @@ func TestRawSpliceDeadlinePreservesPositivePrefix(t *testing.T) {
 	readCounter := new(rawSpliceTestCounter)
 	writeCounter := new(rawSpliceTestCounter)
 	userCounter := new(rawSpliceTestCounter)
-	receipt := &rawCopyReceipt{
-		exchange: exchange, readCounter: readCounter, writeCounter: writeCounter, userCounter: userCounter,
-	}
-	before := rawSpliceFDCount(t)
-	handled, err := copySpliceProgress(destinationWriter, sourceReader, receipt)
+	ctx, _, timer := rawSpliceContext(t, destinationWriter, 1)
+	writer := rawSpliceObservedWriter(destinationWriter, exchange, writeCounter, userCounter)
+	err := CopyRawConnIfExist(ctx, &stat.CounterConnection{Connection: sourceReader, ReadCounter: readCounter}, destinationWriter, writer, timer, nil)
 	written := int64(exchange.downlink.Load())
-	if after := rawSpliceFDCount(t); after != before {
-		t.Fatalf("failed splice leaked pipe descriptors: before=%d after=%d", before, after)
-	}
-	if !handled || err == nil || written <= 0 {
-		t.Fatalf("deadline result = written=%d handled=%v err=%v", written, handled, err)
+	if err == nil || written <= 0 {
+		t.Fatalf("deadline result = written=%d err=%v", written, err)
 	}
 	var timeout interface{ Timeout() bool }
 	if !errors.As(err, &timeout) || !timeout.Timeout() {
 		t.Fatalf("deadline error is not observable as timeout: %T %v", err, err)
 	}
-	assertRawSpliceReceipts(t, written, exchange, readCounter, writeCounter, userCounter)
+	assertRawSpliceReceipts(t, written, exchange, writeCounter)
+	// Native buffered input and USER counters describe consumed/offered bytes,
+	// while the receipt and destination counter describe actual accepted writes.
+	consumed := readCounter.Value()
+	if consumed <= written || userCounter.Value() != consumed {
+		t.Fatalf("partial copy accepted=%d consumed=%d offered=%d", written, consumed, userCounter.Value())
+	}
 	if err := sourceReader.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -256,8 +223,8 @@ func TestRawSpliceDeadlinePreservesPositivePrefix(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("source writer did not unblock after copy failure")
 	}
-	if got := written + int64(len(remaining)); got >= int64(len(payload)) {
-		t.Fatalf("splice failure did not consume any uncredited pipe residue: accepted=%d unread=%d payload=%d", written, len(remaining), len(payload))
+	if got := consumed + int64(len(remaining)); got != int64(len(payload)) {
+		t.Fatalf("consumed/unread custody: consumed=%d unread=%d payload=%d", consumed, len(remaining), len(payload))
 	}
 }
 
@@ -356,11 +323,9 @@ func assertRawSpliceReceipts(t *testing.T, want int64, exchange *rawSpliceTestEx
 	}
 }
 
-func rawSpliceFDCount(t *testing.T) int {
-	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return len(entries)
+// Each native counter retains its own role; only completed transfers make
+// consumed input, offered USER bytes and accepted destination bytes equal.
+func rawSpliceObservedWriter(dst net.Conn, exchange stats.Exchange, writeCounter, userCounter stats.Counter) buf.Writer {
+	writer := buf.NewWriter(&stat.CounterConnection{Connection: dst, WriteCounter: writeCounter})
+	return &dispatcher.SizeStatWriter{Writer: buf.AttachWriterReceipt(writer, exchange), Counter: userCounter}
 }

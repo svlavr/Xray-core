@@ -43,7 +43,7 @@ type ICMPEchoReceipt struct {
 	Elapsed      time.Duration // Admission through I/O completion, excluding cleanup.
 }
 
-// ICMPEcho executes one endpoint Echo. Existing RunSeries supplies repetitions.
+// ICMPEcho executes one endpoint Echo.
 // It does not invoke a system ping process, a proxy route or a shared socket.
 func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (receipt ICMPEchoReceipt, resultErr error) {
 	if ctx == nil || !request.Route.valid() || !request.Destination.IsValid() || request.Destination.Zone() != "" || request.Timeout <= 0 {

@@ -78,23 +78,23 @@ func TestSOCKSUDPResponseReceipts(t *testing.T) {
 				t.Fatal("response did not release input")
 			}
 			flow.Finish()
-			page, _ := view.ReadTerminals()
-			if len(page.Rows) != 1 {
-				t.Fatal("missing response terminal")
+			totals, err := view.ReadTotals()
+			if err != nil {
+				t.Fatal(err)
 			}
-			fact := page.Rows[0].Flow.Downlink
+			fact := totals.User.Downlink
 			switch mode {
 			case "full", "full-error":
 				if fact != want {
-					t.Fatalf("full datagram receipt: %+v", fact)
+					t.Fatalf("decoded packet bytes: %d want %d", fact, want)
 				}
 			case "partial-error":
 				if fact != 0 {
-					t.Fatalf("partial datagram receipt: %+v", fact)
+					t.Fatalf("failed packet invented bytes: %d", fact)
 				}
 			default:
 				if fact != 0 {
-					t.Fatalf("drop receipt: %+v", fact)
+					t.Fatalf("failed packet invented bytes: %d", fact)
 				}
 			}
 			if (mode == "missing-header" || mode == "encode-error") && calls != 0 {

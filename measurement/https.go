@@ -2,10 +2,8 @@ package measurement
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"io"
 	"math"
@@ -251,23 +249,4 @@ func readHTTPSBody(response *http.Response, receipt *HTTPSReceipt, limit int64) 
 	receipt.Body, receipt.BodyBytes = body, int64(len(body))
 	receipt.BodyComplete = err == nil
 	return err
-}
-
-func withNonce(rawURL, operation string) (string, string, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "", "", errors.New("invalid " + operation + " URL")
-	}
-	query, err := url.ParseQuery(u.RawQuery)
-	if err != nil || query.Has("nonce") {
-		return "", "", errors.New("invalid or conflicting " + operation + " nonce query")
-	}
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", "", err
-	}
-	nonce := hex.EncodeToString(random[:])
-	query.Set("nonce", nonce)
-	u.RawQuery = query.Encode()
-	return u.String(), nonce, nil
 }

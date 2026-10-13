@@ -53,11 +53,7 @@ func (e *inspectionLegFinish) Finish() {
 func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
-	capture, err := view.CaptureObservations(32)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { capture.Close() })
+
 	t.Cleanup(func() { manager.Close() })
 	dest := net.UDPDestination(net.LocalHostIP, 53)
 	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, dest, nil)
@@ -84,35 +80,10 @@ func TestUDPDispatcherInspectionEarlyRayFinishBeforeSelectedRole(t *testing.T) {
 	d.Dispatch(context.Background(), dest, buf.FromBytes([]byte("pending input")))
 	lifecycleWait(t, legFinished)
 	root.Finish()
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != uint64(len("pending input")) {
-		t.Fatalf("owner-end pending snapshot: %+v", page)
-	}
+
 	close(roleSelected)
 	lifecycleWait(t, selectedDone)
-	var requested, selected bool
-	var rayID, flowID uint64
-	for _, event := range capture.ReadInto(nil).Rows {
-		if event.RayID == 0 {
-			continue
-		}
-		if rayID != 0 && (event.RayID != rayID || event.FlowID != flowID) {
-			t.Fatal("one native ray lost its capture identity")
-		}
-		rayID, flowID = event.RayID, event.FlowID
-		if event.Flow.Destination != dest {
-			t.Fatalf("native ray has another destination: %+v", event)
-		}
-		requested = requested || event.Kind == fs.ObservationDestination && !event.Selected
-		selected = selected || event.Kind == fs.ObservationSelection && event.Selected && event.Flow.Outbound.Tag == "ordinary"
-	}
-	if !requested || !selected || rayID == 0 || flowID == 0 {
-		t.Fatal("capture lost pending input or late selected route")
-	}
-	again, _ := view.ReadTerminals()
-	if len(again.Rows) != 1 || again.Rows[0].Flow.Uplink != uint64(len("pending input")) {
-		t.Fatalf("selected role changed immutable terminal: %+v", again)
-	}
+
 	totals, _ := view.ReadTotals()
 	for _, total := range totals.Rows {
 		if total.Outbound.Tag == "ordinary" {
@@ -144,12 +115,9 @@ func TestUDPDispatcherInspectionSynchronousRejection(t *testing.T) {
 	}
 	d.RemoveRay()
 	root.Finish()
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != want || page.Rows[0].Flow.Downlink != 0 || page.Rows[0].Flow.Outbound.Tag != "" {
-		t.Fatalf("synchronous rejection lost decoded custody: %+v", page.Rows)
-	}
+
 	totals, _ := view.ReadTotals()
-	if totals.User.Uplink != want || len(totals.Rows) != 0 {
+	if totals.User.Uplink != want || totals.User.Downlink != 0 || len(totals.Rows) != 0 {
 		t.Fatalf("rejected general total: %+v", totals)
 	}
 }
@@ -208,19 +176,16 @@ func TestUDPDispatcherInspectionOverlappingRays(t *testing.T) {
 	old.Close() // A stale close must leave the new entry intact.
 	outputs[1].WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("new response"))})
 	lifecycleWait(t, secondDone)
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != root.Ref() || live.Rows[0].Outbound.Tag != "ray-2" || live.Rows[0].Uplink != 18 || live.Rows[0].Downlink != 12 {
+		t.Fatalf("overlapping ray live facts: %+v %v", live, err)
+	}
 	d.RemoveRay()
 	root.Finish()
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 18 || page.Rows[0].Flow.Downlink != 12 {
-		t.Fatalf("owner-end association snapshot: %+v", page)
-	}
+
 	close(releaseFirst)
 	lifecycleWait(t, firstDone)
-	page, _ = view.ReadTerminals()
-	row := page.Rows[0].Flow
-	if row.Ref != root.Ref() || row.Uplink != 18 || row.Downlink != 12 || row.Outbound.Tag != "ray-2" {
-		t.Fatalf("overlapping ray facts: %+v", row)
-	}
+
 	totals, _ := view.ReadTotals()
 	if len(totals.Rows) != 2 || totals.User != (fs.ClientTotals{Uplink: 18, Downlink: 24}) {
 		t.Fatalf("late ray general bytes/buckets: %+v", totals)
@@ -252,12 +217,15 @@ func TestUDPDispatcherInspectionUnclaimedOwner(t *testing.T) {
 	d.Observation = root
 	d.callClose = func() error { close(done); return nil }
 	d.Dispatch(context.Background(), dest, buf.FromBytes([]byte("unknown owner")))
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != root.Ref() || live.Rows[0].Outbound.Tag != "" || live.Rows[0].Destination != dest || live.Rows[0].Uplink != uint64(len("unknown owner")) || live.Rows[0].Downlink != 0 {
+		t.Fatalf("unclaimed native owner facts: %+v %v", live, err)
+	}
 	d.RemoveRay()
 	root.Finish()
 	lifecycleWait(t, done)
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "" {
-		t.Fatalf("unclaimed owner snapshot: %+v", page)
+	if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("joined unclaimed root remained live: %+v %v", live, err)
 	}
 }
 
@@ -317,20 +285,20 @@ func TestInspectionDispatcherAPIConsumption(t *testing.T) {
 	if err != nil || n != len(read) {
 		t.Fatalf("ReadFrom %d/%d: %v", n, len(read), err)
 	}
+	live, err = view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != root.Ref() || live.Rows[0].Uplink != uint64(len(payload)) || live.Rows[0].Downlink != uint64(n) || live.Rows[0].Destination != destination || live.Rows[0].Outbound.Tag != "api" {
+		t.Fatalf("API consumed bytes/destination: %+v %v", live, err)
+	}
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		page, err := view.ReadTerminals()
+		live, err := view.ReadLiveInto(nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(page.Rows) == 1 {
-			flow := page.Rows[0].Flow
-			if flow.Uplink != uint64(len(payload)) || flow.Downlink != uint64(n) || flow.Destination != destination || flow.Outbound.Tag != "api" {
-				t.Fatalf("API dispatcher facts: %+v", flow)
-			}
+		if len(live.Rows) == 0 {
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -381,29 +349,32 @@ func TestInspectionDispatcherAPINaturalEndDrainsBeforeFinish(t *testing.T) {
 	if !c.done.Done() {
 		t.Fatal("native ray did not end")
 	}
-	if page, _ := view.ReadTerminals(); len(page.Rows) != 0 {
-		t.Fatalf("native EOF finished root before queued response read: %+v", page.Rows)
+
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != root.Ref() || live.Rows[0].Downlink != 0 {
+		t.Fatalf("queued native end retired root before delivery: %+v %v", live, err)
 	}
 	read := make([]byte, len(responsePayload))
 	n, _, err := packetConn.ReadFrom(read)
 	if err != nil || n != len(responsePayload) {
 		t.Fatalf("read queued response %d/%d: %v", n, len(responsePayload), err)
 	}
-	if page, _ := view.ReadTerminals(); len(page.Rows) != 0 {
-		t.Fatalf("last queued response finished before caller observed EOF: %+v", page.Rows)
+
+	live, err = view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Downlink != uint64(n) {
+		t.Fatalf("delivered packet root before EOF: %+v %v", live, err)
 	}
 	if _, _, err := packetConn.ReadFrom(read); !errors.Is(err, io.EOF) {
 		t.Fatalf("post-drain read: %v", err)
 	}
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != uint64(len(responsePayload)) {
-		t.Fatalf("post-drain terminal: %+v", page.Rows)
+	if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("EOF retained API root: %+v %v", live, err)
 	}
 }
 
 func TestInspectionDispatcherAPIExplicitCloseDrainsCache(t *testing.T) {
 	manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
-	view, _ := manager.EnableInspection(fs.ObservationOptions{})
+	_, _ = manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
 	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
 	rootObservation := &session.LogicalObservation{Exchange: root, InputAtExecution: true}
@@ -438,10 +409,6 @@ func TestInspectionDispatcherAPIExplicitCloseDrainsCache(t *testing.T) {
 	c.callback(callbackCtx, &protocoludp.Packet{Payload: late})
 	if !late.IsEmpty() || len(c.cache) != 0 {
 		t.Fatalf("callback enqueued after close: empty=%v cache=%d", late.IsEmpty(), len(c.cache))
-	}
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 {
-		t.Fatalf("explicit-close loss facts: %+v", page.Rows)
 	}
 }
 
@@ -528,7 +495,7 @@ func TestInspectionDispatcherAPIReadCloseSamePacket(t *testing.T) {
 	manager, _ := appstats.NewManager(context.Background(), &appstats.Config{})
 	view, _ := manager.EnableInspection(fs.ObservationOptions{})
 	t.Cleanup(func() { manager.Close() })
-	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginInternal, net.Destination{}, net.Destination{}, nil)
+	root := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
 	rootObservation := &session.LogicalObservation{Exchange: root, InputAtExecution: true}
 	rootObservation.ReturnedLink.Store(true)
 	packetConn, err := DialDispatcher(session.ContextWithLogicalObservation(context.Background(), rootObservation), lifecycleDispatcher{})
@@ -572,9 +539,12 @@ func TestInspectionDispatcherAPIReadCloseSamePacket(t *testing.T) {
 	if read.n != 0 && (read.n != len("racing response") || read.err != nil) {
 		t.Fatalf("returned read: %d %v", read.n, read.err)
 	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != uint64(read.n) || !payload.IsEmpty() {
-		t.Fatalf("read/close terminal: %+v %v released=%v", page.Rows, err, payload.IsEmpty())
+	if !payload.IsEmpty() {
+		t.Fatal("joined read/close retained packet payload")
+	}
+	totals, err := view.ReadTotals()
+	if err != nil || totals.User.Downlink != uint64(read.n) || len(totals.Rows) != 1 || totals.Rows[0].Outbound.Tag != "api" || totals.Rows[0].Downlink != uint64(read.n) {
+		t.Fatalf("persistent read/close byte totals: %+v %v read=%d", totals, err, read.n)
 	}
 }
 
@@ -616,9 +586,11 @@ func TestInspectionDispatcherAPIUnclaimedEndReconcilesBeforeEOF(t *testing.T) {
 		t.Fatalf("EOF reached caller before ray reconciliation: %v", err)
 	case <-time.After(30 * time.Millisecond):
 	}
-	if page, _ := view.ReadTerminals(); len(page.Rows) != 0 {
+
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref != root.Ref() || live.Rows[0].Outbound.Tag != "" || live.Rows[0].Destination != destination || live.Rows[0].Uplink != 0 || live.Rows[0].Downlink != 0 {
 		c.dispatcher.Unlock()
-		t.Fatalf("unclaimed root published before ray reconciliation: %+v", page.Rows)
+		t.Fatalf("unclaimed root before reconciliation: %+v %v", live, err)
 	}
 	c.dispatcher.Unlock()
 	select {
@@ -629,8 +601,7 @@ func TestInspectionDispatcherAPIUnclaimedEndReconcilesBeforeEOF(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("unclaimed ray did not retire")
 	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Outbound.Tag != "" {
-		t.Fatalf("unclaimed root terminal: %+v %v", page.Rows, err)
+	if live, err := view.ReadLiveInto(nil); err != nil || len(live.Rows) != 0 {
+		t.Fatalf("joined unclaimed API root remained live: %+v %v", live, err)
 	}
 }

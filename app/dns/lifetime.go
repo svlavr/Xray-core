@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
@@ -65,15 +66,15 @@ func (o *resolverOwner) closeResources() error {
 	return errors.Join(errs...)
 }
 
-// closeOwned shares one terminal close and query join between retirement callers.
+// closeOwned shares one terminal close, query join and pending-slot cleanup.
 // The resolver is already retired and canceled under dnsRuntime.mu.
-func (o *resolverOwner) closeOwned() error {
-	o.startClose()
+func (o *resolverOwner) closeOwned(rt *dnsRuntime) error {
+	o.startClose(rt)
 	<-o.closeDone
 	return o.closeErr
 }
 
-func (o *resolverOwner) startClose() {
+func (o *resolverOwner) startClose(rt *dnsRuntime) {
 	o.closeOnce.Do(func() {
 		go func() {
 			o.closeErr = o.closeResources()
@@ -82,6 +83,11 @@ func (o *resolverOwner) startClose() {
 				engine.close()
 			}
 			o.resolver.queries.Wait()
+			rt.mu.Lock()
+			if rt.closing == o {
+				rt.closing = nil
+			}
+			rt.mu.Unlock()
 			close(o.closeDone)
 		}()
 	})
@@ -102,6 +108,14 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	if err := ctx.Err(); err != nil {
 		return ApplyResult{Err: err}
 	}
+	var program *xlua.Program
+	if clone.Script != "" {
+		var err error
+		program, err = xlua.Compile(clone.Script)
+		if err != nil {
+			return ApplyResult{Err: err}
+		}
+	}
 	var dispatcher routing.Dispatcher
 	var fake featuredns.FakeDNSEngine
 	if instance := core.FromContext(s.ctx); instance != nil {
@@ -112,12 +126,12 @@ func (s *DNS) applyConfig(ctx context.Context, config *Config) ApplyResult {
 	if core.FromContext(s.ctx) != nil {
 		base = core.ToBackgroundDetachedContext(s.ctx)
 	}
-	candidate, err := buildDNS(base, clone, dispatcher, fake)
+	candidate, err := buildDNS(base, clone, dispatcher, fake, program)
 	if err != nil {
 		return ApplyResult{Err: err}
 	}
 	candidate.strictSelection = true
-	if candidate.scriptPath != "" {
+	if candidate.scriptProgram != nil {
 		return s.applyScript(ctx, candidate)
 	}
 	unsafeSystemDNS := resolverMayUseSystem(candidate)

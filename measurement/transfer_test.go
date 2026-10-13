@@ -3,15 +3,11 @@ package measurement_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -39,22 +35,11 @@ func downloadRequest(s *httptest.Server, kind measurement.RouteKind) measurement
 }
 
 func uploadRequest(s *httptest.Server, kind measurement.RouteKind) measurement.UploadRequest {
-	return measurement.UploadRequest{HTTPS: request(s, kind), PayloadBytes: 128<<10 + 7, TransferTimeout: time.Second, RequireAcknowledgment: true}
+	return measurement.UploadRequest{HTTPS: request(s, kind), PayloadBytes: 128<<10 + 7, TransferTimeout: time.Second}
 }
 
-func acknowledge(w http.ResponseWriter, r *http.Request) {
-	digest := sha256.New()
-	n, err := io.Copy(digest, r.Body)
-	if err != nil {
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"nonce": r.URL.Query().Get("nonce"), "bytes": n, "sha256": hex.EncodeToString(digest.Sum(nil))})
-}
-
-func TestDownloadDirectExactStreamDigestAndLimits(t *testing.T) {
+func TestDownloadDirectExactStreamAndLimits(t *testing.T) {
 	payload := bytes.Repeat([]byte("fixed-payload"), 100000)
-	digest := sha256.Sum256(payload)
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.Header.Get("Accept-Encoding") != "" {
 			t.Error("unexpected request semantics")
@@ -74,34 +59,21 @@ func TestDownloadDirectExactStreamDigestAndLimits(t *testing.T) {
 		for _, path := range []string{"/fixed", "/chunked"} {
 			req := downloadRequest(s, kind)
 			req.HTTPS.URL += path
-			req.ExpectedSHA256 = &digest
 			r, err := e.Download(context.Background(), req)
-			if err != nil || r.PayloadBytes != int64(len(payload)) || r.SHA256 == nil || *r.SHA256 != digest || !r.HTTPS.BodyComplete || !r.IntegrityVerified || r.ActiveElapsed == nil || r.DeclaredLength == nil || len(r.HTTPS.Body) != 0 || r.HTTPS.BodyBytes != 0 {
+			if err != nil || r.PayloadBytes != int64(len(payload)) || !r.HTTPS.BodyComplete || r.ActiveElapsed == nil || r.DeclaredLength == nil || len(r.HTTPS.Body) != 0 || r.HTTPS.BodyBytes != 0 {
 				t.Fatalf("complete stream: %+v %v", r, err)
 			}
-
 		}
 		limited := downloadRequest(s, kind)
 		limited.HTTPS.MaxBodyBytes = 65539
 		r, err := e.Download(context.Background(), limited)
-		if err != nil || r.PayloadBytes != limited.HTTPS.MaxBodyBytes || !r.ByteLimitReached || r.HTTPS.BodyComplete || r.SHA256 != nil || r.IntegrityVerified {
+		if err != nil || r.PayloadBytes != limited.HTTPS.MaxBodyBytes || !r.ByteLimitReached || r.HTTPS.BodyComplete {
 			t.Fatalf("bounded prefix: %+v %v", r, err)
-		}
-		limited.ExpectedSHA256 = &digest
-		if r, err := e.Download(context.Background(), limited); !errors.Is(err, measurement.ErrIntegrityIncomplete) || r.IntegrityVerified {
-			t.Fatalf("partial integrity: %+v %v", r, err)
 		}
 		exact := downloadRequest(s, kind)
 		exact.HTTPS.MaxBodyBytes = int64(len(payload))
-		exact.ExpectedSHA256 = &digest
-		if r, err := e.Download(context.Background(), exact); err != nil || !r.HTTPS.BodyComplete || !r.IntegrityVerified || !r.ByteLimitReached {
+		if r, err := e.Download(context.Background(), exact); err != nil || !r.HTTPS.BodyComplete || !r.ByteLimitReached {
 			t.Fatalf("exact fixed-length cap: %+v %v", r, err)
-		}
-		wrong := digest
-		wrong[0] ^= 1
-		exact.ExpectedSHA256 = &wrong
-		if r, err := e.Download(context.Background(), exact); !errors.Is(err, measurement.ErrDigestMismatch) || r.IntegrityVerified || *r.SHA256 != digest {
-			t.Fatalf("digest mismatch: %+v %v", r, err)
 		}
 	}
 }
@@ -120,7 +92,7 @@ func TestDownloadPartialFramingAndPhaseTimeout(t *testing.T) {
 	for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
 		req := downloadRequest(s, kind)
 		r, err := e.Download(context.Background(), req)
-		if !errors.Is(err, io.ErrUnexpectedEOF) || r.PayloadBytes != 6 || r.HTTPS.BodyComplete || r.SHA256 != nil {
+		if !errors.Is(err, io.ErrUnexpectedEOF) || r.PayloadBytes != 6 || r.HTTPS.BodyComplete {
 			t.Fatalf("early EOF: %+v %v", r, err)
 		}
 		req.HTTPS.URL += "/stall"
@@ -132,113 +104,56 @@ func TestDownloadPartialFramingAndPhaseTimeout(t *testing.T) {
 	}
 }
 
-func TestUploadDirectExactCountsNonceAndACK(t *testing.T) {
+func TestUploadDirectExactCounts(t *testing.T) {
 	var calls atomic.Int32
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		if r.Method != http.MethodPost || r.ContentLength != -1 || len(r.TransferEncoding) != 1 || r.TransferEncoding[0] != "chunked" || r.Header.Get("Content-Type") != "application/octet-stream" {
 			t.Error("upload counting framing changed")
 		}
-		acknowledge(w, r)
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, "raw-response")
 	}))
 	defer s.Close()
 	e := executor(t, instance(t))
-	nonces := make(map[string]bool)
 	for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
 		req := uploadRequest(s, kind)
 		r, err := e.Upload(context.Background(), req)
-		if err != nil || r.GeneratedBytes != req.PayloadBytes || r.WriterAcceptedBytes != req.PayloadBytes || r.ActiveElapsed == nil || r.WriterAcceptedSHA256 == nil || r.Acknowledgment == nil || r.Acknowledgment.Bytes != req.PayloadBytes || r.Acknowledgment.SHA256 != *r.WriterAcceptedSHA256 || !r.HTTPS.BodyComplete {
+		if err != nil || r.GeneratedBytes != req.PayloadBytes || r.WriterAcceptedBytes != req.PayloadBytes || r.ActiveElapsed == nil || !r.HTTPS.BodyComplete {
 			t.Fatalf("upload facts: %+v %v", r, err)
 		}
-		if len(r.Nonce) != 32 || nonces[r.Nonce] {
-			t.Fatal("nonce reused")
-		}
-		nonces[r.Nonce] = true
-
 	}
 	if calls.Load() != 2 {
 		t.Fatal("extra endpoint exchange")
 	}
 }
 
-func TestUploadACKRejectionAndRawResponse(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(map[string]any) string
-		status int
-		media  string
-	}{
-		{"nonce", func(a map[string]any) string { a["nonce"] = "wrong"; b, _ := json.Marshal(a); return string(b) }, 200, "application/json"},
-		{"count", func(a map[string]any) string { a["bytes"] = 1; b, _ := json.Marshal(a); return string(b) }, 200, "application/json"},
-		{"digest", func(a map[string]any) string {
-			a["sha256"] = strings.Repeat("0", 64)
-			b, _ := json.Marshal(a)
-			return string(b)
-		}, 200, "application/json"},
-		{"duplicate", func(a map[string]any) string {
-			b, _ := json.Marshal(a)
-			return strings.TrimSuffix(string(b), "}") + `,"bytes":1}`
-		}, 200, "application/json"},
-		{"unknown", func(a map[string]any) string { a["extra"] = true; b, _ := json.Marshal(a); return string(b) }, 200, "application/json"},
-		{"null", func(a map[string]any) string { a["bytes"] = nil; b, _ := json.Marshal(a); return string(b) }, 200, "application/json"},
-		{"string-count", func(a map[string]any) string { a["bytes"] = "131079"; b, _ := json.Marshal(a); return string(b) }, 200, "application/json"},
-		{"fraction", func(a map[string]any) string { a["bytes"] = 1.5; b, _ := json.Marshal(a); return string(b) }, 200, "application/json"},
-		{"missing", func(a map[string]any) string { delete(a, "nonce"); b, _ := json.Marshal(a); return string(b) }, 200, "application/json"},
-		{"extra-json", func(a map[string]any) string { b, _ := json.Marshal(a); return string(b) + "{}" }, 200, "application/json"},
-		{"invalid-utf8", func(a map[string]any) string { return "{\"nonce\":\"\xff\"}" }, 200, "application/json"},
-		{"status", func(a map[string]any) string { b, _ := json.Marshal(a); return string(b) }, 201, "application/json"},
-		{"media", func(a map[string]any) string { b, _ := json.Marshal(a); return string(b) }, 200, "text/plain"},
-		{"parameter", func(a map[string]any) string { b, _ := json.Marshal(a); return string(b) }, 200, "application/json; boundary=x"},
-		{"oversize", func(a map[string]any) string { return strings.Repeat("x", (16<<10)+1) }, 200, "application/json"},
-	}
+func TestUploadRawResponse(t *testing.T) {
 	e := executor(t, instance(t))
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				h := sha256.New()
-				n, err := io.Copy(h, r.Body)
-				if err != nil {
-					return
-				}
-				w.Header().Set("Content-Type", tc.media)
-				w.WriteHeader(tc.status)
-				io.WriteString(w, tc.mutate(map[string]any{"nonce": r.URL.Query().Get("nonce"), "bytes": n, "sha256": hex.EncodeToString(h.Sum(nil))}))
-			}))
-			defer s.Close()
-			req := uploadRequest(s, measurement.Direct)
-			req.HTTPS.MaxBodyBytes = 1 << 20
-			r, err := e.Upload(context.Background(), req)
-			ordinaryJSON := tc.name == "unknown" || tc.name == "media" || tc.name == "parameter"
-			if ordinaryJSON {
-				if err != nil || r.Acknowledgment == nil {
-					t.Fatalf("ordinary ACK decoding failed: %+v %v", r, err)
-				}
-			} else if !errors.Is(err, measurement.ErrUploadACK) || r.Acknowledgment != nil || r.WriterAcceptedBytes != req.PayloadBytes {
-				t.Fatalf("mismatched ACK: %+v %v", r, err)
-			}
-		})
-	}
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		io.WriteString(w, "raw-200")
 	}))
 	defer s.Close()
 	req := uploadRequest(s, measurement.ExactOutbound)
-	req.RequireAcknowledgment = false
 	r, err := e.Upload(context.Background(), req)
-	if err != nil || r.Acknowledgment != nil || string(r.HTTPS.Body) != "raw-200" || r.WriterAcceptedBytes != req.PayloadBytes {
+	if err != nil || string(r.HTTPS.Body) != "raw-200" || r.WriterAcceptedBytes != req.PayloadBytes {
 		t.Fatalf("raw response: %+v %v", r, err)
 	}
 }
 
 func TestTransferValidationAndMissingExactNoFallback(t *testing.T) {
 	var calls atomic.Int32
-	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); acknowledge(w, r) }))
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		io.Copy(io.Discard, r.Body)
+		io.WriteString(w, "raw-response")
+	}))
 	defer s.Close()
 	e := executor(t, instance(t))
 	d := downloadRequest(s, measurement.ExactOutbound)
 	d.HTTPS.Route.Tag = "missing"
-	if r, err := e.Download(context.Background(), d); err == nil || r.SHA256 != nil {
+	if r, err := e.Download(context.Background(), d); err == nil || r.PayloadBytes != 0 {
 		t.Fatalf("missing download: %+v %v", r, err)
 	}
 	u := uploadRequest(s, measurement.ExactOutbound)
@@ -257,11 +172,6 @@ func TestTransferValidationAndMissingExactNoFallback(t *testing.T) {
 		if _, err := e.Upload(context.Background(), u); err == nil {
 			t.Fatal("invalid upload budget opened")
 		}
-	}
-	u = uploadRequest(s, measurement.Direct)
-	u.HTTPS.URL += "?nonce=caller"
-	if _, err := e.Upload(context.Background(), u); err == nil {
-		t.Fatal("nonce conflict opened")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -289,9 +199,8 @@ func TestUploadEarlyResponsePreservesPartialCounts(t *testing.T) {
 	for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
 		u := uploadRequest(s, kind)
 		u.PayloadBytes = 64 << 20
-		u.RequireAcknowledgment = false
 		r, err := e.Upload(context.Background(), u)
-		if err == nil || r.Acknowledgment != nil || r.WriterAcceptedBytes >= u.PayloadBytes || r.GeneratedBytes < r.WriterAcceptedBytes || r.GeneratedBytes > r.WriterAcceptedBytes+(32<<10) {
+		if err == nil || r.WriterAcceptedBytes >= u.PayloadBytes || r.GeneratedBytes < r.WriterAcceptedBytes || r.GeneratedBytes > r.WriterAcceptedBytes+(32<<10) {
 			t.Fatalf("early response partial counts changed: %+v %v", r, err)
 		}
 	}
@@ -309,7 +218,8 @@ func TestTransferConcurrentCancellationAndSibling(t *testing.T) {
 			return
 		}
 		if r.Method == http.MethodPost {
-			acknowledge(w, r)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "raw-response")
 		} else {
 			io.WriteString(w, "sibling")
 		}
@@ -334,7 +244,7 @@ func TestTransferConcurrentCancellationAndSibling(t *testing.T) {
 			defer wg.Done()
 			u := uploadRequest(s, measurement.ExactOutbound)
 			r, err := e.Upload(context.Background(), u)
-			if err != nil || r.Acknowledgment == nil {
+			if err != nil || r.WriterAcceptedBytes != u.PayloadBytes || !r.HTTPS.BodyComplete {
 				t.Errorf("upload sibling: %+v %v", r, err)
 			}
 		}()
@@ -381,10 +291,10 @@ func TestTransferExactVLESS(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := bytes.Repeat([]byte("vless-transfer"), 20000)
-	sum := sha256.Sum256(payload)
 	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
-			acknowledge(w, r)
+			io.Copy(io.Discard, r.Body)
+			io.WriteString(w, "raw-response")
 		} else {
 			w.Write(payload)
 		}
@@ -392,11 +302,11 @@ func TestTransferExactVLESS(t *testing.T) {
 	defer s.Close()
 	e := executor(t, v)
 	d := downloadRequest(s, measurement.ExactOutbound)
-	d.ExpectedSHA256 = &sum
-	if r, err := e.Download(context.Background(), d); err != nil || !r.IntegrityVerified {
+	if r, err := e.Download(context.Background(), d); err != nil || r.PayloadBytes != int64(len(payload)) || !r.HTTPS.BodyComplete {
 		t.Fatalf("VLESS download: %+v %v", r, err)
 	}
-	if r, err := e.Upload(context.Background(), uploadRequest(s, measurement.ExactOutbound)); err != nil || r.Acknowledgment == nil {
+	u := uploadRequest(s, measurement.ExactOutbound)
+	if r, err := e.Upload(context.Background(), u); err != nil || r.WriterAcceptedBytes != u.PayloadBytes || !r.HTTPS.BodyComplete {
 		t.Fatalf("VLESS upload: %+v %v", r, err)
 	}
 }
@@ -413,7 +323,7 @@ func TestUploadBackpressureActiveDeadline(t *testing.T) {
 		u.PayloadBytes = 64 << 20
 		u.TransferTimeout = 50 * time.Millisecond
 		r, err := e.Upload(context.Background(), u)
-		if !errors.Is(err, measurement.ErrTransferTimeout) || r.WriterAcceptedBytes >= u.PayloadBytes || r.Acknowledgment != nil {
+		if !errors.Is(err, measurement.ErrTransferTimeout) || r.WriterAcceptedBytes >= u.PayloadBytes {
 			close(gate)
 			t.Fatalf("backpressure: %+v %v", r, err)
 		}
@@ -501,20 +411,19 @@ func TestTransferUnknownLengthCapAndPartialUploadResponse(t *testing.T) {
 	}
 	u := uploadRequest(s, measurement.ExactOutbound)
 	upload, err := e.Upload(context.Background(), u)
-	if !errors.Is(err, io.ErrUnexpectedEOF) || upload.WriterAcceptedBytes != u.PayloadBytes || upload.HTTPS.BodyComplete || string(upload.HTTPS.Body) != "partial" || upload.Acknowledgment != nil {
+	if !errors.Is(err, io.ErrUnexpectedEOF) || upload.WriterAcceptedBytes != u.PayloadBytes || upload.HTTPS.BodyComplete || string(upload.HTTPS.Body) != "partial" {
 		t.Fatalf("partial response: %+v %v", upload, err)
 	}
 }
 
-func TestDownloadRequestedDigestOnPartialExit(t *testing.T) {
+func TestDownloadRawPartialExit(t *testing.T) {
 	prefix := []byte("prefix")
-	partial := sha256.Sum256(prefix)
 	for _, kind := range []measurement.RouteKind{measurement.Direct, measurement.ExactOutbound} {
 		routeName := "direct"
 		if kind == measurement.ExactOutbound {
 			routeName = "exact"
 		}
-		for _, mode := range []string{"truncated", "timeout", "capped", "cancel", "pre-cancel", "no-digest", "raw-status"} {
+		for _, mode := range []string{"truncated", "timeout", "capped", "cancel", "pre-cancel", "complete", "raw-status"} {
 			t.Run(routeName+"/"+mode, func(t *testing.T) {
 				entered := make(chan struct{})
 				s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -522,7 +431,7 @@ func TestDownloadRequestedDigestOnPartialExit(t *testing.T) {
 						io.WriteString(w, "sibling")
 						return
 					}
-					if mode == "no-digest" || mode == "raw-status" {
+					if mode == "complete" || mode == "raw-status" {
 						w.Header().Set("Content-Length", "6")
 					} else {
 						w.Header().Set("Content-Length", "100")
@@ -540,7 +449,6 @@ func TestDownloadRequestedDigestOnPartialExit(t *testing.T) {
 				defer s.Close()
 				e := executor(t, instance(t))
 				req := downloadRequest(s, kind)
-				req.ExpectedSHA256 = &partial
 				if mode == "timeout" {
 					req.TransferTimeout = 80 * time.Millisecond
 				}
@@ -549,9 +457,6 @@ func TestDownloadRequestedDigestOnPartialExit(t *testing.T) {
 				}
 				if mode == "capped" {
 					req.HTTPS.MaxBodyBytes = 3
-				}
-				if mode == "no-digest" {
-					req.ExpectedSHA256 = nil
 				}
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
@@ -592,31 +497,31 @@ func TestDownloadRequestedDigestOnPartialExit(t *testing.T) {
 						t.Fatalf("timeout %+v %v", got, err)
 					}
 				case "capped":
-					if !errors.Is(err, measurement.ErrIntegrityIncomplete) || got.PayloadBytes != 3 || !got.ByteLimitReached {
+					if err != nil || got.PayloadBytes != 3 || !got.ByteLimitReached {
 						t.Fatalf("cap %+v %v", got, err)
 					}
 				case "cancel":
 					if !errors.Is(err, context.Canceled) || errors.Is(err, measurement.ErrTransferTimeout) {
 						t.Fatalf("cancel %+v %v", got, err)
 					}
-					t.Logf("cancellation bytes=%d response=%t digest=%t", got.PayloadBytes, got.DeclaredLength != nil, got.SHA256 != nil)
+					t.Logf("cancellation bytes=%d response=%t", got.PayloadBytes, got.DeclaredLength != nil)
 				case "pre-cancel":
 					if !errors.Is(err, context.Canceled) || got.DeclaredLength != nil {
 						t.Fatalf("pre-cancel %+v %v", got, err)
 					}
-				case "no-digest":
-					if err != nil || !got.HTTPS.BodyComplete || got.SHA256 != nil || got.IntegrityVerified {
+				case "complete":
+					if err != nil || !got.HTTPS.BodyComplete {
 						t.Fatalf("unrequested %+v %v", got, err)
 					}
 					return
 				case "raw-status":
-					if err != nil || got.HTTPS.StatusCode != 503 || !got.HTTPS.BodyComplete || !got.IntegrityVerified {
+					if err != nil || got.HTTPS.StatusCode != 503 || !got.HTTPS.BodyComplete {
 						t.Fatalf("raw status %+v %v", got, err)
 					}
 				}
 				// Cancellation may win before response admission; preserve that honest boundary.
 				if got.DeclaredLength == nil {
-					if mode != "cancel" && mode != "pre-cancel" || got.SHA256 != nil || got.ActiveElapsed != nil || got.PayloadBytes != 0 || got.HTTPS.BodyComplete || got.IntegrityVerified {
+					if mode != "cancel" && mode != "pre-cancel" || got.ActiveElapsed != nil || got.PayloadBytes != 0 || got.HTTPS.BodyComplete {
 						t.Fatalf("before response %+v", got)
 					}
 					return
@@ -624,11 +529,10 @@ func TestDownloadRequestedDigestOnPartialExit(t *testing.T) {
 				if got.PayloadBytes < 0 || got.PayloadBytes > 6 {
 					t.Fatal(got.PayloadBytes)
 				}
-				want := sha256.Sum256(prefix[:got.PayloadBytes])
-				if got.SHA256 == nil || *got.SHA256 != want || got.ActiveElapsed == nil {
-					t.Fatalf("partial digest %+v %v", got, err)
+				if got.ActiveElapsed == nil {
+					t.Fatalf("partial phase %+v %v", got, err)
 				}
-				if mode != "raw-status" && (got.HTTPS.BodyComplete || got.IntegrityVerified) {
+				if mode != "raw-status" && got.HTTPS.BodyComplete {
 					t.Fatalf("false completion %+v", got)
 				}
 			})

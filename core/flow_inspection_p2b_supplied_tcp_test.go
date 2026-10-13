@@ -32,18 +32,14 @@ func TestFlowInspectionP2BSuppliedTCP(t *testing.T) {
 
 func inspectionDecodedTCPReceiverAcceptance(t *testing.T, receiver inspectionSuppliedTCPReceiver) {
 	t.Helper()
-	inspectionDecodedTCPReceiverAcceptanceMode(t, receiver, false)
-}
-
-func inspectionDecodedTCPReceiverAcceptanceMode(t *testing.T, receiver inspectionSuppliedTCPReceiver, pendingPeerEOF bool) {
-	inspectionTCPReceiverAcceptanceAt(t, receiver, pendingPeerEOF, false)
+	inspectionTCPReceiverAcceptanceAt(t, receiver, false)
 }
 
 func inspectionAppClientReceiverAcceptance(t *testing.T, receiver inspectionSuppliedTCPReceiver) {
-	inspectionTCPReceiverAcceptanceAt(t, receiver, false, true)
+	inspectionTCPReceiverAcceptanceAt(t, receiver, true)
 }
 
-func inspectionTCPReceiverAcceptanceAt(t *testing.T, receiver inspectionSuppliedTCPReceiver, pendingPeerEOF, atClient bool) {
+func inspectionTCPReceiverAcceptanceAt(t *testing.T, receiver inspectionSuppliedTCPReceiver, atClient bool) {
 	t.Helper()
 	t.Run("disabled", func(t *testing.T) {
 		receiving, _, outbound := receiver(t, false, false)
@@ -92,13 +88,9 @@ func inspectionTCPReceiverAcceptanceAt(t *testing.T, receiver inspectionSupplied
 		if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 			t.Fatalf("supplied TCP exact stop: %+v %v", outcomes, err)
 		}
-		if pendingPeerEOF {
-			// The local native close is not a remote half-close completion receipt.
-			first.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		}
 		if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
 			t.Fatalf("stopped endpoint returned %d, %v", n, err)
-		} else if timeout, ok := err.(stdnet.Error); ok && timeout.Timeout() && !pendingPeerEOF {
+		} else if timeout, ok := err.(stdnet.Error); ok && timeout.Timeout() {
 			t.Fatal("stopped endpoint did not close before deadline")
 		}
 		extra := []byte("sibling after supplied TCP stop")
@@ -110,38 +102,7 @@ func inspectionTCPReceiverAcceptanceAt(t *testing.T, receiver inspectionSupplied
 		}
 		inspectionResponse(t, sibling, extra)
 		sibling.Close()
-		if pendingPeerEOF {
-			// Native sing copy retains its other pipe pump after client EOF.
-			// Require actual local stop/join rather than inventing an ending.
-			var siblingRef fs.FlowRef
-			var liveStorage115 []fs.FlowRecord
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				live, _ := view.ReadLiveInto(liveStorage115)
-				liveStorage115 = live.Rows
-				if len(page.Rows) != 1 || page.Rows[0].Flow.Ref != firstRow.Ref || len(live.Rows) != 1 {
-					return false
-				}
-				siblingRef = live.Rows[0].Ref
-				return siblingRef != firstRow.Ref
-			})
-			outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{siblingRef})
-			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
-				t.Fatalf("pending sibling stop: %+v %v", outcomes, err)
-			}
-		}
-		inspectionWait(t, func() bool {
-			page, _ := view.ReadTerminals()
-			if len(page.Rows) != 2 {
-				return false
-			}
-			for _, row := range page.Rows {
-				if row.Flow.Ref == firstRow.Ref {
-					return row.Flow.Uplink == uint64(len(payload)) && row.Flow.Downlink == uint64(len(payload))
-				}
-			}
-			return false
-		})
+
 		inspectionOutboundTotals(t, view, tag, uint64(2*len(payload)+len(extra)))
 		if !atClient && sender.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation() != nil {
 			t.Fatal("disabled sender acquired inspection state")
@@ -176,10 +137,7 @@ func TestFlowInspectionP2BVLESSEarlyStopExcludesResponseHeader(t *testing.T) {
 	if n, err := client.Read(make([]byte, 1)); n != 0 || err == nil {
 		t.Fatalf("stopped VLESS endpoint returned %d, %v", n, err)
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref && page.Rows[0].Flow.Downlink == 0
-	})
+
 	inspectionOutboundTotals(t, view, outbound.Tag, 0)
 }
 
@@ -200,10 +158,6 @@ func TestFlowInspectionP2BSpecialCarriersNotAdmitted(t *testing.T) {
 			live, err := view.ReadLiveInto(nil)
 			if err != nil || len(live.Rows) != 1 || live.Rows[0].Destination != destination {
 				t.Fatalf("shared carrier admitted as a logical exchange: %+v %v", live, err)
-			}
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 0 {
-				t.Fatalf("shared carrier produced a terminal exchange: %+v %v", page, err)
 			}
 		})
 	}

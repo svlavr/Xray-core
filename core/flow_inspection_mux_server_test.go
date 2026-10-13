@@ -25,7 +25,6 @@ func TestFlowInspectionMuxServerTCP(t *testing.T) {
 // framing bytes. Shared by earlier protocol-specific carrier exclusions.
 func inspectionOnlyMuxFlow(t *testing.T, view fs.FlowInspection, conn net.Conn, destination cnet.Destination, payload []byte, tag string) {
 	t.Helper()
-	var ref fs.FlowRef
 	var liveStorage30 []fs.FlowRecord
 	inspectionWait(t, func() bool {
 		live, err := view.ReadLiveInto(liveStorage30)
@@ -37,18 +36,11 @@ func inspectionOnlyMuxFlow(t *testing.T, view fs.FlowInspection, conn net.Conn, 
 		if r.Destination != destination || r.Outbound.Tag != tag || r.Outbound.Tag == "" || r.Origin != fs.TrafficOriginUser {
 			t.Fatalf("MUX logical owner: %+v", r)
 		}
-		ref = r.Ref
 		return r.Uplink == uint64(len(payload)) && r.Downlink == uint64(len(payload))
 	})
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 0 {
-		t.Fatalf("carrier produced terminal: %+v %v", page, err)
-	}
+
 	conn.Close()
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == ref
-	})
+
 	totals, _ := view.ReadTotals()
 	var up, down uint64
 	for _, r := range totals.Rows {
@@ -152,10 +144,7 @@ func TestFlowInspectionMuxServerUDP(t *testing.T) {
 					t.Fatalf("retained stop: %+v %v", out, err)
 				}
 			}
-			inspectionWait(t, func() bool {
-				page, _ := remote.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == retainedRef
-			})
+
 			inspectionOutboundTotals(t, remote, "direct", total)
 		})
 	}

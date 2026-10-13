@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-
-	xlua "github.com/xtls/xray-core/common/lua"
 )
 
 func (s *DNS) getScript() *scriptEngine {
@@ -21,11 +19,11 @@ func (s *DNS) setScript(engine *scriptEngine) {
 }
 
 func (s *DNS) startNativeScript() error {
-	if s.scriptPath == "" {
+	if s.scriptProgram == nil {
 		return nil
 	}
-	engine, err := newScriptEngine(s.scriptPath, s)
-	if err != nil {
+	engine := newScriptEngineProgram(s.scriptProgram)
+	if err := engine.start(s); err != nil {
 		return err
 	}
 	s.setScript(engine)
@@ -34,16 +32,11 @@ func (s *DNS) startNativeScript() error {
 
 // initializeScript owns creation until the engine is installed or disposed.
 // initDone is closed only after late creation can no longer escape retirement.
-func (rt *dnsRuntime) initializeScript(owner *resolverOwner, program *xlua.Program) <-chan error {
+func (rt *dnsRuntime) initializeScript(owner *resolverOwner) <-chan error {
 	result := make(chan error, 1)
 	go func() {
-		var engine *scriptEngine
-		var err error
-		if program == nil {
-			engine, err = newScriptEngine(owner.resolver.scriptPath, owner.resolver)
-		} else {
-			engine, err = newScriptEngineProgram(program, owner.resolver)
-		}
+		engine := newScriptEngineProgram(owner.resolver.scriptProgram)
+		err := engine.start(owner.resolver)
 		rt.mu.Lock()
 		if err == nil && owner.ctx.Err() == nil {
 			owner.resolver.setScript(engine)
@@ -73,7 +66,7 @@ func (s *DNS) startRuntime() error {
 		rt.mu.Unlock()
 		return nil
 	}
-	if owner.resolver.scriptPath == "" {
+	if owner.resolver.scriptProgram == nil {
 		rt.started = true
 		rt.mu.Unlock()
 		return nil
@@ -86,7 +79,7 @@ func (s *DNS) startRuntime() error {
 	}
 	owner.initDone = make(chan struct{})
 	rt.mu.Unlock()
-	err := <-rt.initializeScript(owner, nil)
+	err := <-rt.initializeScript(owner)
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if err == nil && rt.current == owner && owner.ctx.Err() == nil {
@@ -102,10 +95,7 @@ func (s *DNS) startRuntime() error {
 // applyScript is the new script-enabled update path. Activation can perform
 // external script actions; rejection preserves publication, not those actions.
 func (s *DNS) applyScript(ctx context.Context, candidate *DNS) ApplyResult {
-	program, err := xlua.CompileFile(candidate.scriptPath)
-	if err != nil {
-		return ApplyResult{Err: err}
-	}
+	var err error
 	rt := s.runtime
 	unsafe := resolverMayUseSystem(candidate)
 	if unsafe && !rt.systemDNSMu.TryLock() {
@@ -146,7 +136,7 @@ func (s *DNS) applyScript(ctx context.Context, candidate *DNS) ApplyResult {
 		rt.mu.Unlock()
 	})
 	defer stopCaller()
-	initialized := rt.initializeScript(owner, program)
+	initialized := rt.initializeScript(owner)
 	select {
 	case err = <-initialized:
 	case <-ctx.Done():
@@ -162,9 +152,10 @@ func (s *DNS) applyScript(ctx context.Context, candidate *DNS) ApplyResult {
 	if err != nil {
 		owner.cancel()
 		rt.mu.Unlock()
+		owner.startClose(rt)
 		select {
-		case closeErr := <-rt.retire(owner):
-			return ApplyResult{Err: errors.Join(err, closeErr)}
+		case <-owner.closeDone:
+			return ApplyResult{Err: errors.Join(err, owner.closeErr)}
 		case <-ctx.Done():
 			return ApplyResult{Err: errors.Join(err, ctx.Err())}
 		}
@@ -176,25 +167,11 @@ func (s *DNS) applyScript(ctx context.Context, candidate *DNS) ApplyResult {
 	return rt.waitRetirement(ctx, old)
 }
 
-func (rt *dnsRuntime) retire(owner *resolverOwner) <-chan error {
-	done := make(chan error, 1)
-	owner.startClose()
-	go func() {
-		err := owner.closeOwned()
-		rt.mu.Lock()
-		if rt.closing == owner {
-			rt.closing = nil
-		}
-		rt.mu.Unlock()
-		done <- err
-	}()
-	return done
-}
-
 func (rt *dnsRuntime) waitRetirement(ctx context.Context, owner *resolverOwner) ApplyResult {
+	owner.startClose(rt)
 	select {
-	case err := <-rt.retire(owner):
-		return ApplyResult{Applied: true, Err: err}
+	case <-owner.closeDone:
+		return ApplyResult{Applied: true, Err: owner.closeErr}
 	case <-ctx.Done():
 		return ApplyResult{Applied: true, Err: ctx.Err()}
 	}

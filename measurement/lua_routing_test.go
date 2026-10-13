@@ -39,7 +39,7 @@ func TestM3LuaRoutingPreservesMeasurementExactDirectAndIsolation(t *testing.T) {
 			t.Cleanup(func() { v.Close() })
 			var view fs.FlowInspection
 			if enabled {
-				view, err = core.EnableFlowInspection(v, fs.ObservationOptions{MaxLive: 16, MaxTerminals: 16, MaxBuckets: 8})
+				view, err = core.EnableFlowInspection(v, fs.ObservationOptions{MaxLive: 16, MaxBuckets: 8})
 				if err != nil {
 					t.Fatal(err)
 				}

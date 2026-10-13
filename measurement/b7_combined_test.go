@@ -8,13 +8,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
+	"github.com/xtls/xray-core/app/router"
 	appstats "github.com/xtls/xray-core/app/stats"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
@@ -30,7 +30,7 @@ import (
 // standalone profile suite retains its original setup and all its cases.
 var (
 	b7Enabled            bool
-	b7ObservationOptions = fs.ObservationOptions{MaxLive: 64, MaxTerminals: 256, MaxBuckets: 16}
+	b7ObservationOptions = fs.ObservationOptions{MaxLive: 64, MaxBuckets: 16}
 	b7Views              sync.Map // *core.Instance -> fs.FlowInspection
 	b7UserMu             sync.Mutex
 	b7UserObservation    *session.LogicalObservation
@@ -79,7 +79,6 @@ type b7OrdinaryFacts struct {
 	view          fs.FlowInspection
 	want          fs.ClientTotals
 	tags          map[string]fs.ClientTotals
-	capture       fs.ObservationCapture
 	lastAt        time.Duration
 	minLiveUser   int
 	nativeManager fs.Manager
@@ -100,15 +99,11 @@ func b7BeginOrdinary(t *testing.T, v *core.Instance, exactUDP bool) *b7OrdinaryF
 	if err != nil || totals.User != (fs.ClientTotals{}) || len(totals.Rows) != 0 {
 		t.Fatalf("cold Measurement contaminated USER totals: %+v %v", totals, err)
 	}
-	capture, err := view.CaptureObservations(2048)
-	if err != nil {
-		t.Fatal(err)
-	}
 	b7UserMu.Lock()
 	b7UserObservation = nil
 	b7UserRuntime = view.Runtime()
 	b7UserMu.Unlock()
-	b := &b7OrdinaryFacts{view: view, tags: make(map[string]fs.ClientTotals), capture: capture, lastAt: totals.At, minLiveUser: 2, nativeManager: v.GetFeature(fs.ManagerType()).(fs.Manager), nativeStart: make(map[string]int64)}
+	b := &b7OrdinaryFacts{view: view, tags: make(map[string]fs.ClientTotals), lastAt: totals.At, minLiveUser: 2, nativeManager: v.GetFeature(fs.ManagerType()).(fs.Manager), nativeStart: make(map[string]int64)}
 	if exactUDP {
 		b.minLiveUser = 4
 	}
@@ -156,22 +151,6 @@ func (b *b7OrdinaryFacts) checkUserEndpoint(t *testing.T, flow fs.FlowRecord, se
 	t.Fatalf("USER source/destination did not match actual endpoint: %+v want=%+v", flow, b.endpoints)
 }
 
-func b7HTTPDestination(raw string) xnet.Destination {
-	u, err := url.Parse(raw)
-	if err != nil {
-		panic(err)
-	}
-	dest, err := xnet.ParseDestination("tcp:" + u.Host)
-	if err != nil {
-		panic(err)
-	}
-	return dest
-}
-
-func fsB7Expected(dest xnet.Destination, tag string) fs.FlowRecord {
-	return fs.FlowRecord{Kind: dest.Network, Destination: dest, Outbound: fs.OutboundRef{Tag: tag}}
-}
-
 func (b *b7OrdinaryFacts) check(t *testing.T, held bool) {
 	if b == nil {
 		return
@@ -213,14 +192,14 @@ func (b *b7OrdinaryFacts) check(t *testing.T, held bool) {
 	}
 }
 
-func (b *b7OrdinaryFacts) checkLive(t *testing.T, expected ...fs.FlowRecord) {
+func (b *b7OrdinaryFacts) checkLive(t *testing.T) {
 	t.Helper()
 	live, err := b.view.ReadLiveInto(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var user, controlled int
-	matched := len(expected) == 0
+	// Held endpoint entry is witnessed by each operation fixture.
 	for _, row := range live.Rows {
 		if row.Ref.Runtime != b.view.Runtime() || row.Ref.ID == 0 {
 			t.Fatalf("live row lacks exact local reference: %+v", row)
@@ -237,18 +216,12 @@ func (b *b7OrdinaryFacts) checkLive(t *testing.T, expected ...fs.FlowRecord) {
 			}
 		case fs.TrafficOriginControlledMeasurement:
 			controlled++
-			if row.Source.IsValid() {
-				t.Fatalf("controlled operation inherited USER source: %+v", row)
-			}
-			for _, want := range expected {
-				matched = matched || row.Kind == want.Kind && row.Destination == want.Destination && row.Outbound == want.Outbound
-			}
 		default:
 			t.Fatalf("unexpected live origin: %+v", row)
 		}
 	}
-	if user < b.minLiveUser || controlled == 0 || !matched {
-		t.Fatalf("held Measurement/USER overlap absent: user=%d controlled=%d live=%+v", user, controlled, live)
+	if user < b.minLiveUser || controlled != 0 {
+		t.Fatalf("native USER overlap or retired API boundary violated: user=%d controlled=%d live=%+v", user, controlled, live)
 	}
 }
 
@@ -281,51 +254,6 @@ func (b *b7OrdinaryFacts) finish(t *testing.T, connections []net.Conn) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	terminals, err := b.view.ReadTerminals()
-	if err != nil || terminals.Overwritten != 0 {
-		t.Fatalf("B7 terminal loss: %+v %v", terminals, err)
-	}
-	var user, controlled int
-	for _, row := range terminals.Rows {
-		switch row.Flow.Origin {
-		case fs.TrafficOriginUser:
-			user++
-			b.checkUserEndpoint(t, row.Flow, true)
-		case fs.TrafficOriginControlledMeasurement:
-			controlled++
-		default:
-			t.Fatalf("terminal origin: %+v", row)
-		}
-	}
-	if user < b.minLiveUser || controlled == 0 {
-		t.Fatalf("B7 terminal origins user=%d controlled=%d", user, controlled)
-	}
-	if err := b.capture.Close(); err != nil {
-		t.Fatal(err)
-	}
-	var seenUser, seenControlled bool
-	for {
-		batch := b.capture.ReadInto(nil)
-		if batch.Dropped != 0 || !batch.ExistingPartial {
-			t.Fatalf("B7 unexpected capture loss: %+v", batch)
-		}
-		for _, row := range batch.Rows {
-			if row.Flow.Origin == fs.TrafficOriginUser {
-				b.checkUserEndpoint(t, row.Flow, row.Selected)
-			}
-			seenUser = seenUser || row.Flow.Origin == fs.TrafficOriginUser
-			seenControlled = seenControlled || row.Flow.Origin == fs.TrafficOriginControlledMeasurement
-			if row.FlowID == 0 || row.Flow.Ref.Runtime != b.view.Runtime() {
-				t.Fatalf("capture identity/runtime: %+v", row)
-			}
-		}
-		if batch.Stopped && len(batch.Rows) == 0 {
-			break
-		}
-	}
-	if !seenUser || !seenControlled {
-		t.Fatalf("capture missed mixed origin: user=%t controlled=%t", seenUser, seenControlled)
-	}
 }
 
 func TestB7CombinedProfiles(t *testing.T) {
@@ -355,7 +283,7 @@ func TestB7CombinedProfiles(t *testing.T) {
 		})
 		testProtocolMeasurements(t, e, v, counters)
 	})
-	t.Run("hysteria", TestHysteriaMeasurementSeriesAndUDPCancellation)
+	t.Run("hysteria", TestHysteriaMeasurementUDPCancellation)
 	t.Run("wireguard", TestWireGuardProtocolMeasurements)
 }
 
@@ -370,7 +298,7 @@ func TestB7ObservationModes(t *testing.T) {
 func b7ObservationMode(t *testing.T, mode string) {
 	t.Helper()
 	apps := []*serial.TypedMessage{
-		serial.ToTypedMessage(&dispatcher.Config{}),
+		serial.ToTypedMessage(&dispatcher.Config{}), serial.ToTypedMessage(&router.Config{}),
 		serial.ToTypedMessage(&proxyman.InboundConfig{}),
 		serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 	}
@@ -397,9 +325,9 @@ func b7ObservationMode(t *testing.T, mode string) {
 	}
 	var view fs.FlowInspection
 	if mode == "enabled-sufficient" || mode == "enabled-constrained" {
-		options := fs.ObservationOptions{MaxLive: 16, MaxTerminals: 32, MaxBuckets: 4}
+		options := fs.ObservationOptions{MaxLive: 16, MaxBuckets: 4}
 		if mode == "enabled-constrained" {
-			options = fs.ObservationOptions{MaxLive: 1, MaxTerminals: 1, MaxBuckets: 1}
+			options = fs.ObservationOptions{MaxLive: 1, MaxBuckets: 1}
 		}
 		view, err = core.EnableFlowInspection(v, options)
 		if err != nil {
@@ -411,18 +339,6 @@ func b7ObservationMode(t *testing.T, mode string) {
 	}
 	if mode == "inspection-off" && provider.Observation() != nil {
 		t.Fatal("disabled inspection unexpectedly admitted a store")
-	}
-	var capture fs.ObservationCapture
-	if view != nil {
-		capacity := uint32(64)
-		if mode == "enabled-constrained" {
-			capacity = 1
-		}
-		capture, err = view.CaptureObservations(capacity)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer capture.Close()
 	}
 
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -463,15 +379,12 @@ func b7ObservationMode(t *testing.T, mode string) {
 		{"exact", "tcp", listener.Addr().String()},
 		{"second", "udp", packet.LocalAddr().String()},
 	} {
-		ctx := session.ContextWithTrafficOrigin(session.SetForcedOutboundTagToContext(ctx, item.tag), session.TrafficOriginUser)
+		ordinaryCtx := nativeIngressContext(ctx, item.tag)
 		dest, err := xnet.ParseDestination(item.network + ":" + item.address)
 		if err != nil {
 			t.Fatal(err)
 		}
-		c, err := core.Dial(ctx, v, dest)
-		if err != nil {
-			t.Fatal(err)
-		}
+		c, _ := nativeIngressDial(t, ordinaryCtx, v, dest)
 		ordinary = append(ordinary, c)
 	}
 	defer func() {
@@ -559,6 +472,28 @@ func b7ObservationMode(t *testing.T, mode string) {
 		t.Fatal("mode measurement did not reach endpoint")
 	}
 	pulse()
+	if view != nil {
+		live, err := view.ReadLiveInto(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var user, controlled int
+		for _, row := range live.Rows {
+			if row.Origin == fs.TrafficOriginUser {
+				user++
+			}
+			if row.Origin == fs.TrafficOriginControlledMeasurement {
+				controlled++
+			}
+		}
+		if mode == "enabled-constrained" {
+			if len(live.Rows) != 1 || user != 1 || controlled != 0 {
+				t.Fatalf("bounded live capacity: %+v", live)
+			}
+		} else if user != 2 || controlled != 0 {
+			t.Fatalf("missing live overlap: %+v", live)
+		}
+	}
 	stop()
 	select {
 	case err := <-finished:
@@ -584,63 +519,16 @@ func b7ObservationMode(t *testing.T, mode string) {
 	}
 	pulse()
 	if view != nil {
-		if mode == "enabled-constrained" {
-			overlap := capture.ReadInto(nil)
-			overlapTotals, err := view.ReadTotals()
-			if err != nil || overlap.Dropped == 0 || !overlap.ExistingPartial || overlapTotals.BucketsOmitted == 0 || overlapTotals.User != want {
-				t.Fatalf("overlap capacity loss was hidden: capture=%+v totals=%+v err=%v", overlap, overlapTotals, err)
-			}
-			// The occupied live slot makes Measurement roots unindexed. Such
-			// roots deliberately do not enter the passive terminal ring.
-			terminals, err := view.ReadTerminals()
-			if err != nil || len(terminals.Rows) != 0 || terminals.Overwritten != 0 {
-				t.Fatalf("unindexed work fabricated terminal history: %+v %v", terminals, err)
-			}
-			for _, c := range ordinary {
-				c.Close()
-			}
-			waitEmpty := func() {
-				t.Helper()
-				deadline := time.Now().Add(3 * time.Second)
-				for {
-					live, err := view.ReadLiveInto(nil)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if len(live.Rows) == 0 {
-						return
-					}
-					if time.Now().After(deadline) {
-						t.Fatalf("indexed caller root did not close: %+v", live)
-					}
-					time.Sleep(time.Millisecond)
-				}
-			}
-			waitEmpty()
-			// Reuse the now-free native slot; genuine indexed completions
-			// exercise terminal overwrite independently of live omissions.
-			for range 2 {
-				if got, err := e.HTTP(ctx, http.MethodGet, r); err != nil || !got.BodyComplete || string(got.Body) != "complete" {
-					t.Fatalf("indexed capacity cycle: %+v %v", got, err)
-				}
-				waitEmpty()
-			}
-		}
 		totals, err := view.ReadTotals()
 		if err != nil || totals.User != want {
 			t.Fatalf("controlled mode traffic entered USER totals: %+v %v", totals, err)
 		}
-		batch := capture.ReadInto(nil)
-		if !batch.ExistingPartial {
-			t.Fatal("capture claimed a complete pre-start inventory")
-		}
 		if mode == "enabled-constrained" {
-			terminals, err := view.ReadTerminals()
-			if err != nil || batch.Dropped == 0 || totals.BucketsOmitted == 0 || terminals.Overwritten == 0 {
-				t.Fatalf("constrained loss was hidden: capture=%+v totals=%+v terminals=%+v err=%v", batch, totals, terminals, err)
+			if totals.BucketsOmitted == 0 {
+				t.Fatalf("constrained bucket omission hidden: %+v", totals)
 			}
-		} else if batch.Dropped != 0 || totals.BucketsOmitted != 0 {
-			t.Fatalf("sufficient mode lost facts: %+v %+v", batch, totals)
+		} else if totals.BucketsOmitted != 0 {
+			t.Fatalf("sufficient mode lost buckets: %+v", totals)
 		}
 	}
 }

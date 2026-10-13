@@ -120,8 +120,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	input := link.Reader
 	output := link.Writer
-	// Controlled UDP needs source-bearing responses on this invocation only.
-	requirePacketSource := session.TrafficOriginFromContext(ctx) == session.TrafficOriginControlledMeasurement && session.UDPPacketSourceRequired(ctx)
+	// INTERNAL and controlled UDP may explicitly require source-bearing responses.
+	origin := session.TrafficOriginFromContext(ctx)
+	requirePacketSource := (origin == session.TrafficOriginInternal || origin == session.TrafficOriginControlledMeasurement) && session.UDPPacketSourceRequired(ctx)
 
 	hashkdf := hmac.New(sha256.New, []byte("VMessBF"))
 	hashkdf.Write(account.ID.Bytes())

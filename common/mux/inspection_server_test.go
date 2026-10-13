@@ -31,12 +31,22 @@ func (w *muxPrefixWriter) Write(p []byte) (int, error) {
 
 type stopAdmissionStore struct {
 	fs.AdmissionStore
-	view fs.FlowInspection
+	view     fs.FlowInspection
+	t        *testing.T
+	admitted chan fs.FlowRef
 }
 
 func (s stopAdmissionStore) Begin(kind net.Network, origin fs.TrafficOrigin, source, dest net.Destination, stop func() error) fs.Exchange {
 	flow := s.AdmissionStore.Begin(kind, origin, source, dest, stop)
-	s.view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
+	ref := flow.Ref()
+	if ref.ID == 0 {
+		s.t.Fatal("fault provider did not admit a logical reference")
+	}
+	outcomes, err := s.view.CloseFlows(context.Background(), []fs.FlowRef{ref})
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
+		s.t.Fatalf("admission exact stop: %+v %v", outcomes, err)
+	}
+	s.admitted <- ref
 	return flow
 }
 
@@ -45,17 +55,27 @@ func (s stopAdmissionStore) PrepareTCP(origin fs.TrafficOrigin, source, dest net
 	// This fault provider classifies the logical endpoint before exposing it,
 	// then injects stop before its native session endpoints are published.
 	flow.Route(fs.OutboundRef{})
-	s.view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
+	ref := flow.Ref()
+	if ref.ID == 0 {
+		s.t.Fatal("fault provider did not admit a logical reference")
+	}
+	outcomes, err := s.view.CloseFlows(context.Background(), []fs.FlowRef{ref})
+	if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
+		s.t.Fatalf("admission exact stop: %+v %v", outcomes, err)
+	}
+	s.admitted <- ref
 	return flow
 }
 
 type stopAdmissionManager struct {
 	*appstats.Manager
-	view fs.FlowInspection
+	view     fs.FlowInspection
+	t        *testing.T
+	admitted chan fs.FlowRef
 }
 
 func (m stopAdmissionManager) Observation() fs.AdmissionStore {
-	return stopAdmissionStore{m.Manager.Observation(), m.view}
+	return stopAdmissionStore{m.Manager.Observation(), m.view, m.t, m.admitted}
 }
 
 func TestMuxServerStopDuringAdmissionKeepsCarrier(t *testing.T) {
@@ -70,7 +90,8 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	wrapped := stopAdmissionManager{manager, view}
+	admitted := make(chan fs.FlowRef, 1)
+	wrapped := stopAdmissionManager{manager, view, t, admitted}
 	launched := make(chan struct{}, 1)
 	d := &retainedDispatcher{dispatch: func(ctx context.Context) (*transport.Link, error) {
 		obs := session.LogicalObservationFromContext(ctx)
@@ -91,6 +112,14 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 	if err != nil {
 		t.Fatalf("exact child stop would terminate carrier: %v", err)
 	}
+	select {
+	case ref := <-admitted:
+		if ref.ID == 0 {
+			t.Fatal("stopped admission had no exact reference")
+		}
+	default:
+		t.Fatal("native admission stop was not exercised")
+	}
 	if live, _ := w.sessionManager.Get(9); live != sibling {
 		t.Fatal("sibling lost")
 	}
@@ -103,8 +132,11 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) == 1 {
+		live, err := view.ReadLiveInto(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(live.Rows) == 0 {
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -142,9 +174,26 @@ func TestMuxEndRetiresBeforeLateInitialFrame(t *testing.T) {
 		returned <- w.handleStatusNew(ctx, meta, &buf.BufferedReader{Reader: buf.NewReader(input)})
 	}()
 	muxWait(t, carrier.entered)
-	muxCheckTerminal(t, view, 0)
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Ref.ID == 0 || live.Rows[0].Uplink != 0 {
+		t.Fatalf("blocked END admission: %+v %v", live, err)
+	}
 	release()
-	waitMuxTerminal(t, view)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		live, err = view.ReadLiveInto(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(live.Rows) == 0 {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("END did not retire before late initial frame")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	if got, _ := w.sessionManager.Get(9); got != sibling {
 		t.Fatal("END retirement closed a sibling")
 	}
@@ -159,15 +208,15 @@ func TestMuxEndRetiresBeforeLateInitialFrame(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("late initial frame blocked the carrier")
 	}
-	page, _ := view.ReadTerminals()
+
 	totals, _ := view.ReadTotals()
 	var uplink uint64
 	for _, row := range totals.Rows {
 		uplink += row.Uplink
 	}
 	// The late frame is drained at general admission, never read by selected execution.
-	if page.Rows[0].Flow.Uplink != 0 || totals.User.Uplink != 3 || uplink != 0 {
-		t.Fatalf("late frame changed snapshot or lost totals: %+v %+v", page, totals)
+	if totals.User.Uplink != 3 || uplink != 0 {
+		t.Fatalf("late initial frame USER/selected bytes: %+v", totals)
 	}
 }
 
@@ -338,22 +387,8 @@ func TestMuxStopDuringRetainedRebindKeepsCarrier(t *testing.T) {
 	if d.count.Load() != 1 {
 		t.Fatal("stopped rebind dispatched again")
 	}
-	muxCheckTerminal(t, view, 0)
-	release()
-	waitMuxTerminal(t, view)
-}
 
-func waitMuxTerminal(t *testing.T, view fs.FlowInspection) {
-	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		page, _ := view.ReadTerminals()
-		if len(page.Rows) == 1 {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("native owners did not complete")
+	release()
 }
 
 func TestMuxStopDuringRetainedDispatchKeepsCarrier(t *testing.T) {
@@ -391,7 +426,7 @@ func TestMuxStopDuringRetainedDispatchKeepsCarrier(t *testing.T) {
 		t.Fatalf("stop: %+v %v", outcomes, err)
 	}
 	muxWait(t, canceled)
-	muxCheckTerminal(t, view, 1)
+
 	resume()
 	select {
 	case err := <-done:
@@ -402,12 +437,11 @@ func TestMuxStopDuringRetainedDispatchKeepsCarrier(t *testing.T) {
 		t.Fatal("dispatch did not return")
 	}
 	muxWait(t, carrier.entered)
-	muxCheckTerminal(t, view, 1)
+
 	if got, _ := w.sessionManager.Get(9); got != sibling {
 		t.Fatal("sibling lost")
 	}
 	release()
-	waitMuxTerminal(t, view)
 }
 
 type muxHeaderGate struct {
@@ -447,11 +481,11 @@ func TestMuxHeaderCloseKeepsReceiptOwner(t *testing.T) {
 	case <-time.After(10 * time.Millisecond):
 	}
 	flow.Finish()
-	muxCheckTerminal(t, view, 1)
+
 	release()
 	muxWait(t, closed)
 	muxWait(t, written)
-	muxCheckTerminal(t, view, 1)
+
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, row := range totals.Rows {

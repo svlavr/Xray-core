@@ -66,6 +66,7 @@ func TestFlowInspectionAppReverseChildren(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
+	ctx = session.ContextWithTrafficOrigin(ctx, fs.TrafficOriginUser)
 	object, err := common.CreateObject(ctx, &reverse.Config{BridgeConfig: []*reverse.BridgeConfig{{Tag: "bridge", Domain: "bridge.invalid"}}})
 	if err != nil {
 		t.Fatal(err)
@@ -130,18 +131,12 @@ func TestFlowInspectionAppReverseChildren(t *testing.T) {
 	if row.Origin != fs.TrafficOriginUnknown || row.Destination != destination || row.Outbound.Tag != "direct" {
 		t.Fatalf("reverse child: %+v", row)
 	}
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 0 {
-		t.Fatal("reverse control generated logical records")
-	}
+
 	out, err := view.CloseFlows(context.Background(), []fs.FlowRef{row.Ref})
 	if err != nil || out[0] != nil {
 		t.Fatalf("reverse exact stop: %+v %v", out, err)
 	}
-	inspectionWait(t, func() bool {
-		page, _ := view.ReadTerminals()
-		return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == row.Ref
-	})
+
 	totals, _ := view.ReadTotals()
 	if len(totals.Rows) != 0 || totals.User != (fs.ClientTotals{}) {
 		t.Fatalf("UNKNOWN reverse child promoted to USER: %+v", totals)

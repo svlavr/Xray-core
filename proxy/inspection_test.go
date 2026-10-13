@@ -45,13 +45,10 @@ func TestRecordPacketWritePartialZeroPayload(t *testing.T) {
 			flow.Route(fs.OutboundRef{Tag: "tag-1"})
 			proxy.RecordPacketWrite(flow, test.payload, 10, 3)
 			flow.Finish()
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 {
-				t.Fatalf("packet terminal: %+v %v", page, err)
-			}
-			want := uint64(0)
-			if page.Rows[0].Flow.Downlink != want {
-				t.Fatalf("partial packet facts: %+v", page.Rows[0])
+
+			got, err := view.ReadTotals()
+			if err != nil || got.User.Downlink != 0 {
+				t.Fatalf("partial packet invented decoded bytes: %+v %v", got, err)
 			}
 		})
 	}
@@ -95,10 +92,6 @@ func TestObservedEndpointStopNormalizesOnlyAlreadyClosed(t *testing.T) {
 				outcomes, err := view.CloseFlows(context.Background(), []fs.FlowRef{flow.Ref()})
 				if err != nil || len(outcomes) != 1 || (test.wantFailure && !errors.Is(outcomes[0], test.err)) || (!test.wantFailure && outcomes[0] != nil) {
 					t.Fatalf("exact stop: %+v %v, want failure=%t", outcomes, err, test.wantFailure)
-				}
-				page, err := view.ReadTerminals()
-				if err != nil || len(page.Rows) != 1 {
-					t.Fatalf("terminal: %+v %v", page, err)
 				}
 			})
 		}
@@ -263,20 +256,14 @@ func TestNativeCopyTasksEarlyReturnKeepsHistoryImmutable(t *testing.T) {
 			t.Fatalf("native error changed: %v", err)
 		}
 		flow.Finish()
-		page, err := view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
-			t.Fatalf("owner-end snapshot: %+v %v", page, err)
-		}
+
 		close(release)
 		select {
 		case <-done:
 		case <-time.After(3 * time.Second):
 			t.Fatal("copy task did not release")
 		}
-		page, err = view.ReadTerminals()
-		if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 0 {
-			t.Fatalf("late receipt mutated history: %+v %v", page, err)
-		}
+
 		totals, _ := view.ReadTotals()
 		known := totals.User.Uplink
 		if known != 7 {
@@ -315,11 +302,14 @@ func TestObserveTCPRetainedInputAndOwnerEnd(t *testing.T) {
 	if buf.WriterReceipt(link.Writer) != flow {
 		t.Fatal("endpoint receipt was not attached")
 	}
-	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Origin != fs.TrafficOriginInternal || page.Rows[0].Flow.Uplink != 12 {
-		t.Fatalf("owner-end snapshot: %+v %v", page, err)
+	// This decoded fixture has no router; explicitly classify its unassigned logical endpoint.
+	flow.Unassign()
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Origin != fs.TrafficOriginInternal || live.Rows[0].Uplink != 12 || live.Rows[0].Downlink != 0 {
+		t.Fatalf("retained INTERNAL input facts: %+v %v", live, err)
 	}
+	finish()
+
 	if ctx.Err() != context.Canceled {
 		t.Fatal("cleanup did not cancel the endpoint")
 	}
@@ -386,9 +376,9 @@ func TestObserveTCPPrebufferedWriterRemainsUnavailable(t *testing.T) {
 	if err := link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("payload"))}); err != nil || output.String() != "headerpayload" {
 		t.Fatalf("native output changed: %q %v", output.String(), err)
 	}
-	finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Uplink != 5 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("unsupported output or supported input facts: %+v %v", page, err)
+	live, err := view.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 1 || live.Rows[0].Uplink != 5 || live.Rows[0].Downlink != 0 || live.Rows[0].Outbound.Tag != "prebuffered" {
+		t.Fatalf("prebuffered writer facts: %+v %v", live, err)
 	}
+	finish()
 }

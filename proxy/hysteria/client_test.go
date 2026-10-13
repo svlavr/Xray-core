@@ -3,10 +3,10 @@ package hysteria
 import (
 	"bytes"
 	"errors"
+	"github.com/apernet/quic-go"
 	"io"
 	"testing"
 
-	"github.com/apernet/quic-go"
 	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
@@ -166,23 +166,23 @@ func TestInspectionHysteriaPacketResults(t *testing.T) {
 				t.Fatal("packet was not released")
 			}
 			flow.Finish()
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 {
-				t.Fatalf("packet terminal: %+v %v", page, err)
+			totals, err := view.ReadTotals()
+			if err != nil {
+				t.Fatal(err)
 			}
-			fact := page.Rows[0].Flow.Downlink
+			fact := totals.User.Downlink
 			switch mode {
 			case "full", "fragments":
 				if fact != 512 {
-					t.Fatalf("complete packet result: %+v", fact)
+					t.Fatalf("decoded packet bytes: %d", fact)
 				}
 			case "middle-fragment-error":
 				if fact != 0 {
-					t.Fatalf("partial packet result: %+v", fact)
+					t.Fatalf("failed packet invented bytes: %d", fact)
 				}
 			default:
 				if fact != 0 {
-					t.Fatalf("no accepted packet: %+v", fact)
+					t.Fatalf("failed packet invented bytes: %d", fact)
 				}
 			}
 		})
@@ -220,13 +220,12 @@ func TestInspectionHysteriaPacketBatchFailure(t *testing.T) {
 			t.Fatal("failed batch retained payload")
 		}
 	}
-	flow.Finish()
-	page, _ := view.ReadTerminals()
-	if len(page.Rows) != 1 {
-		t.Fatal("missing batch terminal")
+	if calls != 2 {
+		t.Fatalf("failed Hysteria batch attempted %d packets, want 2", calls)
 	}
-	fact := page.Rows[0].Flow.Downlink
-	if calls != 2 || fact != 5 {
-		t.Fatalf("batch results: %+v, calls %d", fact, calls)
+	flow.Finish()
+	got, err := view.ReadTotals()
+	if err != nil || got.User.Downlink != uint64(len("first")) {
+		t.Fatalf("batch prefix bytes: %+v %v", got, err)
 	}
 }

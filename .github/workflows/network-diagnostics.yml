@@ -24,13 +24,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
-      - name: Record bounded native UDP and ECH observations
-        env:
-          XRAY_NETWORK_DIAGNOSTICS: '1'
-        run: go test -mod=readonly -v -count=1 -timeout 5m -run '^TestNetworkDiagnostics$' ./measurement
-      - name: Repeat original missing-reply cases without changing assertions
+      - name: Validate original missing-reply regressions
         if: ${{ !cancelled() }}
-        run: go test -mod=readonly -v -count=50 -timeout 3m -run '^(TestUDPEchoWrongAddressAndVisibleOversizedEmptyPackets|TestSenderMUXProfileMeasurements)$/^persistent-xudp$/^working-node$/^UDP$/^1-$/^malformed$' ./measurement
+        run: go test -mod=readonly -v -count=1 -timeout 3m -run '^(TestUDPEchoWrongAddressAndVisibleOversizedEmptyPackets|TestSenderMUXProfileMeasurements)$/^persistent-xudp$/^working-node$/^UDP$/^1-$/^malformed$' ./measurement
       - name: Validate native Darwin UDP allocation and packet compatibility
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         env:

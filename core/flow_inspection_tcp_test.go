@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -154,20 +155,7 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 			if err != nil || len(outcomes) != 1 || outcomes[0] != nil {
 				t.Fatalf("exact close: %+v %v", outcomes, err)
 			}
-			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if len(page.Rows) != 1 {
-					return false
-				}
-				ended := page.Rows[0]
-				if ended.Flow.Ref != selected.Ref || ended.Flow.Uplink != uint64(len(payload)) || ended.Flow.Downlink != uint64(len(payload)) {
-					t.Fatalf("terminal: %+v", ended)
-				}
-				return true
-			})
+
 			if n, err := first.Read(make([]byte, 1)); n != 0 || err == nil {
 				t.Fatalf("stopped endpoint remains open: %d %v", n, err)
 			} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
@@ -179,10 +167,8 @@ func TestFlowInspectionTCPAdmissions(t *testing.T) {
 			}
 			inspectionResponse(t, second, extra)
 			second.Close()
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 2
-			})
+			inspectionWait(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
+
 			inspectionTCPTotals(t, view, uint64(2*len(payload)+len(extra)))
 			live, err := view.ReadLiveInto(nil)
 			if err != nil || len(live.Rows) != 0 {
@@ -243,10 +229,25 @@ func TestFlowInspectionTCPAdmissionsDisabled(t *testing.T) {
 // requests exercise the next request already retained in that same reader and
 // must become distinct request-local observations on one accepted connection.
 func TestFlowInspectionHTTPDelegationKeepAliveControl(t *testing.T) {
+	releases := map[string]chan struct{}{"/first": make(chan struct{}, 1), "/second": make(chan struct{}, 1)}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, r.URL.Path)
+		body := r.URL.Path
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		io.WriteString(w, body[:len(body)-1])
+		w.(http.Flusher).Flush()
+		select {
+		case <-releases[r.URL.Path]:
+		case <-r.Context().Done():
+			return
+		}
+		io.WriteString(w, body[len(body)-1:])
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		for _, release := range releases {
+			close(release)
+		}
+	})
 	_, view, address := inspectionTCPInbound(t, "socks-http-connect", cnet.Destination{}, true, false)
 	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
 	if err != nil {
@@ -261,33 +262,40 @@ func TestFlowInspectionHTTPDelegationKeepAliveControl(t *testing.T) {
 	if _, err = io.WriteString(conn, request); err != nil {
 		t.Fatal(err)
 	}
-	reader := bufio.NewReader(conn)
+	wire := &inspectionHTTPResponseWire{Conn: conn}
+	reader := bufio.NewReader(wire)
+	destination := cnet.DestinationFromAddr(server.Listener.Addr())
+	var previous fs.FlowRef
+	var wantTotals fs.ClientTotals
 	for _, want := range []string{"/first", "/second"} {
+		before := wire.read - uint64(reader.Buffered())
 		response, err := http.ReadResponse(reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		body, err := io.ReadAll(response.Body)
+		prefix := make([]byte, len(want)-1)
+		if _, err := io.ReadFull(response.Body, prefix); err != nil {
+			t.Fatal(err)
+		}
+		row := inspectionHTTPActiveRequest(t, view, conn, destination, wire.read-uint64(reader.Buffered())-before)
+		if row.Ref == previous {
+			t.Fatal("keep-alive reused a request reference")
+		}
+		previous = row.Ref
+		wantTotals.Uplink += row.Uplink
+		wantTotals.Downlink += row.Downlink + 1
+		releases[want] <- struct{}{}
+		tail, err := io.ReadAll(response.Body)
+		body := append(prefix, tail...)
 		response.Body.Close()
+		inspectionLiveAbsent(t, view, row.Ref)
 		if err != nil || response.StatusCode != http.StatusOK || string(body) != want {
 			t.Fatalf("keep-alive response: %d %q %v", response.StatusCode, body, err)
 		}
 	}
-	inspectionWait(t, func() bool {
-		page, err := view.ReadTerminals()
-		if err != nil || len(page.Rows) != 2 {
-			return false
-		}
-		if page.Rows[0].Flow.Ref == page.Rows[1].Flow.Ref {
-			t.Fatal("pipelined HTTP requests reused one FlowRef")
-		}
-		for _, row := range page.Rows {
-			if row.Flow.Kind != cnet.Network_TCP || row.Flow.Outbound.Tag != "direct" || row.Flow.Outbound.Tag == "" || row.Flow.Uplink == 0 || row.Flow.Downlink == 0 {
-				t.Fatalf("plain HTTP request receipt: %+v", row)
-			}
-		}
-		return true
-	})
+
+	inspectionByteTotals(t, view, "direct", wantTotals, wantTotals)
+	inspectionWait(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 	live, err := view.ReadLiveInto(nil)
 	if err != nil || len(live.Rows) != 0 {
 		t.Fatalf("completed plain HTTP request remained live: %+v %v", live, err)
@@ -306,21 +314,46 @@ func TestFlowInspectionTCPAdmissionsRejected(t *testing.T) {
 				t.Fatal(err)
 			}
 			payload := []byte("GET / HTTP/1.1\r\nHost: rejected.invalid\r\n\r\n")
-			inspectionTCPClient(t, kind, address, destination, payload)
-			inspectionWait(t, func() bool {
-				page, err := view.ReadTerminals()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if len(page.Rows) != 1 {
-					return false
-				}
-				final := page.Rows[0]
-				if final.Flow.Uplink != uint64(len(payload)) || final.Flow.Downlink != 0 || final.Flow.Outbound.Tag != "" {
-					t.Fatalf("rejected receipt: %+v", final)
-				}
-				return true
-			})
+			conn := inspectionTCPClient(t, kind, address, destination, payload)
+			if n, err := conn.Read(make([]byte, 1)); n != 0 || err == nil {
+				t.Fatalf("rejected native completion: %d %v", n, err)
+			} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				t.Fatalf("rejected admission timed out: %v", err)
+			}
+			inspectionByteTotals(t, view, "", fs.ClientTotals{Uplink: uint64(len(payload))}, fs.ClientTotals{})
+			inspectionWait(t, func() bool { live, err := view.ReadLiveInto(nil); return err == nil && len(live.Rows) == 0 })
 		})
 	}
+}
+
+type inspectionHTTPResponseWire struct {
+	net.Conn
+	read uint64
+}
+
+func (c *inspectionHTTPResponseWire) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.read += uint64(n)
+	return n, err
+}
+func inspectionHTTPActiveRequest(t *testing.T, view fs.FlowInspection, conn net.Conn, destination cnet.Destination, downlink uint64) fs.FlowRecord {
+	t.Helper()
+	var row fs.FlowRecord
+	inspectionWait(t, func() bool {
+		live, err := view.ReadLiveInto(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, candidate := range live.Rows {
+			if candidate.Source.Port == cnet.Port(conn.LocalAddr().(*net.TCPAddr).Port) && candidate.Uplink > 0 && candidate.Downlink == downlink && downlink > 0 {
+				row = candidate
+				if row.Ref.ID == 0 || row.Kind != cnet.Network_TCP || row.Origin != fs.TrafficOriginUser || row.Outbound.Tag != "direct" || row.Destination != destination {
+					t.Fatalf("active HTTP request facts: %+v", row)
+				}
+				return true
+			}
+		}
+		return false
+	})
+	return row
 }

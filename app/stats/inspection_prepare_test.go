@@ -27,12 +27,13 @@ func TestInspectionPreparedCarrierNeverRegisters(t *testing.T) {
 	flow.AddDownlink(99)
 
 	flow.Finish()
-	live, _ := s.ReadLiveInto(nil)
-	page, _ := s.ReadTerminals()
-	totals, _ := s.ReadTotals()
-	if len(live.Rows) != 0 || len(page.Rows) != 0 || s.nextID != 0 {
-		t.Fatalf("carrier published state: %+v %+v", live, page)
+	live, err := s.ReadLiveInto(nil)
+	if err != nil || len(live.Rows) != 0 || s.nextID != 0 {
+		t.Fatalf("carrier registered: %+v %v", live, err)
 	}
+
+	totals, _ := s.ReadTotals()
+
 	for _, row := range totals.Rows {
 		if row.Uplink != 0 || row.Downlink != 0 {
 			t.Fatalf("carrier totals: %+v", row)
@@ -77,15 +78,15 @@ func TestInspectionPreparedFirstRouteAndFailure(t *testing.T) {
 			flow.AddUplink(3)
 			flow.AddSelectedUplink(3)
 		}
-		flow.Finish()
-		page, _ := s.ReadTerminals()
+		live, _ = s.ReadLiveInto(nil)
 		want := uint64(14)
 		if failed {
 			want = 11
 		}
-		if len(page.Rows) != 1 || page.Rows[0].Flow.Opened != opened || page.Rows[0].Flow.Uplink != want || page.Rows[0].Flow.Outbound.Tag != "forward" {
-			t.Fatalf("early facts lost: %+v", page)
+		if len(live.Rows) != 1 || live.Rows[0].Opened != opened || live.Rows[0].Uplink != want || live.Rows[0].Outbound.Tag != "forward" {
+			t.Fatalf("early live facts lost: %+v", live)
 		}
+		flow.Finish()
 	}
 }
 

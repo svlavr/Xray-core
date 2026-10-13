@@ -241,7 +241,7 @@ func nativeEchoCapability(t *testing.T, destination netip.Addr) {
 	}
 }
 
-func TestICMPEchoNativeLoopbackControllersAndSeries(t *testing.T) {
+func TestICMPEchoNativeLoopbackControllers(t *testing.T) {
 	for _, address := range []string{"127.0.0.1", "::1"} {
 		t.Run(address, func(t *testing.T) {
 			destination := netip.MustParseAddr(address)
@@ -286,17 +286,16 @@ func TestICMPEchoNativeLoopbackControllersAndSeries(t *testing.T) {
 				return raw.Control(func(uintptr) {})
 			})
 			internet.ControllersLock.Unlock()
-			samples, err := RunSeries(context.Background(), e, 4, 2, func(ctx context.Context, _ int) (ICMPEchoReceipt, error) { return e.ICMPEcho(ctx, request) })
-			if err != nil || len(samples) != 4 || calls != 4 {
-				t.Fatalf("native ICMP series: %d samples, %d controllers, %v", len(samples), calls, err)
-			}
 			seen := make(map[[16]byte]bool)
-			for _, sample := range samples {
-				r := sample.Receipt
-				if sample.Err != nil || r.RoundTrip == nil || r.ReplySource != destination || r.WrittenBytes == nil || *r.WrittenBytes != 32 || r.ReplyBytes != 32 || seen[r.Nonce] {
-					t.Fatalf("native ICMP receipt association: %+v, %v", r, sample.Err)
+			for range 4 {
+				r, err := e.ICMPEcho(context.Background(), request)
+				if err != nil || r.RoundTrip == nil || r.ReplySource != destination || r.WrittenBytes == nil || *r.WrittenBytes != 32 || r.ReplyBytes != 32 || seen[r.Nonce] {
+					t.Fatalf("native ICMP receipt association: %+v, %v", r, err)
 				}
 				seen[r.Nonce] = true
+			}
+			if calls != 4 {
+				t.Fatal("unexpected controller count", calls)
 			}
 			internet.ControllersLock.Lock()
 			internet.Controllers = append(internet.Controllers, func(string, string, syscall.RawConn) error { return controllerErr })

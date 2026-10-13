@@ -98,15 +98,13 @@ func TestInspectionPacketWriterRawResults(t *testing.T) {
 				if perDestination && err != nil || !perDestination && !errors.Is(err, tc.err) {
 					t.Fatalf("native return changed: %v", err)
 				}
+				{
+					page, err := view.ReadLiveInto(nil)
+					if err != nil || len(page.Rows) != 1 || page.Rows[0].Downlink != tc.known {
+						t.Fatalf("live: %+v %v", page, err)
+					}
+				}
 				flow.Finish()
-				page, err := view.ReadTerminals()
-				if err != nil || len(page.Rows) != 1 {
-					t.Fatalf("terminal: %+v %v", page, err)
-				}
-				fact := page.Rows[0].Flow.Downlink
-				if fact != tc.known {
-					t.Fatalf("destination=%t fact=%+v", perDestination, fact)
-				}
 			}
 		})
 	}
@@ -135,10 +133,7 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 		t.Fatal("write did not start")
 	}
 	flow.Finish()
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("owner-end write snapshot: %+v %v", page, err)
-	}
+
 	closed := make(chan struct{})
 	go func() { native.Close(); close(closed) }()
 	select {
@@ -150,14 +145,7 @@ func TestInspectionPacketWriterCloseUnblocksAndRetires(t *testing.T) {
 	if err := <-done; !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatal(err)
 	}
-	page, err = view.ReadTerminals()
-	if err != nil || len(page.Rows) != 1 {
-		t.Fatalf("terminal: %+v %v", page, err)
-	}
-	fact := page.Rows[0].Flow.Downlink
-	if fact != 0 {
-		t.Fatalf("late write mutated history: %+v", fact)
-	}
+
 	totals, _ := view.ReadTotals()
 	var known uint64
 	for _, total := range totals.Rows {

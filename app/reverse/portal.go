@@ -252,7 +252,6 @@ func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
 	ctx := context.Background()
-	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginInternal)
 	outbounds := []*session.Outbound{{
 		Target: net.UDPDestination(net.DomainAddress(internalDomain), 0),
 	}}

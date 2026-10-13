@@ -123,10 +123,6 @@ func TestInspectionSelectedLateOverlappingRays(t *testing.T) {
 		}
 		t.Fatalf("late result moved to another ray: %+v", row)
 	}
-	terminal, _ := view.ReadTerminals()
-	if len(terminal.Rows) != 1 || terminal.Rows[0].Flow.Uplink != 9 || terminal.Rows[0].Flow.Downlink != 0 {
-		t.Fatalf("late result rewrote owner-end snapshot: %+v", terminal)
-	}
 }
 
 type inspectionReceipt struct {
@@ -670,5 +666,99 @@ func BenchmarkInspectionWriter(b *testing.B) {
 				})
 			}
 		}
+	}
+}
+
+func TestInspectionSequentialWriterScalarReceiptTimingAndCustody(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		inspected bool
+		first     int
+		lifecycle string
+	}{
+		{"live", true, 3, ""},
+		{"short-nil", true, 1, ""},
+		{"finish", true, 3, "finish"},
+		{"fence", true, 3, "fence"},
+		{"native", false, 3, ""},
+		{"native-short-nil", false, 1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager, err := appstats.NewManager(context.Background(), &appstats.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { manager.Close() })
+			view, err := manager.EnableInspection(fs.ObservationOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			flow := manager.Observation().PrepareTCP(fs.TrafficOriginUser, xnet.Destination{}, xnet.Destination{}, nil)
+			flow.Route(fs.OutboundRef{Tag: "sequential"})
+			t.Cleanup(flow.Finish)
+
+			owned := []*buf.Buffer{buf.New(), buf.New(), buf.New()}
+			mb := buf.MultiBuffer(owned)
+			for i, payload := range []string{"abc", "defgh", "tail"} {
+				if n, err := owned[i].Write([]byte(payload)); err != nil || n != len(payload) {
+					buf.ReleaseMulti(mb)
+					t.Fatalf("managed fixture: %d %v", n, err)
+				}
+			}
+			// Keep independent pointer holders: SplitFirst clears the mb slots.
+			held := append([]*buf.Buffer(nil), owned...)
+			calls := 0
+			lower := inspectionWriteFunc(func(p []byte) (int, error) {
+				calls++
+				if calls == 1 {
+					return tc.first, nil
+				}
+				if calls != 2 || string(p) != "defgh" {
+					t.Errorf("tail was written or scalar retried: call=%d payload=%q", calls, p)
+					return 0, errInspectionWrite
+				}
+				before, err := view.ReadTotals()
+				want := uint64(0)
+				if tc.inspected {
+					want = uint64(tc.first)
+				}
+				if err != nil || before.User.Downlink != want || len(before.Rows) != 1 || before.Rows[0].Downlink != want {
+					t.Errorf("completed first scalar was not visible before second: %+v %v want=%d", before, err, want)
+				}
+				if !held[0].IsEmpty() || held[1].IsEmpty() || held[2].IsEmpty() {
+					t.Error("completed/current/tail custody changed before second result")
+				}
+				switch tc.lifecycle {
+				case "finish":
+					flow.Finish()
+				case "fence":
+					flow.Rebind(view.Runtime(), fs.TrafficOriginInternal)
+				}
+				return 2, errInspectionWrite
+			})
+			var writer buf.Writer = &buf.SequentialWriter{Writer: lower}
+			if tc.inspected {
+				writer = buf.AttachWriterReceipt(writer, flow)
+			}
+			if err := writer.WriteMultiBuffer(mb); !errors.Is(err, errInspectionWrite) || calls != 2 {
+				t.Fatalf("native error/call sequence changed: %v calls=%d", err, calls)
+			}
+			for i, b := range held {
+				if !b.IsEmpty() {
+					t.Errorf("managed buffer %d retained after error", i)
+				}
+			}
+			want := uint64(0)
+			if tc.inspected {
+				want = uint64(tc.first)
+				if tc.lifecycle != "fence" {
+					want += 2
+				}
+			}
+			after, err := view.ReadTotals()
+			if err != nil || after.User.Downlink != want || len(after.Rows) != 1 || after.Rows[0].Downlink != want {
+				t.Fatalf("final scalar facts: %+v %v want=%d", after, err, want)
+			}
+		})
 	}
 }

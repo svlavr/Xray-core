@@ -375,8 +375,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
-		detached := context.Background()
-		newCtx, newCancel = context.WithCancel(detached)
+		newCtx, newCancel = context.WithCancel(context.Background())
 	}
 
 	plcy := h.policy()

@@ -118,10 +118,6 @@ func TestFlowInspectionMuxRetainedProvenance(t *testing.T) {
 			if err != nil || out[0] != nil {
 				t.Fatalf("retained close: %+v %v", out, err)
 			}
-			inspectionWait(t, func() bool {
-				page, _ := view.ReadTerminals()
-				return len(page.Rows) == 1 && page.Rows[0].Flow.Ref == first.Ref
-			})
 		})
 	}
 }

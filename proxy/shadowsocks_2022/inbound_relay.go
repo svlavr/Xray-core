@@ -33,18 +33,16 @@ type relayDest struct {
 	destination net.Destination
 	email       string
 	level       uint32
-	key         []byte
 	blockCipher cipher.Block
 }
 
 type RelayInbound struct {
-	networks        []net.Network
-	method          *CipherMethod
-	relayPSK        []byte
-	relayBlock      cipher.Block
-	destinations    map[[AESBlockSize]byte]*relayDest
-	rawDestinations []*RelayDestination
-	policyManager   policy.Manager
+	networks      []net.Network
+	method        *CipherMethod
+	relayPSK      []byte
+	relayBlock    cipher.Block
+	destinations  map[[AESBlockSize]byte]*relayDest
+	policyManager policy.Manager
 }
 
 func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbound, error) {
@@ -76,13 +74,12 @@ func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbou
 
 	v := core.MustFromContext(ctx)
 	i := &RelayInbound{
-		networks:        networks,
-		method:          method,
-		relayPSK:        relayPSK,
-		relayBlock:      relayBlock,
-		destinations:    make(map[[AESBlockSize]byte]*relayDest),
-		rawDestinations: config.Destinations,
-		policyManager:   v.GetFeature(policy.ManagerType()).(policy.Manager),
+		networks:      networks,
+		method:        method,
+		relayPSK:      relayPSK,
+		relayBlock:    relayBlock,
+		destinations:  make(map[[AESBlockSize]byte]*relayDest),
+		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 	}
 
 	for idx, d := range config.Destinations {
@@ -106,7 +103,6 @@ func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbou
 			destination: net.TCPDestination(d.Address.AsAddress(), net.Port(d.Port)),
 			email:       d.Email,
 			level:       uint32(d.Level),
-			key:         destKey,
 			blockCipher: destBlock,
 		}
 	}
@@ -233,11 +229,7 @@ func (i *RelayInbound) processUDP(ctx context.Context, conn stat.Connection, dis
 			var packetHeader [AESBlockSize]byte
 			i.relayBlock.Decrypt(packetHeader[:], data[:AESBlockSize])
 
-			var eiHeader [AESBlockSize]byte
-			i.relayBlock.Decrypt(eiHeader[:], data[AESBlockSize:2*AESBlockSize])
-			for idx := 0; idx < AESBlockSize; idx++ {
-				eiHeader[idx] ^= packetHeader[idx]
-			}
+			eiHeader := DecryptUDPEIH(i.relayBlock, packetHeader[:], data[AESBlockSize:2*AESBlockSize])
 
 			targetDest, ok := i.destinations[eiHeader]
 			if !ok {

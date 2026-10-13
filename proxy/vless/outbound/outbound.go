@@ -315,8 +315,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	clientReader := link.Reader // .(*pipe.Reader)
 	clientWriter := link.Writer // .(*pipe.Writer)
 	trafficState := proxy.NewTrafficState(account.ID.Bytes())
-	// Controlled UDP needs source-bearing responses on this invocation only.
-	requirePacketSource := session.TrafficOriginFromContext(ctx) == session.TrafficOriginControlledMeasurement && session.UDPPacketSourceRequired(ctx)
+	// INTERNAL and controlled UDP may explicitly require source-bearing responses.
+	origin := session.TrafficOriginFromContext(ctx)
+	requirePacketSource := (origin == session.TrafficOriginInternal || origin == session.TrafficOriginControlledMeasurement) && session.UDPPacketSourceRequired(ctx)
 	if request.Command == protocol.RequestCommandUDP && (requestAddons.Flow == vless.XRV || (h.cone && request.Port != 53 && request.Port != 443) || requirePacketSource) {
 		request.Command = protocol.RequestCommandMux
 		request.Address = net.DomainAddress("v1.mux.cool")

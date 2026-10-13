@@ -46,7 +46,7 @@ func (w *inspectionUDPPrefixWriter) Write(payload []byte) (int, error) {
 	return min(2, len(payload)), errInspectionUDPWrite
 }
 
-func TestObserveUDPPacketReceiptsOriginsAndTerminalGate(t *testing.T) {
+func TestObserveUDPPacketReceiptsOriginsAndLiveRetirement(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		origin session.TrafficOrigin
@@ -111,20 +111,14 @@ func TestObserveUDPPacketReceiptsOriginsAndTerminalGate(t *testing.T) {
 			// The native sequential writer accepted the first payload and two
 			// bytes from the second operation before returning its error.
 			wantDownlink := uint64(len("packet-one") + 2)
+			live, err := view.ReadLiveInto(nil)
+			if err != nil || len(live.Rows) != 1 || live.Rows[0].Origin != test.origin || live.Rows[0].Uplink != uint64(len("firstsecond")) || live.Rows[0].Downlink != wantDownlink || live.Rows[0].Destination != destinations[1] {
+				t.Fatalf("decoded UDP live facts: %+v %v", live, err)
+			}
 			finish()
-			page, err := view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 || page.Rows[0].Flow.Downlink != wantDownlink {
-				t.Fatalf("owner-end UDP snapshot: %+v %v", page, err)
-			}
+
 			flow.AddDownlink(1)
-			page, err = view.ReadTerminals()
-			if err != nil || len(page.Rows) != 1 {
-				t.Fatalf("UDP terminal: %+v %v", page, err)
-			}
-			row := page.Rows[0]
-			if row.Flow.Origin != fs.TrafficOrigin(test.origin) || row.Flow.Uplink != uint64(len("firstsecond")) || row.Flow.Downlink != wantDownlink || row.Flow.Destination != destinations[1] {
-				t.Fatalf("UDP terminal receipts: %+v", row)
-			}
+
 			totals, _ := view.ReadTotals()
 			want := fs.ClientTotals{}
 			if test.origin == session.TrafficOriginUser {

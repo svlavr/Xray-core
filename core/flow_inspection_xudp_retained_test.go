@@ -90,9 +90,6 @@ func TestFlowInspectionXUDPRetainedRebind(t *testing.T) {
 		})
 		control.Close()
 	}
-	page, err := view.ReadTerminals()
-	if err != nil || len(page.Rows) != 2 {
-		t.Fatalf("client terminals: %+v %v", page, err)
-	}
+
 	inspectionOutboundTotals(t, view, "vmess-proxy", uint64(len("first retained packet")+len("packet after client exact stop")))
 }

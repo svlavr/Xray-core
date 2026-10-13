@@ -353,8 +353,13 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 		SuppressOuterCloseNotify(w.conn)
 		rawConn, _, writerCounter := UnwrapRawConn(w.conn)
-		w.Writer = buf.NewWriter(rawConn)
-		w.directWriteCounter = writerCounter
+		if w.receipt != nil {
+			w.Writer = buf.AttachWriterReceipt(buf.NewWriter(&stat.CounterConnection{Connection: rawConn, WriteCounter: writerCounter}), w.receipt)
+			w.directWriteCounter = nil
+		} else {
+			w.Writer = buf.NewWriter(rawConn)
+			w.directWriteCounter = writerCounter
+		}
 		*switchToDirectCopy = false
 	}
 	if !mb.IsEmpty() && w.directWriteCounter != nil {
@@ -408,7 +413,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
 		return err
 	}
-	if w.receipt != nil && payload != 0 {
+	if w.receipt != nil && payload != 0 && buf.WriterReceipt(w.Writer) == nil {
 		w.receipt.AddDownlink(payload)
 	}
 	if spliceReadyInbound != nil && spliceReadyInbound.CanSpliceCopy == 2 {
@@ -797,20 +802,8 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			receipt := endpointWriterReceipt(writer)
-			if receipt != nil {
-				rawReceipt := rawCopyReceipt{exchange: receipt, readCounter: readCounter, writeCounter: writeCounter}
-				if statWriter != nil {
-					rawReceipt.userCounter = statWriter.Counter
-				}
-				handled, err := copySpliceProgress(tc, readerConn, &rawReceipt)
-				if !handled {
-					return readV(ctx, reader, writer, timer, readCounter)
-				}
-				if err != nil && errors.Cause(err) != io.EOF {
-					return err
-				}
-				return nil
+			if endpointWriterReceipt(writer) != nil {
+				return readV(ctx, reader, writer, timer, readCounter)
 			}
 			w, err := tc.ReadFrom(readerConn)
 			if readCounter != nil {
@@ -871,28 +864,4 @@ func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
 	_, ok2 := iConn.(*net.TCPConn)
 	_, ok3 := iConn.(*internet.UnixConnWrapper)
 	return ok1 || ok2 || ok3
-}
-
-// rawCopyReceipt is the bounded set of existing sinks updated for every
-// positive destination-pump result. Callers must not repeat a final addition.
-type rawCopyReceipt struct {
-	exchange     stats.Exchange
-	readCounter  stats.Counter
-	writeCounter stats.Counter
-	userCounter  stats.Counter
-}
-
-func (r *rawCopyReceipt) add(n int64) {
-	if r.exchange != nil {
-		r.exchange.AddDownlink(uint64(n))
-	}
-	if r.readCounter != nil {
-		r.readCounter.Add(n)
-	}
-	if r.writeCounter != nil {
-		r.writeCounter.Add(n)
-	}
-	if r.userCounter != nil {
-		r.userCounter.Add(n)
-	}
 }
