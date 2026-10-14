@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -28,9 +27,9 @@ func m3DNSFile(t *testing.T, text string) string {
 	return path
 }
 
-func mustM3Program(t *testing.T, script string) *xlua.Program {
+func mustM3Engine(t *testing.T, script string) *scriptEngine {
 	t.Helper()
-	program, err := xlua.Compile(script)
+	program, err := newScriptEngine(script)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +38,7 @@ func mustM3Program(t *testing.T, script string) *xlua.Program {
 
 func m3DNSFeature(t *testing.T) *DNS {
 	t.Helper()
-	s, err := New(context.Background(), &Config{})
+	s, err := New(dnsTestContext(t), &Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,9 +98,9 @@ end`)
 		t.Fatalf("initialization plus query count=%d", calls.Load())
 	}
 	config.Script = m3DNSFile(t, `local dns = require("xray.dns"); dns.Servers[1]:Query("init.example", true, false, false); error("after external action")`)
-	before := s.runtime.current
+	before := s.active.Load()
 	result = ApplyConfig(context.Background(), s, config)
-	if result.Applied || result.Err == nil || s.runtime.current != before {
+	if result.Applied || result.Err == nil || s.active.Load() != before {
 		t.Fatalf("failed activation: %+v", result)
 	}
 	if calls.Load() != 3 {
@@ -154,17 +153,17 @@ func TestM3DNSCloseStartsAllResourceClosuresBeforeInitJoin(t *testing.T) {
 	second := &m3BlockedServer{entered: make(chan struct{}), release: make(chan struct{}), closeSignal: otherClosed}
 	option := featuredns.IPOption{IPv4Enable: true}
 	path := m3DNSFile(t, `local s=require("xray.dns").Servers[1]; s:Query("init.example",true,false,false); function HandleDNSQuery(...) return s:Query(...) end`)
-	resolver := &DNS{ctx: context.Background(), scriptProgram: mustM3Program(t, path), clients: []*Client{
+	r := &resolver{ctx: context.Background(), prepared: mustM3Engine(t, path), clients: []*Client{
 		{server: first, ipOption: &option, timeoutMs: time.Hour, tag: "activating"},
 		{server: second, ipOption: &option, timeoutMs: time.Hour},
 	}}
-	owner := newResolverOwner(resolver)
-	resolver.ctx = bindResolverContext(owner.ctx, s.runtime, owner)
-	owner.initDone = make(chan struct{})
-	s.runtime.mu.Lock()
-	s.runtime.closing = owner
-	s.runtime.mu.Unlock()
-	initialized := s.runtime.initializeScript(owner)
+	owner := dnsTestResolver(s, r)
+	r.ctx = owner.ctx
+	owner.initialized = make(chan struct{})
+	s.mu.Lock()
+	s.pending = owner
+	s.mu.Unlock()
+	initialized := owner.initialize()
 	m3DNSReceive(t, first.entered)
 	if !s.IsOwnLink(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "activating"})) {
 		t.Fatal("activation tag absent")
@@ -177,11 +176,11 @@ func TestM3DNSCloseStartsAllResourceClosuresBeforeInitJoin(t *testing.T) {
 	if err := m3DNSReceive(t, initialized); err == nil {
 		t.Fatal("late engine installed into canceled owner")
 	}
-	if resolver.getScript() != nil {
+	if r.script.Load() != nil {
 		t.Fatal("late engine escaped disposal")
 	}
 	select {
-	case <-owner.closeDone:
+	case <-owner.done:
 	default:
 		t.Fatal("close returned before terminal disposal")
 	}
@@ -193,9 +192,8 @@ func TestM3DNSBoundCallbacksRejectRetiredOwnerAndKeepIDs(t *testing.T) {
 	for _, id := range []string{"", "same", "same"} {
 		clients = append(clients, &Client{id: id, server: &scriptNameServer{name: "exact", answers: map[string]net.IP{"good.example": {192, 0, 2, 51}}, ttl: 7}, ipOption: &option, timeoutMs: time.Second})
 	}
-	resolver := &DNS{ctx: context.Background(), clients: clients, ipOption: &option, hosts: new(StaticHosts)}
-	s := &DNS{ctx: context.Background()}
-	s.initRuntime(resolver)
+	r := &resolver{ctx: context.Background(), clients: clients, ipOption: &option, hosts: new(StaticHosts)}
+	s := dnsTestFeature(t, r)
 	t.Cleanup(func() { s.Close() })
 	L := lua.NewState()
 	defer L.Close()
@@ -208,7 +206,7 @@ saved=dns.Servers[2]; query=saved.Query; general=dns.Query
 local ips,_,err=query(saved,"good.example",true,false,false);assert(not err and #ips==1)`); err != nil {
 		t.Fatal(err)
 	}
-	old := s.runtime.current
+	old := s.active.Load()
 	config := stageBConfig(stageBServer("127.0.0.1:53", "replacement"))
 	if result := ApplyConfig(context.Background(), s, config); !result.Applied || result.Err != nil {
 		t.Fatalf("apply: %+v", result)
@@ -216,7 +214,7 @@ local ips,_,err=query(saved,"good.example",true,false,false);assert(not err and 
 	if err := L.DoString(`local _,_,err=query(saved,"good.example",true,false,false);assert(err); local _,_,err=general("good.example",true,false,false);assert(err)`); err != nil {
 		t.Fatal(err)
 	}
-	ctx := bindResolverContext(context.Background(), s.runtime, old)
+	ctx := context.WithValue(context.Background(), resolverContextKey{}, old)
 	if _, _, err := s.LookupIPContext(ctx, "good.example", option); !errors.Is(err, context.Canceled) {
 		t.Fatalf("old binding retargeted: %v", err)
 	}
@@ -224,15 +222,15 @@ local ips,_,err=query(saved,"good.example",true,false,false);assert(not err and 
 
 func TestM3DNSBindingSurvivesDetachedTransportAndCacheContext(t *testing.T) {
 	s := m3DNSFeature(t)
-	owner := s.runtime.current
+	owner := s.active.Load()
 	base := context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance))
-	base = bindResolverContext(base, s.runtime, owner)
+	base = context.WithValue(base, resolverContextKey{}, owner)
 	ctx := toDnsContext(base, context.Background(), "dns")
-	if resolverFromContext(ctx, s.runtime) != owner || session.TrafficOriginFromContext(ctx) != session.TrafficOriginInternal {
+	if ctx.Value(resolverContextKey{}) != owner || session.TrafficOriginFromContext(ctx) != session.TrafficOriginInternal {
 		t.Fatal("detachment lost owner identity or INTERNAL origin")
 	}
 	ctx = &dnsRequestContext{Context: context.WithoutCancel(ctx), caller: context.Background()}
-	if resolverFromContext(ctx, s.runtime) != owner {
+	if ctx.Value(resolverContextKey{}) != owner {
 		t.Fatal("cache-owned cancellation lost owner identity")
 	}
 }
@@ -254,19 +252,19 @@ func TestM3DNSActivationCancellationRetainsOwnedPendingSlot(t *testing.T) {
 			defer unblock()
 			blocked := &m3BlockedServer{entered: make(chan struct{}), release: make(chan struct{}), closeSignal: make(chan struct{}), waitClose: release}
 			option := featuredns.IPOption{IPv4Enable: true}
-			candidate := &DNS{ctx: context.Background(), scriptProgram: mustM3Program(t, m3DNSFile(t, `local s=require("xray.dns").Servers[1]; s:Query("initializing.example",true,false,false); function HandleDNSQuery(...) return s:Query(...) end`)), clients: []*Client{
+			candidate := &resolver{ctx: context.Background(), prepared: mustM3Engine(t, m3DNSFile(t, `local s=require("xray.dns").Servers[1]; s:Query("initializing.example",true,false,false); function HandleDNSQuery(...) return s:Query(...) end`)), clients: []*Client{
 				{server: blocked, ipOption: &option, timeoutMs: time.Hour, tag: "pending"},
 				{server: NewLocalNameServer(), ipOption: &option, tag: "local-pending"},
 			}}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			applied := make(chan ApplyResult, 1)
-			go func() { applied <- s.applyScript(ctx, candidate) }()
+			go func() { applied <- s.applyResolver(ctx, dnsTestResolver(s, candidate)) }()
 			m3DNSReceive(t, blocked.entered)
-			s.runtime.mu.Lock()
-			owner, old := s.runtime.closing, s.runtime.current
-			s.runtime.mu.Unlock()
-			if owner == nil || owner.resolver != candidate {
+			s.mu.Lock()
+			owner, old := s.pending, s.active.Load()
+			s.mu.Unlock()
+			if owner == nil || owner != candidate {
 				t.Fatal("activating candidate not owned")
 			}
 			if !s.MayUseSystemResolver() {
@@ -290,21 +288,21 @@ func TestM3DNSActivationCancellationRetainsOwnedPendingSlot(t *testing.T) {
 				t.Fatalf("canceled activation published: %+v", a)
 			}
 			m3DNSReceive(t, blocked.closeSignal)
-			s.runtime.mu.Lock()
-			stillPending, current := s.runtime.closing == owner, s.runtime.current
-			s.runtime.mu.Unlock()
+			s.mu.Lock()
+			stillPending, current := s.pending == owner, s.active.Load()
+			s.mu.Unlock()
 			if !stillPending || current != old {
 				t.Fatal("unfinished activation forgotten or publication changed")
 			}
 			unblock()
-			m3DNSReceive(t, owner.closeDone)
-			s.runtime.mu.Lock()
-			stillPending = s.runtime.closing == owner
-			s.runtime.mu.Unlock()
+			m3DNSReceive(t, owner.done)
+			s.mu.Lock()
+			stillPending = s.pending == owner
+			s.mu.Unlock()
 			if stillPending {
 				t.Fatal("terminal activation retained its pending slot")
 			}
-			if candidate.getScript() != nil {
+			if candidate.script.Load() != nil {
 				t.Fatal("late initialization escaped retirement")
 			}
 			if closed != nil {
@@ -322,7 +320,7 @@ func TestM3DNSFeatureCloseStartsBothOwnersBeforeJoining(t *testing.T) {
 	pending := &m3BlockedServer{entered: make(chan struct{}), release: make(chan struct{}), closeSignal: otherClosed}
 	s := stageBManualFeature(t, current)
 	option := featuredns.IPOption{IPv4Enable: true}
-	s.runtime.closing = newResolverOwner(&DNS{clients: []*Client{{server: pending, ipOption: &option}}})
+	s.pending = dnsTestResolver(s, &resolver{clients: []*Client{{server: pending, ipOption: &option}}})
 	done := make(chan error, 1)
 	go func() { done <- s.Close() }()
 	if err := m3DNSReceive(t, done); err != nil {
@@ -333,12 +331,13 @@ func TestM3DNSFeatureCloseStartsBothOwnersBeforeJoining(t *testing.T) {
 func TestM3DNSNativeEngineCloseCancelsExplicitPoolContext(t *testing.T) {
 	upstream := &stageBBlockingServer{started: make(chan struct{})}
 	option := featuredns.IPOption{IPv4Enable: true}
-	s := &DNS{ctx: context.Background(), clients: []*Client{{server: upstream, ipOption: &option, timeoutMs: time.Hour}}}
+	s := &resolver{ctx: context.Background(), clients: []*Client{{server: upstream, ipOption: &option, timeoutMs: time.Hour}}}
 	path := m3DNSFile(t, `local s=require("xray.dns").Servers[1]; function HandleDNSQuery(...) return s:Query(...) end`)
 	engine, err := newScriptEngine(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	dnsTestFeature(t, s)
 	if err := engine.start(s); err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +358,7 @@ func TestM3DNSInlineApplyCancellationBeforePublication(t *testing.T) {
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}
-	old := server.runtime.current
+	old := server.active.Load()
 	config := stageBConfig(stageBServer(address, "inline"))
 	config.Script = "base64:" + base64.StdEncoding.EncodeToString([]byte(`
  local s=require("xray.dns").Servers[1]
@@ -384,9 +383,9 @@ func TestM3DNSInlineApplyCancellationBeforePublication(t *testing.T) {
 		case <-ticker.C:
 		}
 	}
-	server.runtime.mu.Lock()
-	pending := server.runtime.closing
-	server.runtime.mu.Unlock()
+	server.mu.Lock()
+	pending := server.pending
+	server.mu.Unlock()
 	if pending == nil {
 		t.Fatal("inline activation was not owned")
 	}
@@ -395,11 +394,11 @@ func TestM3DNSInlineApplyCancellationBeforePublication(t *testing.T) {
 	if result.Applied || !errors.Is(result.Err, context.Canceled) {
 		t.Fatalf("canceled inline apply: %+v", result)
 	}
-	m3DNSReceive(t, pending.closeDone)
-	server.runtime.mu.Lock()
-	current, closing := server.runtime.current, server.runtime.closing
-	server.runtime.mu.Unlock()
-	if current != old || closing != nil || pending.resolver.getScript() != nil {
+	m3DNSReceive(t, pending.done)
+	server.mu.Lock()
+	current, closing := server.active.Load(), server.pending
+	server.mu.Unlock()
+	if current != old || closing != nil || pending.script.Load() != nil {
 		t.Fatal("canceled inline activation changed publication or escaped retirement")
 	}
 }

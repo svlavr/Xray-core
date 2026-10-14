@@ -1,88 +1,36 @@
 package mux
 
 import (
-	"bytes"
 	"context"
 	"io"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/transport/pipe"
 )
 
-type childCloser struct{ session *Session }
-
-func (c childCloser) Close() error { return c.session.Close(false) }
-
-// A stop during preparation still has a native child END owner. The admission
-// finishes at response END; carrier-frame drain retains its own native reader.
-func (s *Session) cancelAdmission(ctx context.Context, output buf.Writer) {
-	s.Close(false)
-	s.parent.Lock()
-	canReply := !s.parent.closed && (s.parent.sessions[s.ID] == nil || s.parent.sessions[s.ID] == s)
-	if canReply {
-		if s.parent.sessions[s.ID] == nil {
-			s.parent.sessions[s.ID] = s
-			s.parent.count++
-			s.parent.markSeenLocked(s.ID)
-		}
-		s.input = buf.NewReader(bytes.NewReader(nil))
-		s.output = buf.Discard
-	}
-	s.parent.Unlock()
-	if canReply {
-		go handle(ctx, s, output)
-	} else {
-		s.finishServer()
-	}
-}
-
 func (w *ServerWorker) initializeInspection(ctx context.Context) {
-	instance := core.FromContext(ctx)
-	if instance == nil {
-		return
+	if instance := core.FromContext(ctx); instance != nil {
+		if manager, ok := instance.GetFeature(stats.ManagerType()).(stats.Manager); ok {
+			w.store = proxy.ObservationStore(manager)
+		}
 	}
-	manager, ok := instance.GetFeature(stats.ManagerType()).(stats.Manager)
-	if !ok {
-		return
-	}
-	w.stats = manager
-	w.store = proxy.ObservationStore(manager)
-	if w.store == nil {
-		return
-	}
-	w.runtime = w.store.Runtime()
-	w.link.Writer = newFrameWriter(w.link.Writer)
 }
 
-func (w *ServerWorker) observeChild(ctx context.Context, dest net.Destination, s *Session) (context.Context, func()) {
+func (w *ServerWorker) inspectChild(dest net.Destination) bool {
 	if w.store == nil {
-		return ctx, nil
+		return false
 	}
-	if admission, ok := w.dispatcher.(interface{ InspectMuxChild(net.Destination) bool }); ok && !admission.InspectMuxChild(dest) {
-		return ctx, nil
-	}
-	kind := net.Network_TCP
-	if dest.Network == net.Network_UDP {
-		kind = net.Network_UDP
-	}
-	ctx = session.ContextWithLogicalObservation(ctx, nil)
-	ctx, observation, cleanup := proxy.BeginReturnedObservation(ctx, w.stats, childCloser{s}, dest, kind)
-	if observation != nil {
-		s.parent.Lock()
-		s.inspection = observation.Exchange
-		s.parent.Unlock()
-	}
-	return ctx, cleanup
+	admission, ok := w.dispatcher.(interface{ InspectMuxChild(net.Destination) bool })
+	return !ok || admission.InspectMuxChild(dest)
 }
 
-func (w *ServerWorker) observeRetained(ctx context.Context, dest net.Destination, x *XUDP) (context.Context, error) {
-	if w.store == nil {
-		return ctx, nil
-	}
+func (w *ServerWorker) observeChild(ctx context.Context, dest net.Destination, s *Session) context.Context {
 	original := ctx
 	ctx = session.ContextWithLogicalObservation(ctx, nil)
 	ctx, cancel := context.WithCancel(ctx)
@@ -90,22 +38,38 @@ func (w *ServerWorker) observeRetained(ctx context.Context, dest net.Destination
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		source = inbound.Source
 	}
-	flow := w.store.Begin(net.Network_UDP, session.TrafficOriginFromContext(ctx), source, dest, func() error { x.Interrupt(); return nil })
+	stop := func() error { cancel(); return s.Close(false) }
+	var flow stats.Exchange
+	if dest.Network == net.Network_UDP {
+		flow = w.store.Begin(net.Network_UDP, session.TrafficOriginFromContext(ctx), source, dest, stop)
+	} else {
+		flow = w.store.PrepareTCP(session.TrafficOriginFromContext(ctx), source, dest, stop)
+	}
 	if flow == nil {
 		cancel()
-		return original, nil
+		return original
 	}
-	XUDPManager.Lock()
-	current := XUDPManager.Map[x.GlobalID] == x
-	x.inspection, x.cancel = flow, cancel
-	XUDPManager.Unlock()
-	if !current {
-		cancel()
-		return ctx, io.ErrClosedPipe
-	}
+	s.parent.Lock()
+	s.inspection = flow
+	s.cleanup = func() { cancel(); flow.Finish() }
+	s.parent.Unlock()
 	observation := &session.LogicalObservation{Exchange: flow}
 	observation.ReturnedLink.Store(true)
-	return session.ContextWithLogicalObservation(ctx, observation), nil
+	return session.ContextWithLogicalObservation(ctx, observation)
+}
+
+func (s *Session) finishServer() {
+	s.Close(false)
+	s.parent.Lock()
+	if s.parent.sessions[s.ID] == s {
+		delete(s.parent.sessions, s.ID)
+	}
+	cleanup := s.cleanup
+	s.cleanup = nil
+	s.parent.Unlock()
+	if cleanup != nil {
+		cleanup()
+	}
 }
 
 type childInput struct {
@@ -130,17 +94,87 @@ func (r *childInput) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 func (s *Session) copyInput(reader *buf.BufferedReader, target net.Destination) error {
-	rr := s.NewReader(reader, &target)
-	raw := rr
-	if s.inspection != nil {
-		if s.xudp == nil {
-			rr = &childInput{Reader: rr, flow: s.inspection, target: target}
-		}
+	raw := s.NewReader(reader, &target)
+	input, output := raw, s.output
+	if s.server && s.XUDP != nil {
+		output = s
+	} else if s.inspection != nil {
+		input = &childInput{Reader: raw, flow: s.inspection, target: target}
 	}
-	err := buf.Copy(rr, s.output)
-	if err != nil && buf.IsWriteError(err) {
+	err := buf.Copy(input, output)
+	if buf.IsWriteError(err) {
 		s.Close(false)
 		return buf.Copy(raw, buf.Discard)
 	}
 	return err
+}
+
+// ReadMultiBuffer is selected only for an observed retained session. The gate
+// ends at native dequeue, before its response can block on the old carrier.
+func (s *Session) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	s.ioGate.RLock()
+	defer s.ioGate.RUnlock()
+	if s.done.Done() {
+		return nil, io.EOF
+	}
+	return s.input.ReadMultiBuffer()
+}
+
+func (s *Session) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	s.ioGate.RLock()
+	defer s.ioGate.RUnlock()
+	if s.done.Done() {
+		buf.ReleaseMulti(mb)
+		return io.EOF
+	}
+	writer := s.output.(interface {
+		WriteMultiBufferStop(buf.MultiBuffer, <-chan struct{}) error
+	})
+	size := uint64(mb.Len())
+	var target net.Destination
+	if len(mb) == 1 && mb[0] != nil && mb[0].UDP != nil {
+		target = *mb[0].UDP
+	}
+	if s.inspection != nil {
+		s.inspection.PacketDestination(target)
+	}
+	err := writer.WriteMultiBufferStop(mb, s.done.Wait())
+	if err == nil && s.inspection != nil {
+		s.inspection.AddUplink(size)
+	}
+	return err
+}
+
+func retainedEndpointsSupported(s *Session) bool {
+	_, reader := s.input.(*pipe.Reader)
+	_, writer := s.output.(interface {
+		WriteMultiBufferStop(buf.MultiBuffer, <-chan struct{}) error
+	})
+	return reader && writer
+}
+
+func closeRetainedEndpoints(s *Session) {
+	common.Interrupt(s.input)
+	common.Close(s.output)
+}
+
+// replyEnd owns only the canceled admission's native END. The parser can drain
+// its current frame while that response waits for its own carrier.
+func (s *Session) replyEnd(output buf.Writer) {
+	s.Close(false)
+	s.parent.Lock()
+	if !s.parent.closed && s.parent.sessions[s.ID] == nil {
+		s.parent.sessions[s.ID] = s
+		s.parent.count++
+	}
+	canReply := !s.parent.closed && s.parent.sessions[s.ID] == s
+	s.parent.Unlock()
+	if canReply {
+		go func() {
+			NewResponseWriter(s.ID, output, s.transferType).Close()
+			s.finishServer()
+		}()
+	} else {
+		s.finishServer()
+	}
 }

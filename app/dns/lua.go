@@ -2,93 +2,71 @@ package dns
 
 import (
 	"context"
-	"strings"
-
 	"github.com/xtls/xray-core/common/errors"
 	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/common/net"
 	featureDNS "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/dns/localdns"
 	lua "github.com/yuin/gopher-lua"
+	"strings"
 )
 
-// luaDNSServer adapts configured and local DNS to the same Lua API.
+type luaDNSQuery func(context.Context, string, featureDNS.IPOption) ([]net.IP, uint32, error)
+
 type luaDNSServer struct {
 	id    string
 	name  string
-	query func(context.Context, string, featureDNS.IPOption) ([]net.IP, uint32, error)
+	query luaDNSQuery
 }
 
-// RegisterLua makes xray.dns available to scripts backed by client.
+// RegisterLua retains native inventory and general Query. Every captured
+// configured server and Query function references the same exact resolver.
 func RegisterLua(L *lua.LState, client featureDNS.Client) {
 	var servers []luaDNSServer
-	switch client := client.(type) {
+	var query luaDNSQuery
+	if client != nil {
+		query = func(ctx context.Context, domain string, option featureDNS.IPOption) ([]net.IP, uint32, error) {
+			return featureDNS.LookupIPContext(ctx, client, domain, option)
+		}
+	}
+	switch c := client.(type) {
 	case *DNS:
-		if client.runtime != nil {
-			ctx := L.Context()
-			if ctx == nil {
-				ctx = client.ctx
+		c.mu.Lock()
+		var r *resolver
+		if ctx := L.Context(); ctx != nil {
+			r, _ = ctx.Value(resolverContextKey{}).(*resolver)
+		}
+		if r == nil || r.owner != c {
+			r = c.active.Load()
+		}
+		c.mu.Unlock()
+		if r != nil {
+			servers = luaServers(r)
+			query = func(ctx context.Context, domain string, option featureDNS.IPOption) ([]net.IP, uint32, error) {
+				return r.query(ctx, nil, domain, option)
 			}
-			client.runtime.mu.Lock()
-			owner := resolverFromContext(ctx, client.runtime)
-			if owner == nil {
-				owner = client.runtime.current
-			}
-			client.runtime.mu.Unlock()
-			if owner != nil {
-				binding := resolverBinding{client.runtime, owner}
-				servers = luaBoundServers(owner.resolver, binding)
-				registerLua(L, servers, &boundLuaClient{server: client, binding: binding})
-				return
-			}
-		} else {
-			servers = luaServers(client)
 		}
 	case *localdns.Client:
-		servers = []luaDNSServer{{
-			id:   "localhost",
-			name: "localhost",
-			query: func(ctx context.Context, domain string, option featureDNS.IPOption) ([]net.IP, uint32, error) {
-				return client.LookupIPContext(ctx, domain, option)
-			},
-		}}
+		servers = []luaDNSServer{{id: "localhost", name: "localhost", query: c.LookupIPContext}}
 	}
-	registerLua(L, servers, client)
+	registerLua(L, servers, query)
 }
 
-// registerLua makes xray.dns available to DNS scripts.
-func (s *DNS) registerLua(L *lua.LState) {
-	var binding resolverBinding
-	var ok bool
-	if s.ctx != nil {
-		binding, ok = s.ctx.Value(resolverContextKey{}).(resolverBinding)
-	}
-	if ok {
-		registerLua(L, luaBoundServers(s, binding), nil)
-	} else {
-		registerLua(L, luaServers(s), nil)
-	}
+func (r *resolver) registerLua(L *lua.LState) {
+	registerLua(L, luaServers(r), nil)
 }
 
-func luaBoundServers(s *DNS, binding resolverBinding) []luaDNSServer {
-	servers := make([]luaDNSServer, len(s.clients))
-	for i, client := range s.clients {
+func luaServers(r *resolver) []luaDNSServer {
+	servers := make([]luaDNSServer, len(r.clients))
+	for i, client := range r.clients {
 		servers[i] = luaDNSServer{id: client.id, name: client.Name(), query: func(ctx context.Context, domain string, option featureDNS.IPOption) ([]net.IP, uint32, error) {
-			return queryLuaServer(ctx, binding, client, domain, option)
+			return r.query(ctx, client, domain, option)
 		}}
 	}
 	return servers
 }
 
-func luaServers(s *DNS) []luaDNSServer {
-	servers := make([]luaDNSServer, len(s.clients))
-	for i, client := range s.clients {
-		servers[i] = luaDNSServer{id: client.id, name: client.Name(), query: client.QueryIP}
-	}
-	return servers
-}
-
-func registerLua(L *lua.LState, servers []luaDNSServer, client featureDNS.Client) {
+func registerLua(L *lua.LState, servers []luaDNSServer, client luaDNSQuery) {
 	L.PreloadModule("xray.dns", func(L *lua.LState) int {
 		pushIPs := xlua.NewSlicePusher[net.IP](L)
 
@@ -142,7 +120,7 @@ func registerLua(L *lua.LState, servers []luaDNSServer, client featureDNS.Client
 	})
 }
 
-func newLuaClientQuery(L *lua.LState, client featureDNS.Client, pushIPs func(*lua.LState, []net.IP)) *lua.LFunction {
+func newLuaClientQuery(L *lua.LState, client luaDNSQuery, pushIPs func(*lua.LState, []net.IP)) *lua.LFunction {
 	return L.NewFunction(func(L *lua.LState) int {
 		domain, ok := L.Get(1).(lua.LString)
 		if !ok {
@@ -158,7 +136,7 @@ func newLuaClientQuery(L *lua.LState, client featureDNS.Client, pushIPs func(*lu
 			L.RaiseError("dns.Query requires an active DNS query")
 			return 0
 		}
-		ips, ttl, err := featureDNS.LookupIPContext(L.Context(), client, string(domain), option)
+		ips, ttl, err := client(L.Context(), string(domain), option)
 		pushIPs(L, ips)
 		xlua.PushNumber(L, ttl)
 		xlua.PushError(L, err)

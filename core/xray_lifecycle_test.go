@@ -5,50 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
-	"time"
 )
-
-type lifecycleStateFeature struct {
-	instance *Instance
-}
-
-func (*lifecycleStateFeature) Type() interface{} { return (*lifecycleStateFeature)(nil) }
-func (f *lifecycleStateFeature) Start() error {
-	if !f.instance.IsRunning() {
-		return fmt.Errorf("Start callback cannot observe running instance")
-	}
-	return nil
-}
-
-func (f *lifecycleStateFeature) Close() error {
-	if f.instance.IsRunning() {
-		return fmt.Errorf("Close callback observes running instance")
-	}
-	return nil
-}
-
-func TestInstanceLifecycleStateCallbacks(t *testing.T) {
-	s := &Instance{ctx: context.Background()}
-	if err := s.AddFeature(&lifecycleStateFeature{instance: s}); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		if err := s.Start(); err != nil {
-			done <- err
-			return
-		}
-		done <- s.Close()
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("feature callback deadlocked reading instance state")
-	}
-}
 
 func TestInstanceLifecycleConcurrentState(t *testing.T) {
 	s := &Instance{ctx: context.Background()}

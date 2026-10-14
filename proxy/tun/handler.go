@@ -71,7 +71,7 @@ type tunTCPWriter struct {
 }
 
 func (w *tunTCPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	if c, ok := w.writer.(*tcpConn); ok {
+	if c, ok := w.writer.(*tcpConn); ok && c.receipt != nil {
 		// The native writer owns the accepted prefix, including progress before an error.
 		return c.writeMultiBuffer(mb, w.counter)
 	}

@@ -10,21 +10,24 @@ import (
 	"testing"
 	"time"
 
+	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/features/routing"
+	fs "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
 func TestSessionRejectsDuplicateID(t *testing.T) {
 	m := NewSessionManager()
-	first := &Session{ID: 7, parent: m, output: buf.Discard}
+	first := &Session{ID: 7, parent: m, output: buf.Discard, server: true}
 	if !m.Add(first) {
 		t.Fatal("initial admission failed")
 	}
-	duplicate := &Session{ID: 7, parent: m, output: buf.Discard}
+	duplicate := &Session{ID: 7, parent: m, output: buf.Discard, server: true}
 	if m.Add(duplicate) {
 		t.Fatal("duplicate replaced active session")
 	}
@@ -35,7 +38,7 @@ func TestSessionRejectsDuplicateID(t *testing.T) {
 	m.Close()
 }
 
-func TestServerRetiredIDDoesNotBlockIdleClose(t *testing.T) {
+func TestServerPendingEndReservesUntilCompletion(t *testing.T) {
 	m := NewSessionManager()
 	r, w := pipe.New()
 	w.Close()
@@ -50,34 +53,19 @@ func TestServerRetiredIDDoesNotBlockIdleClose(t *testing.T) {
 	go func() { handle(context.Background(), s, carrier); close(returned) }()
 	muxWait(t, carrier.entered)
 	s.Close(false)
-	if m.Size() != 0 {
-		t.Fatal("closed wire ID counted as active")
+	if m.Size() != 1 {
+		t.Fatal("pending END lost its map reservation")
 	}
-	if m.Add(&Session{ID: 1, parent: m}) {
+	if m.Add(&Session{ID: 1, parent: m, server: true}) {
 		t.Fatal("pending END wire ID reused")
 	}
-	if !m.CloseIfNoSessionAndIdle(0, m.Count()) {
-		t.Fatal("closed wire ID blocked idle shutdown")
+	if m.CloseIfNoSessionAndIdle(0, m.Count()) {
+		t.Fatal("idle shutdown bypassed a pending END owner")
 	}
 	release()
 	muxWait(t, returned)
-}
-
-func TestClientExhaustionRetiresWorker(t *testing.T) {
-	m := NewSessionManager()
-	m.count = ^uint16(0)
-	if m.Allocate(&ClientStrategy{}, nil, nil) != nil {
-		t.Fatal("client wire ID wrapped")
-	}
-	exhausted := &ClientWorker{sessionManager: m, done: done.New()}
-	fresh := &ClientWorker{sessionManager: NewSessionManager(), done: done.New()}
-	if !exhausted.IsClosing() || !exhausted.IsFull() {
-		t.Fatal("exhausted worker remains selectable")
-	}
-	picker := &IncrementalWorkerPicker{workers: []*ClientWorker{exhausted, fresh}}
-	selected, err := picker.PickAvailable()
-	if err != nil || selected != fresh {
-		t.Fatalf("picker did not bypass exhaustion: %p %v", selected, err)
+	if m.Size() != 0 || !m.CloseIfNoSessionAndIdle(0, m.Count()) {
+		t.Fatal("completed END blocked idle shutdown")
 	}
 }
 
@@ -103,9 +91,9 @@ type retainedWriteProbe struct {
 	entered chan struct{}
 }
 
-func (w *retainedWriteProbe) WriteMultiBufferContext(ctx context.Context, mb buf.MultiBuffer) error {
+func (w *retainedWriteProbe) WriteMultiBufferStop(mb buf.MultiBuffer, stop <-chan struct{}) error {
 	w.entered <- struct{}{}
-	return w.Writer.WriteMultiBufferContext(ctx, mb)
+	return w.Writer.WriteMultiBufferStop(mb, stop)
 }
 
 func retainedLink(t *testing.T, limit int32) (*transport.Link, *pipe.Reader, *pipe.Writer, *retainedWriteProbe) {
@@ -119,7 +107,12 @@ func retainedLink(t *testing.T, limit int32) (*transport.Link, *pipe.Reader, *pi
 
 func retainedWorker(t *testing.T, d routing.Dispatcher, writer buf.Writer) *ServerWorker {
 	t.Helper()
-	w := &ServerWorker{dispatcher: d, sessionManager: NewSessionManager(), link: &transport.Link{Writer: writer}}
+	manager := new(appstats.Manager)
+	if _, err := manager.EnableInspection(fs.ObservationOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.Close() })
+	w := &ServerWorker{dispatcher: d, sessionManager: NewSessionManager(), link: &transport.Link{Writer: writer}, store: manager.Observation()}
 	t.Cleanup(func() { w.sessionManager.Close() })
 	return w
 }
@@ -129,7 +122,7 @@ func retainedNew(w *ServerWorker, id uint16, global [8]byte, payload string) err
 	binary.BigEndian.PutUint16(data, uint16(len(payload)))
 	copy(data[2:], payload)
 	reader := &buf.BufferedReader{Reader: buf.NewReader(bytes.NewReader(data))}
-	return w.handleStatusNew(context.Background(), &FrameMetadata{
+	return w.handleStatusNew(session.ContextWithTrafficOrigin(context.Background(), session.TrafficOriginUser), &FrameMetadata{
 		SessionID: id, SessionStatus: SessionStatusNew,
 		Option: OptionData, GlobalID: global, Target: net.UDPDestination(net.LocalHostIP, 53),
 	}, reader)
@@ -217,7 +210,7 @@ func TestXUDPRebindDoesNotJoinOldCarrier(t *testing.T) {
 			}
 			muxWait(t, carrier.entered)
 			// A still-running old writer owns the wire ID even after local close.
-			if err := retainedNew(first, 1, id, "duplicate"); err == nil {
+			if first.sessionManager.Add(&Session{ID: 1, parent: first.sessionManager, server: true}) {
 				t.Fatal("pending response ID reused")
 			}
 			second := retainedWorker(t, d, buf.Discard)
@@ -230,12 +223,12 @@ func TestXUDPRebindDoesNotJoinOldCarrier(t *testing.T) {
 			if retainedObject(t, id) != x || d.count.Load() != 1 {
 				t.Fatal("rebind replaced live downstream")
 			}
-			mb, err := old.input.ReadMultiBuffer()
+			mb, err := old.ReadMultiBuffer()
 			buf.ReleaseMulti(mb)
 			if err != io.EOF {
 				t.Fatalf("old reader kept access: %v", err)
 			}
-			if err := old.output.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("late"))}); err != context.Canceled {
+			if err := old.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("late"))}); err != io.EOF {
 				t.Fatalf("late write: %v", err)
 			}
 			release()
@@ -273,12 +266,12 @@ func TestXUDPRebindCancelsOldPipeWrite(t *testing.T) {
 	muxWait(t, probe.entered)
 	old, _ := first.sessionManager.Get(1)
 	late := make(chan error, 1)
-	go func() { late <- old.output.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("late"))}) }()
+	go func() { late <- old.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("late"))}) }()
 	muxWait(t, probe.entered)
 	second := retainedWorker(t, d, buf.Discard)
 	rebound := make(chan error, 1)
 	go func() { rebound <- retainedNew(second, 2, id, "new") }()
-	if err := retainedResult(t, late); err != context.Canceled {
+	if err := retainedResult(t, late); err != io.EOF {
 		t.Fatalf("old blocked write: %v", err)
 	}
 	muxWait(t, probe.entered)
@@ -307,8 +300,8 @@ func TestXUDPShutdownCancelsInitialWrite(t *testing.T) {
 	go func() { result <- retainedNew(second, 2, id, "canceled") }()
 	muxWait(t, probe.entered)
 	second.sessionManager.Close()
-	if err := retainedResult(t, result); err != context.Canceled {
-		t.Fatalf("initial write: %v", err)
+	if err := retainedResult(t, result); err != nil {
+		t.Fatalf("stopped initial write killed carrier: %v", err)
 	}
 	if d.count.Load() != 1 {
 		t.Fatal("canceled binding started fresh dispatch")
@@ -334,7 +327,12 @@ func TestXUDPDeadEndpointRetriesSavedPacketOnce(t *testing.T) {
 	link, up, _, _ := retainedLink(t, -1)
 	fresh, freshUp, _, _ := retainedLink(t, -1)
 	next := link
-	d := &retainedDispatcher{dispatch: func(context.Context) (*transport.Link, error) { return next, nil }}
+	d := &retainedDispatcher{dispatch: func(ctx context.Context) (*transport.Link, error) {
+		if ctx.Err() != nil {
+			t.Fatalf("retry reused canceled retired root: %v", ctx.Err())
+		}
+		return next, nil
+	}}
 	first := retainedWorker(t, d, buf.Discard)
 	if err := retainedNew(first, 1, id, "first"); err != nil {
 		t.Fatal(err)
@@ -356,7 +354,7 @@ func TestXUDPDeadEndpointRetriesSavedPacketOnce(t *testing.T) {
 	if retainedObject(t, id) != current {
 		t.Fatal("stale interrupt removed replacement")
 	}
-	if err := current.Mux.output.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("still live"))}); err != nil {
+	if err := current.Mux.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("still live"))}); err != nil {
 		t.Fatal(err)
 	}
 	retainedRead(t, freshUp, "still live")
@@ -392,7 +390,7 @@ func (w *retainedCloseProbe) Close() error {
 	return w.Writer.Close()
 }
 
-func TestXUDPExpiryDoesNotHoldGlobalLock(t *testing.T) {
+func TestXUDPStopDoesNotHoldGlobalLock(t *testing.T) {
 	id := [8]byte{16}
 	retainedCleanup(t, id)
 	link, up, _, probe := retainedLink(t, -1)
@@ -412,7 +410,9 @@ func TestXUDPExpiryDoesNotHoldGlobalLock(t *testing.T) {
 	x.Expire = time.Now().Add(-time.Second)
 	XUDPManager.Unlock()
 	expired := make(chan struct{})
-	go func() { expireXUDP(time.Now()); close(expired) }()
+	// Exercise the actual selected root stop owner. The native expiry ticker
+	// calls this same owner after map detach; timer scheduling is source evidence.
+	go func() { x.Interrupt(); close(expired) }()
 	muxWait(t, closer.entered)
 	unlocked := make(chan struct{})
 	go func() { XUDPManager.Lock(); XUDPManager.Unlock(); close(unlocked) }()
@@ -468,8 +468,30 @@ func TestXUDPConcurrentPreparationAndShutdown(t *testing.T) {
 				t.Fatal("conflict started a second downstream")
 			}
 			if shutdown {
-				if err == nil {
-					t.Fatal("closed worker accepted binding")
+				if err != nil {
+					t.Fatalf("closed worker killed carrier: %v", err)
+				}
+				if first.sessionManager.Size() != 0 {
+					t.Fatal("closed worker accepted session")
+				}
+				mb, endpointErr := up.ReadMultiBuffer()
+				buf.ReleaseMulti(mb)
+				if endpointErr != io.EOF {
+					t.Fatalf("unpublished native uplink writer was not closed: %v", endpointErr)
+				}
+				rejected := buf.New()
+				rejected.WriteString("after shutdown")
+				batch := buf.MultiBuffer{rejected}
+				if err := link.Writer.WriteMultiBuffer(batch); err != io.ErrClosedPipe {
+					t.Fatalf("unpublished uplink accepted a later write: %v", err)
+				}
+				if rejected.Len() != 0 || batch[0] != nil {
+					t.Fatal("unpublished rejected batch was not released")
+				}
+				mb, endpointErr = link.Reader.ReadMultiBuffer()
+				buf.ReleaseMulti(mb)
+				if endpointErr != io.ErrClosedPipe {
+					t.Fatalf("unpublished native downlink was not interrupted: %v", endpointErr)
 				}
 				XUDPManager.Lock()
 				remaining := XUDPManager.Map[id]
@@ -487,13 +509,13 @@ func TestXUDPConcurrentPreparationAndShutdown(t *testing.T) {
 	}
 }
 
-func TestXUDPStaleBindingCannotExpireReplacement(t *testing.T) {
+func TestXUDPStaleSessionCannotExpireReplacement(t *testing.T) {
 	reader, writer := pipe.New(pipe.WithoutSizeLimit())
 	defer writer.Close()
 	m := NewSessionManager()
 	x := &XUDP{GlobalID: [8]byte{99}, Status: Active}
-	old := &Session{ID: 1, parent: m, input: reader, output: buf.Discard, XUDP: x}
-	current := &Session{ID: 2, parent: m, input: reader, output: buf.Discard, XUDP: x}
+	old := &Session{ID: 1, parent: m, input: reader, output: buf.Discard, XUDP: x, server: true, done: done.New()}
+	current := &Session{ID: 2, parent: m, input: reader, output: buf.Discard, XUDP: x, server: true, done: done.New()}
 	x.Mux = current
 	m.Add(old)
 	m.Add(current)

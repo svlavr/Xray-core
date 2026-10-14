@@ -109,8 +109,7 @@ func TestWarpConfiguredPinAndNameVerification(t *testing.T) {
 			if tc.trusted {
 				settings.Certificate = []*xraytls.Certificate{root}
 			}
-			config := settings.GetTLSConfig(xraytls.WithClient())
-			defer xraytls.CloseConfig(config)
+			config := settings.GetTLSConfig()
 			if err := useWarp(&Config{Warp: &Warp{PrivateKey: privateKey, PublicKey: tc.key}}, config); err != nil {
 				t.Fatal(err)
 			}

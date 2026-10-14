@@ -2,13 +2,11 @@ package ocsp
 
 import (
 	"bytes"
-	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"io"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/platform/filesystem"
@@ -51,13 +49,6 @@ func GetOCSPStapling(cert [][]byte, path string) ([]byte, error) {
 }
 
 func GetOCSPForCert(cert [][]byte) ([]byte, error) {
-	return GetOCSPForCertContext(context.Background(), cert)
-}
-
-// GetOCSPForCertContext bounds the complete issuer and responder exchange.
-func GetOCSPForCertContext(parent context.Context, cert [][]byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
 	bundle := new(bytes.Buffer)
 	for _, derBytes := range cert {
 		err := pem.Encode(bundle, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
@@ -79,17 +70,13 @@ func GetOCSPForCertContext(parent context.Context, cert [][]byte) ([]byte, error
 		if len(issuedCert.IssuingCertificateURL) == 0 {
 			return nil, errors.New("no issuing certificate URL")
 		}
-		issuerRequest, errC := http.NewRequestWithContext(ctx, http.MethodGet, issuedCert.IssuingCertificateURL[0], nil)
+		resp, errC := http.Get(issuedCert.IssuingCertificateURL[0])
 		if errC != nil {
-			return nil, errC
-		}
-		resp, errC := http.DefaultClient.Do(issuerRequest)
-		if errC != nil {
-			return nil, errC
+			return nil, errors.New("no issuing certificate URL")
 		}
 		defer resp.Body.Close()
 
-		issuerBytes, errC := readBoundedOCSP(resp.Body)
+		issuerBytes, errC := io.ReadAll(resp.Body)
 		if errC != nil {
 			return nil, errors.New(errC)
 		}
@@ -107,33 +94,17 @@ func GetOCSPForCertContext(parent context.Context, cert [][]byte) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, issuedCert.OCSPServer[0], bytes.NewReader(ocspReq))
+	reader := bytes.NewReader(ocspReq)
+	req, err := http.Post(issuedCert.OCSPServer[0], "application/ocsp-request", reader)
 	if err != nil {
-		return nil, err
+		return nil, errors.New(err)
 	}
-	request.Header.Set("Content-Type", "application/ocsp-request")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	ocspResBytes, err := readBoundedOCSP(response.Body)
+	defer req.Body.Close()
+	ocspResBytes, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, errors.New(err)
 	}
 	return ocspResBytes, nil
-}
-
-func readBoundedOCSP(body io.Reader) ([]byte, error) {
-	const maximum = 1 << 20
-	data, err := io.ReadAll(io.LimitReader(body, maximum+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maximum {
-		return nil, errors.New("OCSP response exceeds 1 MiB")
-	}
-	return data, nil
 }
 
 // parsePEMBundle parses a certificate bundle from top to bottom and returns

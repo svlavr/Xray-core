@@ -73,7 +73,7 @@ func TestStageBTCPWithheldReplyCancellation(t *testing.T) {
 				t.Fatal("query did not return on cancellation")
 			}
 			joined := make(chan struct{})
-			go func() { server.workers.Wait(); close(joined) }()
+			go func() { server.cacheController.workers.Wait(); close(joined) }()
 			select {
 			case <-joined:
 			case <-time.After(time.Second):
@@ -185,7 +185,7 @@ func TestStageBQUICWithheldReplyCancellationKeepsSibling(t *testing.T) {
 		t.Fatal("DoQ query did not return on cancellation")
 	}
 	joined := make(chan struct{})
-	go func() { server.workers.Wait(); close(joined) }()
+	go func() { server.cacheController.workers.Wait(); close(joined) }()
 	select {
 	case <-joined:
 	case <-time.After(time.Second):

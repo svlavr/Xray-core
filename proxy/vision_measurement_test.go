@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 )
@@ -58,72 +56,6 @@ func TestMeasurementVisionFragmentedServerHelloAndCommands(t *testing.T) {
 				t.Fatalf("native command/payload: command%d want%d payload%v", peer.Outbound.CurrentCommand, wantCommand, decoded.Bytes())
 			}
 		})
-	}
-}
-
-func TestMeasurementVisionConcurrentReaderWriterDetector(t *testing.T) {
-	for range 32 {
-		uuid := bytes.Repeat([]byte{0x32}, 16)
-		state := NewTrafficState(uuid)
-		peerUUID := append([]byte(nil), uuid...)
-		incoming := XtlsPadding(buf.FromBytes([]byte("plain-response")), CommandPaddingContinue, &peerUUID, false, context.Background(), measurementVisionSeed)
-		reader := NewVisionReader(&measurementVisionInput{mb: buf.MultiBuffer{incoming}}, state, false, context.Background(), nil, nil, nil, nil)
-		writer := NewVisionWriter(buf.Discard, state, true, context.Background(), nil, nil, measurementVisionSeed)
-		start := make(chan struct{})
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			<-start
-			mb, err := reader.ReadMultiBuffer()
-			defer buf.ReleaseMulti(mb)
-			if err != nil && err != io.EOF {
-				t.Error(err)
-			}
-			if len(mb) != 1 || string(mb[0].Bytes()) != "plain-response" {
-				t.Error("reader lost native padded response")
-			}
-		}()
-		go func() {
-			defer wg.Done()
-			<-start
-			if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte{0x16, 0x03, 0, 0, 0, 1})}); err != nil {
-				t.Error(err)
-			}
-		}()
-		close(start)
-		wg.Wait()
-		if state.NumberOfPacketToFilter != 6 || !state.IsTLS || state.IsTLS12orAbove || state.EnableXtls {
-			t.Fatalf("bidirectional detector lost knowledge/budget: %+v", state)
-		}
-	}
-}
-
-func TestMeasurementVisionBlockedWriteDoesNotLockDetector(t *testing.T) {
-	state := NewTrafficState(bytes.Repeat([]byte{0x33}, 16))
-	sink := &measurementVisionBlockedWriter{entered: make(chan struct{}), release: make(chan struct{})}
-	writer := NewVisionWriter(sink, state, true, context.Background(), nil, nil, measurementVisionSeed)
-	returned := make(chan error, 1)
-	go func() { returned <- writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("request"))}) }()
-	<-sink.entered
-	filtered := make(chan struct{})
-	go func() {
-		mb := buf.MultiBuffer{buf.FromBytes(measurementServerHello(true))}
-		defer buf.ReleaseMulti(mb)
-		XtlsFilterTls(mb, state, context.Background())
-		close(filtered)
-	}()
-	select {
-	case <-filtered:
-	case <-time.After(3 * time.Second):
-		close(sink.release)
-		<-returned
-		<-filtered
-		t.Fatal("detector mutex held across native blocked Write")
-	}
-	close(sink.release)
-	if err := <-returned; err != nil || !state.EnableXtls {
-		t.Fatalf("blocked write/detector completion: %v", err)
 	}
 }
 

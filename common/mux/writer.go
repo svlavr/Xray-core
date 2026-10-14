@@ -1,8 +1,6 @@
 package mux
 
 import (
-	"sync"
-
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
@@ -11,41 +9,6 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/stats"
 )
-
-// The optional router serializes each native carrier frame operation while
-// retaining child-local decoded accounting.
-type frameWriter struct {
-	sync.Mutex
-	writer buf.Writer
-}
-
-func newFrameWriter(writer buf.Writer) *frameWriter {
-	return &frameWriter{writer: writer}
-}
-
-func (o *frameWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	o.Lock()
-	defer o.Unlock()
-	return o.writer.WriteMultiBuffer(mb)
-}
-
-func (o *frameWriter) Close() error {
-	// Serialize a buffered carrier flush with normal frame writes.
-	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
-		o.Lock()
-		defer o.Unlock()
-	}
-	return common.Close(o.writer)
-}
-
-func (o *frameWriter) Interrupt() {
-	if _, buffered := o.writer.(*buf.BufferedWriter); buffered {
-		o.Close()
-		return
-	}
-	// Pipe interruption must remain able to unblock a capacity-waiting frame.
-	common.Interrupt(o.writer)
-}
 
 type Writer struct {
 	dest         net.Destination
@@ -122,10 +85,10 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	mb2 := make(buf.MultiBuffer, 0, len(data)+1)
 	mb2 = append(mb2, frame)
 	mb2 = append(mb2, data...)
-	payload := data.Len()
+	size := data.Len()
 	err := writer.WriteMultiBuffer(mb2)
-	if err == nil && receipt != nil && payload > 0 {
-		receipt.AddDownlink(uint64(payload))
+	if err == nil && receipt != nil {
+		receipt.AddDownlink(uint64(size))
 	}
 	return err
 }

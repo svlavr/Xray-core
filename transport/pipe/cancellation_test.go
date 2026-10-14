@@ -1,7 +1,7 @@
 package pipe
 
 import (
-	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -19,42 +19,32 @@ func cancellationResult(t *testing.T, result <-chan error) error {
 	}
 }
 
-func TestReadCancellationPreservesPipe(t *testing.T) {
+func TestStoppedWriteDoesNotEnqueue(t *testing.T) {
 	r, w := New()
 	defer r.Interrupt()
-	ctx, cancel := context.WithCancel(context.Background())
+	stop := make(chan struct{})
+	b := buf.New()
+	b.WriteString("stopped")
+	batch := buf.MultiBuffer{b}
+	// Recheck revocation under the native enqueue lock.
+	r.pipe.Lock()
 	result := make(chan error, 1)
-	go func() { mb, err := r.ReadMultiBufferContext(ctx); buf.ReleaseMulti(mb); result <- err }()
-	cancel()
-	if err := cancellationResult(t, result); err != context.Canceled {
-		t.Fatalf("cancel: %v", err)
+	go func() { result <- w.WriteMultiBufferStop(batch, stop) }()
+	close(stop)
+	r.pipe.Unlock()
+	if err := cancellationResult(t, result); err != io.EOF {
+		t.Fatalf("stopped enqueue: %v", err)
 	}
-	w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("next"))})
+	if b.Len() != 0 || batch[0] != nil {
+		t.Fatal("stopped managed batch was not released or cleared")
+	}
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("next"))}); err != nil {
+		t.Fatal(err)
+	}
 	mb, err := r.ReadMultiBuffer()
 	defer buf.ReleaseMulti(mb)
 	if err != nil || mb.String() != "next" {
-		t.Fatalf("next read: %s %v", mb.String(), err)
-	}
-}
-
-func TestCanceledReadDoesNotDequeue(t *testing.T) {
-	r, w := New()
-	defer r.Interrupt()
-	w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("queued"))})
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancellation must be rechecked under the pipe lock, not only before it.
-	r.pipe.Lock()
-	result := make(chan error, 1)
-	go func() { mb, err := r.ReadMultiBufferContext(ctx); buf.ReleaseMulti(mb); result <- err }()
-	cancel()
-	r.pipe.Unlock()
-	if err := cancellationResult(t, result); err != context.Canceled {
-		t.Fatalf("cancel: %v", err)
-	}
-	mb, err := r.ReadMultiBuffer()
-	defer buf.ReleaseMulti(mb)
-	if err != nil || mb.String() != "queued" {
-		t.Fatalf("queued custody: %s %v", mb.String(), err)
+		t.Fatalf("stopped write changed queue: %q %v", mb.String(), err)
 	}
 }
 
@@ -62,24 +52,25 @@ func TestWriteCancellationPreservesQueuedCustody(t *testing.T) {
 	r, w := New(WithSizeLimit(0))
 	defer r.Interrupt()
 	w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("queued"))})
-	ctx, cancel := context.WithCancel(context.Background())
+	stop := make(chan struct{})
 	b := buf.New()
 	b.WriteString("canceled")
+	batch := buf.MultiBuffer{b}
 	result := make(chan error, 1)
-	go func() { result <- w.WriteMultiBufferContext(ctx, buf.MultiBuffer{b}) }()
-	cancel()
-	if err := cancellationResult(t, result); err != context.Canceled {
-		t.Fatalf("cancel: %v", err)
+	go func() { result <- w.WriteMultiBufferStop(batch, stop) }()
+	close(stop)
+	if err := cancellationResult(t, result); err != io.EOF {
+		t.Fatalf("stop: %v", err)
 	}
-	if b.Len() != 0 {
-		t.Fatal("canceled batch was not released")
+	if b.Len() != 0 || batch[0] != nil {
+		t.Fatal("canceled managed batch was not released or cleared")
 	}
 	mb, err := r.ReadMultiBuffer()
 	if err != nil || mb.String() != "queued" {
 		t.Fatalf("prior data changed: %s %v", mb.String(), err)
 	}
 	buf.ReleaseMulti(mb)
-	if err := w.WriteMultiBufferContext(context.Background(), buf.MultiBuffer{buf.FromBytes([]byte("fresh"))}); err != nil {
+	if err := w.WriteMultiBufferStop(buf.MultiBuffer{buf.FromBytes([]byte("fresh"))}, nil); err != nil {
 		t.Fatal(err)
 	}
 	mb, err = r.ReadMultiBuffer()
@@ -92,11 +83,11 @@ func TestWriteCancellationPreservesQueuedCustody(t *testing.T) {
 func TestAcceptedWriteSurvivesCancellation(t *testing.T) {
 	r, w := New()
 	defer r.Interrupt()
-	ctx, cancel := context.WithCancel(context.Background())
-	if err := w.WriteMultiBufferContext(ctx, buf.MultiBuffer{buf.FromBytes([]byte("accepted"))}); err != nil {
+	stop := make(chan struct{})
+	if err := w.WriteMultiBufferStop(buf.MultiBuffer{buf.FromBytes([]byte("accepted"))}, stop); err != nil {
 		t.Fatal(err)
 	}
-	cancel()
+	close(stop)
 	mb, err := r.ReadMultiBuffer()
 	defer buf.ReleaseMulti(mb)
 	if err != nil || mb.String() != "accepted" {
@@ -104,36 +95,37 @@ func TestAcceptedWriteSurvivesCancellation(t *testing.T) {
 	}
 }
 
-func TestCancellationRacingPacketHasOneOwner(t *testing.T) {
+func TestStopRacingPacketWriteHasOneOwner(t *testing.T) {
 	for range 100 {
 		r, w := New()
-		ctx, cancel := context.WithCancel(context.Background())
-		result := make(chan buf.MultiBuffer, 1)
-		go func() { mb, _ := r.ReadMultiBufferContext(ctx); result <- mb }()
-		w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("packet"))})
-		cancel()
-		var mb buf.MultiBuffer
-		select {
-		case mb = <-result:
-		case <-time.After(3 * time.Second):
-			t.Fatal("canceled packet read blocked")
-		}
-		if mb.IsEmpty() {
-			var err error
-			mb, err = r.ReadMultiBufferTimeout(3 * time.Second)
-			if err != nil {
-				t.Fatal(err)
+		stop := make(chan struct{})
+		b := buf.New()
+		b.WriteString("packet")
+		batch := buf.MultiBuffer{b}
+		result := make(chan error, 1)
+		go func() { result <- w.WriteMultiBufferStop(batch, stop) }()
+		close(stop)
+		err := cancellationResult(t, result)
+		switch err {
+		case nil:
+			mb, readErr := r.ReadMultiBufferTimeout(time.Second)
+			if readErr != nil || mb.String() != "packet" {
+				buf.ReleaseMulti(mb)
+				t.Fatalf("accepted packet lost: %v", readErr)
 			}
+			buf.ReleaseMulti(mb)
+		case io.EOF:
+			if b.Len() != 0 || batch[0] != nil {
+				t.Fatal("rejected managed packet retained custody")
+			}
+		default:
+			t.Fatalf("stop result: %v", err)
 		}
-		if mb.String() != "packet" {
-			t.Fatalf("packet lost: %q", mb.String())
-		}
-		buf.ReleaseMulti(mb)
 		r.pipe.Lock()
 		pending := r.pipe.data.Len()
 		r.pipe.Unlock()
 		if pending != 0 {
-			t.Fatal("packet replayed into new binding")
+			t.Fatal("packet replayed into next session")
 		}
 		r.Interrupt()
 	}

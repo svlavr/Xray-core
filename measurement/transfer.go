@@ -38,41 +38,21 @@ func (e *Executor) Download(ctx context.Context, request DownloadRequest) (resul
 	if ctx == nil || request.TransferTimeout <= 0 {
 		return result, errors.New("invalid download context/time budget")
 	}
-	phaseCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	result.HTTPS, resultErr = e.exchangeHTTP(phaseCtx, request.HTTPS, http.MethodGet, nil, nil, func(ctx context.Context, response *http.Response, receipt *HTTPSReceipt) (err error) {
+	result.HTTPS, resultErr = e.http(ctx, request.HTTPS, httpPlan{method: http.MethodGet, secure: true, consume: func(ctx *operation, response *http.Response, receipt *HTTPSReceipt) (err error) {
 		result.DeclaredLength = receipt.ContentLength
 		started := time.Now()
-		timer := time.AfterFunc(request.TransferTimeout, func() { cancel(ErrTransferTimeout) })
+		timer := time.AfterFunc(request.TransferTimeout, func() { ctx.cancel(ErrTransferTimeout) })
 		defer timer.Stop()
 		defer func() {
 			elapsed := time.Since(started)
 			result.ActiveElapsed = &elapsed
-			if cause := context.Cause(phaseCtx); cause != nil {
+			if cause := context.Cause(ctx); cause != nil {
 				err = errors.Join(err, cause)
 			}
 		}()
-		buffer := make([]byte, transferChunk)
-		for result.PayloadBytes < request.HTTPS.MaxBodyBytes {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			remaining := request.HTTPS.MaxBodyBytes - result.PayloadBytes
-			n, readErr := response.Body.Read(buffer[:min(int64(len(buffer)), remaining)])
-			if n > 0 {
-				result.PayloadBytes += int64(n)
-				result.ByteLimitReached = result.PayloadBytes == request.HTTPS.MaxBodyBytes
-			}
-			if readErr != nil {
-				if readErr == io.EOF {
-					receipt.BodyComplete = true
-					break
-				}
-				return readErr
-			}
-		}
-		return nil
-	})
+		result.PayloadBytes, result.ByteLimitReached, err = consumeHTTPBody(ctx, response, receipt, request.HTTPS.MaxBodyBytes, false)
+		return err
+	}})
 	return result, resultErr
 }
 
@@ -97,27 +77,23 @@ func (e *Executor) Upload(ctx context.Context, request UploadRequest) (result Up
 	if ctx == nil || request.PayloadBytes < 1 || request.TransferTimeout <= 0 {
 		return result, errors.New("invalid upload context/byte/time budget")
 	}
-	phaseCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	body := &uploadBody{ctx: phaseCtx, cancel: cancel, bytes: request.PayloadBytes, timeout: request.TransferTimeout}
-	result.HTTPS, resultErr = e.exchangeHTTP(phaseCtx, request.HTTPS, http.MethodPost, body, nil, nil)
-	// Native HTTP may return before its body writer. Snapshot observed raw
-	// counts without a completion certificate or a second cleanup deadline.
-	body.mu.Lock()
-	result.GeneratedBytes, result.WriterAcceptedBytes = body.produced, body.written
-	if !body.began.IsZero() {
-		elapsed := body.elapsed
-		if elapsed == 0 {
-			elapsed = time.Since(body.began)
+	body := &uploadBody{bytes: request.PayloadBytes, timeout: request.TransferTimeout}
+	result.HTTPS, resultErr = e.http(ctx, request.HTTPS, httpPlan{method: http.MethodPost, secure: true, body: body, finish: func() error {
+		// Native HTTP may return before its body writer. Snapshot without joining,
+		// before operation cleanup can be mistaken for a native writer failure.
+		body.mu.Lock()
+		result.GeneratedBytes, result.WriterAcceptedBytes = body.produced, body.written
+		if !body.began.IsZero() {
+			elapsed := body.elapsed
+			if elapsed == 0 {
+				elapsed = time.Since(body.began)
+			}
+			result.ActiveElapsed = &elapsed
 		}
-		result.ActiveElapsed = &elapsed
-	}
-	writeErr := body.err
-	body.mu.Unlock()
-	resultErr = errors.Join(resultErr, writeErr)
-	if cause := context.Cause(phaseCtx); cause != nil {
-		resultErr = errors.Join(resultErr, cause)
-	}
+		writeErr := body.err
+		body.mu.Unlock()
+		return writeErr
+	}})
 	if result.GeneratedBytes != request.PayloadBytes || result.WriterAcceptedBytes != request.PayloadBytes {
 		resultErr = errors.Join(resultErr, ErrUploadIncomplete)
 	}

@@ -12,8 +12,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal"
-	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
@@ -33,7 +31,6 @@ type Inbound struct {
 	user          *protocol.MemoryUser
 	saltFilter    *antireplay.ReplayFilter[[32]byte]
 	udpCodec      *UDPServerCodec
-	udpConns      *utils.TypedSyncMap[uint64, *udpConnEntry]
 	policyManager policy.Manager
 }
 
@@ -72,18 +69,12 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 			Level: uint32(config.Level),
 		},
 		udpCodec:      udpCodec,
-		udpConns:      utils.NewTypedSyncMap[uint64, *udpConnEntry](),
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 	}, nil
 }
 
 func (i *Inbound) Network() []net.Network {
 	return i.networks
-}
-
-func (i *Inbound) Close() error {
-	i.udpConns.Range(func(_ uint64, entry *udpConnEntry) bool { entry.Close(); return true })
-	return nil
 }
 
 func (i *Inbound) Process(ctx context.Context, network net.Network, connection stat.Connection, dispatcher routing.Dispatcher) error {
@@ -95,7 +86,7 @@ func (i *Inbound) Process(ctx context.Context, network net.Network, connection s
 	if network == net.Network_TCP {
 		return i.processTCP(ctx, connection, dispatcher)
 	}
-	return i.processUDP(packetContext(ctx, connection), connection, dispatcher)
+	return i.processUDP(ctx, connection, dispatcher)
 }
 
 func (i *Inbound) processTCP(ctx context.Context, conn net.Conn, dispatcher routing.Dispatcher) error {
@@ -155,8 +146,6 @@ func (i *Inbound) processTCP(ctx context.Context, conn net.Conn, dispatcher rout
 }
 
 func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	udpConns := i.udpConns
-
 	reader := buf.NewPacketReader(conn)
 	for {
 		mb, err := reader.ReadMultiBuffer()
@@ -167,71 +156,30 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, dispatch
 
 		for _, b := range mb {
 			decoded, err := i.udpCodec.DecodePacket(b.Bytes())
+			b.Release()
+			if err != nil || decoded.HeaderType != HeaderTypeClient {
+				continue
+			}
+
+			sessionItem := i.udpCodec.GetSession(decoded.SessionID)
+			if sessionItem.User == nil {
+				sessionItem.Lock()
+				if sessionItem.User == nil {
+					sessionItem.User = i.user
+				}
+				sessionItem.Unlock()
+			}
+			link, err := sessionItem.EnsureLink(ctx, conn, decoded.Destination, dispatcher, i.policyManager, func(dest net.Destination, payload []byte) ([]byte, error) {
+				return i.udpCodec.EncodeServerPacket(decoded.SessionID, dest, payload)
+			})
 			if err != nil {
-				b.Release()
 				continue
 			}
 
-			entry, ok := udpConns.Load(decoded.SessionID)
-			if !ok {
-				sessCtx, cancel := context.WithCancel(packetSessionContext(ctx))
-				newEntry := &udpConnEntry{cancel: cancel}
-				newEntry.setTransport(conn)
-				newEntry.onClose = func() {
-					udpConns.CompareAndDelete(decoded.SessionID, newEntry)
-				}
-				sessCtx = log.ContextWithAccessMessage(sessCtx, &log.AccessMessage{
-					From:   conn.RemoteAddr(),
-					To:     decoded.Destination,
-					Status: log.AccessAccepted,
-					Email:  i.user.Email,
-				})
-
-				link, err := dispatcher.Dispatch(sessCtx, decoded.Destination)
-				if err != nil {
-					newEntry.Close()
-					b.Release()
-					continue
-				}
-				if !newEntry.bind(link) {
-					newEntry.Close()
-					b.Release()
-					continue
-				}
-				sessionPolicy := i.policyManager.ForLevel(uint32(i.user.Level))
-				newEntry.setTimer(signal.CancelAfterInactivity(sessCtx, func() { newEntry.Close() }, sessionPolicy.Timeouts.ConnectionIdle))
-
-				actual, loaded := udpConns.LoadOrStore(decoded.SessionID, newEntry)
-				if loaded {
-					// Another goroutine/packet beat us to storing, terminate our redundant link
-					newEntry.Close()
-					entry = actual
-				} else {
-					entry = newEntry
-					if entry.isClosed() {
-						udpConns.CompareAndDelete(decoded.SessionID, entry)
-						b.Release()
-						continue
-					}
-					sessionID := decoded.SessionID
-					go entry.writeResponses(decoded.Destination, func(dest net.Destination, payload []byte) ([]byte, error) {
-						return i.udpCodec.EncodeServerPacket(sessionID, dest, payload)
-					})
-				}
-			}
-
-			if entry.isClosed() {
-				b.Release()
-				continue
-			}
-			entry.setTransport(conn)
-			entry.timer.Update()
 			payloadBuf := buf.New()
 			payloadBuf.Write(decoded.Payload)
-			packetDest := decoded.Destination
-			payloadBuf.UDP = &packetDest
-			b.Release()
-			_ = entry.link.Writer.WriteMultiBuffer(buf.MultiBuffer{payloadBuf})
+			payloadBuf.UDP = &decoded.Destination
+			_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{payloadBuf})
 		}
 	}
 }

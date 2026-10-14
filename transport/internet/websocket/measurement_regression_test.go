@@ -1,4 +1,4 @@
-package websocket_test
+package websocket
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 
 	gorilla "github.com/gorilla/websocket"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/transport/internet/websocket"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -24,7 +23,7 @@ func TestMeasurementNormalCloseDrainsBufferedPayload(t *testing.T) {
 		}
 		return peer.WriteControl(gorilla.CloseMessage, gorilla.FormatCloseMessage(gorilla.CloseNormalClosure, ""), time.Now().Add(3*time.Second))
 	})
-	wrapped := websocket.NewConnection(conn, conn.RemoteAddr(), nil, 0)
+	wrapped := measurementSelectedWebSocketConnection(conn, nil)
 	reader, writer := pipe.New(pipe.WithoutSizeLimit())
 	defer reader.Interrupt()
 	// Delay the consumer until the native copy completes: ordinary EOF must close
@@ -53,7 +52,7 @@ func TestMeasurementAbnormalWebSocketClosePreserved(t *testing.T) {
 		}
 		return peer.WriteControl(gorilla.CloseMessage, gorilla.FormatCloseMessage(gorilla.ClosePolicyViolation, "fixture violation"), time.Now().Add(3*time.Second))
 	})
-	got, err := io.ReadAll(websocket.NewConnection(conn, conn.RemoteAddr(), nil, 0))
+	got, err := io.ReadAll(measurementSelectedWebSocketConnection(conn, nil))
 	var closeErr *gorilla.CloseError
 	if !bytes.Equal(got, payload) || !errors.As(err, &closeErr) || closeErr.Code != gorilla.ClosePolicyViolation || closeErr.Text != "fixture violation" {
 		t.Fatalf("abnormal close: payload=%q error=%v", got, err)
@@ -77,7 +76,7 @@ func TestMeasurementIncompleteWebSocketMessagePreserved(t *testing.T) {
 		}
 		return peer.WriteControl(gorilla.CloseMessage, gorilla.FormatCloseMessage(gorilla.CloseNormalClosure, ""), time.Now().Add(3*time.Second))
 	})
-	got, err := io.ReadAll(websocket.NewConnection(conn, conn.RemoteAddr(), nil, 0))
+	got, err := io.ReadAll(measurementSelectedWebSocketConnection(conn, nil))
 	var closeErr *gorilla.CloseError
 	if !bytes.Equal(got, payload) || !errors.As(err, &closeErr) || closeErr.Code != gorilla.CloseNormalClosure {
 		t.Fatalf("incomplete message: got=%d want=%d error=%v", len(got), len(payload), err)
@@ -95,13 +94,22 @@ func TestMeasurementWebSocketExtraReaderBytesWithEOF(t *testing.T) {
 		return peer.WriteControl(gorilla.CloseMessage, gorilla.FormatCloseMessage(gorilla.CloseNormalClosure, ""), time.Now().Add(3*time.Second))
 	})
 	extra := &measurementEOFReader{Reader: bytes.NewReader([]byte("extra payload/"))}
-	got, err := io.ReadAll(websocket.NewConnection(conn, conn.RemoteAddr(), extra, 0))
+	got, err := io.ReadAll(measurementSelectedWebSocketConnection(conn, extra))
 	if err != nil || string(got) != "extra payload/wire payload" {
 		t.Fatalf("extra-reader bytes with EOF: payload=%q error=%v", got, err)
 	}
 	if err := <-peerDone; err != nil {
 		t.Fatal(err)
 	}
+}
+
+// measurementSelectedWebSocketConnection selects the same private connection
+// behavior as an explicitly selected outbound dial. The context-free public
+// constructor retains ordinary native semantics.
+func measurementSelectedWebSocketConnection(conn *gorilla.Conn, extra io.Reader) *connection {
+	wrapped := NewConnection(conn, conn.RemoteAddr(), extra, 0)
+	wrapped.selected = true
+	return wrapped
 }
 
 type measurementEOFReader struct {

@@ -17,7 +17,6 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
-	"github.com/xtls/xray-core/common/signal/semaphore"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
@@ -28,8 +27,7 @@ import (
 )
 
 type client struct {
-	access *semaphore.Instance
-
+	lock         chan struct{}
 	instance     *core.Instance
 	forced       bool
 	dest         net.Destination
@@ -68,9 +66,6 @@ func (c *client) close() {
 }
 
 func (c *client) dial(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	if c.forced {
 		return errors.New("client is closed")
 	}
@@ -183,8 +178,6 @@ func (c *client) dial(ctx context.Context) error {
 	}
 	resp, err := rt.RoundTrip(req.WithContext(ctx))
 	if err != nil {
-		// Close joins HTTP/3's asynchronous Dial callback before its captured
-		// connection or provisional transport/socket can be inspected/released.
 		_ = rt.Close()
 		if conn != nil {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
@@ -193,15 +186,15 @@ func (c *client) dial(ctx context.Context) error {
 		_ = pktConn.Close()
 		return err
 	}
+	_ = resp.Body.Close()
+
 	if resp.StatusCode != StatusAuthOK {
-		_ = resp.Body.Close()
 		_ = rt.Close()
 		_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		_ = tr.Close()
 		_ = pktConn.Close()
 		return errors.New("auth failed code ", resp.StatusCode)
 	}
-	_ = resp.Body.Close()
 
 	// udp, _ := strconv.ParseBool(resp.Header.Get(ResponseHeaderUDPEnabled))
 	down, _ := strconv.ParseUint(resp.Header.Get(CommonHeaderCCRX), 10, 64)
@@ -236,13 +229,17 @@ func (c *client) dial(ctx context.Context) error {
 	return nil
 }
 
+func (c *client) unlock() {
+	<-c.lock
+}
+
 func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-c.access.Wait():
+	case c.lock <- struct{}{}:
+		defer c.unlock()
 	}
-	defer c.access.Signal()
 
 	err := c.dial(ctx)
 	if err != nil {
@@ -267,9 +264,9 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-c.access.Wait():
+	case c.lock <- struct{}{}:
+		defer c.unlock()
 	}
-	defer c.access.Signal()
 
 	err := c.dial(ctx)
 	if err != nil {
@@ -279,20 +276,20 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	return c.udpSM.udp()
 }
 
-// cleanLocked requires the existing client admission token.
-func (c *client) cleanLocked(force bool) {
+func (c *client) clean(force bool) {
+	c.lock <- struct{}{}
 	if force {
 		c.forced = true
 	}
 	if status := c.status(); force && status != StatusNull || status == StatusInactive {
 		c.close()
 	}
+	c.unlock()
 }
 
 type dialerConf struct {
 	net.Destination
 	*internet.MemoryStreamConfig
-	instance *core.Instance
 }
 
 type clientManager struct {
@@ -302,40 +299,22 @@ type clientManager struct {
 
 func (m *clientManager) clean() {
 	ticker := time.NewTicker(idleCleanupInterval)
-	defer ticker.Stop()
 	for range ticker.C {
-		m.cleanOnce()
-	}
-}
-
-func (m *clientManager) cleanOnce() {
-	m.RLock()
-	snapshot := make(map[dialerConf]*client, len(m.m))
-	for key, c := range m.m {
-		snapshot[key] = c
-	}
-	m.RUnlock()
-	for key, c := range snapshot {
-		force := c.instance != nil && !c.instance.IsRunning()
-		select {
-		case <-c.access.Wait():
-			// One cleanup owner per client. A busy handshake or lower Close
-			// cannot hold map membership or queue another cleanup waiter.
-			go m.cleanClient(key, c, force)
-		default:
+		m.RLock()
+		entries := make(map[dialerConf]*client, len(m.m))
+		for k, c := range m.m {
+			entries[k] = c
 		}
-	}
-}
-
-func (m *clientManager) cleanClient(key dialerConf, c *client, force bool) {
-	c.cleanLocked(force)
-	c.access.Signal()
-	if force {
-		m.Lock()
-		if m.m[key] == c {
-			delete(m.m, key)
+		m.RUnlock()
+		for k, c := range entries {
+			force := c.instance != nil && !c.instance.IsRunning()
+			c.clean(force)
+			if force {
+				m.Lock()
+				delete(m.m, k)
+				m.Unlock()
+			}
 		}
-		m.Unlock()
 	}
 }
 
@@ -360,7 +339,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		go manager.clean()
 	})
 
-	dialerConfKey := dialerConf{dest, streamSettings, core.FromContext(ctx)}
+	dialerConfKey := dialerConf{dest, streamSettings}
 
 	manager.RLock()
 	c := manager.m[dialerConfKey]
@@ -371,11 +350,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		c = manager.m[dialerConfKey]
 		if c == nil {
 			c = &client{
-				access:       semaphore.New(1),
+				lock:         make(chan struct{}, 1),
 				instance:     core.FromContext(ctx),
 				dest:         dest,
 				config:       streamSettings.ProtocolSettings.(*Config),
-				tlsConfig:    tlsConfig.GetTLSConfig(tls.WithClient(), tls.WithDestination(dest)),
+				tlsConfig:    tlsConfig.GetTLSConfig(tls.WithDestination(dest)),
 				socketConfig: streamSettings.SocketSettings,
 				finalMask:    streamSettings.FinalMask,
 				quicParams:   streamSettings.QuicParams,

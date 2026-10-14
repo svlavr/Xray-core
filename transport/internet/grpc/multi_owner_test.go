@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
 	"google.golang.org/grpc"
@@ -27,6 +28,7 @@ func TestGRPCMultiModeCloseOwnership(t *testing.T) {
 	t.Cleanup(func() { server.Stop(); <-served })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
+	ctx = internet.ContextWithMUTransport(ctx)
 	dest := net.TCPDestination(net.LocalHostIP, net.Port(listener.Addr().(*net.TCPAddr).Port))
 	exchange := func(conn net.Conn, payload string) {
 		t.Helper()
@@ -56,9 +58,7 @@ func TestGRPCMultiModeCloseOwnership(t *testing.T) {
 			t.Fatal("closed MultiMode stream remained active on server")
 		}
 	}
-	owner, cancelOwner := context.WithCancel(ctx)
-	t.Cleanup(cancelOwner)
-	pooledSettings := &internet.MemoryStreamConfig{Owner: owner, ProtocolName: protocolName, ProtocolSettings: config}
+	pooledSettings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: config}
 	client, err := getGrpcClient(ctx, dest, pooledSettings)
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +67,7 @@ func TestGRPCMultiModeCloseOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = client.Close() })
 	t.Cleanup(func() { _ = first.Close() })
 	exchange(first, "first")
 	firstRPC := streamContext()
@@ -95,7 +96,8 @@ func TestGRPCMultiModeCloseOwnership(t *testing.T) {
 	exchange(sibling, "sibling-after-close")
 
 	standaloneSettings := &internet.MemoryStreamConfig{ProtocolName: protocolName, ProtocolSettings: config}
-	standalone, err := dialgRPC(ctx, dest, standaloneSettings)
+	standaloneCtx := session.ContextWithOutbounds(ctx, []*session.Outbound{{Gateway: net.LocalHostIP}})
+	standalone, err := dialgRPC(standaloneCtx, dest, standaloneSettings)
 	if err != nil {
 		t.Fatal(err)
 	}

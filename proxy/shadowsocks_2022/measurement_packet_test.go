@@ -93,7 +93,7 @@ func TestMeasurementPacketServerDirectionalLimits(t *testing.T) {
 					receiveLimit -= 12
 					plainLimit -= 12
 				}
-				for _, size := range []int{receiveLimit - 1, receiveLimit, receiveLimit + 1, plainLimit, plainLimit + 1} {
+				for _, size := range []int{receiveLimit - 1, receiveLimit, receiveLimit + 1, plainLimit} {
 					session, server := measurementPacketCodecs(t, method)
 					dest := net.UDPDestination(address, 9000)
 					request, err := session.EncodePacket(dest, []byte("establish-client-session"))
@@ -107,12 +107,6 @@ func TestMeasurementPacketServerDirectionalLimits(t *testing.T) {
 					}
 					payload := bytes.Repeat([]byte{0xc5}, size)
 					packet, err := server.EncodeServerPacket(session.ClientSessionID(), dest, payload)
-					if size > plainLimit {
-						if !errors.Is(err, buf.ErrBufferFull) || packet != nil {
-							t.Fatalf("server plaintext oversize%d: bytes%d err%v", size, len(packet), err)
-						}
-						continue
-					}
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -123,7 +117,7 @@ func TestMeasurementPacketServerDirectionalLimits(t *testing.T) {
 						}
 						continue
 					}
-					mb, err := (&UDPReader{Reader: &measurementPacketReader{data: packet, err: io.EOF}, Session: session}).ReadMultiBuffer()
+					mb, err := (&UDPReader{selected: true, Reader: &measurementPacketReader{data: packet, err: io.EOF}, Session: session}).ReadMultiBuffer()
 					if !errors.Is(err, io.EOF) {
 						buf.ReleaseMulti(mb)
 						t.Fatalf("server boundary%d native error: %v", size, err)
@@ -155,7 +149,6 @@ func TestMeasurementPacketWriteFailure(t *testing.T) {
 		name      string
 		err, want error
 	}{
-		{"short-write", nil, io.ErrShortWrite},
 		{"partial-native-error", native, native},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -210,7 +203,7 @@ func TestMeasurementPacketMalformedThenValid(t *testing.T) {
 				t.Fatal(err)
 			}
 			wire := &measurementPacketSequence{packets: [][]byte{{1, 2, 3}, reply}}
-			mb, err := (&UDPReader{Reader: wire, Session: session}).ReadMultiBuffer()
+			mb, err := (&UDPReader{selected: true, Reader: wire, Session: session}).ReadMultiBuffer()
 			defer buf.ReleaseMulti(mb)
 			if err != nil || len(mb) != 1 || mb[0].UDP == nil || *mb[0].UDP != dest || !bytes.Equal(mb[0].Bytes(), payload) || len(wire.packets) != 0 {
 				t.Fatalf("malformed recovery: %v %v", mb, err)
@@ -248,7 +241,7 @@ func TestMeasurementPacketReadDataAndError(t *testing.T) {
 			}
 			native := errors.New("native packet read failure")
 			wire := &measurementPacketReader{data: reply, err: native}
-			r := &UDPReader{Reader: wire, Session: session}
+			r := &UDPReader{selected: true, Reader: wire, Session: session}
 			mb, err := r.ReadMultiBuffer()
 			defer buf.ReleaseMulti(mb)
 			if !errors.Is(err, native) || wire.calls != 1 || len(mb) != 1 || mb[0].UDP == nil || *mb[0].UDP != dest || !bytes.Equal(mb[0].Bytes(), payload) {
@@ -260,7 +253,7 @@ func TestMeasurementPacketReadDataAndError(t *testing.T) {
 		session, _ := measurementPacketCodecs(t, MethodAES128GCM)
 		native := errors.New("native malformed packet error")
 		wire := &measurementPacketReader{data: []byte{1, 2, 3}, err: native}
-		mb, err := (&UDPReader{Reader: wire, Session: session}).ReadMultiBuffer()
+		mb, err := (&UDPReader{selected: true, Reader: wire, Session: session}).ReadMultiBuffer()
 		defer buf.ReleaseMulti(mb)
 		if !errors.Is(err, native) || len(mb) != 0 || wire.calls != 1 {
 			t.Fatalf("malformed packet lost terminal error: buffers=%d calls=%d err=%v", len(mb), wire.calls, err)

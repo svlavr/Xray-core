@@ -180,10 +180,7 @@ func (m *udpSessionManager) clean() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		m.RLock()
-		closed := m.closed
-		m.RUnlock()
-		if closed {
+		if m.closed {
 			return
 		}
 

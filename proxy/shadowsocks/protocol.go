@@ -215,17 +215,12 @@ func EncodeUDPPacket(request *protocol.RequestHeader, payload []byte) (*buf.Buff
 	}
 
 	if err := addrParser.WriteAddressPort(buffer, request.Address, request.Port); err != nil {
-		buffer.Release()
 		return nil, errors.New("failed to write address").Base(err)
 	}
 
-	if _, err := buffer.Write(payload); err != nil {
-		buffer.Release()
-		return nil, errors.New("failed to write UDP payload").Base(err)
-	}
+	buffer.Write(payload)
 
 	if err := account.Cipher.EncodePacket(account.Key, buffer); err != nil {
-		buffer.Release()
 		return nil, errors.New("failed to encrypt UDP payload").Base(err)
 	}
 
@@ -310,8 +305,28 @@ func (v *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 type UDPWriter struct {
-	Writer  io.Writer
-	Request *protocol.RequestHeader
+	Writer         io.Writer
+	Request        *protocol.RequestHeader
+	selected       bool
+	packetOverhead int
+}
+
+func (w *UDPWriter) checkUDPPacketSize(request *protocol.RequestHeader, payloadLen int32) error {
+	account := request.User.Account.(*MemoryAccount)
+	header := buf.StackNew()
+	defer header.Release()
+	if err := addrParser.WriteAddressPort(&header, request.Address, request.Port); err != nil {
+		return errors.New("failed to write address").Base(err)
+	}
+	if w.packetOverhead == 0 {
+		if cipher, ok := account.Cipher.(*AEADCipher); ok {
+			w.packetOverhead = cipher.AEADAuthCreator(account.Key).Overhead()
+		}
+	}
+	if int64(payloadLen)+int64(header.Len())+int64(account.Cipher.IVSize())+int64(w.packetOverhead) > int64(buf.Size) {
+		return buf.ErrBufferFull
+	}
+	return nil
 }
 
 func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -329,7 +344,14 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				Port:    b.UDP.Port,
 			}
 		}
-		packet, err := EncodeUDPPacket(request, b.Bytes())
+		var packet *buf.Buffer
+		var err error
+		if w.selected {
+			err = w.checkUDPPacketSize(request, b.Len())
+		}
+		if err == nil {
+			packet, err = EncodeUDPPacket(request, b.Bytes())
+		}
 		b.Release()
 		if err != nil {
 			buf.ReleaseMulti(mb)

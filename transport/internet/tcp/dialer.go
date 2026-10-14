@@ -35,9 +35,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		mitmAlpn11 := session.MitmAlpn11FromContext(ctx)
 		var tlsConfig *gotls.Config
 		if tls.IsFromMitm(config.ServerName) {
-			tlsConfig = config.GetTLSConfig(tls.WithClient(), tls.WithOverrideName(mitmServerName))
+			tlsConfig = config.GetTLSConfig(tls.WithOverrideName(mitmServerName))
 		} else {
-			tlsConfig = config.GetTLSConfig(tls.WithClient(), tls.WithDestination(dest))
+			tlsConfig = config.GetTLSConfig(tls.WithDestination(dest))
 		}
 
 		isFromMitmVerify := false
@@ -82,7 +82,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			err = conn.(*tls.Conn).HandshakeContext(ctx)
 		}
 		if err != nil {
-			conn.Close()
+			if internet.MUSelected(ctx) {
+				conn.Close()
+			}
 			if isFromMitmVerify {
 				return nil, errors.New("MITM freedom RAW TLS: failed to verify Domain Fronting certificate from " + mitmServerName).Base(err)
 			}
@@ -103,12 +105,16 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if tcpSettings.HeaderSettings != nil {
 		headerConfig, err := tcpSettings.HeaderSettings.GetInstance()
 		if err != nil {
-			conn.Close()
+			if internet.MUSelected(ctx) {
+				conn.Close()
+			}
 			return nil, errors.New("failed to get header settings").Base(err)
 		}
 		auth, err := internet.CreateConnectionAuthenticator(headerConfig)
 		if err != nil {
-			conn.Close()
+			if internet.MUSelected(ctx) {
+				conn.Close()
+			}
 			return nil, errors.New("failed to create header authenticator").Base(err)
 		}
 		conn = auth.Client(conn)

@@ -12,7 +12,7 @@ import (
 func EnableFlowInspection(instance *Instance, options stats.ObservationOptions) (stats.FlowInspection, error) {
 	instance.statusLock.Lock()
 	defer instance.statusLock.Unlock()
-	if instance.IsRunning() {
+	if instance.running {
 		return nil, fmt.Errorf("inspection enablement is too late")
 	}
 	feature := instance.GetFeature(stats.ManagerType())

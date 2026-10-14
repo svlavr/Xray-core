@@ -69,16 +69,16 @@ func TestInspectionRetainedFenceRejectsConcurrentLateCredit(t *testing.T) {
 		}
 	}()
 	flow.Rebind(fs.RuntimeID{2}, fs.TrafficOriginUser)
-	flow.mu.Lock()
+	flow.store.mu.Lock()
 	fenced := flow.record
-	flow.mu.Unlock()
+	flow.store.mu.Unlock()
 	wg.Wait()
 	flow.AddUplink(99)
 	flow.AddSelectedUplink(99)
 	flow.AddDownlink(99)
-	flow.mu.Lock()
+	flow.store.mu.Lock()
 	final := flow.record
-	flow.mu.Unlock()
+	flow.store.mu.Unlock()
 	if final.Uplink != fenced.Uplink || final.Downlink != fenced.Downlink {
 		t.Fatal("post-fence credit changed known lower bound")
 	}

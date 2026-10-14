@@ -101,34 +101,3 @@ func (c *fixedTargetConn) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
-
-func TestFreedomDialerProxyRejectsDifferentPacketTarget(t *testing.T) {
-	target := net.UDPDestination(net.LocalHostIP, 1000)
-	other := net.UDPDestination(net.LocalHostIP, 2000)
-	for _, override := range []bool{false, true} {
-		t.Run(map[bool]string{false: "reject", true: "override"}[override], func(t *testing.T) {
-			c := new(fixedTargetConn)
-			redirect := net.Destination{}
-			if override {
-				redirect = target
-			}
-			writer := NewPacketWriter(context.Background(), c, &Handler{usesDialerProxy: true}, nil, redirect, target, nil)
-			var mb buf.MultiBuffer
-			for _, dest := range []net.Destination{target, other} {
-				b := buf.New()
-				b.Write([]byte("x"))
-				d := dest
-				b.UDP = &d
-				mb = append(mb, b)
-			}
-			err := writer.WriteMultiBuffer(mb)
-			if override {
-				if err != nil || c.writes != 2 {
-					t.Fatalf("override: writes=%d err=%v", c.writes, err)
-				}
-			} else if err == nil || c.writes != 1 {
-				t.Fatalf("misroute: writes=%d err=%v", c.writes, err)
-			}
-		})
-	}
-}

@@ -1,14 +1,12 @@
 package shadowsocks_2022
 
 import (
-	"context"
 	"io"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -17,144 +15,97 @@ type responseBatchReader func() (buf.MultiBuffer, error)
 
 func (r responseBatchReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return r() }
 
-type responsePacketConn struct {
+type nativeResponseConn struct {
 	*authPacketConn
-	peer  net.Addr
-	write func([]byte, net.Addr) (int, error)
+	write func([]byte) (int, error)
 }
 
-func (c *responsePacketConn) RemoteAddr() net.Addr { return c.peer }
-
-func (c *responsePacketConn) WriteTo(p []byte, peer net.Addr) (int, error) {
-	return c.write(p, peer)
-}
-
+func (c *nativeResponseConn) Write(p []byte) (int, error) { return c.write(p) }
 func responseBuffer(payload string) *buf.Buffer {
 	b := buf.New()
-	b.Write([]byte(payload))
+	if _, err := b.WriteString(payload); err != nil {
+		panic(err)
+	}
 	return b
 }
 
-func responseEntry(t *testing.T, reader buf.Reader) (*udpConnEntry, context.Context, *int) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	closed := new(int)
-	e := &udpConnEntry{link: &transport.Link{Reader: reader}, cancel: cancel, onClose: func() { *closed++ }}
-	e.setTimer(signal.CancelAfterInactivity(ctx, func() { e.Close() }, time.Hour))
-	t.Cleanup(func() { e.Close() })
-	return e, ctx, closed
-}
-
-func TestUDPResponsesDestinationsEncodingAndRebind(t *testing.T) {
+func TestNativeUDPResponsesDestinationsAndEncoding(t *testing.T) {
 	fallback := net.UDPDestination(net.LocalHostIP, 1001)
 	explicit := net.UDPDestination(net.LocalHostIP, 1002)
 	mb := buf.MultiBuffer{responseBuffer("a"), responseBuffer("b"), responseBuffer("bad"), responseBuffer("c")}
-	owned := append(buf.MultiBuffer(nil), mb...)
 	mb[1].UDP = &explicit
+	owned := append(buf.MultiBuffer(nil), mb...)
 	read := false
-	e, ctx, closed := responseEntry(t, responseBatchReader(func() (buf.MultiBuffer, error) {
+	link := &transport.Link{Reader: responseBatchReader(func() (buf.MultiBuffer, error) {
 		if read {
 			return nil, io.EOF
 		}
 		read = true
 		return mb, nil
-	}))
-	first, second := newAuthPacketConn(), newAuthPacketConn()
-	defer first.Close()
-	defer second.Close()
+	})}
+	conn := &nativeResponseConn{authPacketConn: newAuthPacketConn()}
+	t.Cleanup(func() { conn.Close() })
 	var got []string
-	secondPeer := &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: 40001}
-	secondConn := &responsePacketConn{authPacketConn: second, peer: secondPeer, write: func(p []byte, peer net.Addr) (int, error) {
-		if peer != secondPeer {
-			t.Fatal("response retained old peer")
-		}
-		got = append(got, "second:"+string(p))
-		return len(p), nil
-	}}
-	e.setTransport(&responsePacketConn{authPacketConn: first, peer: first.RemoteAddr(), write: func(p []byte, peer net.Addr) (int, error) {
-		got = append(got, "first:"+string(p))
-		e.setTransport(secondConn)
-		return len(p), nil
-	}})
+	conn.write = func(p []byte) (int, error) { got = append(got, string(p)); return len(p), nil }
+	s := new(ServerUDPSession)
+	s.UpdateConn(conn)
 	var destinations []net.Destination
-	e.writeResponses(fallback, func(dest net.Destination, p []byte) ([]byte, error) {
+	handleUDPResponse(s, link, fallback, func(dest net.Destination, payload []byte) ([]byte, error) {
 		destinations = append(destinations, dest)
-		if string(p) == "bad" {
+		if string(payload) == "bad" {
 			return nil, io.ErrUnexpectedEOF
 		}
-		return append([]byte(nil), p...), nil
+		return append([]byte(nil), payload...), nil
 	})
 	want := []net.Destination{fallback, explicit, fallback, fallback}
 	if len(destinations) != len(want) {
-		t.Fatalf("encoded destinations: %v", destinations)
+		t.Fatalf("destinations %v", destinations)
 	}
-	for i, dest := range want {
-		if destinations[i] != dest {
-			t.Fatalf("destination %d: %v want %v", i, destinations[i], dest)
+	for i := range want {
+		if destinations[i] != want[i] {
+			t.Fatalf("destination %d: %v", i, destinations[i])
 		}
 	}
-	if len(got) != 3 || got[0] != "first:a" || got[1] != "second:b" || got[2] != "second:c" {
-		t.Fatalf("response order/rebind: %v", got)
+	if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+		t.Fatalf("responses %v", got)
 	}
 	for _, b := range owned {
 		if !b.IsEmpty() {
-			t.Fatal("decoded buffer retained")
+			t.Fatal("native decoded response retained")
 		}
 	}
-	if ctx.Err() == nil || *closed != 1 {
-		t.Fatal("association did not close once")
-	}
 	select {
-	case <-first.done:
-		t.Fatal("association closed shared listener")
+	case <-conn.done:
+		t.Fatal("response closed shared connection")
 	default:
 	}
 }
 
-func TestUDPResponsesFailureReleasesBatch(t *testing.T) {
-	for _, mode := range []string{"short", "partial-error", "full-error", "read-error"} {
-		t.Run(mode, func(t *testing.T) {
-			mb := buf.MultiBuffer{responseBuffer("one"), responseBuffer("two")}
-			owned := append(buf.MultiBuffer(nil), mb...)
-			reads, writes := 0, 0
-			e, ctx, closed := responseEntry(t, responseBatchReader(func() (buf.MultiBuffer, error) {
-				reads++
-				if reads > 1 {
-					return nil, io.EOF
-				}
-				if mode == "read-error" {
-					return mb, io.ErrUnexpectedEOF
-				}
-				return mb, nil
-			}))
-			conn := newAuthPacketConn()
-			defer conn.Close()
-			e.setTransport(&responsePacketConn{authPacketConn: conn, write: func(p []byte, _ net.Addr) (int, error) {
-				writes++
-				if mode == "short" {
-					return 1, nil
-				}
-				if mode == "full-error" {
-					return len(p), io.ErrClosedPipe
-				}
-				return 1, io.ErrClosedPipe
-			}})
-			e.writeResponses(net.UDPDestination(net.LocalHostIP, 1001), func(_ net.Destination, p []byte) ([]byte, error) {
-				return append([]byte(nil), p...), nil
-			})
-			wantWrites := 1
-			if mode == "read-error" {
-				wantWrites = 0
+func TestNativeUDPResponsesWriteFailureReleasesBatch(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		mb := buf.MultiBuffer{responseBuffer("first"), responseBuffer("tail")}
+		owned := append(buf.MultiBuffer(nil), mb...)
+		reads, writes := 0, 0
+		link := &transport.Link{Reader: responseBatchReader(func() (buf.MultiBuffer, error) { reads++; return mb, nil })}
+		conn := &nativeResponseConn{authPacketConn: newAuthPacketConn(), write: func(p []byte) (int, error) {
+			writes++
+			if full {
+				return len(p), io.ErrClosedPipe
 			}
-			if reads != 1 || writes != wantWrites || *closed != 1 || ctx.Err() == nil {
-				t.Fatalf("termination: reads=%d writes=%d closes=%d err=%v", reads, writes, *closed, ctx.Err())
+			return 1, io.ErrClosedPipe
+		}}
+		s := new(ServerUDPSession)
+		s.UpdateConn(conn)
+		handleUDPResponse(s, link, net.UDPDestination(net.LocalHostIP, 1001), nil)
+		conn.Close()
+		if reads != 1 || writes != 1 {
+			t.Fatalf("reads=%d writes=%d", reads, writes)
+		}
+		for _, b := range owned {
+			if !b.IsEmpty() {
+				t.Fatal("native failure retained batch tail")
 			}
-			for _, b := range owned {
-				if !b.IsEmpty() {
-					t.Fatal("failed response retained batch tail")
-				}
-			}
-		})
+		}
 	}
 }
 
@@ -167,22 +118,20 @@ func (r *responseBlockingReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	close(r.entered)
 	return r.Reader.ReadMultiBuffer()
 }
-
-func TestUDPResponsesCloseUnblocksRead(t *testing.T) {
-	reader, writer := pipe.New()
-	defer writer.Close()
-	r := &responseBlockingReader{Reader: reader, entered: make(chan struct{})}
-	e, _, _ := responseEntry(t, r)
-	done := make(chan struct{})
-	go func() {
-		e.writeResponses(net.UDPDestination(net.LocalHostIP, 1001), nil)
-		close(done)
-	}()
-	<-r.entered
-	e.Close()
+func TestNativeUDPResponsesExplicitCloseUnblocksRead(t *testing.T) {
+	r, w := pipe.New()
+	defer w.Close()
+	reader := &responseBlockingReader{Reader: r, entered: make(chan struct{})}
+	link := &transport.Link{Reader: reader, Writer: w}
+	s := new(ServerUDPSession)
+	s.link.Store(link)
+	finished := make(chan struct{})
+	go func() { handleUDPResponse(s, link, net.UDPDestination(net.LocalHostIP, 1001), nil); close(finished) }()
+	<-reader.entered
+	s.Close()
 	select {
-	case <-done:
+	case <-finished:
 	case <-time.After(time.Second):
-		t.Fatal("response worker retained blocked read after close")
+		t.Fatal("native response read remained blocked")
 	}
 }

@@ -17,26 +17,6 @@ type udpWriterFunc func([]byte) (int, error)
 
 func (f udpWriterFunc) Write(p []byte) (int, error) { return f(p) }
 
-func TestUDPWriterSendMessageLarge(t *testing.T) {
-	data := bytes.Repeat([]byte("p"), buf.Size)
-	message := &UDPMessage{FragCount: 1, Addr: "127.0.0.1:53", Data: data}
-	var encoded []byte
-	writer := &UDPWriter{writer: udpWriterFunc(func(p []byte) (int, error) {
-		encoded = append([]byte(nil), p...)
-		return len(p), nil
-	})}
-	if err := writer.SendMessage(message); err != nil {
-		t.Fatal(err)
-	}
-	if len(encoded) != message.Size() || len(encoded) <= buf.Size {
-		t.Fatalf("encoded size %d, want %d above fixed buffer", len(encoded), message.Size())
-	}
-	parsed, err := ParseUDPMessage(encoded)
-	if err != nil || parsed.Addr != message.Addr || !bytes.Equal(parsed.Data, data) {
-		t.Fatalf("large message was not serialized intact: %+v %v", parsed, err)
-	}
-}
-
 func TestUDPWriterFragmentationAndFailures(t *testing.T) {
 	t.Run("fragments", func(t *testing.T) {
 		const maxDatagram = 128
@@ -76,18 +56,6 @@ func TestUDPWriterFragmentationAndFailures(t *testing.T) {
 		}
 	})
 
-	t.Run("empty-fragmentation", func(t *testing.T) {
-		calls := 0
-		writer := &UDPWriter{addr: "127.0.0.1:53", writer: udpWriterFunc(func(p []byte) (int, error) {
-			calls++
-			return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 1}
-		})}
-		err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("payload"))})
-		if err == nil || calls != 1 {
-			t.Fatalf("empty fragmentation returned %v after %d writes", err, calls)
-		}
-	})
-
 	t.Run("fragment-write-error", func(t *testing.T) {
 		failure := errors.New("fragment failed")
 		calls := 0
@@ -103,17 +71,6 @@ func TestUDPWriterFragmentationAndFailures(t *testing.T) {
 			t.Fatalf("fragment failure returned %v after %d writes", err, calls)
 		}
 	})
-}
-
-func TestInspectionUDPFragmentCountLimit(t *testing.T) {
-	message := &UDPMessage{Addr: "127.0.0.1:53", Data: bytes.Repeat([]byte("p"), 256)}
-	if fragments := FragUDPMessage(message, message.HeaderSize()+1); len(fragments) != 0 {
-		t.Fatalf("unrepresentable fragment count: %d", len(fragments))
-	}
-	message.Data = message.Data[:255]
-	if fragments := FragUDPMessage(message, message.HeaderSize()+1); len(fragments) != 255 {
-		t.Fatalf("maximum representable fragment count: %d", len(fragments))
-	}
 }
 
 func TestInspectionHysteriaPacketResults(t *testing.T) {

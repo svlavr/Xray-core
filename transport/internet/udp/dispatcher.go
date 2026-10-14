@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 type ResponseCallback func(ctx context.Context, packet *udp.Packet)
@@ -59,6 +60,7 @@ type Dispatcher struct {
 	callback         ResponseCallback
 	callClose        func() error
 	closed           bool
+	readers          sync.WaitGroup
 }
 
 func NewDispatcher(dispatcher routing.Dispatcher, callback ResponseCallback) *Dispatcher {
@@ -81,6 +83,14 @@ func (v *Dispatcher) RemoveRay() {
 		v.conn.Close()
 		v.conn = nil
 	}
+}
+
+// Close stops admission and joins the native input reader. Existing RemoveRay
+// callers retain their native asynchronous behavior.
+func (v *Dispatcher) Close() error {
+	v.RemoveRay()
+	v.readers.Wait()
+	return nil
 }
 
 func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*connEntry, error) {
@@ -151,7 +161,11 @@ func (v *Dispatcher) getInboundRay(ctx context.Context, dest net.Destination) (*
 
 	entry.timer = signal.CancelAfterInactivity(ctx, entry.terminate, time.Minute)
 	v.conn = entry
-	go handleInput(ctx, entry, dest, v.callback, v.callClose)
+	v.readers.Add(1)
+	go func() {
+		defer v.readers.Done()
+		handleInput(ctx, entry, dest, v.callback, v.callClose)
+	}()
 	return entry, nil
 }
 
@@ -210,6 +224,10 @@ func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, cal
 		}
 
 		mb, err := input.ReadMultiBuffer()
+		if err != nil && conn.observation == nil && !internet.MUSelected(ctx) {
+			buf.ReleaseMulti(mb)
+			return
+		}
 		timer.Update()
 		for _, b := range mb {
 			if b.UDP != nil {
@@ -230,13 +248,14 @@ func handleInput(ctx context.Context, conn *connEntry, dest net.Destination, cal
 }
 
 type dispatcherConn struct {
-	dispatcher  *Dispatcher
-	cache       chan dispatcherPacket
-	done        *done.Instance
-	ctx         context.Context
-	observation stats.Exchange
-	mu          sync.Mutex
-	closed      bool
+	dispatcher *Dispatcher
+	cache      chan dispatcherPacket
+	done       *done.Instance
+	ctx        context.Context
+	selected   bool
+	mu         sync.Mutex
+	closed     bool
+	root       stats.Exchange
 }
 
 type dispatcherPacket struct {
@@ -246,9 +265,10 @@ type dispatcherPacket struct {
 
 func DialDispatcher(ctx context.Context, dispatcher routing.Dispatcher) (net.PacketConn, error) {
 	c := &dispatcherConn{
-		cache: make(chan dispatcherPacket, 16),
-		done:  done.New(),
-		ctx:   ctx,
+		cache:    make(chan dispatcherPacket, 16),
+		done:     done.New(),
+		ctx:      ctx,
+		selected: internet.MUSelected(ctx),
 	}
 
 	d := &Dispatcher{
@@ -257,9 +277,8 @@ func DialDispatcher(ctx context.Context, dispatcher routing.Dispatcher) (net.Pac
 		callClose:  c.endRay,
 	}
 	if observation := session.LogicalObservationFromContext(ctx); observation != nil && observation.ReturnedLink.CompareAndSwap(true, false) {
-		d.Observation = observation.Exchange
-		d.InputAtExecution = observation.InputAtExecution
-		c.observation = observation.Exchange
+		d.Observation, d.InputAtExecution = observation.Exchange, observation.InputAtExecution
+		c.root = observation.Exchange
 	}
 	c.dispatcher = d
 	return c, nil
@@ -270,57 +289,57 @@ func (c *dispatcherConn) callback(ctx context.Context, packet *udp.Packet) {
 	if observation := session.LogicalObservationFromContext(ctx); observation != nil {
 		receipt = observation.Exchange
 	}
-	c.mu.Lock()
-	if c.closed {
-		packet.Payload.Release()
-		c.mu.Unlock()
-		return
+	if c.selected {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.closed {
+			packet.Payload.Release()
+			return
+		}
 	}
 	select {
+	case <-c.done.Wait():
+		packet.Payload.Release()
+		return
 	case c.cache <- dispatcherPacket{packet: packet, receipt: receipt}:
 	default:
 		packet.Payload.Release()
+		return
 	}
-	c.mu.Unlock()
 }
 
 func (c *dispatcherConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	var cached dispatcherPacket
-	for {
+s:
+	select {
+	case <-c.done.Wait():
 		select {
 		case cached = <-c.cache:
-			goto packet
+			break s
 		default:
-		}
-		if c.done.Done() {
-			c.finishRoot()
+			if c.root != nil {
+				c.root.Finish()
+			}
 			return 0, nil, io.EOF
 		}
-		select {
-		case cached = <-c.cache:
-			goto packet
-		case <-c.done.Wait():
+	case cached = <-c.cache:
+	}
+	packet := cached.packet
+	if c.selected {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		defer packet.Payload.Release()
+		if c.closed {
+			return 0, nil, io.EOF
 		}
 	}
-
-packet:
-	packet := cached.packet
-	c.mu.Lock()
-	if c.closed {
-		packet.Payload.Release()
-		c.mu.Unlock()
-		return 0, nil, io.EOF
-	}
 	n := copy(p, packet.Payload.Bytes())
-	source := packet.Source
-	if cached.receipt != nil && n > 0 {
+	if cached.receipt != nil {
 		cached.receipt.AddDownlink(uint64(n))
 	}
-	packet.Payload.Release()
-	c.mu.Unlock()
 	return n, &net.UDPAddr{
-		IP:   source.Address.IP(),
-		Port: int(source.Port),
+		IP:   packet.Source.Address.IP(),
+		Port: int(packet.Source.Port),
 	}, nil
 }
 
@@ -337,35 +356,28 @@ func (c *dispatcherConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 }
 
 func (c *dispatcherConn) Close() error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return nil
-	}
-	c.closed = true
-	for {
-		select {
-		case cached := <-c.cache:
-			cached.packet.Payload.Release()
-		default:
+	if c.selected {
+		c.mu.Lock()
+		if c.closed {
 			c.mu.Unlock()
-			c.dispatcher.RemoveRay()
-			err := c.done.Close()
-			c.finishRoot()
-			return err
+			return nil
+		}
+		c.closed = true
+		for {
+			select {
+			case cached := <-c.cache:
+				cached.packet.Payload.Release()
+			default:
+				c.mu.Unlock()
+				c.dispatcher.RemoveRay()
+				if c.root != nil {
+					c.root.Finish()
+				}
+				return c.done.Close()
+			}
 		}
 	}
-}
-
-func (c *dispatcherConn) endRay() error {
-	c.dispatcher.RemoveRay()
 	return c.done.Close()
-}
-
-func (c *dispatcherConn) finishRoot() {
-	if c.observation != nil {
-		c.observation.Finish()
-	}
 }
 
 func (c *dispatcherConn) LocalAddr() net.Addr {
@@ -385,4 +397,11 @@ func (c *dispatcherConn) SetReadDeadline(t time.Time) error {
 
 func (c *dispatcherConn) SetWriteDeadline(t time.Time) error {
 	return nil
+}
+
+func (c *dispatcherConn) endRay() error {
+	if c.selected {
+		c.dispatcher.RemoveRay()
+	}
+	return c.done.Close()
 }

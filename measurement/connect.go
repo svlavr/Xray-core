@@ -39,13 +39,13 @@ func (e *Executor) TCPConnect(ctx context.Context, request TCPConnectRequest) (r
 	if request.Route.Kind == ExactOutbound {
 		return receipt, ErrUnsupported
 	}
-	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
-	defer cancel()
-	if err := e.acquire(ctx); err != nil {
+	o, err := e.begin(ctx, request.Timeout)
+	if err != nil {
 		return receipt, err
 	}
-	defer func() { <-e.slots }()
-	started := time.Now()
+	defer o.end()
+	ctx = o
+	started := o.started
 	dest := xnet.TCPDestination(xnet.IPAddress(request.Destination.Addr().AsSlice()), xnet.Port(request.Destination.Port()))
 	conn, err := internet.DialSystemTCPConnect(ctx, dest)
 	elapsed := time.Since(started)

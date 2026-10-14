@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -86,38 +86,25 @@ type readerOnly struct {
 }
 
 type plainRequestOwner struct {
-	mu     sync.Mutex
 	cancel context.CancelFunc
-	link   *transport.Link
-	closed bool
+	link   atomic.Pointer[transport.Link]
+	closed atomic.Bool
 }
 
 func (o *plainRequestOwner) attach(link *transport.Link) {
-	o.mu.Lock()
-	o.link = link
-	closed := o.closed
-	o.mu.Unlock()
-	if closed {
+	o.link.Store(link)
+	if o.closed.Load() {
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
 	}
 }
 
 func (o *plainRequestOwner) Close() error {
-	o.mu.Lock()
-	if o.closed {
-		o.mu.Unlock()
-		return nil
-	}
-	o.closed = true
-	link := o.link
-	o.mu.Unlock()
-	if link != nil {
+	o.closed.Store(true)
+	if link := o.link.Load(); link != nil {
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
 	} else {
-		// Before Dispatch returns its request-local pipes, cancellation is the
-		// only exact way to prevent that request from starting execution.
 		o.cancel()
 	}
 	return nil
@@ -153,10 +140,11 @@ func (s *Server) ProcessWithFirstbyte(ctx context.Context, network net.Network, 
 		inbound.CanSpliceCopy = 3
 	}
 	var reader *bufio.Reader
-	if len(firstbyte) > 0 {
-		// CONNECT transfers this reader's residual to the tunnel. A second
-		// buffered reader underneath would hide bytes from that transfer.
-		multiReader := io.MultiReader(bytes.NewReader(firstbyte), readerOnly{conn})
+	if len(firstbyte) > 0 && proxy.ObservationStore(s.statsManager) != nil {
+		reader = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(firstbyte), readerOnly{conn}), buf.Size)
+	} else if len(firstbyte) > 0 {
+		readerWithoutFirstbyte := bufio.NewReaderSize(readerOnly{conn}, buf.Size)
+		multiReader := io.MultiReader(bytes.NewReader(firstbyte), readerWithoutFirstbyte)
 		reader = bufio.NewReaderSize(multiReader, buf.Size)
 	} else {
 		reader = bufio.NewReaderSize(readerOnly{conn}, buf.Size)
@@ -276,16 +264,21 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		return response.Write(writer)
 	}
 
-	requestCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	owner := &plainRequestOwner{cancel: cancel}
-	ctx, observation, cleanup := proxy.BeginExecutionObservation(requestCtx, s.statsManager, owner, dest)
-	if cleanup != nil {
-		defer cleanup()
-	}
+	var owner *plainRequestOwner
 	responseWriter := writer
-	if observation != nil {
-		responseWriter = &responseReceiptWriter{Writer: writer, receipt: observation.Exchange}
+	if proxy.ObservationStore(s.statsManager) != nil {
+		requestCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		owner = &plainRequestOwner{cancel: cancel}
+		observedCtx, observation, cleanup := proxy.BeginExecutionObservation(requestCtx, s.statsManager, owner, dest)
+		ctx = observedCtx
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if observation != nil {
+			responseWriter = &responseReceiptWriter{Writer: writer, receipt: observation.Exchange}
+			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{}})
+		}
 	}
 
 	if len(request.URL.Host) > 0 {
@@ -310,15 +303,14 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 	}
 
 	ctx = session.ContextWithContent(ctx, content)
-	// A keep-alive request may start while the previous outbound is still
-	// finishing. Do not reuse its mutable route and splice metadata.
-	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{}})
 
 	link, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
 		return err
 	}
-	owner.attach(link)
+	if owner != nil {
+		owner.attach(link)
+	}
 
 	// Plain HTTP request is not a stream. The request always finishes before response. Hense request has to be closed later.
 	defer common.Close(link.Writer)

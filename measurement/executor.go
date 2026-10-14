@@ -1,10 +1,9 @@
-// Package measurement executes caller-requested bounded raw operations.
-// Executors own no background loop and do not register an Xray feature.
 package measurement
 
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"time"
 
@@ -14,18 +13,11 @@ import (
 
 var ErrUnsupported = errors.New("unsupported measurement execution shape")
 
-// Executor enforces the caller's concurrent-operation limit. The caller must
-// cancel its operations before closing a supplied instance. Slots count live method
-// invocations; native Xray/Go own their ordinary connection lifecycle.
 type Executor struct {
 	instance *core.Instance
 	slots    chan struct{}
 }
 
-// New creates an idle executor with a positive, caller-selected concurrency limit.
-// The limit is fixed for this executor's lifetime; scheduling policy stays outside.
-// A nil instance permits DIRECT operations; exact outbound operations return
-// ErrUnsupported before dispatch when no instance is supplied.
 func New(instance *core.Instance, maxConcurrent int) (*Executor, error) {
 	if maxConcurrent <= 0 {
 		return nil, errors.New("measurement concurrency limit must be positive")
@@ -33,25 +25,48 @@ func New(instance *core.Instance, maxConcurrent int) (*Executor, error) {
 	return &Executor{instance: instance, slots: make(chan struct{}, maxConcurrent)}, nil
 }
 
-// acquire admits one live invocation and rechecks cancellation before native
-// work. A free slot and a canceled context can both satisfy the select.
-func (e *Executor) acquire(ctx context.Context) error {
+// operation owns one admission and its cancellation/native feedback boundaries.
+// Method-specific facts are finalized before end cancels cleanup and frees the slot.
+type operation struct {
+	context.Context
+	cancel        context.CancelCauseFunc
+	timeoutCancel context.CancelFunc
+	owner         *Executor
+	started       time.Time
+	mu            sync.Mutex
+	nativeError   error
+	tlsTime       *time.Duration
+	firstByte     *time.Duration
+	tlsStarted    time.Time
+}
+
+func (e *Executor) begin(ctx context.Context, timeout time.Duration) (*operation, error) {
+	if ctx == nil {
+		return nil, errors.New("nil request context")
+	}
+	ctx, timeoutCancel := context.WithTimeout(ctx, timeout)
 	select {
 	case e.slots <- struct{}{}:
 		if err := ctx.Err(); err != nil {
 			<-e.slots
-			return err
+			timeoutCancel()
+			return nil, err
 		}
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		timeoutCancel()
+		return nil, ctx.Err()
 	}
+	started := time.Now()
+	ctx, cancel := context.WithCancelCause(ctx)
+	o := &operation{Context: ctx, cancel: cancel, timeoutCancel: timeoutCancel, started: started, owner: e}
+	o.Context = measurementContext(ctx, o)
+	return o, nil
 }
 
-type operation struct {
-	mu          sync.Mutex
-	nativeError error
-	tlsTime     *time.Duration
+func (o *operation) end() {
+	o.cancel(nil)
+	o.timeoutCancel()
+	<-o.owner.slots
 }
 
 func (o *operation) SubmitError(err error) {
@@ -62,18 +77,28 @@ func (o *operation) SubmitError(err error) {
 	}
 }
 
-var _ session.TrackedRequestErrorFeedback = (*operation)(nil)
+func (o *operation) outboundError() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.nativeError
+}
 
-// measurementContext replaces mutable caller session objects, preserving cancellation.
+// Pipe deadlines are no-ops; close the actual connection on cancellation.
+func closeOnCancel(ctx context.Context, conn net.Conn) func() {
+	closeConn := sync.OnceFunc(func() { _ = conn.Close() })
+	stop := context.AfterFunc(ctx, closeConn)
+	return func() {
+		stop()
+		closeConn()
+	}
+}
+
 func measurementContext(ctx context.Context, o *operation) context.Context {
-	// Never mutate caller-owned session pointers or inherit USER admission.
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{})
 	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{}})
 	ctx = session.ContextWithContent(ctx, &session.Content{SkipDNSResolve: true})
 	ctx = session.ContextWithTimeoutOnly(ctx, false)
-	// A measurement cannot continue the caller's logical USER exchange.
 	ctx = session.ContextWithLogicalObservation(ctx, nil)
 	ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginControlledMeasurement)
-	ctx = session.TrackedConnectionError(ctx, o)
-	return ctx
+	return session.TrackedConnectionError(ctx, o)
 }

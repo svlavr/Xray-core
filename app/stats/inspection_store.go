@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	xnet "github.com/xtls/xray-core/common/net"
@@ -13,161 +12,133 @@ import (
 	featurestats "github.com/xtls/xray-core/features/stats"
 )
 
-type aggregateCell struct {
-	uplink   atomic.Uint64
-	downlink atomic.Uint64
-}
-
+// The instance lock protects records and receipts as well as the two indexes.
+// Endpoint I/O, cancellation and owner callbacks never run under it.
 type inspectionStore struct {
-	runtime featurestats.RuntimeID
-	limits  featurestats.ObservationOptions
-	epoch   time.Time
-
-	mu             sync.RWMutex
-	live           map[uint64]*inspectionExchange
-	buckets        map[string]*aggregateCell
-	user           aggregateCell
+	mu             sync.Mutex
+	runtime        featurestats.RuntimeID
+	limits         featurestats.ObservationOptions
+	epoch          time.Time
+	live           map[uint64]*inspectionFlow
+	buckets        map[string]*featurestats.ClientTotals
+	user           featurestats.ClientTotals
 	bucketsOmitted uint64
 	nextID         uint64
 }
 
+// One record owns association facts. A receipt adds only its immutable role
+// and first route binding; old UDP receipts never consult a newer binding.
+type inspectionFlow struct {
+	store              *inspectionStore
+	record             featurestats.FlowRecord
+	stop               func() error
+	hasLeg             bool
+	stopRequested      bool
+	provenanceConflict bool
+	published          bool
+	excluded           bool
+	admitted           bool
+}
+
+type inspectionExchange struct {
+	*inspectionFlow
+	bucket *featurestats.ClientTotals
+	isLeg  bool
+	bound  bool
+}
+
 func newInspectionStore(runtime featurestats.RuntimeID, limits featurestats.ObservationOptions) *inspectionStore {
-	store := &inspectionStore{
+	return &inspectionStore{
 		runtime: runtime,
 		limits:  limits,
 		epoch:   time.Now(),
-		live:    make(map[uint64]*inspectionExchange),
-		buckets: make(map[string]*aggregateCell),
+		live:    make(map[uint64]*inspectionFlow),
+		buckets: make(map[string]*featurestats.ClientTotals),
 	}
-	return store
 }
 
-func (s *inspectionStore) elapsed() time.Duration {
-	return time.Since(s.epoch)
-}
+func (s *inspectionStore) Runtime() featurestats.RuntimeID { return s.runtime }
 
-func (s *inspectionStore) Runtime() featurestats.RuntimeID {
-	return s.runtime
-}
+func (s *inspectionStore) elapsed() time.Duration { return time.Since(s.epoch) }
 
 func (s *inspectionStore) isClosed() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.live == nil
 }
 
 func (s *inspectionStore) Begin(kind xnet.Network, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
-	flow := s.prepare(kind, origin, source, destination, stop)
-	if flow != nil {
-		e := flow.(*inspectionExchange)
-		e.mu.Lock()
-		e.admitLocked()
-		e.registerLocked()
-		e.mu.Unlock()
-	}
-	return flow
+	return s.prepare(kind, origin, source, destination, stop, true)
 }
 
 func (s *inspectionStore) PrepareTCP(origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
-	return s.prepare(xnet.Network_TCP, origin, source, destination, stop)
+	return s.prepare(xnet.Network_TCP, origin, source, destination, stop, false)
 }
 
-func (s *inspectionStore) prepare(kind xnet.Network, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error) featurestats.Exchange {
-	if s.isClosed() {
-		return nil
-	}
-	origin = normalizeOrigin(origin)
-	var exchange *inspectionExchange
-	if kind == xnet.Network_TCP {
-		root := &struct {
-			flow     inspectionFlow
-			exchange inspectionExchange
-		}{}
-		root.exchange.inspectionFlow = &root.flow
-		exchange = &root.exchange
-	} else {
-		// A late UDP leg retains the flow alone, without retaining the root.
-		exchange = &inspectionExchange{inspectionFlow: &inspectionFlow{}}
-	}
-	exchange.store = s
-	exchange.stop = stop
-	exchange.record = featurestats.FlowRecord{
-		Kind: kind, Origin: origin, Source: source, Destination: destination,
-		Opened: s.elapsed(),
-	}
-	return exchange
-}
-
-// Native endpoint owners retain unregistered receipts themselves. There is no
-// pending index; the existing live map only owns classified logical exchanges.
-func (e *inspectionExchange) registerLocked() {
-	if e.record.Ref.ID != 0 || e.excluded {
-		return
-	}
-	s := e.store
+func (s *inspectionStore) prepare(kind xnet.Network, origin featurestats.TrafficOrigin, source, destination xnet.Destination, stop func() error, admitted bool) featurestats.Exchange {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.live == nil {
-		return
+		return nil
 	}
-	if uint32(len(s.live)) >= s.limits.MaxLive {
-		return
+	e := &inspectionExchange{inspectionFlow: &inspectionFlow{
+		store: s, stop: stop,
+		record: featurestats.FlowRecord{
+			Kind: kind, Origin: normalizeOrigin(origin), Source: source,
+			Destination: destination, Opened: s.elapsed(),
+		},
+		admitted: admitted,
+	}}
+	if admitted {
+		e.registerLocked()
 	}
-	s.nextID++
-	e.record.Ref = featurestats.FlowRef{Runtime: s.runtime, ID: s.nextID}
-	s.live[s.nextID] = e
+	return e
+}
+
+func (e *inspectionExchange) registerLocked() {
+	s := e.store
+	if e.record.Ref.ID == 0 && !e.excluded && s.live != nil && uint32(len(s.live)) < s.limits.MaxLive {
+		s.nextID++
+		e.record.Ref = featurestats.FlowRef{Runtime: s.runtime, ID: s.nextID}
+		s.live[s.nextID] = e.inspectionFlow
+	}
 }
 
 func (s *inspectionStore) ReadLiveInto(storage []featurestats.FlowRecord) (featurestats.LiveSnapshot, error) {
-	s.mu.RLock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.live == nil {
-		s.mu.RUnlock()
 		clear(storage)
 		return featurestats.LiveSnapshot{}, errors.New("inspection closed")
 	}
-	rows := make([]*inspectionExchange, 0, len(s.live))
-	for _, exchange := range s.live {
-		rows = append(rows, exchange)
-	}
-	s.mu.RUnlock()
-
-	result := storage[:0]
-	if result == nil || cap(result) < len(rows) {
+	rows := storage[:0]
+	if rows == nil || cap(rows) < len(s.live) {
 		clear(storage)
-		result = make([]featurestats.FlowRecord, 0, len(rows))
+		rows = make([]featurestats.FlowRecord, 0, len(s.live))
 	}
-	for _, exchange := range rows {
-		exchange.mu.Lock()
-		if !exchange.published {
-			result = append(result, exchange.record)
-		}
-		exchange.mu.Unlock()
+	for _, flow := range s.live {
+		rows = append(rows, flow.record)
 	}
-	if len(result) < len(storage) {
-		clear(storage[len(result):])
+	if len(rows) < len(storage) {
+		clear(storage[len(rows):])
 	}
-	return featurestats.LiveSnapshot{
-		At:   s.elapsed(),
-		Rows: result,
-	}, nil
+	return featurestats.LiveSnapshot{At: s.elapsed(), Rows: rows}, nil
 }
 
 func (s *inspectionStore) ReadTotals() (featurestats.TotalsSnapshot, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.live == nil {
 		return featurestats.TotalsSnapshot{}, errors.New("inspection closed")
 	}
 	rows := make([]featurestats.TotalRecord, 0, len(s.buckets))
 	for tag, cell := range s.buckets {
-		rows = append(rows, featurestats.TotalRecord{Outbound: featurestats.OutboundRef{Tag: tag}, Origin: featurestats.TrafficOriginUser, Uplink: cell.uplink.Load(), Downlink: cell.downlink.Load()})
+		rows = append(rows, featurestats.TotalRecord{
+			Outbound: featurestats.OutboundRef{Tag: tag}, Origin: featurestats.TrafficOriginUser,
+			Uplink: cell.Uplink, Downlink: cell.Downlink,
+		})
 	}
-	return featurestats.TotalsSnapshot{
-		At:             s.elapsed(),
-		User:           featurestats.ClientTotals{Uplink: s.user.uplink.Load(), Downlink: s.user.downlink.Load()},
-		BucketsOmitted: s.bucketsOmitted,
-		Rows:           rows,
-	}, nil
+	return featurestats.TotalsSnapshot{At: s.elapsed(), User: s.user, BucketsOmitted: s.bucketsOmitted, Rows: rows}, nil
 }
 
 func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.FlowRef) ([]error, error) {
@@ -180,101 +151,37 @@ func (s *inspectionStore) CloseFlows(ctx context.Context, refs []featurestats.Fl
 			outcomes[i] = err
 			continue
 		}
-		if ref.Runtime != s.runtime {
-			continue
+		s.mu.Lock()
+		flow := s.live[ref.ID]
+		var stop func() error
+		if ref.Runtime == s.runtime && flow != nil && !flow.published && !flow.stopRequested {
+			if flow.stop == nil {
+				outcomes[i] = errors.ErrUnsupported
+			} else {
+				flow.stopRequested = true
+				stop = flow.stop
+			}
 		}
-		exchange := s.lookup(ref.ID)
-		if exchange == nil {
-			continue
+		s.mu.Unlock()
+		if stop != nil {
+			outcomes[i] = stop()
+			s.mu.Lock()
+			flow.finishLocked()
+			s.mu.Unlock()
 		}
-		stop, err := exchange.requestStop()
-		if err != nil {
-			outcomes[i] = err
-			continue
-		}
-		if stop == nil {
-			continue
-		}
-		err = stop()
-		exchange.Finish()
-		outcomes[i] = err
 	}
 	return outcomes, nil
-}
-
-func (s *inspectionStore) lookup(id uint64) *inspectionExchange {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.live[id]
-}
-
-func (s *inspectionStore) bucketFor(outbound featurestats.OutboundRef, origin featurestats.TrafficOrigin) *aggregateCell {
-	if outbound.Tag == "" || origin != featurestats.TrafficOriginUser {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if cell := s.buckets[outbound.Tag]; cell != nil {
-		return cell
-	}
-	if s.live == nil {
-		return nil
-	}
-	if uint32(len(s.buckets)) >= s.limits.MaxBuckets {
-		s.bucketsOmitted++
-		return nil
-	}
-	cell := &aggregateCell{}
-	s.buckets[outbound.Tag] = cell
-	return cell
-}
-
-func (s *inspectionStore) remove(exchange *inspectionExchange, ref featurestats.FlowRef) {
-	if ref.ID == 0 {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.live[ref.ID] == exchange {
-		delete(s.live, ref.ID)
-	}
 }
 
 func (s *inspectionStore) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.live == nil {
-		return
-	}
-	s.live = nil
-	s.buckets = nil
-}
-
-// One association owns the visible values, lifetime and lock. Native rays retain
-// only route binding; no pending credit or ray lifecycle exists.
-type inspectionFlow struct {
-	store              *inspectionStore
-	stop               func() error
-	mu                 sync.Mutex
-	record             featurestats.FlowRecord
-	hasLeg             bool
-	stopRequested      bool
-	provenanceConflict bool
-	published          bool
-	excluded           bool
-	admitted           bool // Prepared TCP carriers remain private.
-}
-
-type inspectionExchange struct {
-	*inspectionFlow
-	bucket *aggregateCell
-	isLeg  bool
-	bound  bool // Selection can bind without a public tag bucket.
+	s.live, s.buckets = nil, nil
 }
 
 func (e *inspectionExchange) NewLeg() featurestats.Exchange {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	if e.excluded || e.isLeg || e.record.Kind != xnet.Network_UDP || e.stopRequested || e.published {
 		return nil
 	}
@@ -283,14 +190,14 @@ func (e *inspectionExchange) NewLeg() featurestats.Exchange {
 }
 
 func (e *inspectionExchange) Ref() featurestats.FlowRef {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	return e.record.Ref
 }
 
 func (e *inspectionExchange) ExcludeCarrier() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	if e.isLeg || e.admitted || e.record.Ref.ID != 0 {
 		return false
 	}
@@ -299,19 +206,18 @@ func (e *inspectionExchange) ExcludeCarrier() bool {
 }
 
 func (e *inspectionExchange) Route(outbound featurestats.OutboundRef) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	if e.excluded || (!e.isLeg && e.published) || e.bound {
 		return
 	}
 	e.record.Outbound = outbound
-
 	e.bindLocked(outbound)
 }
 
 func (e *inspectionExchange) Unassign() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	if e.isLeg || !e.published {
 		e.bindLocked(featurestats.OutboundRef{})
 	}
@@ -321,64 +227,50 @@ func (e *inspectionExchange) bindLocked(outbound featurestats.OutboundRef) {
 	if e.excluded || e.bound {
 		return
 	}
+	s := e.store
 	if !e.isLeg {
 		e.registerLocked()
-		e.admitLocked()
+		if !e.admitted {
+			e.admitted = true
+			if e.record.Origin == featurestats.TrafficOriginUser {
+				s.user.Uplink += e.record.Uplink
+				s.user.Downlink += e.record.Downlink
+			}
+		}
 	}
-	e.bucket = e.store.bucketFor(outbound, e.record.Origin)
+	if outbound.Tag != "" && e.record.Origin == featurestats.TrafficOriginUser {
+		e.bucket = s.buckets[outbound.Tag]
+		if e.bucket == nil && s.live != nil {
+			if uint32(len(s.buckets)) >= s.limits.MaxBuckets {
+				s.bucketsOmitted++
+			} else {
+				e.bucket = &featurestats.ClientTotals{}
+				s.buckets[outbound.Tag] = e.bucket
+			}
+		}
+	}
 	e.bound = true
 }
 
-// Prepared TCP may still prove to be a carrier. Classify once, then credit its
-// retained pre-route prefix; UDP rays share this root admission and never replay
-// input into the general metric a second time.
-func (e *inspectionExchange) admitLocked() {
-	if e.admitted {
-		return
-	}
-	e.admitted = true
-	if e.record.Origin == featurestats.TrafficOriginUser {
-		e.store.user.uplink.Add(e.record.Uplink)
-		e.store.user.downlink.Add(e.record.Downlink)
-	}
-}
-
 func (e *inspectionExchange) SetSource(source xnet.Destination) {
-	if !source.IsValid() {
-		return
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
+	if source.IsValid() && !e.excluded && !e.published && !e.isLeg && !e.record.Source.IsValid() {
+		e.record.Source = source
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.excluded || e.published || e.isLeg || e.record.Source.IsValid() {
-		return
-	}
-	e.record.Source = source
 }
 
 func (e *inspectionExchange) PacketDestination(destination xnet.Destination) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	// A selected leg may end before the dispatcher records its first packet.
-	// Like late byte receipts, its address still belongs to the shared flow;
-	// root Finish has already removed the live entry.
-	if e.excluded || (!e.isLeg && e.published) || e.provenanceConflict || !destination.IsValid() {
-		return
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
+	if !e.excluded && !e.provenanceConflict && (e.isLeg || !e.published) && destination.IsValid() {
+		e.record.Destination = destination
 	}
-	e.record.Destination = destination
-}
-
-func (e *inspectionExchange) AddUplink(value uint64) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.excluded || e.provenanceConflict {
-		return
-	}
-	e.addUplinkLocked(value)
 }
 
 func (e *inspectionExchange) RecordPacketInput(destination xnet.Destination, value uint64) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	if e.excluded || e.provenanceConflict {
 		return
 	}
@@ -388,47 +280,49 @@ func (e *inspectionExchange) RecordPacketInput(destination xnet.Destination, val
 	e.addUplinkLocked(value)
 }
 
+func (e *inspectionExchange) AddUplink(value uint64) {
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
+	if !e.excluded && !e.provenanceConflict {
+		e.addUplinkLocked(value)
+	}
+}
+
 func (e *inspectionExchange) addUplinkLocked(value uint64) {
 	e.record.Uplink += value
 	if e.admitted && e.record.Origin == featurestats.TrafficOriginUser {
-		e.store.user.uplink.Add(value)
+		e.store.user.Uplink += value
 	}
 }
 
 func (e *inspectionExchange) AddSelectedUplink(value uint64) {
-	if value == 0 {
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	if !e.excluded && !e.provenanceConflict && e.bucket != nil {
-		e.bucket.uplink.Add(value)
+		e.bucket.Uplink += value
 	}
 }
 
 func (e *inspectionExchange) AddDownlink(value uint64) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
 	if e.excluded || e.provenanceConflict {
 		return
 	}
 	e.record.Downlink += value
 	if e.admitted && e.record.Origin == featurestats.TrafficOriginUser {
-		e.store.user.downlink.Add(value)
+		e.store.user.Downlink += value
 	}
 	if e.bucket != nil {
-		e.bucket.downlink.Add(value)
+		e.bucket.Downlink += value
 	}
 }
 
 func (e *inspectionExchange) Rebind(runtime featurestats.RuntimeID, origin featurestats.TrafficOrigin) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.excluded || e.published || e.provenanceConflict {
-		return
-	}
-	if runtime != e.store.runtime ||
-		origin == featurestats.TrafficOriginUnknown || origin != e.record.Origin {
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
+	if !e.excluded && !e.published && !e.provenanceConflict &&
+		(runtime != e.store.runtime || origin == featurestats.TrafficOriginUnknown || origin != e.record.Origin) {
 		e.provenanceConflict = true
 	}
 }
@@ -437,48 +331,20 @@ func (e *inspectionExchange) Finish() {
 	if e.isLeg {
 		return
 	}
-	e.mu.Lock()
-	remove := e.completeLocked()
-	ref := e.record.Ref
-	e.mu.Unlock()
-	if remove {
-		e.store.remove(e, ref)
-	}
-}
-
-func (e *inspectionExchange) requestStop() (func() error, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.published || e.stopRequested {
-		return nil, nil
-	}
-	if e.stop == nil {
-		return nil, errors.ErrUnsupported
-	}
-	e.stopRequested = true
-	return e.stop, nil
-}
-
-func (e *inspectionExchange) completeLocked() bool {
-	if e.published {
-		return false
-	}
-	if e.excluded {
-		e.published = true
-		e.stop = nil
-		return false
-	}
-	if !e.bound && !e.hasLeg {
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
+	if !e.published && !e.excluded && !e.bound && !e.hasLeg {
 		e.bindLocked(featurestats.OutboundRef{})
 	}
-	e.published = true
+	e.finishLocked()
+}
 
-	// Owner-end disables stop; late byte receipts only need the accounting state.
-	e.stop = nil
-	if e.record.Ref.ID == 0 {
-		return false
+func (f *inspectionFlow) finishLocked() {
+	f.published = true
+	f.stop = nil
+	if f.store.live[f.record.Ref.ID] == f {
+		delete(f.store.live, f.record.Ref.ID)
 	}
-	return true
 }
 
 func normalizeOrigin(origin featurestats.TrafficOrigin) featurestats.TrafficOrigin {
@@ -490,10 +356,7 @@ func normalizeOrigin(origin featurestats.TrafficOrigin) featurestats.TrafficOrig
 	}
 }
 
-var defaultObservationOptions = featurestats.ObservationOptions{
-	MaxLive:    256,
-	MaxBuckets: 1024,
-}
+var defaultObservationOptions = featurestats.ObservationOptions{MaxLive: 256, MaxBuckets: 1024}
 
 func normalizeObservationOptions(options featurestats.ObservationOptions) featurestats.ObservationOptions {
 	if options.MaxLive == 0 {
@@ -505,7 +368,6 @@ func normalizeObservationOptions(options featurestats.ObservationOptions) featur
 	return options
 }
 
-// EnableInspection enables the optional observation store before Manager.Start.
 func (m *Manager) EnableInspection(options featurestats.ObservationOptions) (featurestats.FlowInspection, error) {
 	m.access.Lock()
 	defer m.access.Unlock()
@@ -519,7 +381,6 @@ func (m *Manager) EnableInspection(options featurestats.ObservationOptions) (fea
 	return m.inspection, nil
 }
 
-// Observation returns the admission store only while enabled and open.
 func (m *Manager) Observation() featurestats.AdmissionStore {
 	m.access.RLock()
 	store := m.inspection

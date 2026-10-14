@@ -50,7 +50,7 @@ func TestMayUseSystemResolver(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := &DNS{clients: tt.clients}
+			server := dnsTestFeature(t, &resolver{clients: tt.clients})
 			if got := server.MayUseSystemResolver(); got != tt.want {
 				t.Errorf("MayUseSystemResolver() = %v, want %v", got, tt.want)
 			}

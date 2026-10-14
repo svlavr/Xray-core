@@ -148,10 +148,9 @@ type Listener struct {
 	quicParams  *internet.QuicParams
 	addConn     internet.ConnHandler
 
-	pktConn   net.PacketConn
-	tr        *quic.Transport
-	listener  *quic.Listener
-	tlsConfig *gotls.Config
+	pktConn  net.PacketConn
+	tr       *quic.Transport
+	listener *quic.Listener
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
@@ -190,7 +189,6 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
-	defer tls.CloseConfig(l.tlsConfig)
 	return errors.Combine(l.listener.Close(), l.tr.Close(), l.pktConn.Close())
 }
 
@@ -337,12 +335,10 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 
 	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO, StatelessResetKey: k}
 
-	serverTLS := tlsConfig.GetTLSConfig(tls.WithNextProto("h3"))
-	listener, err := tr.Listen(serverTLS, quicConfig)
+	listener, err := tr.Listen(tlsConfig.GetTLSConfig(tls.WithNextProto("h3")), quicConfig)
 	if err != nil {
 		_ = tr.Close()
 		_ = pktConn.Close()
-		tls.CloseConfig(serverTLS)
 		return nil, err
 	}
 
@@ -353,10 +349,9 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		quicParams:  quicParams,
 		addConn:     handler,
 
-		pktConn:   pktConn,
-		tr:        tr,
-		listener:  listener,
-		tlsConfig: serverTLS,
+		pktConn:  pktConn,
+		tr:       tr,
+		listener: listener,
 	}
 
 	go l.keepAccepting()

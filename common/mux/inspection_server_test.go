@@ -100,15 +100,17 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 		return nil, io.ErrClosedPipe
 	}}
 	var wire bytes.Buffer
-	w := &ServerWorker{dispatcher: d, sessionManager: NewSessionManager(), link: &transport.Link{Writer: &buf.SequentialWriter{Writer: &wire}}, stats: wrapped, store: wrapped.Observation()}
-	sibling := &Session{ID: 9, parent: w.sessionManager, output: buf.Discard}
+	w := &ServerWorker{dispatcher: d, sessionManager: NewSessionManager(), link: &transport.Link{Writer: &buf.SequentialWriter{Writer: &wire}}, store: wrapped.Observation()}
+	sink := new(latePayloadWriter)
+	sibling := &Session{ID: 9, parent: w.sessionManager, output: sink, transferType: protocol.TransferTypeStream}
 	w.sessionManager.Add(sibling)
 	meta := &FrameMetadata{SessionID: 1, Option: OptionData, Target: net.TCPDestination(net.LocalHostIP, 80)}
 	if retained {
 		meta.Target = net.UDPDestination(net.LocalHostIP, 53)
 		meta.GlobalID = [8]byte{0xf9, 0xa1}
 	}
-	err = w.handleStatusNew(context.Background(), meta, lateBodies("canceled"))
+	reader := lateBodies("canceled")
+	err = w.handleStatusNew(context.Background(), meta, reader)
 	if err != nil {
 		t.Fatalf("exact child stop would terminate carrier: %v", err)
 	}
@@ -124,11 +126,25 @@ func muxStopDuringAdmission(t *testing.T, retained bool) {
 		t.Fatal("sibling lost")
 	}
 	if !retained {
+		// The explicit selected stop won before native Session publication.
+		// Starting downstream execution after that stop would violate admission.
 		select {
 		case <-launched:
+			t.Fatal("stopped selected admission started downstream execution")
 		default:
-			t.Fatal("ordinary native dispatch was not exercised")
 		}
+		if d.count.Load() != 0 {
+			t.Fatal("stopped selected child was dispatched")
+		}
+	}
+	if _, err := reader.ReadByte(); err != io.EOF {
+		t.Fatalf("stopped initial frame was not drained: %v", err)
+	}
+	if err := w.handleStatusKeep(&FrameMetadata{SessionID: 9, Option: OptionData}, lateBodies("sibling")); err != nil {
+		t.Fatalf("stopped admission blocked sibling forwarding: %v", err)
+	}
+	if sink.body != "sibling" {
+		t.Fatalf("sibling payload lost: %q", sink.body)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -162,7 +178,7 @@ func TestMuxEndRetiresBeforeLateInitialFrame(t *testing.T) {
 	release := sync.OnceFunc(func() { close(carrier.release) })
 	t.Cleanup(release)
 	w := retainedWorker(t, d, carrier)
-	w.stats, w.store = manager, manager.Observation()
+	w.store = manager.Observation()
 	sibling := &Session{ID: 9, parent: w.sessionManager, output: buf.Discard}
 	w.sessionManager.Add(sibling)
 	input, payload := io.Pipe()
@@ -236,7 +252,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 		FrameMetadata{SessionID: 1, SessionStatus: SessionStatusKeep, Option: OptionData}.WriteTo(header)
 		lower := &muxPrefixWriter{left: int(header.Len()) + 2 + 8192 + 2}
 		header.Release()
-		writer := NewResponseWriter(1, newFrameWriter(&buf.SequentialWriter{Writer: lower}), protocol.TransferTypeStream)
+		writer := NewResponseWriter(1, &buf.SequentialWriter{Writer: lower}, protocol.TransferTypeStream)
 		writer.receipt = flow
 		if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, bytes.Repeat([]byte{1}, 8197))); err == nil {
 			t.Fatal("missing partial error")
@@ -253,7 +269,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 		buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: &wire})
 		buffered.Write([]byte("outer header"))
 		buffered.SetFlushNext()
-		output := newFrameWriter(buffered)
+		output := buffered
 		writer := NewResponseWriter(1, output, protocol.TransferTypePacket)
 		writer.receipt = flow
 		if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("body"))}); err != nil {
@@ -268,7 +284,7 @@ func TestMuxDecodedOperations(t *testing.T) {
 	})
 	t.Run("unknown-writer", func(t *testing.T) {
 		flow, view := muxInspectionFlow(t)
-		writer := NewResponseWriter(1, newFrameWriter(buf.Discard), protocol.TransferTypeStream)
+		writer := NewResponseWriter(1, buf.Discard, protocol.TransferTypeStream)
 		writer.receipt = flow
 		writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("unknown"))})
 		row := muxServerFact(t, view)
@@ -284,7 +300,13 @@ func TestMuxDecodedOperationIsolation(t *testing.T) {
 	second, b := muxInspectionFlow(t)
 	reader, lower := pipe.New()
 	defer reader.Interrupt()
-	output := newFrameWriter(lower)
+	manager := new(appstats.Manager)
+	if _, err := manager.EnableInspection(fs.ObservationOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	worker := &ServerWorker{link: &transport.Link{Writer: lower}, store: manager.Observation()}
+	output := worker.carrierWriter()
 	var wg sync.WaitGroup
 	for i, flow := range []fs.Exchange{first, second} {
 		wg.Add(1)
@@ -310,7 +332,7 @@ func TestMuxDeferredBufferDoesNotInventDrop(t *testing.T) {
 	flow, view := muxInspectionFlow(t)
 	var wire bytes.Buffer
 	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: &wire})
-	writer := NewResponseWriter(1, newFrameWriter(buffered), protocol.TransferTypePacket)
+	writer := NewResponseWriter(1, buffered, protocol.TransferTypePacket)
 	writer.receipt = flow
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("later"))}); err != nil {
 		t.Fatal(err)
@@ -374,7 +396,10 @@ func TestMuxStopDuringRetainedRebindKeepsCarrier(t *testing.T) {
 	release := sync.OnceFunc(func() { close(carrier.release) })
 	t.Cleanup(release)
 	next := retainedWorker(t, d, carrier)
-	next.runtime = view.Runtime()
+	next.store = manager.Observation()
+	if next.store.Runtime() != view.Runtime() {
+		t.Fatal("rebind runtime differs")
+	}
 	sibling := &Session{ID: 9, parent: next.sessionManager, output: buf.Discard}
 	next.sessionManager.Add(sibling)
 	if err := retainedNew(next, 2, id, "stopped"); err != nil {
@@ -444,54 +469,31 @@ func TestMuxStopDuringRetainedDispatchKeepsCarrier(t *testing.T) {
 	release()
 }
 
-type muxHeaderGate struct {
-	entered, release chan struct{}
-	once             sync.Once
-}
-
-func (w *muxHeaderGate) Write(p []byte) (int, error) {
-	w.once.Do(func() { close(w.entered); <-w.release })
-	return len(p), nil
-}
-
-func TestMuxHeaderCloseKeepsReceiptOwner(t *testing.T) {
-	flow, view := muxInspectionFlow(t)
-	lower := &muxHeaderGate{entered: make(chan struct{}), release: make(chan struct{})}
-	release := sync.OnceFunc(func() { close(lower.release) })
+// Observation-off native dispatch still executes and forwards ordinary initial
+// data. The selected admission-stop fixture above must not force its execution.
+func TestMuxNativeOrdinaryDispatchRetainsForwarding(t *testing.T) {
+	link, up, response, _ := retainedLink(t, 1024)
+	d := &retainedDispatcher{dispatch: func(ctx context.Context) (*transport.Link, error) {
+		if ctx.Err() != nil || session.LogicalObservationFromContext(ctx) != nil {
+			t.Fatal("native ordinary dispatch inherited selected cancellation or observation")
+		}
+		return link, nil
+	}}
+	carrier := &blockedCarrier{entered: make(chan struct{}), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(carrier.release) })
 	t.Cleanup(release)
-	buffered := buf.NewBufferedWriter(&buf.SequentialWriter{Writer: lower})
-	buffered.Write([]byte("header"))
-	buffered.SetFlushNext()
-	output := newFrameWriter(buffered)
-	closed := make(chan struct{})
-	go func() { output.Close(); close(closed) }()
-	muxWait(t, lower.entered)
-	started, written := make(chan struct{}), make(chan struct{})
-	go func() {
-		close(started)
-		writer := NewResponseWriter(1, output, protocol.TransferTypeStream)
-		writer.receipt = flow
-		writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("payload"))})
-		close(written)
-	}()
-	muxWait(t, started)
-	select {
-	case <-written:
-		t.Fatal("frame bypassed pending header")
-	case <-time.After(10 * time.Millisecond):
+	w := &ServerWorker{dispatcher: d, sessionManager: NewSessionManager(), link: &transport.Link{Writer: carrier}}
+	t.Cleanup(func() { w.sessionManager.Close() })
+	if err := w.handleStatusNew(context.Background(), &FrameMetadata{
+		SessionID: 1, Option: OptionData, Target: net.TCPDestination(net.LocalHostIP, 80),
+	}, lateBodies("native ordinary")); err != nil {
+		t.Fatal(err)
 	}
-	flow.Finish()
-
+	if d.count.Load() != 1 {
+		t.Fatal("native ordinary dispatcher not exercised exactly once")
+	}
+	retainedRead(t, up, "native ordinary")
+	response.Close()
+	muxWait(t, carrier.entered)
 	release()
-	muxWait(t, closed)
-	muxWait(t, written)
-
-	totals, _ := view.ReadTotals()
-	var known uint64
-	for _, row := range totals.Rows {
-		known += row.Downlink
-	}
-	if known != uint64(len("payload")) {
-		t.Fatalf("late frame total = %d", known)
-	}
 }

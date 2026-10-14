@@ -10,7 +10,6 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
-	"google.golang.org/protobuf/proto"
 )
 
 type XmuxConn interface {
@@ -43,19 +42,14 @@ func (c *XmuxClient) maybeClose() {
 }
 
 type XmuxManager struct {
-	xmuxConfig  *XmuxConfig
+	xmuxConfig  XmuxConfig
 	concurrency int32
 	connections int32
 	newConnFunc func() XmuxConn
 	xmuxClients []*XmuxClient
 }
 
-func NewXmuxManager(xmuxConfig *XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
-	if xmuxConfig == nil {
-		xmuxConfig = &XmuxConfig{}
-	} else {
-		xmuxConfig = proto.Clone(xmuxConfig).(*XmuxConfig)
-	}
+func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
 	return &XmuxManager{
 		xmuxConfig:  xmuxConfig,
 		concurrency: xmuxConfig.GetNormalizedMaxConcurrency().rand(),

@@ -11,7 +11,7 @@ import (
 
 func newTestClient(newConn func(c *Client) splithttp.XmuxConn) *Client {
 	c := &Client{ctx: context.Background()}
-	c.xmux = splithttp.NewXmuxManager(&splithttp.XmuxConfig{
+	c.xmux = splithttp.NewXmuxManager(splithttp.XmuxConfig{
 		MaxConnections: &splithttp.RangeConfig{From: 3, To: 3},
 	}, func() splithttp.XmuxConn {
 		return newConn(c)
@@ -61,7 +61,7 @@ func TestGetTunnelFailsWithoutTunnels(t *testing.T) {
 func TestClientCloseOwnsRetiredTunnels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{ctx: ctx, cancel: cancel, tunnels: make(map[*tunnel]struct{})}
-	c.xmux = splithttp.NewXmuxManager(&splithttp.XmuxConfig{
+	c.xmux = splithttp.NewXmuxManager(splithttp.XmuxConfig{
 		CMaxReuseTimes: &splithttp.RangeConfig{From: 1, To: 1},
 	}, func() splithttp.XmuxConn {
 		t := &tunnel{done: make(chan struct{}), onClose: c.removeTunnel}

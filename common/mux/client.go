@@ -32,7 +32,6 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 	for i := 0; i < 16; i++ {
 		worker, err := m.Picker.PickAvailable()
 		if err != nil {
-			// Failure before child launch owns no asynchronous work.
 			return err
 		}
 		if worker.Dispatch(ctx, link) {
@@ -132,8 +131,6 @@ type ClientWorkerFactory interface {
 }
 
 type DialingWorkerFactory struct {
-	// Context carries only instance ownership into the shared carrier.
-	// Create detaches caller cancellation and all other context values.
 	Context  context.Context
 	Proxy    proxy.Outbound
 	Dialer   internet.Dialer
@@ -197,11 +194,6 @@ var (
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
-	// Native pipes already enqueue whole batches atomically. Supplied carriers
-	// may transform data before writing, so their whole writer call is shared.
-	if _, nativePipe := stream.Writer.(*pipe.Writer); !nativePipe {
-		stream.Writer = newFrameWriter(stream.Writer)
-	}
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
 		link:           stream,
@@ -273,12 +265,25 @@ func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
+	transferType := protocol.TransferTypeStream
+	if ob.Target.Network == net.Network_UDP {
+		transferType = protocol.TransferTypePacket
+	}
+	if s.inspection == nil {
+		s.transferType = transferType
+	}
 	var inbound *session.Inbound
 	if session.IsReverseMuxFromContext(ctx) {
 		inbound = session.InboundFromContext(ctx)
 	}
-	writer := NewWriter(s.ID, ob.Target, output, s.transferType, xudp.GetGlobalID(ctx), inbound)
-	defer s.Close(false)
+	writer := NewWriter(s.ID, ob.Target, output, transferType, xudp.GetGlobalID(ctx), inbound)
+	defer func() {
+		if s.inspection != nil {
+			s.finishServer()
+		} else {
+			s.Close(false)
+		}
+	}()
 	defer writer.Close()
 
 	errors.LogInfo(ctx, "dispatching request to ", ob.Target)
@@ -297,8 +302,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 
 func (m *ClientWorker) IsClosing() bool {
 	sm := m.sessionManager
-	count := sm.Count()
-	if count == int(^uint16(0)) || m.strategy.MaxConnection > 0 && count >= int(m.strategy.MaxConnection) {
+	if m.strategy.MaxConnection > 0 && sm.Count() >= int(m.strategy.MaxConnection) {
 		return true
 	}
 	return false
@@ -323,14 +327,16 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 		return false
 	}
 
-	s := &Session{input: link.Reader, output: link.Writer, transferType: protocol.TransferTypeStream}
-	if outbounds := session.OutboundsFromContext(ctx); outbounds[len(outbounds)-1].Target.Network == net.Network_UDP {
-		s.transferType = protocol.TransferTypePacket
-	}
+	sm := m.sessionManager
+	s := &Session{input: link.Reader, output: link.Writer}
 	if observation := proxy.ObservedEndpoint(ctx, link.Reader, true); observation != nil {
 		s.inspection = observation.Exchange
+		s.transferType = protocol.TransferTypeStream
+		if outbounds := session.OutboundsFromContext(ctx); outbounds[len(outbounds)-1].Target.Network == net.Network_UDP {
+			s.transferType = protocol.TransferTypePacket
+		}
 	}
-	if m.sessionManager.allocate(&m.strategy, s) == nil {
+	if sm.allocate(&m.strategy, s) == nil {
 		return false
 	}
 	go fetchInput(ctx, s, m.link.Writer)
@@ -365,9 +371,9 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return nil
 	}
 
-	s, admitted := m.sessionManager.lookup(meta.SessionID, true)
+	s, retired := m.sessionManager.lookup(meta.SessionID)
 	if s == nil {
-		if admitted {
+		if retired {
 			return buf.Copy(NewStreamReader(reader), buf.Discard)
 		}
 		// Notify remote peer to close this session.

@@ -440,7 +440,7 @@ func TestInspectionDispatcherAPIBurstQueue(t *testing.T) {
 			c := conn.(*dispatcherConn)
 			callbackCtx := ctx
 			if inspected {
-				leg := c.observation.NewLeg()
+				leg := c.root.NewLeg()
 				leg.Route(fs.OutboundRef{Tag: "burst"})
 				callbackCtx = session.ContextWithLogicalObservation(ctx, &session.LogicalObservation{Exchange: leg})
 			}

@@ -71,7 +71,7 @@ func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) err
 		return errors.New("outbound metadata not found")
 	}
 
-	if isPortalCarrier(ob.Target, p.domain) {
+	if isDomain(ob.Target, p.domain) {
 		muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
 		if err != nil {
 			return errors.New("failed to create mux client worker").Base(err)

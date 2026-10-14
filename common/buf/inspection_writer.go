@@ -17,7 +17,7 @@ func RecordBufferOperation(receipt stats.Exchange, size uint64, err error) {
 // progress returned with an error.
 func WriteBytesWithReceipt(writer io.Writer, payload []byte, receipt stats.Exchange) (int, error) {
 	n, err := writer.Write(payload)
-	if n > 0 {
+	if n > 0 && receipt != nil {
 		receipt.AddDownlink(uint64(n))
 	}
 	return n, err

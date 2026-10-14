@@ -60,21 +60,19 @@ func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (recei
 	if request.PayloadBytes < len(receipt.Nonce) || request.PayloadBytes > maxPayload {
 		return receipt, errors.New("invalid ICMP payload budget")
 	}
-	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
-	defer cancel()
-	if err := e.acquire(ctx); err != nil {
+	o, err := e.begin(ctx, request.Timeout)
+	if err != nil {
 		return receipt, err
 	}
-	started := time.Now()
+	defer o.end()
+	ctx = o
 	var conn *icmp.PacketConn
 	defer func() {
-		receipt.Elapsed = time.Since(started)
+		receipt.Elapsed = time.Since(o.started)
 		resultErr = errors.Join(resultErr, ctx.Err())
-		cancel()
 		if conn != nil {
 			_ = conn.Close()
 		}
-		<-e.slots
 	}()
 	payload := make([]byte, request.PayloadBytes)
 	if _, err := rand.Read(payload); err != nil {
@@ -92,7 +90,6 @@ func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (recei
 			network = "udp4"
 		}
 	}
-	var err error
 	conn, err = icmp.ListenPacket(network, local)
 	if err != nil {
 		return receipt, err
@@ -117,8 +114,6 @@ func (e *Executor) ICMPEcho(ctx context.Context, request ICMPEchoRequest) (recei
 			controllerNetwork = "ip4"
 		}
 	}
-	// Native controllers receive a socket family and IP:port address. Port zero
-	// preserves their endpoint/loopback parsing; ICMP has no transport port.
 	controllerAddress := net.JoinHostPort(request.Destination.String(), "0")
 	for _, control := range controllers {
 		if err := ctx.Err(); err != nil {
@@ -183,8 +178,6 @@ func exchangeICMPEcho(ctx context.Context, conn net.PacketConn, destination neti
 		message, parseErr := icmp.ParseMessage(protocol, buffer[:n])
 		if parseErr == nil && message.Type == replyType && message.Code == 0 && source.Unmap() == destination {
 			if echo, ok := message.Body.(*icmp.Echo); ok && echo.Seq == 1 && (datagram || echo.ID == id) && bytes.Equal(echo.Data, payload) {
-				// Raw IPv4 sockets may expose packets before ICMP checksum
-				// validation. Reuse native marshaling for the matched frame.
 				if !datagram && destination.Is4() {
 					valid, err := message.Marshal(nil)
 					if err != nil || !bytes.Equal(valid, buffer[:n]) {

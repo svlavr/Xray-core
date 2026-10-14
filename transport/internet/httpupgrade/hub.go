@@ -24,14 +24,11 @@ type server struct {
 	config         *Config
 	addConn        internet.ConnHandler
 	innnerListener net.Listener
-	tlsConfig      *tls.Config
 	socketSettings *internet.SocketConfig
 }
 
 func (s *server) Close() error {
-	err := s.innnerListener.Close()
-	v2tls.CloseConfig(s.tlsConfig)
-	return err
+	return s.innnerListener.Close()
 }
 
 func (s *server) Addr() net.Addr {
@@ -154,10 +151,8 @@ func ListenHTTPUpgrade(ctx context.Context, address net.Address, port net.Port, 
 		errors.LogWarning(ctx, "accepting PROXY protocol")
 	}
 
-	var tlsConfig *tls.Config
 	if config := v2tls.ConfigFromStreamSettings(streamSettings); config != nil {
-		tlsConfig = config.GetTLSConfig()
-		if tlsConfig != nil {
+		if tlsConfig := config.GetTLSConfig(); tlsConfig != nil {
 			listener = tls.NewListener(listener, tlsConfig)
 		}
 	}
@@ -166,7 +161,6 @@ func ListenHTTPUpgrade(ctx context.Context, address net.Address, port net.Port, 
 		config:         transportConfiguration,
 		addConn:        addConn,
 		innnerListener: listener,
-		tlsConfig:      tlsConfig,
 		socketSettings: streamSettings.SocketSettings,
 	}
 	go serverInstance.keepAccepting()

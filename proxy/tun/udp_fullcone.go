@@ -18,7 +18,6 @@ type udpConnectionHandler struct {
 	sync.RWMutex
 
 	udpConns map[net.Destination]*udpConn
-	closed   bool
 
 	handleConnection func(conn net.Conn, dest net.Destination)
 	writePacket      func(data []byte, src net.Destination, dst net.Destination) error
@@ -40,11 +39,6 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 	data.UDP = &dst
 
 	u.RLock()
-	if u.closed {
-		u.RUnlock()
-		data.Release()
-		return
-	}
 	conn, found := u.udpConns[src]
 	if found {
 		select {
@@ -60,10 +54,6 @@ func (u *udpConnectionHandler) HandlePacket(src net.Destination, dst net.Destina
 
 	u.Lock()
 	defer u.Unlock()
-	if u.closed {
-		data.Release()
-		return
-	}
 
 	conn, found = u.udpConns[src]
 	if !found {
@@ -89,26 +79,13 @@ func (u *udpConnectionHandler) connectionFinished(conn *udpConn) {
 	if u.udpConns[conn.src] == conn {
 		delete(u.udpConns, conn.src)
 		close(conn.egress)
-		for b := range conn.egress {
-			b.Release()
+		if conn.receipt != nil {
+			for b := range conn.egress {
+				b.Release()
+			}
 		}
 	}
 	u.Unlock()
-}
-
-// Close seals UDP admission and releases packets whose reader has not taken custody.
-func (u *udpConnectionHandler) Close() error {
-	u.Lock()
-	defer u.Unlock()
-	u.closed = true
-	for src, conn := range u.udpConns {
-		delete(u.udpConns, src)
-		close(conn.egress)
-		for b := range conn.egress {
-			b.Release()
-		}
-	}
-	return nil
 }
 
 // udp connection abstraction
@@ -170,7 +147,10 @@ func (c *udpConn) Write(p []byte) (int, error) {
 	err := c.handler.writePacket(p, c.dst, c.src)
 	proxy.RecordPacketOutcome(c.receipt, uint64(len(p)), err == nil)
 	if err != nil {
-		return 0, err
+		if c.receipt != nil {
+			return 0, err
+		}
+		return 0, nil
 	}
 
 	return len(p), nil

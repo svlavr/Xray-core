@@ -6,7 +6,6 @@ import (
 	"io"
 	stdnet "net"
 	stdhttp "net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -48,76 +47,6 @@ func cachedHTTP2TestConn(t *testing.T, handler stdhttp.Handler) (cnet.Destinatio
 		server.Close()
 	})
 	return destination, h2client, client
-}
-
-func TestHTTP2SetupFailureJoinsPayloadWriterAndPreservesSibling(t *testing.T) {
-	handler := stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		if strings.HasPrefix(r.Host, "reset.") {
-			panic(stdhttp.ErrAbortHandler)
-		}
-		if strings.HasPrefix(r.Host, "reject.") {
-			// A non-200 status below 300 does not make x/net/http2 abort the
-			// request body. Setup must close its own pipe before joining the
-			// first-payload writer.
-			w.WriteHeader(stdhttp.StatusNoContent)
-			w.(stdhttp.Flusher).Flush()
-			return
-		}
-		w.WriteHeader(stdhttp.StatusOK)
-		w.(stdhttp.Flusher).Flush()
-		buffer := make([]byte, 4096)
-		for {
-			n, err := r.Body.Read(buffer)
-			if n > 0 {
-				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-					return
-				}
-				w.(stdhttp.Flusher).Flush()
-			}
-			if err != nil {
-				return
-			}
-		}
-	})
-	destination, _, rawConn := cachedHTTP2TestConn(t, handler)
-
-	firstPayload := []byte("first logical payload")
-	active, err := setUpHTTPTunnel(context.Background(), destination, "active.invalid:80", nil, nil, nil, firstPayload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer active.Close()
-	got := make([]byte, len(firstPayload))
-	if _, err := io.ReadFull(active, got); err != nil || !bytes.Equal(got, firstPayload) {
-		t.Fatalf("first payload: %q %v", got, err)
-	}
-
-	for _, host := range []string{"reject.invalid:80", "reset.invalid:80"} {
-		failed := make(chan error, 1)
-		go func() {
-			_, err := setUpHTTPTunnel(context.Background(), destination, host, nil, nil, nil, bytes.Repeat([]byte("x"), 1<<20))
-			failed <- err
-		}()
-		select {
-		case err := <-failed:
-			if err == nil || (strings.HasPrefix(host, "reject.") && !strings.Contains(err.Error(), "204")) {
-				t.Fatalf("failed setup %s: %v", host, err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("failed HTTP/2 setup %s did not release its payload writer", host)
-		}
-	}
-	if err := rawConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	extra := []byte("sibling remains on the shared carrier")
-	if _, err := active.Write(extra); err != nil {
-		t.Fatal(err)
-	}
-	got = make([]byte, len(extra))
-	if _, err := io.ReadFull(active, got); err != nil || !bytes.Equal(got, extra) {
-		t.Fatalf("surviving sibling: %q %v", got, err)
-	}
 }
 
 type observedHTTP2Endpoint struct {

@@ -385,7 +385,7 @@ func TestInspectionFirstRouteCapturesTagAndBucket(t *testing.T) {
 func TestInspectionIndependentSample(t *testing.T) {
 	store := testInspectionStore(t, featurestats.ObservationOptions{})
 	cell := &store.user
-	cell.uplink.Add(1)
+	cell.Uplink++
 	snapshot, err := store.ReadTotals()
 	if err != nil {
 		t.Fatal(err)

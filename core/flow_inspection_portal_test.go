@@ -138,6 +138,7 @@ func TestFlowInspectionPortalUDPChildOnTCPCarrier(t *testing.T) {
 
 func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	const mask = byte(0x53)
+	const logicalDataDomain = "portal-udp.invalid"
 	portalCore, view, vmess := inspectionVMessReceiver(t, enabled, true)
 	portal, err := reverse.NewPortal(&reverse.PortalConfig{Tag: "portal", Domain: "bridge.invalid"}, portalCore.GetFeature(fout.ManagerType()).(fout.Manager))
 	if err != nil {
@@ -153,7 +154,9 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	}
 
 	serverDestination := startOutboundStatsUDPServer(t, mask)
-	logicalDestination := cnet.UDPDestination(cnet.DomainAddress("bridge.invalid"), serverDestination.Port)
+	// Native Portal reserves bridge.invalid for opening the reverse carrier.
+	// Route a distinct UDP data domain through that already established carrier.
+	logicalDestination := cnet.UDPDestination(cnet.DomainAddress(logicalDataDomain), serverDestination.Port)
 	bridgeCore, _, _ := inspectionCore(t, false, false)
 	if err := core.AddOutboundHandler(bridgeCore, proto.Clone(vmess).(*core.OutboundHandlerConfig)); err != nil {
 		t.Fatal(err)
@@ -166,7 +169,7 @@ func inspectionPortalUDPChildOnTCPCarrier(t *testing.T, enabled bool) {
 	}
 	if err := bridgeCore.GetFeature(frouting.RouterType()).(frouting.Router).AddRule(serial.ToTypedMessage(&router.Config{Rule: []*router.RoutingRule{
 		{Domain: []*geodata.DomainRule{{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "bridge.invalid"}}}}, Networks: []cnet.Network{cnet.Network_TCP}, TargetTag: &router.RoutingRule_Tag{Tag: vmess.Tag}},
-		{Domain: []*geodata.DomainRule{{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "bridge.invalid"}}}}, Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: "udp-echo"}},
+		{Domain: []*geodata.DomainRule{{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: logicalDataDomain}}}}, Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: "udp-echo"}},
 	}}), true); err != nil {
 		t.Fatal(err)
 	}

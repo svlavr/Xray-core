@@ -343,15 +343,7 @@ func (c *tcpConn) input(s segment) bool {
 		if s.ack != c.sndNxt {
 			return true
 		}
-		// c.mu is held. Order half-open completion with the stack's admission seal.
-		c.stack.mu.Lock()
-		if c.stack.closed {
-			c.stack.mu.Unlock()
-			return true
-		}
 		c.established = true
-		c.stack.opening.Add(-1)
-		c.stack.mu.Unlock()
 		c.sndUna = s.ack
 		c.sndBase = s.ack
 		c.sndWnd = uint32(s.window) << c.sndShift
@@ -359,7 +351,8 @@ func (c *tcpConn) input(s segment) bool {
 		if !c.timedAt.IsZero() {
 			c.clocked()
 		}
-		go c.stack.handleTCPConnection(c)
+		c.stack.opening.Add(-1)
+		go c.stack.handle(c, c.dst)
 	} else {
 		c.acknowledge(s)
 	}

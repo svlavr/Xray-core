@@ -55,7 +55,7 @@ func TestFailedDialClosesAcquiredConnection(t *testing.T) {
 			case "header-auth":
 				settings.ProtocolSettings = &Config{HeaderSettings: serial.ToTypedMessage(&Config{})}
 			}
-			conn, err := Dial(context.Background(), net.TCPDestination(net.LocalHostIP, 443), settings)
+			conn, err := Dial(internet.ContextWithMUTransport(context.Background()), net.TCPDestination(net.LocalHostIP, 443), settings)
 			if kind == "success" {
 				if err != nil || conn == nil || c.closed {
 					t.Fatalf("success ownership: conn=%v err=%v closed=%v", conn, err, c.closed)

@@ -1,12 +1,10 @@
 package dispatcher
 
 import (
-	"context"
-	"errors"
-
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/features/stats"
+	"io"
 )
 
 type SizeStatWriter struct {
@@ -19,17 +17,16 @@ func (w *SizeStatWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.Writer.WriteMultiBuffer(mb)
 }
 
-// WriteMultiBufferContext preserves the native offered-byte counter while
-// forwarding cancellation to the actual returned-link pipe owner.
-func (w *SizeStatWriter) WriteMultiBufferContext(ctx context.Context, mb buf.MultiBuffer) error {
+// WriteMultiBufferStop retains native offered-byte accounting.
+func (w *SizeStatWriter) WriteMultiBufferStop(mb buf.MultiBuffer, stop <-chan struct{}) error {
 	w.Counter.Add(int64(mb.Len()))
 	if writer, ok := w.Writer.(interface {
-		WriteMultiBufferContext(context.Context, buf.MultiBuffer) error
+		WriteMultiBufferStop(buf.MultiBuffer, <-chan struct{}) error
 	}); ok {
-		return writer.WriteMultiBufferContext(ctx, mb)
+		return writer.WriteMultiBufferStop(mb, stop)
 	}
 	buf.ReleaseMulti(mb)
-	return errors.New("writer does not support cancellation")
+	return io.ErrClosedPipe
 }
 
 func (w *SizeStatWriter) Close() error {

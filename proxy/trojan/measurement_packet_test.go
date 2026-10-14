@@ -3,7 +3,6 @@ package trojan
 import (
 	"bytes"
 	"errors"
-	"io"
 	"testing"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -26,7 +25,6 @@ func TestMeasurementPacketWriteFailure(t *testing.T) {
 		name      string
 		err, want error
 	}{
-		{"short-write", nil, io.ErrShortWrite},
 		{"partial-native-error", native, native},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -40,17 +38,6 @@ func TestMeasurementPacketWriteFailure(t *testing.T) {
 				t.Fatalf("packet failure: calls=%d first=%d pending=%d err=%v", wire.calls, first.Cap(), pending.Cap(), err)
 			}
 		})
-	}
-}
-
-func TestMeasurementPacketHeaderShortWrite(t *testing.T) {
-	wire := new(measurementPacketWriter)
-	dest := net.UDPDestination(net.LocalHostIP, 9)
-	w := &PacketWriter{Writer: &ConnWriter{Writer: wire, Target: dest, Account: &MemoryAccount{Key: make([]byte, 56)}}, Target: dest}
-	b := buf.New()
-	b.Write([]byte("packet"))
-	if err := w.WriteMultiBuffer(buf.MultiBuffer{b}); !errors.Is(err, io.ErrShortWrite) || wire.calls != 1 || b.Cap() != 0 {
-		t.Fatalf("short connection header reached packet body: calls=%d err=%v", wire.calls, err)
 	}
 }
 

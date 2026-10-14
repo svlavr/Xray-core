@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
-	"strings"
 	"time"
 
 	xnet "github.com/xtls/xray-core/common/net"
@@ -59,18 +58,31 @@ type HTTPRequest HTTPSRequest
 // HTTPReceipt has the same raw facts; EndpointTLS is absent for plain HTTP.
 type HTTPReceipt = HTTPSReceipt
 
+// A plan shares construction and consumption; it cannot acquire a nested slot.
+type httpPlan struct {
+	method      string
+	secure      bool
+	destination *xnet.Destination
+	body        io.Reader
+	headers     http.Header
+	consume     func(*operation, *http.Response, *HTTPSReceipt) error
+	finish      func() error // Snapshot asynchronous writer facts before cleanup cancellation.
+}
+
 // HTTP performs one HEAD or GET through the requested native route. Status
 // qualification and scheduling remain with the caller, including for HEAD.
 func (e *Executor) HTTP(ctx context.Context, method string, request HTTPRequest) (HTTPReceipt, error) {
 	if method != http.MethodHead && method != http.MethodGet {
 		return HTTPReceipt{}, errors.New("HTTP probe method must be HEAD or GET")
 	}
-	return e.exchange(ctx, HTTPSRequest(request), method, nil, nil, nil)
+	return e.http(ctx, HTTPSRequest(request), httpPlan{method: method})
 }
 
-// The standard library's trace context key is private. Mask its typed value
-// before installing our trace, preserving cancellation and other caller values.
-// Inherited Got1xxResponse hooks would reset net/http's aggregate header limit.
+func (e *Executor) HTTPS(ctx context.Context, request HTTPSRequest) (HTTPSReceipt, error) {
+	return e.http(ctx, request, httpPlan{method: http.MethodGet, secure: true})
+}
+
+// Do not compose inherited net/http hooks, including its aggregate-header override.
 type withoutHTTPTrace struct{ context.Context }
 
 func (c withoutHTTPTrace) Value(key any) any {
@@ -81,39 +93,13 @@ func (c withoutHTTPTrace) Value(key any) any {
 	return value
 }
 
-func (e *Executor) HTTPS(ctx context.Context, request HTTPSRequest) (receipt HTTPSReceipt, resultErr error) {
-	return e.exchangeHTTP(ctx, request, http.MethodGet, nil, nil, nil)
-}
-
-type httpExchangeOptions struct {
-	destination xnet.Destination
-	body        io.Reader
-	headers     http.Header
-}
-
-// exchangeHTTP preserves the HTTPS-only contract of existing operation APIs.
-func (e *Executor) exchangeHTTP(ctx context.Context, request HTTPSRequest, method string, upload *uploadBody, options *httpExchangeOptions, consume func(context.Context, *http.Response, *HTTPSReceipt) error) (receipt HTTPSReceipt, resultErr error) {
-	scheme, _, found := strings.Cut(request.URL, ":")
-	if !found || !strings.EqualFold(scheme, "https") {
-		return receipt, errors.New("invalid bounded HTTPS URL")
-	}
-	return e.exchange(ctx, request, method, upload, options, consume)
-}
-
-// exchange owns the one native HTTP transport, route, TLS and cleanup path.
-func (e *Executor) exchange(ctx context.Context, request HTTPSRequest, method string, upload *uploadBody, options *httpExchangeOptions, consume func(context.Context, *http.Response, *HTTPSReceipt) error) (receipt HTTPSReceipt, resultErr error) {
-	if ctx == nil {
-		return receipt, errors.New("nil request context")
-	}
+func (e *Executor) http(ctx context.Context, request HTTPSRequest, plan httpPlan) (receipt HTTPSReceipt, resultErr error) {
 	u, err := url.Parse(request.URL)
-	if err != nil || u.Scheme != "https" && u.Scheme != "http" {
+	if err != nil || u.Scheme != "https" && u.Scheme != "http" || plan.secure && u.Scheme != "https" || u.Hostname() == "" {
 		return receipt, errors.New("invalid bounded HTTP URL")
 	}
-	if request.Timeout <= 0 || request.MaxBodyBytes < 0 || request.MaxBodyBytes == 0 && method != http.MethodHead || request.MaxBodyBytes == math.MaxInt64 || request.MaxHeaderBytes < 1 {
-		return receipt, errors.New("invalid HTTPS byte/time budget")
-	}
-	if !request.Route.valid() {
-		return receipt, errors.New("invalid measurement route")
+	if request.Timeout <= 0 || request.MaxBodyBytes < 0 || request.MaxBodyBytes == 0 && plan.method != http.MethodHead || request.MaxBodyBytes == math.MaxInt64 || request.MaxHeaderBytes < 1 || !request.Route.valid() {
+		return receipt, errors.New("invalid HTTP route/byte/time budget")
 	}
 	port := u.Port()
 	if port == "" {
@@ -126,127 +112,137 @@ func (e *Executor) exchange(ctx context.Context, request HTTPSRequest, method st
 	if err != nil {
 		return receipt, err
 	}
-	if options != nil {
-		dest = options.destination
+	if plan.destination != nil {
+		dest = *plan.destination
 	}
-	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
-	defer cancel()
-	if err := e.acquire(ctx); err != nil {
+	o, err := e.begin(ctx, request.Timeout)
+	if err != nil {
 		return receipt, err
 	}
-	started := time.Now()
-	o := new(operation)
-	// net/http owns concurrent dialing and callbacks; these observations belong
-	// only to this exchange and share the existing operation mutex.
-	var firstByte *time.Duration
-	var tlsStarted time.Time
+	defer o.end()
 	transport := &http.Transport{
 		DisableKeepAlives:      true,
 		DisableCompression:     true,
 		MaxResponseHeaderBytes: request.MaxHeaderBytes,
 		TLSNextProto:           make(map[string]func(string, *tls.Conn) http.RoundTripper),
-		TLSClientConfig:        &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}},
-	}
-	if request.RootCAs != nil {
-		transport.TLSClientConfig.RootCAs = request.RootCAs
+		TLSClientConfig:        &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, RootCAs: request.RootCAs},
 	}
 	var responseBody io.ReadCloser
 	defer func() {
-		receipt.Elapsed = time.Since(started)
-		cancel()
+		receipt.Elapsed = time.Since(o.started)
+		if plan.finish != nil {
+			resultErr = errors.Join(resultErr, plan.finish())
+		}
+		resultErr = errors.Join(resultErr, o.Err(), context.Cause(o))
+		o.cancel(nil)
 		transport.CloseIdleConnections()
 		if responseBody != nil {
 			_ = responseBody.Close()
 		}
 		o.mu.Lock()
-		receipt.OutboundError = o.nativeError
-		receipt.EndpointTLS, receipt.FirstByteElapsed = o.tlsTime, firstByte
+		receipt.OutboundError, receipt.EndpointTLS, receipt.FirstByteElapsed = o.nativeError, o.tlsTime, o.firstByte
 		o.mu.Unlock()
-		<-e.slots
 	}()
-	ctx = measurementContext(ctx, o)
-	transport.DialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
-		conn, err := e.open(ctx, request.Route, dest)
+	transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		conn, err := e.open(o, request.Route, dest)
 		if err == nil && conn != nil {
-			// Pipe connections lack deadlines; ordinary cancellation closes
-			// this concrete connection, including a late native dial result.
-			context.AfterFunc(ctx, func() { _ = conn.Close() })
+			context.AfterFunc(o, func() { _ = conn.Close() })
 		}
 		return conn, err
 	}
 	trace := &httptrace.ClientTrace{
 		TLSHandshakeStart: func() {
 			o.mu.Lock()
-			tlsStarted = time.Now()
+			o.tlsStarted = time.Now()
 			o.mu.Unlock()
 		},
 		TLSHandshakeDone: func(tls.ConnectionState, error) {
 			o.mu.Lock()
-			duration := time.Since(tlsStarted)
-			o.tlsTime = &duration
+			elapsed := time.Since(o.tlsStarted)
+			o.tlsTime = &elapsed
 			o.mu.Unlock()
 		},
 		GotFirstResponseByte: func() {
-			duration := time.Since(started)
 			o.mu.Lock()
-			if firstByte == nil {
-				firstByte = &duration
+			if o.firstByte == nil {
+				elapsed := time.Since(o.started)
+				o.firstByte = &elapsed
 			}
 			o.mu.Unlock()
 		},
 	}
-	var requestBody io.Reader
-	if upload != nil {
-		upload.ctx = ctx
-		requestBody = upload
-	} else if options != nil {
-		requestBody = options.body
+	if upload, ok := plan.body.(*uploadBody); ok {
+		upload.ctx, upload.cancel = o, o.cancel
 	}
-	httpRequest, err := http.NewRequestWithContext(httptrace.WithClientTrace(withoutHTTPTrace{ctx}, trace), method, request.URL, requestBody)
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(withoutHTTPTrace{o}, trace), plan.method, request.URL, plan.body)
 	if err != nil {
 		return receipt, err
 	}
-	if options != nil {
-		httpRequest.Header = options.headers.Clone()
-		httpRequest.GetBody = nil
+	req.Header = plan.headers.Clone()
+	if req.Header == nil {
+		req.Header = make(http.Header)
 	}
-	if upload != nil {
-		// A known length introduces io.LimitReader, bypassing WriterTo. Chunked
-		// serialization preserves the explicitly counted HTTP writer boundary.
-		httpRequest.ContentLength = -1
-		httpRequest.Header.Set("Content-Type", "application/octet-stream")
+	req.GetBody = nil
+	if _, ok := plan.body.(*uploadBody); ok {
+		req.ContentLength = -1
+		req.Header.Set("Content-Type", "application/octet-stream")
 	}
-	response, err := transport.RoundTrip(httpRequest)
+	response, err := transport.RoundTrip(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			err = errors.Join(ctx.Err(), err)
-		}
 		return receipt, err
 	}
 	responseBody = response.Body
-	// This exchange owns the response; transfer its metadata without another copy.
 	receipt.StatusCode, receipt.Header = response.StatusCode, response.Header
 	length := response.ContentLength
-	receipt.ContentLength = &length
-	receipt.TransferEncoding = response.TransferEncoding
-	if consume == nil {
-		err = readHTTPSBody(response, &receipt, request.MaxBodyBytes)
-	} else {
-		err = consume(ctx, response, &receipt)
+	receipt.ContentLength, receipt.TransferEncoding = &length, response.TransferEncoding
+	if plan.consume != nil {
+		return receipt, plan.consume(o, response, &receipt)
 	}
-	if ctx.Err() != nil {
-		err = errors.Join(ctx.Err(), err)
-	}
-	return receipt, err
+	return receipt, readHTTPSBody(o, response, &receipt, request.MaxBodyBytes)
 }
 
-func readHTTPSBody(response *http.Response, receipt *HTTPSReceipt, limit int64) error {
-	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
-	if int64(len(body)) > limit {
-		body = body[:limit]
-		err = errors.Join(err, ErrBodyLimit)
+// Retained bodies inspect one extra byte; streams stop at their caller ceiling.
+// Both retain positive bytes before handling an accompanying reader error.
+func consumeHTTPBody(ctx context.Context, response *http.Response, receipt *HTTPSReceipt, limit int64, retain bool) (count int64, capHit bool, resultErr error) {
+	ceiling := limit
+	if retain {
+		ceiling++
+		receipt.Body = make([]byte, 0) // Preserve native io.ReadAll empty-body representation.
 	}
-	receipt.Body, receipt.BodyBytes = body, int64(len(body))
-	receipt.BodyComplete = err == nil
+	buffer := make([]byte, min(int64(transferChunk), ceiling))
+	for count < ceiling {
+		// Retained mode preserves the former io.ReadAll native read boundary.
+		// Streaming mode retains its explicit between-read cancellation check.
+		if !retain {
+			if err := ctx.Err(); err != nil {
+				return count, count >= limit, err
+			}
+		}
+		n, err := response.Body.Read(buffer[:min(int64(len(buffer)), ceiling-count)])
+		count += int64(n)
+		if retain {
+			kept := min(int64(n), limit-receipt.BodyBytes)
+			receipt.Body = append(receipt.Body, buffer[:kept]...)
+			receipt.BodyBytes += kept
+		}
+		if err == io.EOF {
+			receipt.BodyComplete = true
+			break
+		}
+		if err != nil {
+			resultErr = err
+			break
+		}
+	}
+	capHit = count >= limit
+	if retain && count > limit {
+		receipt.BodyComplete = false
+		resultErr = errors.Join(resultErr, ErrBodyLimit)
+	}
+	return count, capHit, resultErr
+}
+
+func readHTTPSBody(ctx context.Context, response *http.Response, receipt *HTTPSReceipt, limit int64) error {
+	_, _, err := consumeHTTPBody(ctx, response, receipt, limit, true)
 	return err
 }

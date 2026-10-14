@@ -180,10 +180,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		})
 		for {
 			var connTime *ConnExpire
-			select {
-			case connTime = <-h.preConns:
-			case <-ctx.Done():
-				return ctx.Err()
+			if internet.MUSelected(ctx) {
+				select {
+				case connTime = <-h.preConns:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			} else {
+				connTime = <-h.preConns
 			}
 			if connTime == nil {
 				return errors.New("closed handler")
@@ -267,29 +271,29 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			fallthrough // let server break Mux connections that contain TCP requests
 		case protocol.RequestCommandTCP, protocol.RequestCommandRvs:
 			var t reflect.Type
-			var p unsafe.Pointer
+			var p uintptr
 			if commonConn, ok := conn.(*encryption.CommonConn); ok {
 				if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
 					ob.CanSpliceCopy = 3 // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
 				}
 				t = reflect.TypeOf(commonConn).Elem()
-				p = unsafe.Pointer(commonConn)
+				p = uintptr(unsafe.Pointer(commonConn))
 			} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 				t = reflect.TypeOf(tlsConn.Conn).Elem()
-				p = unsafe.Pointer(tlsConn.Conn)
+				p = uintptr(unsafe.Pointer(tlsConn.Conn))
 			} else if utlsConn, ok := iConn.(*tls.UConn); ok {
 				t = reflect.TypeOf(utlsConn.Conn).Elem()
-				p = unsafe.Pointer(utlsConn.Conn)
+				p = uintptr(unsafe.Pointer(utlsConn.Conn))
 			} else if realityConn, ok := iConn.(*reality.UConn); ok {
 				t = reflect.TypeOf(realityConn.Conn).Elem()
-				p = unsafe.Pointer(realityConn.Conn)
+				p = uintptr(unsafe.Pointer(realityConn.Conn))
 			} else {
 				return errors.New("XTLS only supports TLS and REALITY directly for now.")
 			}
 			i, _ := t.FieldByName("input")
 			r, _ := t.FieldByName("rawInput")
-			input = (*bytes.Reader)(unsafe.Add(p, i.Offset))
-			rawInput = (*bytes.Buffer)(unsafe.Add(p, r.Offset))
+			input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
+			rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
 		default:
 			panic("unknown VLESS request command")
 		}

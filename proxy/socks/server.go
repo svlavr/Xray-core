@@ -174,6 +174,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 		if tempUDPConn == nil {
 			return errors.New("UDP associate with listen port failed")
 		}
+		tempUDPConn.observed = proxy.ObservationStore(s.statsManager) != nil
 		tempUDPConn.SetTimeout(plcy.Timeouts.ConnectionIdle)
 		store := proxy.ObservationStore(s.statsManager)
 		var flow stats.Exchange
@@ -267,6 +268,9 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 	var changeRemote sync.Once
 	for {
 		mpayload, err := reader.ReadMultiBuffer()
+		if err != nil && flow == nil {
+			return err
+		}
 		if len(mpayload) != 0 {
 			changeRemote.Do(func() {
 				source := net.DestinationFromAddr(conn.RemoteAddr())

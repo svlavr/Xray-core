@@ -53,7 +53,7 @@ func BenchmarkLuaDNSQuery(b *testing.B) {
 	ip := net.ParseIP("127.0.0.1")
 	upstream := &benchmarkLuaNameServer{ips: []net.IP{ip}}
 	client := &Client{server: upstream, ipOption: &option, timeoutMs: time.Second}
-	server := &DNS{ctx: ctx, clients: []*Client{client}}
+	server := &resolver{ctx: ctx, clients: []*Client{client}}
 	const script = `
 local server = require("xray.dns").Servers[1]
 function HandleDNSQuery(domain, ipv4, ipv6, fake)
@@ -62,7 +62,7 @@ end
 `
 	L := lua.NewState()
 	b.Cleanup(L.Close)
-	server.registerLua(L)
+	dnsTestFeature(b, server).active.Load().registerLua(L)
 	if err := L.DoString(script); err != nil {
 		b.Fatal(err)
 	}

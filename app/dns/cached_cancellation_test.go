@@ -54,7 +54,7 @@ func cancellationTestFetchOption(ctx context.Context, s *cancellationCachedNames
 }
 
 func cancellationTestPublish(s *cancellationCachedNameserver, fqdn string) {
-	s.cache.publish(fqdn+"4", &IPRecord{
+	s.cache.pub.Publish(s.cache.keyPrefix+fqdn+"4", &IPRecord{
 		IP:     []net.IP{{192, 0, 2, 1}},
 		Expire: time.Now().Add(time.Minute),
 		RCode:  dnsmessage.RCodeSuccess,
@@ -85,9 +85,7 @@ func cancellationTestWaitSubscriberGone(t *testing.T, cache *CacheController, ke
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		cache.RLock()
-		remaining := len(cache.subs[key])
-		cache.RUnlock()
+		remaining := dnsTestLiveSubscribers(cache, key)
 		if remaining == 0 {
 			return
 		}
@@ -144,12 +142,12 @@ func TestCachedFetchEmptyIPv4CanceledIPv6RetriesForLiveFollower(t *testing.T) {
 	var queries atomic.Int32
 	s.send = func(_ context.Context, _ chan<- error, fqdn string, _ dns_feature.IPOption) {
 		if queries.Add(1) == 1 {
-			s.cache.publish(fqdn+"4", &IPRecord{Expire: time.Now().Add(time.Minute), RCode: dnsmessage.RCodeSuccess})
+			s.cache.pub.Publish(s.cache.keyPrefix+fqdn+"4", &IPRecord{Expire: time.Now().Add(time.Minute), RCode: dnsmessage.RCodeSuccess})
 			close(started)
 			return
 		}
 		cancellationTestPublish(s, fqdn)
-		s.cache.publish(fqdn+"6", &IPRecord{
+		s.cache.pub.Publish(s.cache.keyPrefix+fqdn+"6", &IPRecord{
 			IP:     []net.IP{{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
 			Expire: time.Now().Add(time.Minute),
 			RCode:  dnsmessage.RCodeSuccess,
@@ -320,7 +318,7 @@ func TestCachedFetchGenuineErrorDoesNotRetry(t *testing.T) {
 	var queries atomic.Int32
 	s.send = func(_ context.Context, _ chan<- error, fqdn string, _ dns_feature.IPOption) {
 		queries.Add(1)
-		s.cache.publish(fqdn+"4", &IPRecord{Expire: time.Now().Add(time.Minute), RCode: dnsmessage.RCodeNameError})
+		s.cache.pub.Publish(s.cache.keyPrefix+fqdn+"4", &IPRecord{Expire: time.Now().Add(time.Minute), RCode: dnsmessage.RCodeNameError})
 	}
 	got := cancellationTestFetch(context.Background(), s)
 	if !errors.Is(got.err, want) {

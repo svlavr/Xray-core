@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -23,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
@@ -35,17 +37,17 @@ type Handler struct {
 	conf          *DeviceConfig
 	policyManager policy.Manager
 	dns           dns.Client
-	deviceCtx     context.Context
-	deviceCancel  context.CancelFunc
+	handler       outbound.Handler
 
 	streamSettings  *internet.MemoryStreamConfig
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	tun  tun.Device
-	tnet *Net
-	dev  *device.Device
-	mu   sync.Mutex
+	tun    tun.Device
+	tnet   *Net
+	dev    *device.Device
+	mu     sync.Mutex
+	newTun func() (tun.Device, *Net, error)
 }
 
 func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
@@ -54,7 +56,8 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 	d := v.GetFeature(dns.ClientType()).(dns.Client)
 
 	streamSettings := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig)
-	tag := session.FullHandlerFromContext(ctx).Tag()
+	handler := session.FullHandlerFromContext(ctx)
+	tag := handler.Tag()
 	var uplinkCounter stats.Counter
 	var downlinkCounter stats.Counter
 	if len(tag) > 0 && p.ForSystem().Stats.OutboundUplink {
@@ -110,39 +113,40 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 		dnses = append(dnses, netip.MustParseAddr(dns))
 	}
 
-	kernelTunSupported, err := KernelTunSupported()
-	if err != nil {
-		errors.LogWarningInner(context.Background(), err, "Failed to check kernel TUN support")
+	newTun := func() (tun.Device, *Net, error) {
+		kernelTunSupported, err := KernelTunSupported()
+		if err != nil {
+			errors.LogWarningInner(context.Background(), err, "Failed to check kernel TUN support")
+		}
+		var tun tun.Device
+		var tnet *Net
+		if !conf.NoKernelTun && kernelTunSupported {
+			errors.LogWarning(context.Background(), "Using kernel TUN")
+			tun, tnet, err = createKernelTun(localAddresses, dnses, int(conf.Mtu))
+		} else {
+			errors.LogWarning(context.Background(), "Using gVisor TUN")
+			tun, tnet, _, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), true)
+		}
+		return tun, tnet, err
 	}
-	var tun tun.Device
-	var tnet *Net
-	if !conf.NoKernelTun && kernelTunSupported {
-		errors.LogWarning(context.Background(), "Using kernel TUN")
-		tun, tnet, err = createKernelTun(localAddresses, dnses, int(conf.Mtu))
-	} else {
-		errors.LogWarning(context.Background(), "Using gVisor TUN")
-		tun, tnet, _, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), true)
-	}
+	tun, tnet, err := newTun()
 	if err != nil {
 		return nil, err
 	}
 
-	deviceCtx := session.ContextWithFullHandler(core.ToBackgroundDetachedContext(ctx), session.FullHandlerFromContext(ctx))
-	deviceCtx = session.ContextWithTrafficOrigin(deviceCtx, session.TrafficOriginInternal)
-	deviceCtx, deviceCancel := context.WithCancel(deviceCtx)
 	return &Handler{
 		conf:          conf,
 		policyManager: p,
 		dns:           d,
-		deviceCtx:     deviceCtx,
-		deviceCancel:  deviceCancel,
+		handler:       handler,
 
 		streamSettings:  streamSettings,
 		uplinkCounter:   uplinkCounter,
 		downlinkCounter: downlinkCounter,
 
-		tun:  tun,
-		tnet: tnet,
+		tun:    tun,
+		tnet:   tnet,
+		newTun: newTun,
 	}, nil
 }
 
@@ -161,8 +165,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		domain := ob.Target.Address.Domain()
 		eligible = eligible && domain != "v1.mux.cool" && domain != "v1.rvs.cool"
 	}
-	observation := proxy.ObservedEndpoint(ctx, link.Reader, eligible)
-	if err := h.init(ob.Gateway); err != nil {
+	_ = proxy.ObservedEndpoint(ctx, link.Reader, eligible)
+	selected := internet.MUSelected(ctx)
+	if err := h.init(ctx); err != nil {
 		return err
 	}
 
@@ -186,8 +191,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		ctx = newCtx
 	}
 	dialCtx := ctx
-	if observation != nil {
-		dialCtx = requestCtx
+	if selected {
+		ctx, dialCtx = requestCtx, requestCtx
 	}
 
 	var reader buf.Reader
@@ -201,7 +206,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			timeoutCtx, timeoutCancel := context.WithTimeout(dialCtx, sessionPolicy.Timeouts.Handshake)
 			conn, err = h.tnet.DialContext(timeoutCtx, "tcp", ob.Target.NetAddr())
 			timeoutCancel()
-		} else if observation != nil {
+		} else if selected {
 			conn, err = h.tnet.DialContext(dialCtx, "tcp", ob.Target.NetAddr())
 		} else {
 			conn, err = h.tnet.Dial("tcp", ob.Target.NetAddr())
@@ -215,7 +220,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	case net.Network_UDP:
 		var conn net.Conn
 		var err error
-		if observation != nil {
+		if selected {
 			conn, err = h.tnet.DialContext(dialCtx, "udp", ob.Target.NetAddr())
 		} else {
 			conn, err = h.tnet.Dial("udp", ob.Target.NetAddr())
@@ -255,11 +260,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 }
 
 func (h *Handler) Close() (err error) {
-	if h.deviceCancel != nil {
-		h.deviceCancel()
-	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.newTun = nil
 	if h.dev != nil {
 		h.dev.Close()
 		h.dev = nil
@@ -271,19 +274,50 @@ func (h *Handler) Close() (err error) {
 	return nil
 }
 
-func (h *Handler) init(gateway net.Address) error {
+func (h *Handler) init(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.tun == nil {
-		return errors.New("closed")
-	}
-	if err := h.deviceCtx.Err(); err != nil {
-		return err
+		if h.newTun == nil {
+			return errors.New("closed")
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var err error
+		h.tun, h.tnet, err = h.newTun()
+		if err != nil {
+			return err
+		}
 	}
 	if h.dev != nil {
 		return h.dev.Up()
 	}
+	selected := internet.MUSelected(ctx)
+	gateway := session.OutboundsFromContext(ctx)[len(session.OutboundsFromContext(ctx))-1].Gateway
+	var ready atomic.Bool
+	ownerCtx := ctx
+	if selected {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Process callers need not carry the constructor-only native handler.
+		ctx = session.ContextWithFullHandler(ctx, h.handler)
+		ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginInternal)
+		ctx = session.ContextWithLogicalObservation(ctx, nil)
+		ownerCtx = session.ContextWithFullHandler(core.ToBackgroundDetachedContext(ctx), session.FullHandlerFromContext(ctx))
+		ownerCtx = session.ContextWithTrafficOrigin(ownerCtx, session.TrafficOriginInternal)
+	}
 	resolveFunc := h.resolveLocal
+	if selected {
+		resolveFunc = func(host string) (net.IP, error) {
+			lookupCtx := ctx
+			if ready.Load() {
+				lookupCtx = ownerCtx
+			}
+			return h.resolveLocalContext(lookupCtx, host)
+		}
+	}
 	listenFunc := func() (net.PacketConn, error) {
 		dest, err := net.ParseDestination("udp:" + h.conf.Peers[0].Endpoint)
 		if err != nil {
@@ -291,16 +325,23 @@ func (h *Handler) init(gateway net.Address) error {
 		}
 		// A reconnect belongs to the device, not its first logical request.
 		// Each physical dial also owns fresh mutable outbound metadata.
-		ctx := h.carrierContext(dest, gateway)
+		dialCtx := ctx
+		if selected {
+			if ready.Load() {
+				dialCtx = ownerCtx
+			}
+			dialCtx = internet.ContextWithMUTransport(dialCtx)
+			dialCtx = session.ContextWithOutbounds(dialCtx, []*session.Outbound{{Target: dest, Gateway: gateway, Tag: session.FullHandlerFromContext(ctx).Tag()}})
+		}
 		var pktConn net.PacketConn
 		if h.streamSettings.FinalMask != nil {
-			conn, err := h.streamSettings.FinalMask.DialUDP(ctx, dest)
+			conn, err := h.streamSettings.FinalMask.DialUDP(dialCtx, dest)
 			if err != nil {
 				return nil, errors.New("failed to dial to dest").Base(err)
 			}
 			pktConn = conn.(*net.PacketConnWrapper).PacketConn
 		} else {
-			conn, err := internet.DialSystem(ctx, dest, h.streamSettings.SocketSettings)
+			conn, err := internet.DialSystem(dialCtx, dest, h.streamSettings.SocketSettings)
 			if err != nil {
 				return nil, errors.New("failed to dial to dest").Base(err)
 			}
@@ -337,12 +378,14 @@ func (h *Handler) init(gateway net.Address) error {
 			})
 		},
 	}
-	// NewDevice starts the TUN event reader, which may immediately open the bind.
-	// Publish its device-dependent callback before Open can start a receiver.
-	bind.mu.Lock()
 	dev := device.NewDevice(h.tun, bind, logger)
-	bind.downFunc = dev.Down
-	bind.mu.Unlock()
+	bind.setDownFunc(dev.Down)
+	defer func() {
+		if selected && h.dev != dev {
+			dev.Close()
+			h.tun, h.tnet = nil, nil
+		}
+	}()
 	var cfg strings.Builder
 	cfg.WriteString("private_key=" + h.conf.SecretKey + "\n")
 	for _, peer := range h.conf.Peers {
@@ -367,21 +410,26 @@ func (h *Handler) init(gateway net.Address) error {
 		return err
 	}
 	h.dev = dev
+	ready.Store(true)
 	return nil
 }
 
-func (h *Handler) carrierContext(dest net.Destination, gateway net.Address) context.Context {
-	return session.ContextWithOutbounds(h.deviceCtx, []*session.Outbound{{
-		OriginalTarget: dest, Target: dest, RouteTarget: dest, Gateway: gateway,
-		Tag: session.FullHandlerFromContext(h.deviceCtx).Tag(), Name: "wireguard", CanSpliceCopy: 3,
-	}})
+func (h *Handler) resolveLocal(host string) (net.IP, error) {
+	return h.resolveLocalContext(nil, host)
 }
 
-func (h *Handler) resolveLocal(host string) (net.IP, error) {
+func (h *Handler) resolveLocalContext(ctx context.Context, host string) (net.IP, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return ip, nil
 	}
-	ips, _, err := h.dns.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
+	var ips []net.IP
+	var err error
+	option := dns.IPOption{IPv4Enable: true, IPv6Enable: true}
+	if ctx == nil {
+		ips, _, err = h.dns.LookupIP(host, option)
+	} else {
+		ips, _, err = dns.LookupIPContext(ctx, h.dns, host, option)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -135,7 +135,9 @@ func startAuthMulti(t *testing.T, master []byte, users map[string][]byte) (*Mult
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { inbound.Close() })
+	t.Cleanup(func() {
+		inbound.udpSessions.sessions.Range(func(_ uint64, s *ServerUDPSession) bool { s.Close(); return true })
+	})
 	conn := newAuthPacketConn()
 	t.Cleanup(func() { conn.Close() })
 	dispatcher := &authDispatcher{received: make(chan authPayload, 16)}
@@ -188,50 +190,6 @@ func receiveAuthPayload(t *testing.T, dispatcher *authDispatcher) authPayload {
 	case <-time.After(3 * time.Second):
 		t.Fatal("authenticated packet was not dispatched")
 		return authPayload{}
-	}
-}
-
-func TestInspectionSS2022MultiUDPRemovedUser(t *testing.T) {
-	userKey := []byte("fedcba9876543210")
-	inbound, conn, dispatcher := startAuthMulti(t, []byte("0123456789abcdef"), map[string][]byte{"removed@example.invalid": userKey})
-	codec := fixedAuthCodec(t, userKey, 0x1122334455667788)
-	sendAuthPacket(t, conn, codec, "before removal")
-	if got := receiveAuthPayload(t, dispatcher); got.user != "removed@example.invalid" || got.payload != "before removal" {
-		t.Fatalf("first packet: %+v", got)
-	}
-	if err := inbound.RemoveUser(context.Background(), "removed@example.invalid"); err != nil {
-		t.Fatal(err)
-	}
-	sendAuthPacket(t, conn, codec, "after removal")
-	select {
-	case got := <-dispatcher.received:
-		t.Fatalf("removed user accepted: %+v", got)
-	case <-time.After(200 * time.Millisecond):
-	}
-	if dispatcher.calls.Load() != 1 {
-		t.Fatalf("removed user reopened association: %d", dispatcher.calls.Load())
-	}
-	inbound.udpConns.Range(func(_ multiUDPKey, _ *udpConnEntry) bool {
-		t.Fatal("removed user's native association remains")
-		return false
-	})
-}
-
-func TestInspectionSS2022MultiUDPCollidingSessionIDs(t *testing.T) {
-	firstKey, secondKey := []byte("fedcba9876543210"), []byte("ABCDEF0123456789")
-	_, conn, dispatcher := startAuthMulti(t, []byte("0123456789abcdef"), map[string][]byte{"first@example.invalid": firstKey, "second@example.invalid": secondKey})
-	const sessionID uint64 = 0x1122334455667788
-	first, second := fixedAuthCodec(t, firstKey, sessionID), fixedAuthCodec(t, secondKey, sessionID)
-	sendAuthPacket(t, conn, first, "first")
-	if got := receiveAuthPayload(t, dispatcher); got.user != "first@example.invalid" || got.payload != "first" {
-		t.Fatalf("first: %+v", got)
-	}
-	sendAuthPacket(t, conn, second, "second")
-	if got := receiveAuthPayload(t, dispatcher); got.user != "second@example.invalid" || got.payload != "second" {
-		t.Fatalf("second: %+v", got)
-	}
-	if dispatcher.calls.Load() != 2 {
-		t.Fatalf("colliding users shared association: %d", dispatcher.calls.Load())
 	}
 }
 

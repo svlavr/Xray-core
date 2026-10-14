@@ -81,7 +81,7 @@ end
 				errors:  map[string]error{"failed.example": upstreamErr},
 				ttl:     60,
 			}
-			server := &DNS{
+			server := &resolver{
 				ctx:     context.Background(),
 				clients: []*Client{{server: upstream, ipOption: &option, timeoutMs: time.Second}},
 			}
@@ -89,6 +89,7 @@ end
 			if err != nil {
 				t.Fatal(err)
 			}
+			dnsTestFeature(t, server)
 			if err := engine.start(server); err != nil {
 				t.Fatal(err)
 			}
@@ -171,20 +172,21 @@ end
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &DNS{
-		ctx:           context.Background(),
-		hosts:         hosts,
-		ipOption:      &option,
-		scriptProgram: engine.program,
+	server := &resolver{
+		ctx:      context.Background(),
+		hosts:    hosts,
+		ipOption: &option,
+		prepared: engine,
 		clients: []*Client{
 			{id: "primary", server: primary, ipOption: &option, timeoutMs: 2 * time.Second},
 			{id: "fallback", server: fallback, ipOption: &option, timeoutMs: 2 * time.Second},
 		},
 	}
-	if err := server.Start(); err != nil {
+	feature := dnsTestFeature(t, server)
+	if err := feature.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer feature.Close()
 
 	for _, tc := range []struct {
 		domain string
@@ -194,7 +196,7 @@ end
 		{"Us.Example.", net.ParseIP("2001:4860:4860::8888"), 30},
 		{"other.example", net.ParseIP("9.9.9.9"), 60},
 	} {
-		ips, ttl, err := server.LookupIP(tc.domain, option)
+		ips, ttl, err := feature.LookupIP(tc.domain, option)
 		if err != nil {
 			t.Fatalf("LookupIP(%q): %v", tc.domain, err)
 		}
@@ -233,7 +235,7 @@ func TestDNSScriptRejectsInvalidStartup(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer server.Close()
-			if server.runtime.current.resolver.scriptProgram == nil || server.runtime.current.resolver.getScript() != nil {
+			if server.active.Load().prepared == nil || server.active.Load().script.Load() != nil {
 				t.Fatal("New did not compile the script without starting its pool")
 			}
 			closed, err := New(context.Background(), &Config{Script: path})
@@ -246,7 +248,7 @@ func TestDNSScriptRejectsInvalidStartup(t *testing.T) {
 			if err := server.Start(); err == nil || go_errors.Is(err, context.Canceled) {
 				t.Fatal("Start accepted an invalid DNS script")
 			}
-			if server.runtime.current.resolver.getScript() != nil {
+			if server.active.Load().script.Load() != nil {
 				t.Fatal("Start retained a script pool after failure")
 			}
 		})
@@ -266,7 +268,7 @@ func TestDNSScriptProgramSnapshot(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.start(&DNS{ctx: context.Background()}); err != nil {
+	if err := engine.start(dnsTestFeature(t, &resolver{ctx: context.Background()}).active.Load()); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := engine.query("example.com", featureDNS.IPOption{}); err == nil || !strings.Contains(err.Error(), "compiled") {
@@ -304,26 +306,27 @@ end
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &DNS{
-		ctx:           context.Background(),
-		hosts:         hosts,
-		ipOption:      &option,
-		scriptProgram: engine.program,
-		clients:       []*Client{{id: "fake", server: upstream, ipOption: &option, timeoutMs: time.Second}},
+	server := &resolver{
+		ctx:      context.Background(),
+		hosts:    hosts,
+		ipOption: &option,
+		prepared: engine,
+		clients:  []*Client{{id: "fake", server: upstream, ipOption: &option, timeoutMs: time.Second}},
 	}
-	if err := server.Start(); err != nil {
+	feature := dnsTestFeature(t, server)
+	if err := feature.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
+	defer feature.Close()
 
-	if _, _, err := server.LookupIP("good.example", option); err != featureDNS.ErrEmptyResponse {
+	if _, _, err := feature.LookupIP("good.example", option); err != featureDNS.ErrEmptyResponse {
 		t.Fatalf("FakeDNS without FakeEnable = %v, want ErrEmptyResponse", err)
 	}
 	if upstream.calls != 0 {
 		t.Fatalf("FakeDNS was queried without FakeEnable: %d calls", upstream.calls)
 	}
 	withFake := featureDNS.IPOption{IPv4Enable: true, FakeEnable: true}
-	ips, ttl, err := server.LookupIP("good.example", withFake)
+	ips, ttl, err := feature.LookupIP("good.example", withFake)
 	if err != nil || ttl != 30 || len(ips) != 1 || !ips[0].Equal(net.ParseIP("198.18.0.1")) {
 		t.Fatalf("FakeDNS with FakeEnable = %v, TTL %d, %v", ips, ttl, err)
 	}
@@ -342,12 +345,12 @@ func TestDNSConstructorScriptSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	if server.runtime.current.resolver.getScript() != nil {
+	if server.active.Load().script.Load() != nil {
 		t.Fatal("constructor activated Lua")
 	}
 	option := featureDNS.IPOption{IPv4Enable: true}
 	upstream := &scriptNameServer{name: "native", answers: map[string]net.IP{"native.example": net.ParseIP("192.0.2.31")}, ttl: 30}
-	server.runtime.current.resolver.clients = []*Client{{server: upstream, ipOption: &option, timeoutMs: time.Second}}
+	server.active.Load().clients = []*Client{{server: upstream, ipOption: &option, timeoutMs: time.Second}}
 	ips, ttl, err := server.LookupIP("native.example", option)
 	if err != nil || ttl != 30 || len(ips) != 1 || !ips[0].Equal(net.ParseIP("192.0.2.31")) {
 		t.Fatalf("pre-Start lookup = %v, TTL %d, %v; want native answer", ips, ttl, err)

@@ -77,11 +77,10 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 type Listener struct {
 	sync.Mutex
-	server    http.Server
-	listener  net.Listener
-	tlsConfig *tls.Config
-	config    *Config
-	addConn   internet.ConnHandler
+	server   http.Server
+	listener net.Listener
+	config   *Config
+	addConn  internet.ConnHandler
 }
 
 func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -120,7 +119,6 @@ func ListenWS(ctx context.Context, address net.Address, port net.Port, streamSet
 
 	if config := v2tls.ConfigFromStreamSettings(streamSettings); config != nil {
 		if tlsConfig := config.GetTLSConfig(); tlsConfig != nil {
-			l.tlsConfig = tlsConfig
 			listener = tls.NewListener(listener, tlsConfig)
 		}
 	}
@@ -154,9 +152,7 @@ func (ln *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
-	err := ln.listener.Close()
-	v2tls.CloseConfig(ln.tlsConfig)
-	return err
+	return ln.listener.Close()
 }
 
 func init() {

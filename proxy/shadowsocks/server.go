@@ -246,7 +246,6 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 		bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
-		defer buf.DiscardBufferedWriter(bufferedWriter)
 		responseWriter, err := WriteTCPResponse(request, bufferedWriter)
 		if err != nil {
 			return errors.New("failed to write response").Base(err)

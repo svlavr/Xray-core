@@ -54,7 +54,7 @@ func lateBodies(parts ...string) *buf.BufferedReader {
 func TestMuxLateIDKeepsSiblingProgress(t *testing.T) {
 	for _, server := range []bool{false, true} {
 		for _, packet := range []bool{false, true} {
-			for _, completed := range []bool{false, true} {
+			{
 				name := "client"
 				if server {
 					name = "server"
@@ -64,11 +64,7 @@ func TestMuxLateIDKeepsSiblingProgress(t *testing.T) {
 				} else {
 					name += "-tcp"
 				}
-				if completed {
-					name += "-retired"
-				} else {
-					name += "-pending"
-				}
+				name += "-pending"
 				t.Run(name, func(t *testing.T) {
 					m := NewSessionManager()
 					carrier := &blockedCarrier{entered: make(chan struct{}), release: make(chan struct{})}
@@ -90,17 +86,21 @@ func TestMuxLateIDKeepsSiblingProgress(t *testing.T) {
 						worker := &ClientWorker{sessionManager: m, done: done.New(), link: transport.Link{Writer: counted}}
 						keep = worker.handleStatusKeep
 						ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Target: net.TCPDestination(net.LocalHostIP, 80)}})
-						worker.Dispatch(ctx, &transport.Link{Reader: input, Writer: buf.Discard})
-						old, _ = m.Get(1)
+						flow, _ := muxInspectionFlow(t)
+						cursor := buf.NewInspectionReader(&buf.BufferedReader{Reader: input}, flow, input.Interrupt)
+						ctx = session.ContextWithLogicalObservation(ctx, &session.LogicalObservation{Exchange: flow})
+						dispatched := make(chan struct{})
+						go func() { worker.Dispatch(ctx, &transport.Link{Reader: cursor, Writer: buf.Discard}); close(dispatched) }()
+						// The carrier gate is entered only after initialized publication.
+						muxWait(t, carrier.entered)
+						m.RLock()
+						old = m.sessions[1]
+						m.RUnlock()
+						t.Cleanup(func() { release(); muxWait(t, dispatched) })
 					}
 					muxWait(t, carrier.entered)
 					old.Close(false)
-					if completed {
-						release()
-						if server {
-							muxWait(t, returned)
-						}
-					}
+
 					sink := new(latePayloadWriter)
 					kind := protocol.TransferTypeStream
 					target := net.TCPDestination(net.LocalHostIP, 80)
@@ -129,6 +129,9 @@ func TestMuxLateIDKeepsSiblingProgress(t *testing.T) {
 						t.Fatal("late frame emitted a second END")
 					}
 					release()
+					if server {
+						muxWait(t, returned)
+					}
 					m.Close()
 				})
 			}
@@ -159,55 +162,4 @@ func TestMuxNeverAdmittedIDRetainsNativeEnd(t *testing.T) {
 			t.Fatalf("unknown frame not drained: %v", err)
 		}
 	}
-}
-
-func TestMuxSeenIDBoundAndReuse(t *testing.T) {
-	m := NewSessionManager()
-	old := &Session{ID: 65535, parent: m, output: buf.Discard, server: true}
-	m.Add(old)
-	old.finishServer()
-	if len(m.seen) != 1024 || cap(m.seen) != 1024 {
-		t.Fatal("seen state exceeded 8 KiB")
-	}
-	if s, seen := m.lookup(65535, false); s != nil || !seen {
-		t.Fatal("retired ID forgotten")
-	}
-	next := &Session{ID: 65535, parent: m, output: buf.Discard}
-	if !m.Add(next) {
-		t.Fatal("valid native server ID reuse rejected")
-	}
-	if s, _ := m.lookup(65535, false); s != next {
-		t.Fatal("seen bit hid live replacement")
-	}
-	m.Close()
-}
-
-func TestMuxClientRetiredIDUsesAllocationCount(t *testing.T) {
-	m := NewSessionManager()
-	m.count = 65533
-	old := m.allocate(&ClientStrategy{}, &Session{output: buf.Discard})
-	old.Close(false)
-	if s, seen := m.lookup(65534, true); s != nil || !seen {
-		t.Fatal("client forgot its last allocated ID")
-	}
-	for _, id := range []uint16{0, 65535} {
-		if _, seen := m.lookup(id, true); seen {
-			t.Fatalf("never-allocated ID %d was admitted", id)
-		}
-	}
-	last := m.allocate(&ClientStrategy{}, &Session{output: buf.Discard})
-	if s, _ := m.lookup(65535, true); s != last {
-		t.Fatal("live client child hidden")
-	}
-	last.Close(false)
-	if s, seen := m.lookup(65535, true); s != nil || !seen {
-		t.Fatal("last ID forgotten")
-	}
-	if m.Allocate(&ClientStrategy{}, nil, nil) != nil {
-		t.Fatal("client ID wrapped")
-	}
-	if len(m.seen) != 0 || cap(m.seen) != 0 {
-		t.Fatal("client allocated server ID history")
-	}
-	m.Close()
 }

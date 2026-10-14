@@ -36,7 +36,6 @@ type QUICNameServer struct {
 	connection      *quic.Conn
 	clientIP        net.IP
 	transport       *quic.Transport
-	workers         sync.WaitGroup
 }
 
 // NewQUICNameServer creates DNS-over-QUIC client object for local resolving
@@ -104,14 +103,14 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- e
 	}
 
 	for _, req := range reqs {
-		if !s.beginWork() {
+		if !s.cacheController.begin() {
 			if noResponseErrCh != nil {
 				noResponseErrCh <- context.Canceled
 			}
 			continue
 		}
 		go func(r *dnsRequest, ctx context.Context) {
-			defer s.workers.Done()
+			defer s.cacheController.workers.Done()
 			workCtx, cancelWork := context.WithCancel(ctx)
 			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
 			defer func() { stop(); cancelWork() }()
@@ -239,16 +238,6 @@ func (s *QUICNameServer) QueryIP(ctx context.Context, domain string, option dns_
 	return queryIP(ctx, s, domain, option)
 }
 
-func (s *QUICNameServer) beginWork() bool {
-	s.Lock()
-	defer s.Unlock()
-	if s.cacheController.ctx.Err() != nil {
-		return false
-	}
-	s.workers.Add(1)
-	return true
-}
-
 func isActive(s *quic.Conn) bool {
 	select {
 	case <-s.Context().Done():
@@ -315,7 +304,7 @@ func (s *QUICNameServer) openConnection(ctx context.Context) (*quic.Conn, error)
 		}
 		s.transport = &quic.Transport{Conn: packetConn}
 	}
-	conn, err := s.transport.Dial(ctx, remote, tlsConfig.GetTLSConfig(tls.WithClient(), tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	conn, err := s.transport.Dial(ctx, remote, tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
 	log.Record(&log.AccessMessage{
 		From:   "DNS",
 		To:     s.destination,
@@ -377,6 +366,5 @@ func (s *QUICNameServer) Close() error {
 		s.Unlock()
 	}
 	s.cacheController.Close()
-	s.workers.Wait()
 	return closeErr
 }

@@ -69,7 +69,7 @@ type TotalsSnapshot struct {
 	// User includes known decoded USER bytes independently of tag/live capacity,
 	// including unassigned bytes and late receipts. Prepared TCP bytes enter on
 	// logical classification (selection/unassignment/failed Finish), excluding
-	// carriers. Directional cells and rows are sampled independently.
+	// carriers. No coherent endpoint or remote-delivery view is promised.
 	User ClientTotals
 	// BucketsOmitted counts lifetime nonempty USER tag bindings refused by
 	// MaxBuckets, not distinct tags or bytes. Existing buckets remain usable.
@@ -96,7 +96,7 @@ type FlowInspection interface {
 	// overwritten or cleared, including on error/replacement; spare capacity is
 	// caller-managed. Retired rows are cleared once when the inventory shrinks.
 	// Readers that retain earlier results must give later calls separate storage.
-	// Rows are sampled separately, not as one atomic cross-row inventory.
+	// No cross-row atomicity is promised to the caller.
 	ReadLiveInto(storage []FlowRecord) (LiveSnapshot, error)
 	ReadTotals() (TotalsSnapshot, error)
 	// CloseFlows returns one error per input ref, in the same order.

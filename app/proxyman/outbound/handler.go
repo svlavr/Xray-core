@@ -58,7 +58,6 @@ type Handler struct {
 	tag             string
 	senderSettings  *proxyman.SenderConfig
 	streamSettings  *internet.MemoryStreamConfig
-	cancelTransport context.CancelFunc
 	proxyConfig     proto.Message
 	proxy           proxy.Outbound
 	mux             *mux.ClientManager
@@ -169,11 +168,6 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 	}
 
 	h.proxy = proxyHandler
-	if h.streamSettings != nil {
-		owner, cancel := context.WithCancel(context.Background())
-		h.streamSettings.Owner = owner
-		h.cancelTransport = cancel
-	}
 	return h, nil
 }
 
@@ -337,9 +331,6 @@ func (h *Handler) Start() error {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
-	if h.cancelTransport != nil {
-		h.cancelTransport()
-	}
 	common.Close(h.mux)
 	common.Close(h.proxy)
 	return nil

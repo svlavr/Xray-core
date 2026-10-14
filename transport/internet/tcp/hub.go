@@ -74,12 +74,10 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	if tcpSettings.HeaderSettings != nil {
 		headerConfig, err := tcpSettings.HeaderSettings.GetInstance()
 		if err != nil {
-			_ = l.Close()
 			return nil, errors.New("invalid header settings").Base(err)
 		}
 		auth, err := internet.CreateConnectionAuthenticator(headerConfig)
 		if err != nil {
-			_ = l.Close()
 			return nil, errors.New("invalid header settings.").Base(err)
 		}
 		l.authConfig = auth
@@ -128,9 +126,7 @@ func (v *Listener) Addr() net.Addr {
 
 // Close implements internet.Listener.Close.
 func (v *Listener) Close() error {
-	err := v.listener.Close()
-	tls.CloseConfig(v.tlsConfig)
-	return err
+	return v.listener.Close()
 }
 
 func init() {

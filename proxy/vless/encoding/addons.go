@@ -183,8 +183,6 @@ func (r *LengthPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		length -= size
 		b := buf.New()
 		if _, err := b.ReadFullFrom(r.Reader, size); err != nil {
-			b.Release()
-			buf.ReleaseMulti(mb)
 			return nil, errors.New("failed to read packet payload").Base(err)
 		}
 		mb = append(mb, b)

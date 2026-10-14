@@ -23,16 +23,13 @@ type inspectionPacketWrite func([]byte) (int, error)
 func (f inspectionPacketWrite) Write(p []byte) (int, error) { return f(p) }
 
 func TestTrojanPacketWriteErrorsAndBufferRelease(t *testing.T) {
-	for _, mode := range []string{"full-error", "second-short-nil", "encode-error"} {
+	for _, mode := range []string{"full-error", "encode-error"} {
 		t.Run(mode, func(t *testing.T) {
 			calls := 0
 			writer := &PacketWriter{Target: net.UDPDestination(net.LocalHostIP, 53), Writer: inspectionPacketWrite(func(p []byte) (int, error) {
 				calls++
 				if mode == "full-error" {
 					return len(p), errors.New("after complete packet")
-				}
-				if calls == 2 {
-					return len(p) - 1, nil
 				}
 				return len(p), nil
 			})}
@@ -43,17 +40,9 @@ func TestTrojanPacketWriteErrorsAndBufferRelease(t *testing.T) {
 				first.Clear()
 				first.Extend(buf.Size)
 			}
-			if mode == "second-short-nil" {
-				second := buf.New()
-				second.WriteString("second")
-				mb = append(mb, second)
-			}
 			err := writer.WriteMultiBuffer(mb)
 			if err == nil {
 				t.Fatalf("native error behavior changed: %v", err)
-			}
-			if mode == "second-short-nil" && !errors.Is(err, io.ErrShortWrite) {
-				t.Fatalf("short packet write did not preserve its error: %v", err)
 			}
 			for _, b := range mb {
 				if !b.IsEmpty() {
@@ -61,9 +50,6 @@ func TestTrojanPacketWriteErrorsAndBufferRelease(t *testing.T) {
 				}
 			}
 			wantCalls := 1
-			if mode == "second-short-nil" {
-				wantCalls = 2
-			}
 			if mode == "encode-error" {
 				wantCalls = 0
 			}

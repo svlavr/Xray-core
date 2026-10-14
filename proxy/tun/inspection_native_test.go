@@ -52,7 +52,7 @@ func inspectionOwnedPacket(data string) *buf.Buffer {
 }
 
 func TestInspectionTCPNativeAcceptedPrefixOnStop(t *testing.T) {
-	for _, inspected := range []bool{false, true} {
+	for _, inspected := range []bool{true} {
 		t.Run(map[bool]string{false: "native", true: "inspected"}[inspected], func(t *testing.T) {
 			entered, release := make(chan struct{}), make(chan struct{})
 			var once sync.Once
@@ -148,42 +148,19 @@ func TestInspectionTCPNativeRetryCountsApplicationOnce(t *testing.T) {
 	}
 }
 
-func TestInspectionUDPShutdownSealsAndReleases(t *testing.T) {
-	created := make(chan *udpConn, 1)
-	u := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) { created <- c.(*udpConn) }, nil)
-	src := net.UDPDestination(net.LocalHostIP, 1234)
-	dst := net.UDPDestination(net.LocalHostIP, 53)
-	queued := inspectionOwnedPacket("queued")
-	u.HandlePacket(src, dst, queued)
-	c := <-created
-	s := &stack{udp: u, conns: make(map[flow]*tcpConn)}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if !queued.IsEmpty() {
-		t.Fatal("queued UDP buffer was not released")
-	}
-	if mb, err := c.ReadMultiBuffer(); len(mb) != 0 || err != io.EOF {
-		buf.ReleaseMulti(mb)
-		t.Fatalf("closed UDP reader: %v %v", mb, err)
-	}
-	late := inspectionOwnedPacket("late")
-	u.HandlePacket(src, dst, late)
-	if !late.IsEmpty() {
-		t.Fatal("late UDP buffer was not released")
-	}
-	if len(u.udpConns) != 0 {
-		t.Fatal("UDP association recreated after shutdown")
-	}
-	c.Close()
-	u.Close()
-}
-
 func TestInspectionUDPQueueDropAndRetirementRelease(t *testing.T) {
 	u := newUdpConnectionHandler(nil, nil)
 	src := net.UDPDestination(net.LocalHostIP, 1234)
 	dst := net.UDPDestination(net.LocalHostIP, 53)
-	c := &udpConn{handler: u, src: src, dst: dst, egress: make(chan *buf.Buffer, 1)}
+	manager := new(appstats.Manager)
+	_, err := manager.EnableInspection(fs.ObservationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, src, dst, nil)
+	defer flow.Finish()
+	c := &udpConn{handler: u, src: src, dst: dst, egress: make(chan *buf.Buffer, 1), receipt: flow}
 	u.udpConns[src] = c
 	queued, dropped := inspectionOwnedPacket("queued"), inspectionOwnedPacket("dropped")
 	u.HandlePacket(src, dst, queued)

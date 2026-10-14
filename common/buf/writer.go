@@ -21,13 +21,7 @@ type BufferToBytesWriter struct {
 
 // Write implements io.Writer and records the native scalar write result when observed.
 func (w *BufferToBytesWriter) Write(payload []byte) (int, error) {
-	var n int
-	var err error
-	if w.receipt == nil {
-		n, err = w.Writer.Write(payload)
-	} else {
-		n, err = WriteBytesWithReceipt(w.Writer, payload, w.receipt)
-	}
+	n, err := WriteBytesWithReceipt(w.Writer, payload, w.receipt)
 	if w.counter != nil && n > 0 {
 		w.counter.Add(int64(n))
 	}
@@ -35,7 +29,7 @@ func (w *BufferToBytesWriter) Write(payload []byte) (int, error) {
 }
 
 // WriteMultiBuffer implements Writer. This method takes ownership of the given buffer.
-func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) (err error) {
+func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) error {
 	defer ReleaseMulti(mb)
 
 	size := mb.Len()
@@ -68,10 +62,8 @@ func (w *BufferToBytesWriter) WriteMultiBuffer(mb MultiBuffer) (err error) {
 		if w.counter != nil {
 			w.counter.Add(wc)
 		}
-		if w.receipt != nil {
-			if wc > 0 {
-				w.receipt.AddDownlink(uint64(wc))
-			}
+		if w.receipt != nil && wc > 0 {
+			w.receipt.AddDownlink(uint64(wc))
 		}
 	}()
 	for size > 0 {
@@ -265,19 +257,12 @@ type SequentialWriter struct {
 
 // Write implements io.Writer and records the native scalar write result when observed.
 func (w *SequentialWriter) Write(payload []byte) (int, error) {
-	if w.receipt == nil {
-		return w.Writer.Write(payload)
-	}
 	return WriteBytesWithReceipt(w.Writer, payload, w.receipt)
 }
 
 // WriteMultiBuffer implements Writer.
 func (w *SequentialWriter) WriteMultiBuffer(mb MultiBuffer) error {
-	writer := w.Writer
-	if w.receipt != nil {
-		writer = w
-	}
-	mb, err := WriteMultiBuffer(writer, mb)
+	mb, err := WriteMultiBuffer(w, mb)
 	ReleaseMulti(mb)
 	return err
 }

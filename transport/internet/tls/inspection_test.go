@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	"github.com/xtls/xray-core/features/stats"
 )
 
@@ -170,4 +171,16 @@ func BenchmarkInspectionTLSWriterConstruction(b *testing.B) {
 			}
 		})
 	}
+}
+
+// Native certificate parsing supplies the existing selected I/O fixture.
+func testCertificate(t *testing.T, commonName string, names ...string) (*Certificate, *stdtls.Certificate) {
+	t.Helper()
+	generated, _ := cert.MustGenerate(nil, cert.CommonName(commonName), cert.DNSNames(names...))
+	entry := ParseCertificate(generated)
+	parsed, err := stdtls.X509KeyPair(entry.Certificate, entry.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entry, &parsed
 }

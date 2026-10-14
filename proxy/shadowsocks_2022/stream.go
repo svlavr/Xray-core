@@ -95,10 +95,7 @@ func (w *StreamWriter) WriteChunk(payload []byte) error {
 	w.buf = w.cipher.Seal(w.buf, w.nonce[:], payload, nil)
 	IncreaseNonce(w.nonce[:])
 
-	n, err := w.writer.Write(w.buf)
-	if n != len(w.buf) && err == nil {
-		err = io.ErrShortWrite
-	}
+	_, err := w.writer.Write(w.buf)
 	return err
 }
 
@@ -110,7 +107,7 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 			chunkSize = MaxPacketSize
 		}
 		if err := w.WriteChunk(p[:chunkSize]); err != nil {
-			return n - len(p), err
+			return 0, err
 		}
 		p = p[chunkSize:]
 	}
@@ -390,11 +387,7 @@ func WriteTCPRequest(w io.Writer, method *CipherMethod, pskList [][]byte, dest n
 	IncreaseNonce(writer.nonce[:])
 	handshakeBuf.Write(varChunk)
 
-	n, err := w.Write(handshakeBuf.Bytes())
-	if err == nil && n != int(handshakeBuf.Len()) {
-		err = io.ErrShortWrite
-	}
-	if err != nil {
+	if _, err := w.Write(handshakeBuf.Bytes()); err != nil {
 		return nil, err
 	}
 
@@ -523,11 +516,7 @@ func (s *ServerStreamWriter) sendHeaderWithFirstPayload(payload []byte) (*Stream
 		outBuf.Write(payloadChunk)
 	}
 
-	n, err := s.w.Write(outBuf.Bytes())
-	if err == nil && n != int(outBuf.Len()) {
-		err = io.ErrShortWrite
-	}
-	if err != nil {
+	if _, err := s.w.Write(outBuf.Bytes()); err != nil {
 		return nil, err
 	}
 	return sw, nil
@@ -595,8 +584,8 @@ func (s *ServerStreamWriter) Write(p []byte) (int, error) {
 		}
 	}
 
-	written, err := s.streamWriter.Write(p)
-	return n - len(p) + written, err
+	_, err := s.streamWriter.Write(p)
+	return n, err
 }
 
 func (s *ServerStreamWriter) Close() error {

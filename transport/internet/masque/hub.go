@@ -39,7 +39,6 @@ type Listener struct {
 	transport    *quic.Transport
 	pktConn      net.PacketConn
 	tcpListener  net.Listener
-	tlsConfig    *gotls.Config
 
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
@@ -49,17 +48,6 @@ func serverVersions(config *tls.Config) (h2, h3 bool) {
 	h2 = slices.Contains(config.NextProtocol, http2.NextProtoTLS)
 	h3 = slices.Contains(config.NextProtocol, http3.NextProtoH3) || !h2
 	return h2, h3
-}
-
-// Build the owner after a native bind succeeds. Protocol clones differ only in
-// ALPN; certificate publication and worker retirement remain shared.
-func (l *Listener) serverTLSConfig(config *tls.Config, alpn string) *gotls.Config {
-	if l.tlsConfig == nil {
-		l.tlsConfig = config.GetTLSConfig()
-	}
-	clone := l.tlsConfig.Clone()
-	clone.NextProtos = []string{alpn}
-	return clone
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
@@ -146,7 +134,8 @@ func (l *Listener) listenHTTP3(address net.Address, port net.Port, streamSetting
 	}
 	l.transport = &quic.Transport{Conn: l.pktConn, DisableGSO: quicParams.DisableGSO, StatelessResetKey: resetKey}
 
-	gotlsConfig := l.serverTLSConfig(tlsConfig, http3.NextProtoH3)
+	gotlsConfig := tlsConfig.GetTLSConfig()
+	gotlsConfig.NextProtos = []string{http3.NextProtoH3}
 	l.quicListener, err = l.transport.Listen(gotlsConfig, quicConfig)
 	if err != nil {
 		return err
@@ -184,7 +173,8 @@ func (l *Listener) listenHTTP2(ctx context.Context, address net.Address, port ne
 	if err != nil {
 		return errors.New("failed to listen TCP on ", address, ":", port).Base(err)
 	}
-	gotlsConfig := l.serverTLSConfig(tlsConfig, http2.NextProtoTLS)
+	gotlsConfig := tlsConfig.GetTLSConfig()
+	gotlsConfig.NextProtos = []string{http2.NextProtoTLS}
 	go l.acceptHTTP2(gotlsConfig)
 	return nil
 }
@@ -251,7 +241,6 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
-	defer tls.CloseConfig(l.tlsConfig)
 	l.cancel()
 	var errs []error
 	if l.quicServer != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	dns_feature "github.com/xtls/xray-core/features/dns"
+	"github.com/xtls/xray-core/transport/internet"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -259,10 +260,11 @@ L:
 // toDnsContext create a new background context with parent inbound, session and dns log
 func toDnsContext(ctx, caller context.Context, addr string) context.Context {
 	dnsCtx := core.ToBackgroundDetachedContext(ctx)
-	if binding, ok := ctx.Value(resolverContextKey{}).(resolverBinding); ok {
+	if binding, ok := ctx.Value(resolverContextKey{}).(*resolver); ok {
 		dnsCtx = context.WithValue(dnsCtx, resolverContextKey{}, binding)
 	}
 	dnsCtx = &dnsRequestContext{Context: dnsCtx, caller: caller}
+	dnsCtx = internet.ContextWithMUTransport(dnsCtx)
 	dnsCtx = session.ContextWithTrafficOrigin(dnsCtx, session.TrafficOriginInternal)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		dnsCtx = session.ContextWithInbound(dnsCtx, inbound)

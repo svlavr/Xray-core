@@ -103,8 +103,10 @@ func hysteriaExecutor(t *testing.T) (*measurement.Executor, *core.Instance, [2]s
 func TestHysteriaMeasurementUDPCancellation(t *testing.T) {
 	e, v, counters := hysteriaExecutor(t)
 	testProtocolMeasurements(t, e, v, counters)
-	// Serialization grows dynamically; the native receive buffer bounds decoded payload.
-	testProtocolPacketBoundary(t, e, "", int(buf.Size), false)
+	// Native serialization includes each actual endpoint address in its fixed buffer.
+	testProtocolPacketBoundary(t, e, "", 0, false, func(addr netip.AddrPort) int {
+		return buf.Size - (&hyproxy.UDPMessage{Addr: addr.String()}).HeaderSize()
+	})
 }
 
 func TestNativeProtocolMeasurements(t *testing.T) {

@@ -71,6 +71,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Outbound, error) {
 }
 
 func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	selected := internet.MUSelected(ctx)
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() {
@@ -136,7 +137,11 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			var initialErr error
 			if timeoutReader, ok := link.Reader.(buf.TimeoutReader); ok {
 				mb, err := timeoutReader.ReadMultiBufferTimeout(0)
-				initialErr = err
+				if selected {
+					initialErr = err
+				} else if err != nil {
+					mb = nil
+				}
 				if !mb.IsEmpty() {
 					remainingMB, firstBuf = buf.SplitFirst(mb)
 					initialPayload = firstBuf.Bytes()
@@ -213,8 +218,9 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 			reader := &UDPReader{
-				Reader:  conn,
-				Session: session,
+				Reader:   conn,
+				Session:  session,
+				selected: selected,
 			}
 
 			if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {

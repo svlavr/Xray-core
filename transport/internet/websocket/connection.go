@@ -20,6 +20,7 @@ type connection struct {
 	conn       *websocket.Conn
 	reader     io.Reader
 	remoteAddr net.Addr
+	selected   bool
 }
 
 func NewConnection(conn *websocket.Conn, remoteAddr net.Addr, extraReader io.Reader, heartbeatPeriod uint32) *connection {
@@ -52,7 +53,7 @@ func (c *connection) Read(b []byte) (int, error) {
 		nBytes, err := reader.Read(b)
 		if errors.Cause(err) == io.EOF {
 			c.reader = nil
-			if nBytes > 0 {
+			if c.selected && nBytes > 0 {
 				return nBytes, nil
 			}
 			continue
@@ -67,7 +68,7 @@ func (c *connection) getReader() (io.Reader, error) {
 	}
 
 	_, reader, err := c.conn.NextReader()
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+	if c.selected && websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		return nil, io.EOF
 	}
 	if err != nil {
@@ -93,6 +94,9 @@ func (c *connection) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (c *connection) Close() error {
+	if c.selected {
+		return c.conn.Close()
+	}
 	var errs []interface{}
 	if err := c.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second*5)); err != nil {
 		errs = append(errs, err)

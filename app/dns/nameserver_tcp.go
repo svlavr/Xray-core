@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	go_errors "errors"
 	"net/url"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,7 +29,6 @@ type TCPNameServer struct {
 	dial            func(context.Context) (net.Conn, error)
 	routed          bool
 	clientIP        net.IP
-	workers         sync.WaitGroup // admission is guarded by cacheController's lock
 }
 
 // NewTCPNameServer creates DNS over TCP server object for remote resolving.
@@ -159,18 +157,14 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
-		s.cacheController.Lock()
-		if s.cacheController.ctx.Err() != nil {
-			s.cacheController.Unlock()
+		if !s.cacheController.begin() {
 			if noResponseErrCh != nil {
 				noResponseErrCh <- context.Canceled
 			}
 			continue
 		}
-		s.workers.Add(1)
-		s.cacheController.Unlock()
 		go func(r *dnsRequest, ctx context.Context) {
-			defer s.workers.Done()
+			defer s.cacheController.workers.Done()
 			workCtx, cancelWork := context.WithCancel(ctx)
 			stop := context.AfterFunc(s.cacheController.ctx, cancelWork)
 			defer func() { stop(); cancelWork() }()
@@ -316,10 +310,8 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 
 func (s *TCPNameServer) Close() error {
 	s.cacheController.cancel()
-	// Cache Close takes the admission lock before this Wait, so no worker can
-	// be added after the barrier. Each admitted worker closes its own connection.
+	// Each admitted worker closes its own connection; the cache joins all work.
 	s.cacheController.Close()
-	s.workers.Wait()
 	return nil
 }
 

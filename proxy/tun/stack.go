@@ -86,7 +86,6 @@ func (s *stack) Close() error {
 		conns = append(conns, c)
 	}
 	s.mu.Unlock()
-	_ = s.udp.Close()
 	for _, c := range conns {
 		c.mu.Lock()
 		if c.err == nil {
@@ -110,12 +109,6 @@ func (s *stack) read() {
 			if !closed {
 				errors.LogErrorInner(s.ctx, err, "[tun] failed to read a packet, no more are read")
 			}
-			return
-		}
-		s.mu.Lock()
-		closed := s.closed
-		s.mu.Unlock()
-		if closed {
 			return
 		}
 		p, ok := parsePacket(b)
@@ -156,10 +149,6 @@ func (s *stack) handleTCP(p packet) {
 	}
 
 	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
 	c := s.conns[f]
 	s.mu.Unlock()
 	if c != nil && c.input(seg) {
@@ -176,30 +165,18 @@ func (s *stack) handleTCP(p packet) {
 		return
 	}
 	c = newTCPConn(s, f, seg)
-	c.mu.Lock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		c.mu.Unlock()
 		return
 	}
 	s.conns[f] = c
-	s.opening.Add(1)
 	s.mu.Unlock()
+	s.opening.Add(1)
+	c.mu.Lock()
 	c.sendSynAck()
 	c.arm(tcpTick)
 	c.mu.Unlock()
-}
-
-// handleTCPConnection admits a scheduled callback against Close's seal. The check
-// is the admission point; callbacks already admitted retain native reset semantics.
-func (s *stack) handleTCPConnection(c *tcpConn) {
-	s.mu.Lock()
-	closed := s.closed
-	s.mu.Unlock()
-	if !closed {
-		s.handle(c, c.dst)
-	}
 }
 
 // refuse answers a segment of a connection that is not known with a reset

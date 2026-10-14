@@ -41,37 +41,19 @@ type Route struct {
 
 // Init initializes the Router.
 func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher) error {
-	script := r.script
-	if config.Script != "" {
-		var err error
-		script, err = prepareScript(config.Script)
-		if err != nil {
-			return err
-		}
-	}
-	return r.initWithScript(ctx, config, d, ohm, dispatcher, script)
-}
-
-func prepareScript(script string) (*scriptEngine, error) {
-	if script == "" {
-		return nil, nil
-	}
-	engine, err := newScriptEngine(script)
-	if err != nil {
-		return nil, errors.New("failed to prepare routing script").Base(err)
-	}
-	return engine, nil
-}
-
-// initWithScript binds ready dependencies to already prepared script bytecode.
-func (r *Router) initWithScript(ctx context.Context, config *Config, d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher, script *scriptEngine) error {
 	r.domainStrategy = config.DomainStrategy
 	r.dns = d
 	r.ctx = ctx
 	r.ohm = ohm
 	r.dispatcher = dispatcher
 
-	r.script = script
+	if config.Script != "" {
+		script, err := newScriptEngine(config.Script)
+		if err != nil {
+			return errors.New("failed to prepare routing script").Base(err)
+		}
+		r.script = script
+	}
 
 	r.rules.Store(new([]*Rule))
 	r.balancers.Store(&map[string]*Balancer{})
@@ -303,13 +285,17 @@ func (r *Route) GetRuleTag() string {
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		snapshot := proto.Clone(config.(*Config)).(*Config)
-		script, err := prepareScript(snapshot.Script)
-		if err != nil {
-			return nil, err
-		}
 		r := new(Router)
+		if snapshot.Script != "" {
+			script, err := newScriptEngine(snapshot.Script)
+			if err != nil {
+				return nil, errors.New("failed to prepare routing script").Base(err)
+			}
+			r.script = script
+			snapshot.Script = ""
+		}
 		if err := core.RequireFeatures(ctx, func(d dns.Client, ohm outbound.Manager, dispatcher routing.Dispatcher) error {
-			return r.initWithScript(ctx, snapshot, d, ohm, dispatcher, script)
+			return r.Init(ctx, snapshot, d, ohm, dispatcher)
 		}); err != nil {
 			return nil, err
 		}

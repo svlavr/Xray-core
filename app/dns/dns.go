@@ -8,13 +8,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/geodata"
-	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
@@ -22,8 +23,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// DNS is a DNS rely server.
-type DNS struct {
+// resolver is one immutable native configuration with its own cancellation.
+type resolver struct {
 	disableFallback        bool
 	disableFallbackIfMatch bool
 	enableParallelQuery    bool
@@ -35,11 +36,15 @@ type DNS struct {
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
 	strictSelection        bool
+	owner                  *DNS
+	cancel                 context.CancelFunc
 	queries                sync.WaitGroup
-	runtime                *dnsRuntime
-	scriptMu               sync.RWMutex
-	script                 *scriptEngine
-	scriptProgram          *xlua.Program
+	prepared               *scriptEngine
+	script                 atomic.Pointer[scriptEngine]
+	initialized            chan struct{}
+	closeOnce              sync.Once
+	done                   chan struct{}
+	closeErr               error
 }
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher.
@@ -48,55 +53,52 @@ type DomainMatcherInfo struct {
 	domainRule string
 }
 
-// New creates a new DNS server with given configuration.
+// New uses native RequireFeatures ordering once, before calling the unchanged
+// native client construction pipeline with ready dependencies.
 func New(ctx context.Context, config *Config) (*DNS, error) {
 	config = proto.Clone(config).(*Config)
-	var program *xlua.Program
+	var prepared *scriptEngine
 	if config.Script != "" {
 		var err error
-		program, err = xlua.Compile(config.Script)
+		prepared, err = newScriptEngine(config.Script)
 		if err != nil {
 			return nil, errors.New("failed to prepare DNS script").Base(err)
 		}
 	}
-	needsFakeDNS := false
-	for _, ns := range config.NameServer {
-		needsFakeDNS = needsFakeDNS || strings.EqualFold(ns.Address.Address.GetDomain(), "fakedns")
-	}
-	if len(config.NameServer) == 0 {
-		prepared, err := buildDNS(ctx, config, nil, nil, program)
-		if err != nil {
-			return nil, err
-		}
-		stable := &DNS{ctx: ctx}
-		stable.initRuntime(prepared)
-		return stable, nil
-	}
-	s := &DNS{ctx: ctx}
-	build := func(dispatcher routing.Dispatcher, fake dns.FakeDNSEngine) error {
-		prepared, err := buildDNS(ctx, config, dispatcher, fake, program)
+	s := &DNS{ctx: ctx, pub: pubsub.NewService()}
+	install := func() error {
+		r, err := s.newResolver(config, prepared)
 		if err == nil {
-			s.initRuntime(prepared)
+			s.mu.Lock()
+			if s.closed {
+				r.cancel()
+				err = context.Canceled
+			} else {
+				s.active.Store(r)
+			}
+			s.mu.Unlock()
 		}
 		return err
 	}
-	var err error
-	if needsFakeDNS {
-		err = core.RequireFeatures(ctx, build)
+	if len(config.NameServer) == 0 {
+		if err := install(); err != nil {
+			return nil, err
+		}
+	} else if needsFakeDNS(config) {
+		if err := core.RequireFeatures(ctx, func(routing.Dispatcher, dns.FakeDNSEngine) error { return install() }); err != nil {
+			return nil, err
+		}
 	} else {
-		err = core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
-			return build(dispatcher, nil)
-		})
-	}
-	if err != nil {
-		return nil, err
+		if err := core.RequireFeatures(ctx, func(routing.Dispatcher) error { return install() }); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }
 
-// buildDNS consumes candidate-owned configuration and already resolved features.
-// It never registers dependency callbacks or starts nameserver I/O or workers.
-func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher, fake dns.FakeDNSEngine, program *xlua.Program) (*DNS, error) {
+// New creates a new DNS server with given configuration.
+func (s *DNS) newResolver(config *Config, prepared *scriptEngine) (*resolver, error) {
+	ctx := s.ctx
 	var clientIP net.IP
 	switch len(config.ClientIp) {
 	case 0, net.IPv4len, net.IPv6len:
@@ -205,12 +207,13 @@ func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher
 			return nil, errors.New("no QueryStrategy available for ", ns.Address)
 		}
 
-		client, err := newClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, dispatcher, fake)
+		client, err := NewClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, updateRules)
 		if err != nil {
 			return nil, errors.New("failed to create client").Base(err)
 		}
-		_, isLocal := client.server.(*LocalNameServer)
-		updateRules(isLocal)
+		if cached, ok := client.server.(CachedNameserver); ok {
+			cached.getCacheController().pub = s.pub
+		}
 		clients = append(clients, client)
 	}
 
@@ -227,7 +230,7 @@ func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher
 		clients = append(clients, NewLocalDNSClient(ipOption))
 	}
 
-	return &DNS{
+	r := &resolver{
 		hosts:                  hosts,
 		ipOption:               &ipOption,
 		clients:                clients,
@@ -238,75 +241,34 @@ func buildDNS(ctx context.Context, config *Config, dispatcher routing.Dispatcher
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
-		scriptProgram:          program,
-	}, nil
+		prepared:               prepared,
+		owner:                  s,
+		initialized:            make(chan struct{}),
+		done:                   make(chan struct{}),
+	}
+	base := context.Background()
+	if core.FromContext(ctx) != nil {
+		base = core.ToBackgroundDetachedContext(ctx)
+	}
+	r.ctx, r.cancel = context.WithCancel(base)
+	r.ctx = context.WithValue(r.ctx, resolverContextKey{}, r)
+	close(r.initialized)
+	return r, nil
 }
 
 // Type implements common.HasType.
-func (*DNS) Type() interface{} {
-	return dns.ClientType()
-}
+func (*DNS) Type() interface{} { return dns.ClientType() }
 
-// Start implements common.Runnable.
-func (s *DNS) Start() error {
-	if s.runtime == nil {
-		return s.startNativeScript()
-	}
-	return s.startRuntime()
-}
-
-// Close implements common.Closable.
-func (s *DNS) Close() error {
-	if s.runtime == nil {
-		if engine := s.getScript(); engine != nil {
-			engine.close()
-		}
-		return nil
-	}
-	rt := s.runtime
-	rt.mu.Lock()
-	if rt.current != nil {
-		rt.current.cancel()
-	}
-	if rt.closing != nil {
-		rt.closing.cancel()
-	}
-	current, closing := rt.current, rt.closing
-	rt.mu.Unlock()
-	var errs []error
-	if current != nil {
-		current.startClose(rt)
-	}
-	if closing != nil {
-		closing.startClose(rt)
-	}
-	if current != nil {
-		errs = append(errs, current.closeOwned(rt))
-	}
-	if closing != nil {
-		errs = append(errs, closing.closeOwned(rt))
-	}
-	rt.mu.Lock()
-	rt.current, rt.closing = nil, nil
-	rt.mu.Unlock()
-	return go_errors.Join(errs...)
-}
-
-// IsOwnLink implements proxy.dns.ownLinkVerifier
 func (s *DNS) IsOwnLink(ctx context.Context) bool {
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {
 		return false
 	}
-	if s.runtime == nil {
-		return false
-	}
-	s.runtime.mu.Lock()
-	current, closing := s.runtime.current, s.runtime.closing
-	s.runtime.mu.Unlock()
-	for _, owner := range []*resolverOwner{current, closing} {
-		if owner != nil {
-			for _, client := range owner.resolver.clients {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range []*resolver{s.active.Load(), s.pending} {
+		if r != nil {
+			for _, client := range r.clients {
 				if inbound.Tag == client.tag {
 					return true
 				}
@@ -316,30 +278,13 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 	return false
 }
 
-// MayUseSystemResolver reports whether any name server configured here could
-// still resolve through the system resolver. That is what happens when no name
-// server is configured at all, and it is also what a name server pointed at
-// "localhost" does. Callers that are about to redirect the system resolver need
-// to know, because a resolution path that reaches it would then loop back to
-// them.
-//
-// Any such server is enough: name servers can be selected per domain, so a
-// single local one makes some query reach the system resolver even when
-// independent upstreams are configured alongside it.
 func (s *DNS) MayUseSystemResolver() bool {
-	if s.runtime == nil {
-		return resolverMayUseSystem(s)
-	}
-	rt := s.runtime
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	if rt.current == nil || rt.current.ctx.Err() != nil {
-		return true
-	}
-	return resolverMayUseSystem(rt.current.resolver) || (rt.closing != nil && resolverMayUseSystem(rt.closing.resolver))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed || resolverMayUseSystem(s.active.Load()) || (s.pending != nil && resolverMayUseSystem(s.pending))
 }
 
-func resolverMayUseSystem(s *DNS) bool {
+func resolverMayUseSystem(s *resolver) bool {
 	if s == nil || len(s.clients) == 0 {
 		return true
 	}
@@ -364,52 +309,27 @@ func resolverMayUseSystem(s *DNS) bool {
 	return false
 }
 
-// AcquireSystemDNS keeps a safe published resolver in place while Linux owns
-// per-link system DNS settings. The caller releases it after successful revert.
 func (s *DNS) AcquireSystemDNS() (func(), error) {
-	if s == nil || s.runtime == nil {
-		return nil, fmt.Errorf("DNS resolver unavailable")
-	}
-	rt := s.runtime
-	rt.systemDNSMu.RLock()
-	rt.mu.Lock()
-	unsafe := rt.current == nil || rt.current.ctx.Err() != nil || resolverMayUseSystem(rt.current.resolver) ||
-		(rt.closing != nil && resolverMayUseSystem(rt.closing.resolver))
-	rt.mu.Unlock()
-	if unsafe {
-		rt.systemDNSMu.RUnlock()
+	s.systemDNSMu.RLock()
+	if s.MayUseSystemResolver() {
+		s.systemDNSMu.RUnlock()
 		return nil, fmt.Errorf("DNS configuration may resolve through the system resolver, takeover would loop or resolver is unavailable")
 	}
-	return rt.systemDNSMu.RUnlock, nil
+	return s.systemDNSMu.RUnlock, nil
 }
 
-// LookupIP implements dns.Client.
 func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	return s.LookupIPContext(s.ctx, domain, option)
 }
 
-// LookupIPContext implements dns.ContextClient with caller cancellation.
 func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
-	if err := ctx.Err(); err != nil {
+	r, queryCtx, finish, err := s.begin(ctx, nil)
+	if err != nil {
 		return nil, 0, err
 	}
-	if s.runtime == nil {
-		return s.lookupIP(ctx, domain, option)
-	}
-	rt := s.runtime
-	rt.mu.Lock()
-	owner := resolverFromContext(ctx, rt)
-	if owner == nil {
-		owner = rt.current
-	}
-	if owner == nil || owner.ctx.Err() != nil {
-		rt.mu.Unlock()
-		return nil, 0, context.Canceled
-	}
-	owner.resolver.queries.Add(1)
-	rt.mu.Unlock()
-	defer owner.resolver.queries.Done()
-
+	defer finish()
+	// Detach transport values from USER/carrier ownership while preserving real
+	// inbound/content metadata, caller cancellation and this exact resolver.
 	base := context.Background()
 	if core.FromContext(s.ctx) != nil {
 		base = core.ToBackgroundDetachedContext(s.ctx)
@@ -420,17 +340,18 @@ func (s *DNS) LookupIPContext(ctx context.Context, domain string, option dns.IPO
 	if content := session.ContentFromContext(ctx); content != nil {
 		base = session.ContextWithContent(base, content)
 	}
-	base = bindResolverContext(base, rt, owner)
-	queryCtx, cancel := context.WithCancel(base)
-	stopCaller := context.AfterFunc(ctx, cancel)
-	stopOwner := context.AfterFunc(owner.ctx, cancel)
-	defer stopCaller()
-	defer stopOwner()
-	defer cancel()
-	return owner.resolver.lookupIP(queryCtx, domain, option)
+	base = context.WithValue(base, resolverContextKey{}, r)
+	if err := queryCtx.Err(); err != nil {
+		return nil, 0, err
+	}
+	ips, ttl, err := r.lookupIP(&dnsRequestContext{Context: base, caller: queryCtx}, domain, option)
+	if callerErr := ctx.Err(); callerErr != nil {
+		return nil, 0, callerErr
+	}
+	return ips, ttl, err
 }
 
-func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *resolver) lookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	// Normalize the FQDN form query
 	domain = strings.TrimSuffix(domain, ".")
 	if domain == "" {
@@ -474,7 +395,7 @@ func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) 
 	}
 
 	// Name servers lookup
-	if engine := s.getScript(); engine != nil {
+	if engine := s.script.Load(); engine != nil {
 		return engine.queryContext(ctx, domain, option)
 	}
 	if s.enableParallelQuery {
@@ -484,7 +405,7 @@ func (s *DNS) lookupIP(ctx context.Context, domain string, option dns.IPOption) 
 	}
 }
 
-func (s *DNS) sortClients(domain string) []*Client {
+func (s *resolver) sortClients(domain string) []*Client {
 	clients := make([]*Client, 0, len(s.clients))
 	clientUsed := make([]bool, len(s.clients))
 	clientNames := make([]string, 0, len(s.clients))
@@ -580,7 +501,7 @@ func mergeQueryErrors(domain string, errs []error) error {
 	return errors.New("returning nil for domain ", domain).Base(noRNF)
 }
 
-func (s *DNS) serialQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *resolver) serialQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	for _, client := range s.sortClients(domain) {
 		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
@@ -603,7 +524,7 @@ func (s *DNS) serialQuery(ctx context.Context, domain string, option dns.IPOptio
 	return nil, 0, mergeQueryErrors(domain, errs)
 }
 
-func (s *DNS) parallelQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+func (s *resolver) parallelQuery(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	clients := s.sortClients(domain)
 
@@ -618,7 +539,15 @@ func (s *DNS) parallelQuery(ctx context.Context, domain string, option dns.IPOpt
 
 	nextGroup := 0
 	for range clients {
-		result := <-resultsChan
+		var result queryResult
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		case result = <-resultsChan:
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 		results[result.index] = &result
 
 		gi := groupOf[result.index]
@@ -664,7 +593,7 @@ type queryResult struct {
 	index int
 }
 
-func (s *DNS) asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context) chan queryResult {
+func (s *resolver) asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context) chan queryResult {
 	if len(clients) == 0 {
 		ch := make(chan queryResult)
 		close(ch)

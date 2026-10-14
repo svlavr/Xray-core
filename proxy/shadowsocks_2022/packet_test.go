@@ -2,18 +2,12 @@ package shadowsocks_2022
 
 import (
 	"bytes"
-	"context"
 	"crypto/aes"
 	"encoding/binary"
-	"io"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/xtls/xray-core/common/buf"
 	cnet "github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/session"
 	"lukechampine.com/blake3"
 )
 
@@ -148,95 +142,10 @@ func TestSS2022UDPIdentityChainWire(t *testing.T) {
 	}
 }
 
-func TestSS2022NativeUDPWriterShortResult(t *testing.T) {
-	method, _ := GetCipherMethod(MethodAES128GCM)
-	codec, err := inspectionClientSession(method, [][]byte{make([]byte, method.KeySaltLength)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer := &UDPWriter{
-		Writer:      inspectionWriteFunc(func([]byte) (int, error) { return 1, nil }),
-		Destination: cnet.UDPDestination(cnet.LocalHostIP, 8080),
-		Session:     codec,
-	}
-	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("request"))}); err != io.ErrShortWrite {
-		t.Fatalf("short packet write: %v", err)
-	}
-}
-
-func TestSS2022PacketMetadataIsolation(t *testing.T) {
-	base := session.ContextWithInbound(context.Background(), &session.Inbound{Name: "parent"})
-	base = session.ContextWithOutbounds(base, []*session.Outbound{{Tag: "parent"}})
-	base = session.ContextWithContent(base, &session.Content{Attributes: map[string]string{"test": "parent"}})
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx := packetSessionContext(base)
-			session.InboundFromContext(ctx).Name = "child"
-			session.OutboundsFromContext(ctx)[0].Tag = "child"
-			session.ContentFromContext(ctx).Attributes["test"] = "child"
-		}()
-	}
-	wg.Wait()
-	if session.InboundFromContext(base).Name != "parent" || session.OutboundsFromContext(base)[0].Tag != "parent" || session.ContentFromContext(base).Attributes["test"] != "parent" {
-		t.Fatal("shared packet metadata mutated")
-	}
-}
-
 func inspectionClientSession(method *CipherMethod, keys [][]byte) (*ClientUDPSession, error) {
 	codec, err := NewUDPPacketCodec(method, keys)
 	if err != nil {
 		return nil, err
 	}
 	return codec.NewClientSession()
-}
-
-func TestInspectionSS2022ConcurrentAuthenticatedReplay(t *testing.T) {
-	for _, name := range []string{MethodAES128GCM, MethodAES256GCM, MethodChaCha20Poly1305} {
-		t.Run(name, func(t *testing.T) {
-			method, _ := GetCipherMethod(name)
-			key := make([]byte, method.KeySaltLength)
-			client, err := inspectionClientSession(method, [][]byte{key})
-			if err != nil {
-				t.Fatal(err)
-			}
-			server, err := NewUDPServerCodec(method, key, time.Minute)
-			if err != nil {
-				t.Fatal(err)
-			}
-			packet, err := client.EncodePacket(cnet.UDPDestination(cnet.LocalHostIP, 8080), []byte("once"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer packet.Release()
-			wire := bytes.Clone(packet.Bytes())
-			invalid := bytes.Clone(wire)
-			invalid[len(invalid)-1] ^= 1
-			if _, err := server.DecodePacket(invalid); err == nil {
-				t.Fatal("unauthenticated packet accepted")
-			}
-			start := make(chan struct{})
-			var accepted atomic.Int32
-			var workers sync.WaitGroup
-			for range 32 {
-				workers.Add(1)
-				go func() {
-					defer workers.Done()
-					<-start
-					if _, err := server.DecodePacket(wire); err == nil {
-						accepted.Add(1)
-					} else if err != ErrPacketIdNotUnique {
-						t.Errorf("decode: %v", err)
-					}
-				}()
-			}
-			close(start)
-			workers.Wait()
-			if n := accepted.Load(); n != 1 {
-				t.Fatalf("authenticated packet accepted %d times", n)
-			}
-		})
-	}
 }

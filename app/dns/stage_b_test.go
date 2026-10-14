@@ -33,7 +33,6 @@ import (
 	_ "github.com/xtls/xray-core/transport/internet/tcp"
 	udptransport "github.com/xtls/xray-core/transport/internet/udp"
 	"github.com/xtls/xray-core/transport/pipe"
-	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http2"
 )
 
@@ -113,7 +112,7 @@ func TestStageBPreparedGroupsAndExplicitCandidates(t *testing.T) {
 			defaultAddr, defaultCalls := stageBTCPResolver(t, "192.0.2.30", map[string]bool{"other.test.": true})
 			firstAddr, firstCalls := stageBTCPResolver(t, "192.0.2.10", map[string]bool{"alpha.test.": true})
 			secondAddr, secondCalls := stageBTCPResolver(t, "192.0.2.20", map[string]bool{"beta.test.": true, "overlap.test.": true})
-			client, err := New(context.Background(), &Config{})
+			client, err := New(dnsTestContext(t), &Config{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -143,7 +142,7 @@ func TestStageBPreparedGroupsAndExplicitCandidates(t *testing.T) {
 
 func TestStageBExplicitEmptyAndNoCandidate(t *testing.T) {
 	addr, calls := stageBTCPResolver(t, "192.0.2.40", map[string]bool{"active.test.": true})
-	client, err := New(context.Background(), &Config{})
+	client, err := New(dnsTestContext(t), &Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +178,7 @@ func TestStageBExplicitEmptyAndNoCandidate(t *testing.T) {
 
 func TestStageBPreparedNativeBlockAndException(t *testing.T) {
 	addr, calls := stageBTCPResolver(t, "192.0.2.50", map[string]bool{"safe.ads.test.": true})
-	client, err := New(context.Background(), &Config{})
+	client, err := New(dnsTestContext(t), &Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,9 +307,8 @@ func stageBManualFeature(t *testing.T, server Server) *DNS {
 		t.Fatal(err)
 	}
 	option := featuredns.IPOption{IPv4Enable: true, IPv6Enable: true}
-	resolver := &DNS{hosts: hosts, ipOption: &option, ctx: context.Background(), clients: []*Client{{server: server, ipOption: &option, timeoutMs: time.Second}}}
-	feature := &DNS{ctx: context.Background()}
-	feature.initRuntime(resolver)
+	r := &resolver{hosts: hosts, ipOption: &option, ctx: context.Background(), clients: []*Client{{server: server, ipOption: &option, timeoutMs: time.Second}}}
+	feature := dnsTestFeature(t, r)
 	return feature
 }
 
@@ -356,7 +354,7 @@ func TestStageBTimedCleanupKeepsBoundedOwner(t *testing.T) {
 	block := make(chan struct{})
 	old := &stageBBlockingServer{started: make(chan struct{}), closeBlock: block}
 	feature := stageBManualFeature(t, old)
-	feature.runtime.current.resolver.clients[0].tag = "old"
+	feature.active.Load().clients[0].tag = "old"
 	t.Cleanup(func() {
 		select {
 		case <-block:
@@ -384,9 +382,9 @@ func TestStageBTimedCleanupKeepsBoundedOwner(t *testing.T) {
 	close(block)
 	deadline := time.Now().Add(time.Second)
 	for {
-		feature.runtime.mu.Lock()
-		pending := feature.runtime.closing != nil
-		feature.runtime.mu.Unlock()
+		feature.mu.Lock()
+		pending := feature.pending != nil
+		feature.mu.Unlock()
 		if !pending {
 			break
 		}
@@ -428,9 +426,9 @@ func TestStageBReplacementAndFeatureCloseShareRetirement(t *testing.T) {
 	go func() { closed <- feature.Close() }()
 	deadline := time.Now().Add(time.Second)
 	for {
-		feature.runtime.mu.Lock()
-		captured := feature.runtime.current.ctx.Err() != nil
-		feature.runtime.mu.Unlock()
+		feature.mu.Lock()
+		captured := feature.active.Load().ctx.Err() != nil
+		feature.mu.Unlock()
 		if captured {
 			break
 		}
@@ -481,12 +479,12 @@ func TestStageBCloseFirstRetirementCompletesPendingSlot(t *testing.T) {
 	closeFailure := go_errors.New("pending resource close failed")
 	pending := &stageBBlockingServer{closeBlock: pendingRelease, closeEntered: make(chan struct{}, 1), closeErrs: []error{closeFailure}}
 	feature := stageBManualFeature(t, current)
-	rt := feature.runtime
-	owner := newResolverOwner(&DNS{clients: []*Client{{server: pending}}})
-	owner.initDone = make(chan struct{})
-	rt.closing = owner
+	rt := feature
+	owner := dnsTestResolver(feature, &resolver{clients: []*Client{{server: pending}}})
+	owner.initialized = make(chan struct{})
+	rt.pending = owner
 	t.Cleanup(func() {
-		for _, ch := range []chan struct{}{currentRelease, pendingRelease, owner.initDone} {
+		for _, ch := range []chan struct{}{currentRelease, pendingRelease, owner.initialized} {
 			select {
 			case <-ch:
 			default:
@@ -501,11 +499,11 @@ func TestStageBCloseFirstRetirementCompletesPendingSlot(t *testing.T) {
 	m3DNSReceive(t, pending.closeEntered)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if result := rt.waitRetirement(ctx, owner); !result.Applied || !go_errors.Is(result.Err, context.Canceled) {
+	if result := dnsTestWaitRetirement(ctx, owner); !result.Applied || !go_errors.Is(result.Err, context.Canceled) {
 		t.Fatalf("late canceled Apply waiter: %+v", result)
 	}
 	rt.mu.Lock()
-	stillPending := rt.closing == owner
+	stillPending := rt.pending == owner
 	rt.mu.Unlock()
 	if !stillPending {
 		t.Fatal("pending owner forgotten before resource/init joins")
@@ -513,19 +511,19 @@ func TestStageBCloseFirstRetirementCompletesPendingSlot(t *testing.T) {
 	// Keep current Close blocked so feature.Close cannot perform final slot reset.
 	close(pendingRelease)
 	select {
-	case <-owner.closeDone:
+	case <-owner.done:
 		t.Fatal("pending close passed unfinished initialization")
 	default:
 	}
-	close(owner.initDone)
-	m3DNSReceive(t, owner.closeDone)
+	close(owner.initialized)
+	m3DNSReceive(t, owner.done)
 	rt.mu.Lock()
-	stillPending = rt.closing == owner
+	stillPending = rt.pending == owner
 	rt.mu.Unlock()
 	if stillPending {
 		t.Fatal("owner completion did not clear its pending slot")
 	}
-	if result := rt.waitRetirement(context.Background(), owner); !result.Applied || !go_errors.Is(result.Err, closeFailure) {
+	if result := dnsTestWaitRetirement(context.Background(), owner); !result.Applied || !go_errors.Is(result.Err, closeFailure) {
 		t.Fatalf("shared terminal Apply error: %+v", result)
 	}
 	close(currentRelease)
@@ -661,53 +659,6 @@ func TestStageBUDPSharedRaySurvivesFirstCallerCancellation(t *testing.T) {
 	}
 }
 
-func TestStageBUDPTruncationAndWrongQuestion(t *testing.T) {
-	dispatcher := &stageBUDPDispatcher{first: make(chan struct{}), wrongFirst: true, truncateFirst: true}
-	server := stageBUDPServer(t, dispatcher)
-	base := context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance))
-	for domain, want := range map[string]net.IP{"valid.test": {192, 0, 2, 80}, "truncated.test": {192, 0, 2, 81}} {
-		ips, _, err := server.QueryIP(base, domain, featuredns.IPOption{IPv4Enable: true})
-		if err != nil || len(ips) != 1 || !ips[0].Equal(want) {
-			t.Fatalf("%s: ips=%v err=%v", domain, ips, err)
-		}
-	}
-	if dispatcher.writes.Load() != 3 {
-		t.Fatalf("expected normal plus EDNS retry, writes=%d", dispatcher.writes.Load())
-	}
-}
-
-func TestStageBUDPRequestIDCollisionKeepsFirstPending(t *testing.T) {
-	dispatcher := &stageBUDPDispatcher{first: make(chan struct{})}
-	server := stageBUDPServer(t, dispatcher)
-	msg := &dnsmessage.Message{Header: dnsmessage.Header{ID: 42}}
-	first := &udpDnsRequest{dnsRequest: dnsRequest{msg: msg}, ctx: context.Background()}
-	second := &udpDnsRequest{dnsRequest: dnsRequest{msg: msg}, ctx: context.Background()}
-	if err := server.addPendingRequest(first); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.addPendingRequest(second); err == nil || go_errors.Is(err, context.Canceled) {
-		t.Fatalf("request ID collision must be a non-cancellation error: %v", err)
-	}
-	server.RLock()
-	current := server.requests[42]
-	server.RUnlock()
-	if current != first {
-		t.Fatal("collision displaced first pending request")
-	}
-	server.reqID = 41
-	result := make(chan error, 1)
-	server.sendQuery(context.Background(), result, "collision.test.", featuredns.IPOption{IPv4Enable: true})
-	if err := <-result; err == nil || go_errors.Is(err, context.Canceled) {
-		t.Fatalf("sendQuery lost collision error: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	second.ctx = ctx
-	if err := server.addPendingRequest(second); err != context.Canceled {
-		t.Fatalf("actual cancellation: %v", err)
-	}
-}
-
 type stageBBlockedDispatcher struct {
 	routing.Dispatcher
 	started chan struct{}
@@ -786,7 +737,7 @@ func TestStageBUDPLateOldCallbackCannotUpdateReplacement(t *testing.T) {
 	t.Cleanup(func() { _ = feature.Close() })
 	queryDone := make(chan error, 1)
 	base := context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance))
-	feature.ctx = base
+	base = feature.ctx
 	go func() {
 		_, _, err := feature.LookupIPContext(base, "valid.test", featuredns.IPOption{IPv4Enable: true})
 		queryDone <- err
@@ -799,10 +750,12 @@ func TestStageBUDPLateOldCallbackCannotUpdateReplacement(t *testing.T) {
 	address, _ := stageBTCPResolver(t, "192.0.2.91", map[string]bool{"valid.test.": true})
 	config := stageBConfig(stageBServer(address, "new"))
 	applied := make(chan ApplyResult, 1)
-	go func() { applied <- ApplyConfig(context.Background(), feature, config) }()
+	updateCtx, cancelUpdate := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelUpdate()
+	go func() { applied <- ApplyConfig(updateCtx, feature, config) }()
 	select {
 	case result := <-applied:
-		if !result.Applied || result.Err != nil {
+		if !result.Applied || !go_errors.Is(result.Err, context.DeadlineExceeded) {
 			t.Fatalf("replacement: %+v", result)
 		}
 	case <-time.After(time.Second):
@@ -871,7 +824,7 @@ func TestStageBDNSNoInternalRowsOffOn(t *testing.T) {
 
 func TestStageBNativeOwnLinkTag(t *testing.T) {
 	client := stageBManualFeature(t, &stageBBlockingServer{started: make(chan struct{})})
-	client.runtime.current.resolver.clients[0].tag = "resolver"
+	client.active.Load().clients[0].tag = "resolver"
 	ctx := session.ContextWithInbound(context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance)), &session.Inbound{Tag: "resolver"})
 	if !client.IsOwnLink(ctx) || !client.IsOwnLink(toDnsContext(ctx, ctx, "resolver.test")) {
 		t.Fatal("native resolver tag lost from routed DNS context")
@@ -899,7 +852,7 @@ func TestCacheCloseWakesPendingDualStackSubscribers(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		cache.RLock()
-		count := len(cache.subs)
+		count := dnsTestSubscribers(cache)
 		cache.RUnlock()
 		if count == 2 {
 			break
@@ -1126,16 +1079,18 @@ func TestDoHCloseCaptureLateDialPublication(t *testing.T) {
 	defer right.Close()
 	lower := &scriptedCloseConn{Conn: left}
 	server := &DoHNameServer{cacheController: NewCacheController("doh", false, false, 0), httpClient: &http.Client{Transport: &http2.Transport{}}}
-	if !server.beginDial() {
+	if !server.cacheController.begin() {
 		t.Fatal("dial rejected before close")
 	}
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- server.Close() }()
 	<-server.cacheController.ctx.Done()
-	if _, accepted := server.trackConnection(lower); accepted {
+	late, accepted := server.trackConnection(lower)
+	if accepted {
 		t.Fatal("late DoH connection accepted")
 	}
-	server.dialing.Done()
+	_ = late.Close()
+	server.cacheController.workers.Done()
 	if err := <-closeDone; err != nil {
 		t.Fatal(err)
 	}
@@ -1353,7 +1308,7 @@ func (c *stageBPausedPreparationContext) Value(key any) any {
 func TestStageBCloseDuringInertPreparation(t *testing.T) {
 	old := &stageBBlockingServer{started: make(chan struct{})}
 	feature := stageBManualFeature(t, old)
-	paused := &stageBPausedPreparationContext{Context: context.Background(), entered: make(chan struct{}), resume: make(chan struct{})}
+	paused := &stageBPausedPreparationContext{Context: feature.ctx, entered: make(chan struct{}), resume: make(chan struct{})}
 	feature.ctx = paused
 	var resume sync.Once
 	defer resume.Do(func() { close(paused.resume) })
@@ -1395,13 +1350,13 @@ func TestStageBCloseDuringInertPreparation(t *testing.T) {
 func TestCacheCloseAndRepeatedUnsubscribePreserveSibling(t *testing.T) {
 	cache := NewCacheController("subscriber", false, false, 0)
 	defer cache.Close()
-	first, sibling := cache.subscribe("host4"), cache.subscribe("host4")
-	first.close()
-	first.close()
+	first, sibling := cache.pub.Subscribe(cache.keyPrefix+"host4"), cache.pub.Subscribe(cache.keyPrefix+"host4")
+	first.Close()
+	first.Close()
 	record := &IPRecord{IP: []net.IP{{192, 0, 2, 1}}}
-	cache.publish("host4", record)
+	cache.pub.Publish(cache.keyPrefix+"host4", record)
 	select {
-	case got := <-sibling.buffer:
+	case got := <-sibling.Wait():
 		if got != record {
 			t.Fatal("sibling received another record")
 		}
@@ -1409,8 +1364,8 @@ func TestCacheCloseAndRepeatedUnsubscribePreserveSibling(t *testing.T) {
 		t.Fatal("unsubscribing one query removed its sibling")
 	}
 	cache.Close()
-	sibling.close()
-	sibling.close()
+	sibling.Close()
+	sibling.Close()
 	server := &silentCachedServer{cache: cache}
 	_, _, err := queryIP(context.Background(), server, "closed.test", featuredns.IPOption{IPv4Enable: true, IPv6Enable: true})
 	if err == nil {

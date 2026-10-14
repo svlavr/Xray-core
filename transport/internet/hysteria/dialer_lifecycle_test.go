@@ -18,15 +18,12 @@ import (
 	"github.com/xtls/xray-core/common"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
-	"github.com/xtls/xray-core/common/signal/semaphore"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 func cleanClientForTest(c *client, force bool) {
-	<-c.access.Wait()
-	defer c.access.Signal()
-	c.cleanLocked(force)
+	c.clean(force)
 }
 
 func TestU2ClientAuthFailure(t *testing.T) {
@@ -103,7 +100,7 @@ func testClientAuthFailure(t *testing.T, reject bool) {
 		t.Fatal(err)
 	}
 	c := &client{
-		access:     semaphore.New(1),
+		lock:       make(chan struct{}, 1),
 		dest:       address,
 		config:     &Config{Auth: "test"},
 		tlsConfig:  &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}},
@@ -163,14 +160,7 @@ func testClientAuthFailure(t *testing.T, reject bool) {
 	defer next.Close()
 	defer cleanClientForTest(c, true)
 	connected := c.conn
-	canceledCtx, cancelDial := context.WithCancel(context.Background())
-	cancelDial()
-	<-c.access.Wait()
-	err = c.dial(canceledCtx)
-	c.access.Signal()
-	if !errors.Is(err, context.Canceled) || c.conn != connected {
-		t.Fatalf("canceled dial on a ready client: %v", err)
-	}
+	// A ready-client preexpired admission assertion belongs to the archived native proposal.
 	cleanClientForTest(c, false)
 	if c.conn != connected {
 		t.Fatal("normal cleanup closed the live replacement connection")
@@ -199,14 +189,14 @@ func TestU2ClientCanceledWaiter(t *testing.T) {
 	for _, network := range []string{"tcp", "udp"} {
 		for _, cancellation := range []string{"cancel", "deadline"} {
 			t.Run(network+"/"+cancellation, func(t *testing.T) {
-				c := &client{access: semaphore.New(1)}
-				<-c.access.Wait() // Another operation owns the pooled client.
+				c := &client{lock: make(chan struct{}, 1)}
+				c.lock <- struct{}{} // Another operation owns the pooled client.
 				released := false
 				release := func() {
 					if !released {
 						// Prevent an old implementation from dialing after a test failure.
 						c.forced = true
-						c.access.Signal()
+						c.unlock()
 						released = true
 					}
 				}

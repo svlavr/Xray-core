@@ -103,3 +103,18 @@ func (s *Service) Publish(name string, message interface{}) {
 		}
 	}
 }
+
+// Close is used after the native publisher/subscriber owners have joined. It
+// stops this core's cleanup task and forgets its terminal subscription keys.
+func (s *Service) Close() error {
+	err := s.ctask.Close()
+	s.Lock()
+	defer s.Unlock()
+	for _, group := range s.subs {
+		for _, sub := range group {
+			_ = sub.Close()
+		}
+	}
+	s.subs = nil
+	return err
+}

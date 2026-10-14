@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 type failedDialConn struct {
@@ -38,7 +39,7 @@ func TestFailedRealityPreparationClosesConnection(t *testing.T) {
 	for _, fingerprint := range []string{"nonexistent-fingerprint", "chrome"} {
 		t.Run(fingerprint, func(t *testing.T) {
 			c := new(failedDialConn)
-			conn, err := UClient(c, &Config{Fingerprint: fingerprint, PublicKey: []byte{1}}, context.Background(), net.TCPDestination(net.LocalHostIP, 443))
+			conn, err := UClient(c, &Config{Fingerprint: fingerprint, PublicKey: []byte{1}}, internet.ContextWithMUTransport(context.Background()), net.TCPDestination(net.LocalHostIP, 443))
 			if err == nil || conn != nil || !c.closed {
 				t.Fatalf("failure ownership: err=%v closed=%v", err, c.closed)
 			}

@@ -16,7 +16,6 @@ import (
 	"github.com/xtls/xray-core/common"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
-	"github.com/xtls/xray-core/common/signal/semaphore"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -223,7 +222,7 @@ func TestMeasurementColdAuthCancellation(t *testing.T) {
 	address, _ := xnet.ParseDestination("udp:" + listener.Addr().String())
 	c := &client{dest: address, config: &Config{Auth: "fixture"}, tlsConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}, quicParams: &internet.QuicParams{DisableChromeParrot: true, Congestion: "reno"}}
 	// Initialized here in the same way as the production pooled-client owner.
-	c.access = semaphore.New(1)
+	c.lock = make(chan struct{}, 1)
 	callCtx, stop := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
@@ -268,9 +267,9 @@ func TestMeasurementColdAuthCancellation(t *testing.T) {
 }
 
 func TestMeasurementCanceledClientWaiter(t *testing.T) {
-	c := &client{access: semaphore.New(1)}
-	<-c.access.Wait() // Another cold opener still owns the pooled client.
-	defer c.access.Signal()
+	c := &client{lock: make(chan struct{}, 1)}
+	c.lock <- struct{}{} // Another cold opener still owns the pooled client.
+	defer c.unlock()
 	for _, udp := range []bool{false, true} {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)

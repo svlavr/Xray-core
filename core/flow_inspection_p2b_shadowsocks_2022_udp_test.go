@@ -23,9 +23,7 @@ func TestFlowInspectionP2BShadowsocks2022UDP(t *testing.T) {
 	}
 }
 
-type inspectionRebindConn struct{ net.Conn }
-
-func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
+func TestFlowInspectionP2BShadowsocks2022NativeMultiDestination(t *testing.T) {
 	for _, multi := range []bool{false, true} {
 		t.Run(map[bool]string{false: "single", true: "multi"}[multi], func(t *testing.T) {
 			instance, view, outbound := inspectionShadowsocks2022ReceiverMode(t, true, false, multi)
@@ -43,7 +41,7 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 				t.Cleanup(func() { conn.Close() })
 				return conn
 			}
-			transport := &inspectionRebindConn{Conn: dial()}
+			transport := dial()
 			method, err := ss.GetCipherMethod(config.Method)
 			if err != nil {
 				t.Fatal(err)
@@ -93,13 +91,11 @@ func TestFlowInspectionP2BShadowsocks2022Rebind(t *testing.T) {
 				}
 			}
 			payload := []byte("first native session")
-			extra := []byte("second destination after rebind")
+			extra := []byte("second native destination")
 			siblingPayload := []byte("sibling")
 			exchange(client, first, payload, 0x19)
 			exchange(sibling, first, siblingPayload, 0x19)
 			assertNoDedicatedServerInspection(t, view)
-			transport.Conn.Close()
-			transport.Conn = dial()
 			exchange(client, second, extra, 0x37)
 			exchange(client, first, payload, 0x19)
 			exchange(sibling, second, siblingPayload, 0x37)

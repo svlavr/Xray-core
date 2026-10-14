@@ -3,11 +3,13 @@ package dns
 import (
 	"context"
 	go_errors "errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/common/task"
 	dns_feature "github.com/xtls/xray-core/features/dns"
 
@@ -32,7 +34,8 @@ type CacheController struct {
 	dirtyips map[string]*record
 
 	sync.RWMutex
-	subs          map[string][]*cacheSubscriber
+	pub           *pubsub.Service
+	keyPrefix     string
 	cleanupMu     sync.Mutex // serializes synchronous periodic Start with Close
 	cacheCleanup  *task.Periodic
 	highWatermark int
@@ -42,27 +45,27 @@ type CacheController struct {
 	cancel        context.CancelFunc
 }
 
-type cacheSubscriber struct {
-	buffer chan *IPRecord
-	owner  *CacheController
-	key    string
+// Standalone native constructors share a fixed process-lifetime notification
+// primitive. DNS.New substitutes its core-owned service before any query.
+var nativeDNSNotifications = pubsub.NewService()
+
+// begin is the only asynchronous cache/transport admission gate.
+func (c *CacheController) begin() bool {
+	c.Lock()
+	defer c.Unlock()
+	if c.ctx.Err() != nil {
+		return false
+	}
+	c.workers.Add(1)
+	return true
 }
 
-func (s *cacheSubscriber) close() {
-	s.owner.Lock()
-	defer s.owner.Unlock()
-	group := s.owner.subs[s.key]
-	for i, candidate := range group {
-		if candidate == s {
-			group = append(group[:i], group[i+1:]...)
-			break
-		}
+func (c *CacheController) cleanup(execute func() error) error {
+	if !c.begin() {
+		return context.Canceled
 	}
-	if len(group) == 0 {
-		delete(s.owner.subs, s.key)
-	} else {
-		s.owner.subs[s.key] = group
-	}
+	defer c.workers.Done()
+	return execute()
 }
 
 func NewCacheController(name string, disableCache bool, serveStale bool, serveExpiredTTL uint32) *CacheController {
@@ -73,12 +76,13 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		serveStale:      serveStale,
 		serveExpiredTTL: -int32(serveExpiredTTL),
 		ips:             make(map[string]*record),
-		subs:            make(map[string][]*cacheSubscriber),
+		pub:             nativeDNSNotifications,
 		ctx:             ctx,
 		cancel:          cancel,
 	}
 
-	c.cacheCleanup = &task.Periodic{Interval: 300 * time.Second, Execute: c.CacheCleanup}
+	c.keyPrefix = fmt.Sprintf("%p/", c)
+	c.cacheCleanup = &task.Periodic{Interval: 300 * time.Second, Execute: func() error { return c.cleanup(c.CacheCleanup) }}
 	return c
 }
 
@@ -111,13 +115,9 @@ func (c *CacheController) CacheCleanup() error {
 }
 
 func (c *CacheController) startPull(ctx context.Context, s CachedNameserver, fqdn string, option dns_feature.IPOption) {
-	c.Lock()
-	if c.ctx.Err() != nil {
-		c.Unlock()
+	if !c.begin() {
 		return
 	}
-	c.workers.Add(1)
-	c.Unlock()
 	// Keep query metadata while the cache owner controls refresh cancellation.
 	ctx = &dnsRequestContext{Context: context.WithoutCancel(ctx), caller: c.ctx}
 	go func() { defer c.workers.Done(); pull(ctx, s, fqdn, option) }()
@@ -310,9 +310,9 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 
 	switch req.reqType {
 	case dnsmessage.TypeA:
-		c.publish(req.domain+"4", rep)
+		c.pub.Publish(c.keyPrefix+req.domain+"4", rep)
 	case dnsmessage.TypeAAAA:
-		c.publish(req.domain+"6", rep)
+		c.pub.Publish(c.keyPrefix+req.domain+"6", rep)
 	}
 
 	if c.disableCache {
@@ -360,7 +360,7 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 	if pubRecord != nil {
 		_, ttl, err := pubRecord.getIPs()
 		if ttl > 0 && !go_errors.Is(err, errRecordNotFound) {
-			c.publish(req.domain+pubSuffix, pubRecord)
+			c.pub.Publish(c.keyPrefix+req.domain+pubSuffix, pubRecord)
 		}
 	}
 
@@ -382,46 +382,23 @@ func (c *CacheController) findRecords(domain string) *record {
 	return rec
 }
 
-func (c *CacheController) subscribe(key string) *cacheSubscriber {
-	sub := &cacheSubscriber{buffer: make(chan *IPRecord, 16), owner: c, key: key}
-	c.Lock()
-	if c.ctx.Err() != nil {
-		c.Unlock()
-		return sub
-	}
-	c.subs[key] = append(c.subs[key], sub)
-	c.Unlock()
-	return sub
-}
-
-func (c *CacheController) publish(key string, record *IPRecord) {
-	c.RLock()
-	defer c.RUnlock()
-	for _, sub := range c.subs[key] {
-		select {
-		case sub.buffer <- record:
-		default:
-		}
-	}
-}
-
-func (c *CacheController) registerSubscribers(domain string, option dns_feature.IPOption) (sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
+func (c *CacheController) registerSubscribers(domain string, option dns_feature.IPOption) (sub4 *pubsub.Subscriber, sub6 *pubsub.Subscriber) {
 	// ipv4 and ipv6 belong to different subscription groups
 	if option.IPv4Enable {
-		sub4 = c.subscribe(domain + "4")
+		sub4 = c.pub.Subscribe(c.keyPrefix + domain + "4")
 	}
 	if option.IPv6Enable {
-		sub6 = c.subscribe(domain + "6")
+		sub6 = c.pub.Subscribe(c.keyPrefix + domain + "6")
 	}
 	return
 }
 
-func closeSubscribers(sub4 *cacheSubscriber, sub6 *cacheSubscriber) {
+func closeSubscribers(sub4 *pubsub.Subscriber, sub6 *pubsub.Subscriber) {
 	if sub4 != nil {
-		sub4.close()
+		sub4.Close()
 	}
 	if sub6 != nil {
-		sub6.close()
+		sub6.Close()
 	}
 }
 
@@ -429,7 +406,6 @@ func (c *CacheController) Close() {
 	c.cancel()
 	c.stopCleanup(c.cacheCleanup)
 	c.Lock()
-	c.subs = nil
 	c.Unlock()
 	c.workers.Wait()
 }

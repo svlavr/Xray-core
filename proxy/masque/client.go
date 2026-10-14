@@ -98,7 +98,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 	if xmuxConfig == nil {
 		xmuxConfig = &splithttp.XmuxConfig{}
 	}
-	c.xmux = splithttp.NewXmuxManager(xmuxConfig, c.newXmuxConn)
+	c.xmux = splithttp.NewXmuxManager(*xmuxConfig, c.newXmuxConn)
 	carrierCtx := session.ContextWithFullHandler(core.ToBackgroundDetachedContext(ctx), session.FullHandlerFromContext(ctx))
 	carrierCtx = session.ContextWithTrafficOrigin(carrierCtx, session.TrafficOriginInternal)
 	c.ctx, c.cancel = context.WithCancel(carrierCtx)
@@ -280,7 +280,11 @@ func (c *Client) removeTunnel(t *tunnel) {
 func (c *Client) establish(ctx context.Context, dialer internet.Dialer) (*tunnel, error) {
 	outbounds := session.OutboundsFromContext(ctx)
 	gateway := outbounds[len(outbounds)-1].Gateway
-	ctx, cancel := context.WithTimeout(c.carrierContext(c.server.Destination, gateway), establishTimeout)
+	carrierCtx := c.carrierContext(c.server.Destination, gateway)
+	if internet.MUSelected(ctx) {
+		carrierCtx = internet.ContextWithMUTransport(carrierCtx)
+	}
+	ctx, cancel := context.WithTimeout(carrierCtx, establishTimeout)
 	defer cancel()
 	conn, err := dialer.Dial(ctx, c.server.Destination)
 	if err != nil {

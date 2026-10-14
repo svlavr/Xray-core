@@ -11,7 +11,6 @@ import (
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/dns/fakedns"
-	appgeodata "github.com/xtls/xray-core/app/geodata"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
@@ -60,7 +59,7 @@ func TestDNSPreparationDependencyOrderRules(t *testing.T) {
 			t.Cleanup(func() { instance.Close() })
 			resolver := instance.GetFeature(fdns.ClientType()).(*DNS)
 			for name, want := range map[string]string{"specific.example": "preferred", "printer.local": "local", "ordinary.example.net": "default"} {
-				clients := resolver.runtime.current.resolver.sortClients(name)
+				clients := resolver.active.Load().sortClients(name)
 				if len(clients) == 0 || clients[0].tag != want {
 					t.Fatalf("%s selected %v, want %s", name, clients, want)
 				}
@@ -94,25 +93,6 @@ func TestDNSPreparationInvalidDeferredRule(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("deferred invalid domain rule bypassed preparation")
-	}
-}
-
-func TestDNSPreparationFailureSurvivesLaterCallback(t *testing.T) {
-	ns := preparationServer("tcp://127.0.0.1:53", "invalid")
-	ns.Domain = []*geodata.DomainRule{preparationDomain(geodata.Domain_Regex, "[")}
-	instance, err := core.New(&core.Config{App: []*serial.TypedMessage{
-		serial.ToTypedMessage(&Config{NameServer: []*NameServer{ns}}),
-		// Geodata registers a second dispatcher callback. Its successful result
-		// must not erase the DNS build failure when both become ready together.
-		serial.ToTypedMessage(&appgeodata.Config{Cron: "* * * * *", Assets: []*appgeodata.Asset{{Url: "https://example.invalid/geodata", File: "unused.dat"}}}),
-		serial.ToTypedMessage(&dispatcher.Config{}),
-		serial.ToTypedMessage(&proxyman.OutboundConfig{}),
-	}})
-	if instance != nil {
-		instance.Close()
-	}
-	if err == nil {
-		t.Fatal("later successful dependency callback masked failed DNS preparation")
 	}
 }
 
@@ -158,7 +138,7 @@ func TestDNSPreparationAllNativeKinds(t *testing.T) {
 		t.Run(tc.address, func(t *testing.T) {
 			config := &Config{NameServer: []*NameServer{preparationServer(tc.address, "prepared")}}
 			// No core in this context: a deferred RequireFeatures call would panic.
-			first, err := buildDNS(context.Background(), proto.Clone(config).(*Config), dispatcher, fake, nil)
+			first, err := dnsTestPrepare(t, proto.Clone(config).(*Config), dispatcher, fake)
 			if err != nil || first == nil || len(first.clients) != 1 {
 				t.Fatalf("build %s: %v %v", tc.address, first, err)
 			}
@@ -184,7 +164,7 @@ func TestDNSPreparationAllNativeKinds(t *testing.T) {
 				}
 			}
 			if cached, ok := server.(CachedNameserver); ok {
-				second, err := buildDNS(context.Background(), proto.Clone(config).(*Config), dispatcher, fake, nil)
+				second, err := dnsTestPrepare(t, proto.Clone(config).(*Config), dispatcher, fake)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -223,7 +203,7 @@ func TestDNSPreparationInputSnapshot(t *testing.T) {
 	if err := instance.AddFeature(new(preparationDispatcher)); err != nil {
 		t.Fatal(err)
 	}
-	clients := resolver.runtime.current.resolver.sortClients("snapshot.example.net")
+	clients := resolver.active.Load().sortClients("snapshot.example.net")
 	if len(clients) != 2 || clients[0].tag != "original" {
 		t.Fatalf("deferred preparation used caller-mutated rules: %+v", clients)
 	}
@@ -249,7 +229,7 @@ func TestDNSPreparationFailuresPublishNothing(t *testing.T) {
 			config := &Config{NameServer: []*NameServer{preparationServer("localhost", "first"), preparationServer("tcp://127.0.0.1", "second")}}
 			alter(config)
 			dispatcher := new(preparationDispatcher)
-			candidate, err := buildDNS(context.Background(), config, dispatcher, nil, nil)
+			candidate, err := dnsTestPrepare(t, config, dispatcher, nil)
 			if err == nil || candidate != nil || dispatcher.calls.Load() != 0 {
 				t.Fatalf("failed candidate escaped: %v %v calls=%d", candidate, err, dispatcher.calls.Load())
 			}
@@ -257,33 +237,8 @@ func TestDNSPreparationFailuresPublishNothing(t *testing.T) {
 	}
 }
 
-func TestDNSPreparationSynchronousHelpers(t *testing.T) {
-	instance := new(core.Instance)
-	ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
-	ns := preparationServer("tcp://127.0.0.1", "ready")
-	updated := false
-	update := func(bool) { updated = true }
-	if client, err := NewClient(ctx, ns, nil, false, false, 0, "ready", fdns.IPOption{IPv4Enable: true}, update); err == nil || client != nil || updated {
-		t.Fatalf("missing dispatcher returned partial client: %v %v", client, err)
-	}
-	if err := instance.AddFeature(new(preparationDispatcher)); err != nil {
-		t.Fatal(err)
-	}
-	if updated {
-		t.Fatal("failed synchronous constructor left a deferred callback")
-	}
-	client, err := NewClient(ctx, ns, nil, false, false, 0, "ready", fdns.IPOption{IPv4Enable: true}, update)
-	if err != nil || client == nil || !updated {
-		t.Fatalf("ready constructor: %v %v", client, err)
-	}
-	fakeDest := net.TCPDestination(net.DomainAddress("fakedns"), 0)
-	if server, err := NewServer(ctx, fakeDest, nil, false, false, 0, nil); err == nil || server != nil {
-		t.Fatalf("missing FakeDNS returned partial server: %v %v", server, err)
-	}
-}
-
 func TestDNSApplyUsesNativePerServerStrategyInheritance(t *testing.T) {
-	feature, err := New(context.Background(), &Config{})
+	feature, err := New(dnsTestContext(t), &Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +252,7 @@ func TestDNSApplyUsesNativePerServerStrategyInheritance(t *testing.T) {
 	if !result.Applied || result.Err != nil {
 		t.Fatalf("native per-server strategy inheritance: %+v", result)
 	}
-	option := feature.runtime.current.resolver.clients[0].ipOption
+	option := feature.active.Load().clients[0].ipOption
 	if option == nil || !option.IPv4Enable || option.IPv6Enable {
 		t.Fatalf("server did not inherit global IPv4 strategy: %+v", option)
 	}
@@ -318,7 +273,7 @@ func TestDNSApplyUsesOwningCoreReadyFakeDNS(t *testing.T) {
 		t.Fatalf("ready FakeDNS apply: %+v", result)
 	}
 	fake := instance.GetFeature((*fdns.FakeDNSEngine)(nil)).(fdns.FakeDNSEngine)
-	server := feature.runtime.current.resolver.clients[0].server.(*FakeDNSServer)
+	server := feature.active.Load().clients[0].server.(*FakeDNSServer)
 	if server.fakeDNSEngine != fake {
 		t.Fatal("applied resolver did not use its owning core's ready FakeDNS")
 	}
@@ -341,7 +296,7 @@ func TestDNSPreparationDeferredScriptSnapshot(t *testing.T) {
 			}
 			server := object.(*DNS)
 			defer server.Close()
-			if server.runtime != nil {
+			if server.active.Load() != nil {
 				t.Fatal("dispatcher dependency unexpectedly resolved")
 			}
 			config.Script = "missing-after-construction.lua"
@@ -357,7 +312,7 @@ func TestDNSPreparationDeferredScriptSnapshot(t *testing.T) {
 			if err := instance.AddFeature(dispatcher); err != nil {
 				t.Fatal(err)
 			}
-			if server.runtime == nil || server.runtime.current.resolver.getScript() != nil {
+			if server.active.Load() == nil || server.active.Load().script.Load() != nil {
 				t.Fatal("dependency resolution activated Lua")
 			}
 			if err := server.Start(); err != nil {

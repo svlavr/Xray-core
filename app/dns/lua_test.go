@@ -128,8 +128,8 @@ func TestLuaDNSServerQuery(t *testing.T) {
 	geodata.RegisterLua(L)
 	option := featureDNS.IPOption{IPv4Enable: true}
 	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("8.8.8.8")}
-	server := &DNS{clients: []*Client{{server: &benchmarkLuaNameServer{ips: ips}, ipOption: &option, timeoutMs: time.Second}}}
-	server.registerLua(L)
+	server := &resolver{clients: []*Client{{server: &benchmarkLuaNameServer{ips: ips}, ipOption: &option, timeoutMs: time.Second}}}
+	dnsTestFeature(t, server).active.Load().registerLua(L)
 	if err := L.DoString(`
 local server = require("xray.dns").Servers[1]
 local matcher = require("xray.geodata").BuildIPMatcher("127.0.0.0/8")
@@ -236,9 +236,10 @@ func TestLuaDNSQueryEmptyIPs(t *testing.T) {
 			client := &luaDNSClient{lookup: func(string, featureDNS.IPOption) ([]net.IP, uint32, error) {
 				return tc.ips, 0, featureDNS.ErrEmptyResponse
 			}}
-			registerLua(L, []luaDNSServer{{query: func(_ context.Context, domain string, option featureDNS.IPOption) ([]net.IP, uint32, error) {
+			query := func(_ context.Context, domain string, option featureDNS.IPOption) ([]net.IP, uint32, error) {
 				return client.LookupIP(domain, option)
-			}}}, client)
+			}
+			registerLua(L, []luaDNSServer{{query: query}}, query)
 			if err := L.DoString(`
 local dns = require("xray.dns")
 for _, query in ipairs({

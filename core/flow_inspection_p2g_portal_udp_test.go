@@ -83,7 +83,7 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 	routerFeature := instance.GetFeature(routing.RouterType()).(routing.Router)
 	if err := routerFeature.AddRule(serial.ToTypedMessage(&router.Config{Rule: []*router.RoutingRule{
 		{Domain: []*geodata.DomainRule{{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "data.invalid"}}}}, Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: "udp-data"}},
-		{Domain: []*geodata.DomainRule{{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "carrier.invalid"}}}}, Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: "portal"}},
+		{Domain: []*geodata.DomainRule{{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "portal-data.invalid"}}}}, Networks: []cnet.Network{cnet.Network_UDP}, TargetTag: &router.RoutingRule_Tag{Tag: "portal"}},
 	}}), true); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,8 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 		t.Error("unavailable Portal worker returned a UDP packet")
 	})
 	portalRay.Observation = root
-	portalDestination := cnet.UDPDestination(cnet.DomainAddress("carrier.invalid"), 443)
+	// Keep the data target distinct from the native Portal carrier domain.
+	portalDestination := cnet.UDPDestination(cnet.DomainAddress("portal-data.invalid"), 443)
 	portalPayload := "same-domain UDP child"
 	portalRay.Dispatch(context.Background(), portalDestination, buf.FromBytes([]byte(portalPayload)))
 	var liveStorage125 []fs.FlowRecord
@@ -157,8 +158,8 @@ func TestFlowInspectionP2GPortalUDPMixedDataRays(t *testing.T) {
 		}
 	}
 
-	// A packet-started association whose only ray targets the Portal domain
-	// is still logical UDP data. It must not disappear as a physical carrier.
+	// A packet-started association whose only ray selects the Portal handler
+	// for a data domain is logical UDP data and must not become a carrier.
 	onlyRoot := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider).Observation().Begin(cnet.Network_UDP, fs.TrafficOriginUser, cnet.Destination{}, cnet.Destination{}, nil)
 	onlyRay := internetudp.NewDispatcher(dispatcherFeature, func(_ context.Context, packet *protocoludp.Packet) { packet.Payload.Release() })
 	onlyRay.Observation = onlyRoot

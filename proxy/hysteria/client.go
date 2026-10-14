@@ -62,6 +62,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.Name = "hysteria"
 	ob.CanSpliceCopy = 3
 	target := ob.Target
+	selected := internet.MUSelected(ctx)
+
 	conn, err := dialer.Dial(hysteria.ContextWithDatagram(ctx, target.Network == net.Network_UDP), c.server.Destination)
 	if err != nil {
 		return errors.New("failed to find an available destination").Base(err)
@@ -71,7 +73,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	var newCtx context.Context
 	var newCancel context.CancelFunc
-	if session.TimeoutOnlyFromContext(ctx) {
+	if session.TimeoutOnlyFromContext(ctx) && !selected {
 		newCtx, newCancel = context.WithCancel(context.Background())
 	}
 
@@ -116,8 +118,9 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
 		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
-			// Interrupt this stream before graceful QUIC teardown.
-			_ = conn.SetDeadline(time.Now())
+			if selected {
+				_ = conn.SetDeadline(time.Now())
+			}
 			return errors.New("connection ends").Base(err)
 		}
 
@@ -135,8 +138,9 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
 			writer := &UDPWriter{
-				writer: conn,
-				addr:   target.NetAddr(),
+				writer:   conn,
+				addr:     target.NetAddr(),
+				selected: selected,
 			}
 
 			if err := buf.Copy(link.Reader, writer, buf.UpdateActivity(timer)); err != nil {
@@ -150,8 +154,9 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 
 			reader := &UDPReader{
-				reader: conn,
-				df:     &Defragger{},
+				reader:   conn,
+				df:       &Defragger{},
+				selected: selected,
 			}
 
 			if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {
@@ -179,24 +184,28 @@ func init() {
 }
 
 type UDPWriter struct {
-	writer  io.Writer
-	addr    string
-	buf     [buf.Size]byte
-	receipt stats.Exchange
+	writer   io.Writer
+	addr     string
+	buf      [buf.Size]byte
+	selected bool
+	receipt  stats.Exchange
 }
 
 func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
-	size := msg.Size()
-	message := w.buf[:]
-	if size > len(message) {
-		message = make([]byte, size)
-	}
-	msg.Serialize(message)
-	n, err := w.writer.Write(message[:size])
-	if err == nil && n != size {
-		return io.ErrShortWrite
-	}
+	_, err := w.sendMessage(msg)
 	return err
+}
+
+func (w *UDPWriter) sendMessage(msg *UDPMessage) (bool, error) {
+	msgN := msg.Serialize(w.buf[:])
+	if msgN < 0 {
+		if w.selected || w.receipt != nil {
+			return false, buf.ErrBufferFull
+		}
+		return false, nil
+	}
+	n, err := w.writer.Write(w.buf[:msgN])
+	return n == msgN, err
 }
 
 func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -211,14 +220,14 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (w *UDPWriter) writePacket(b *buf.Buffer) (err error) {
-	if receipt := w.receipt; receipt != nil {
-		defer func() { proxy.RecordPacketOutcome(receipt, uint64(b.Len()), err == nil) }()
+	complete := false
+	if w.receipt != nil {
+		defer func() { proxy.RecordPacketOutcome(w.receipt, uint64(b.Len()), complete) }()
 	}
 	addr := w.addr
 	if b.UDP != nil {
 		addr = b.UDP.NetAddr()
 	}
-
 	msg := &UDPMessage{
 		SessionID: 0,
 		PacketID:  0,
@@ -227,25 +236,31 @@ func (w *UDPWriter) writePacket(b *buf.Buffer) (err error) {
 		Addr:      addr,
 		Data:      b.Bytes(),
 	}
-
-	err = w.SendMessage(msg)
+	complete, err = w.sendMessage(msg)
 	var errTooLarge *quic.DatagramTooLargeError
 	if go_errors.As(err, &errTooLarge) {
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
-		fMsgs := FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
-		if len(fMsgs) == 0 {
-			return errors.New("failed to fragment UDP message").Base(err)
-		}
-		for _, fMsg := range fMsgs {
-			if err := w.SendMessage(&fMsg); err != nil {
+		maxSize := int(errTooLarge.MaxDatagramPayloadSize)
+		if w.selected || w.receipt != nil {
+			maxPayload := maxSize - msg.HeaderSize()
+			if maxPayload <= 0 || (len(msg.Data)+maxPayload-1)/maxPayload > 255 {
 				return err
 			}
 		}
-
-	} else if err != nil {
-		return err
+		fMsgs := FragUDPMessage(msg, maxSize)
+		fragmentComplete := len(fMsgs) != 0
+		for index, fMsg := range fMsgs {
+			accepted, fragmentErr := w.sendMessage(&fMsg)
+			fragmentComplete = fragmentComplete && accepted
+			if fragmentErr != nil {
+				complete = complete || (fragmentComplete && index == len(fMsgs)-1)
+				return fragmentErr
+			}
+		}
+		complete = complete || fragmentComplete
+		return nil
 	}
-	return nil
+	return err
 }
 
 func (w *UDPWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
@@ -255,6 +270,7 @@ func (w *UDPWriter) WithWriterReceipt(flow stats.Exchange) buf.Writer {
 
 type UDPReader struct {
 	reader   io.Reader
+	selected bool
 	df       *Defragger
 	firstBuf *buf.Buffer
 }
@@ -264,7 +280,7 @@ func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error)
 		var packet [1500]byte
 
 		n, readErr := r.reader.Read(packet[:])
-		if n == 0 && readErr != nil {
+		if readErr != nil && (!r.selected || n == 0) {
 			return 0, nil, readErr
 		}
 
@@ -312,7 +328,7 @@ func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.New()
 	b.Resize(0, buf.Size)
 	n, addr, err := r.ReadFrom(b.Bytes())
-	if err != nil && n == 0 {
+	if err != nil && (!r.selected || n == 0) {
 		b.Release()
 		return nil, err
 	}

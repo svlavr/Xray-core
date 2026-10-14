@@ -54,7 +54,7 @@ func TestFailedUpgradeClosesAcquiredConnection(t *testing.T) {
 			case "success":
 				c.input = strings.NewReader("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n")
 			}
-			conn, err := dialhttpUpgrade(context.Background(), net.TCPDestination(net.LocalHostIP, 443), settings)
+			conn, err := dialhttpUpgrade(internet.ContextWithMUTransport(context.Background()), net.TCPDestination(net.LocalHostIP, 443), settings)
 			if kind == "success" {
 				if err != nil || conn == nil || c.closed {
 					t.Fatalf("success ownership err=%v closed=%v", err, c.closed)

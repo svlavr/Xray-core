@@ -121,6 +121,7 @@ func (c *inspectionClosePacketConn) Close() error { c.calls.Add(1); return nil }
 func TestSOCKSTempUDPConnCloseIsIdempotent(t *testing.T) {
 	tcp, udp := &inspectionCloseConn{}, &inspectionClosePacketConn{}
 	conn := NewTempUDPConn(udp, tcp, &net.UDPAddr{})
+	conn.observed = true
 	conn.SetTimeout(time.Hour)
 	var group sync.WaitGroup
 	for range 16 {
@@ -142,6 +143,7 @@ func TestSOCKSTempUDPConnTimeoutInitialization(t *testing.T) {
 			for range 16 {
 				tcp, udp := &inspectionCloseConn{}, &inspectionClosePacketConn{}
 				conn := NewTempUDPConn(udp, tcp, &net.UDPAddr{})
+				conn.observed = true
 				conn.SetTimeout(timeout)
 				deadline := time.Now().Add(time.Second)
 				for udp.calls.Load() == 0 && time.Now().Before(deadline) {

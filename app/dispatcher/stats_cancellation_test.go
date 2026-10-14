@@ -1,7 +1,7 @@
 package dispatcher_test
 
 import (
-	"context"
+	"io"
 	"testing"
 
 	"github.com/xtls/xray-core/app/dispatcher"
@@ -14,13 +14,13 @@ func TestStatsWriterForwardsCancellation(t *testing.T) {
 	defer r.Interrupt()
 	var counter TestCounter
 	writer := &dispatcher.SizeStatWriter{Writer: w, Counter: &counter}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err := writer.WriteMultiBufferContext(ctx, buf.MultiBuffer{buf.FromBytes([]byte("offered"))})
-	if err != context.Canceled || counter.Value() != 7 {
+	stop := make(chan struct{})
+	close(stop)
+	err := writer.WriteMultiBufferStop(buf.MultiBuffer{buf.FromBytes([]byte("offered"))}, stop)
+	if err != io.EOF || counter.Value() != 7 {
 		t.Fatalf("canceled native offer: %v %d", err, counter.Value())
 	}
-	if err := writer.WriteMultiBufferContext(context.Background(), buf.MultiBuffer{buf.FromBytes([]byte("next"))}); err != nil {
+	if err := writer.WriteMultiBufferStop(buf.MultiBuffer{buf.FromBytes([]byte("next"))}, nil); err != nil {
 		t.Fatal(err)
 	}
 	mb, err := r.ReadMultiBuffer()

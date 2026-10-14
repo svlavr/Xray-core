@@ -2,64 +2,54 @@ package inbound
 
 import (
 	"context"
-	"sync"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/net"
 )
 
-func TestUDPWorkerConnectionCancellationAndExpectedRemoval(t *testing.T) {
-	worker := &udpWorker{
-		ctx:        context.Background(),
-		address:    net.LocalHostIP,
-		activeConn: make(map[connID]*udpConn),
-	}
+func TestUDPWorkerNativeCloseAndExpectedRemoval(t *testing.T) {
+	w := &udpWorker{ctx: context.Background(), address: net.LocalHostIP, activeConn: make(map[connID]*udpConn)}
 	id := connID{src: net.UDPDestination(net.LocalHostIP, 31001)}
-	first, existing := worker.getConnection(id)
-	if existing || first.cancel == nil {
-		t.Fatal("new association did not publish cancellation before use")
+	first, existing := w.getConnection(id)
+	if existing || first.done.Done() {
+		t.Fatal("new native association missing")
 	}
-	select {
-	case <-first.ctx.Done():
-		t.Fatal("new association context started canceled")
-	default:
-	}
+	ctx, cancel := context.WithCancel(w.ctx)
+	// The native callback publishes cancel immediately before Process.
+	first.cancel = cancel
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-first.ctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("association close did not cancel its published context")
+	if ctx.Err() != context.Canceled || !first.done.Done() {
+		t.Fatal("native close failed to stop its association")
 	}
-
-	replacement, existing := worker.getConnection(id)
+	replacement, existing := w.getConnection(id)
 	if existing || replacement == first {
 		t.Fatal("closed association was reused")
 	}
-	worker.removeConn(id, first)
-	if worker.activeConn[id] != replacement {
-		t.Fatal("stale removal deleted the replacement association")
+	t.Cleanup(func() { replacement.Close() })
+	w.removeConn(id, first)
+	if w.activeConn[id] != replacement {
+		t.Fatal("stale removal deleted replacement")
 	}
-
 	atomic.StoreInt64(&replacement.lastActivityTime, time.Now().Add(-3*time.Minute).Unix())
-	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() { defer wg.Done(); replacement.Close() }()
-	go func() { defer wg.Done(); worker.removeConn(id, first) }()
-	go func() { defer wg.Done(); _ = worker.clean() }()
-	wg.Wait()
-	worker.RLock()
-	remaining := len(worker.activeConn)
-	worker.RUnlock()
-	if remaining != 0 {
-		t.Fatalf("expired association remained after concurrent close/clean/removal: %d", remaining)
+	if err := w.clean(); err != nil {
+		t.Fatal(err)
 	}
-	select {
-	case <-replacement.ctx.Done():
-	default:
-		t.Fatal("replacement context remained active after cleanup")
+	if len(w.activeConn) != 0 || !replacement.done.Done() {
+		t.Fatal("native inactive cleanup left association")
+	}
+}
+
+func TestUDPWorkerNativeScalarResult(t *testing.T) {
+	native := errors.New("write failed after accepting bytes")
+	counter := new(appstats.Counter)
+	c := &udpConn{downlink: counter, output: func([]byte) (int, error) { return 2, native }}
+	if n, err := c.Write([]byte("response")); n != 2 || !errors.Is(err, native) || counter.Value() != 2 {
+		t.Fatalf("actual native scalar result: n=%d err=%v count=%d", n, err, counter.Value())
 	}
 }

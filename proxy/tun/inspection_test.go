@@ -39,7 +39,15 @@ func TestInspectionUDPStaleClosePreservesReplacement(t *testing.T) {
 func TestInspectionUDPScalarWritePreservesError(t *testing.T) {
 	want := io.ErrUnexpectedEOF
 	u := newUdpConnectionHandler(nil, func([]byte, net.Destination, net.Destination) error { return want })
-	c := &udpConn{handler: u}
+	manager := new(appstats.Manager)
+	_, err := manager.EnableInspection(fs.ObservationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, net.Destination{}, net.Destination{}, nil)
+	defer flow.Finish()
+	c := &udpConn{handler: u, receipt: flow}
 	n, err := c.Write([]byte("payload"))
 	if n != 0 || !errors.Is(err, want) {
 		t.Fatalf("native result hidden: %d %v", n, err)

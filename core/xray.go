@@ -2,10 +2,8 @@ package core
 
 import (
 	"context"
-	go_errors "errors"
 	"reflect"
 	"sync"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -86,7 +84,7 @@ type Instance struct {
 	features                   []features.Feature
 	pendingResolutions         []resolution
 	pendingOptionalResolutions []resolution
-	running                    atomic.Bool
+	running                    bool
 	resolveLock                sync.Mutex
 
 	ctx context.Context
@@ -94,7 +92,9 @@ type Instance struct {
 
 // Instance state
 func (server *Instance) IsRunning() bool {
-	return server.running.Load()
+	server.statusLock.Lock()
+	defer server.statusLock.Unlock()
+	return server.running
 }
 
 func AddInboundHandler(server *Instance, config *InboundHandlerConfig) error {
@@ -264,7 +264,7 @@ func (s *Instance) Close() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
-	s.running.Store(false)
+	s.running = false
 
 	var errs []interface{}
 	for _, f := range s.features {
@@ -370,13 +370,11 @@ func (s *Instance) AddFeature(feature features.Feature) error {
 	s.pendingOptionalResolutions = pendingOptional
 	s.resolveLock.Unlock()
 
-	var errs []error
+	var err error
 	for _, r := range availableResolution {
-		if err := r.callbackResolution(s.features); err != nil {
-			errs = append(errs, err)
-		}
+		err = r.callbackResolution(s.features) // only return the last error for now
 	}
-	return go_errors.Join(errs...)
+	return err
 }
 
 // GetFeature returns a feature of the given type, or nil if such feature is not registered.
@@ -392,7 +390,7 @@ func (s *Instance) Start() error {
 	s.statusLock.Lock()
 	defer s.statusLock.Unlock()
 
-	s.running.Store(true)
+	s.running = true
 	for _, f := range s.features {
 		if err := f.Start(); err != nil {
 			return err

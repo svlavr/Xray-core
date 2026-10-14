@@ -548,10 +548,6 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	}
 	ob.Tag = handler.Tag()
 	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
-		// Publication may be asynchronous. A recursive route must not mutate
-		// the message already being formatted for an earlier selection.
-		accessCopy := *accessMessage
-		accessMessage = &accessCopy
 		if tag := handler.Tag(); tag != "" {
 			if inTag == "" {
 				accessMessage.Detour = tag

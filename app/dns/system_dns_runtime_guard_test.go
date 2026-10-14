@@ -6,7 +6,7 @@ import (
 )
 
 func TestSystemDNSGuardFollowsPublishedResolver(t *testing.T) {
-	feature, err := New(context.Background(), &Config{})
+	feature, err := New(dnsTestContext(t), &Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestSystemDNSGuardFollowsPublishedResolver(t *testing.T) {
 }
 
 func TestSystemDNSGuardRejectsClosingAndClosedResolver(t *testing.T) {
-	feature, err := New(context.Background(), &Config{})
+	feature, err := New(dnsTestContext(t), &Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,15 +53,15 @@ func TestSystemDNSGuardRejectsClosingAndClosedResolver(t *testing.T) {
 	if result := ApplyConfig(context.Background(), feature, remote); !result.Applied || result.Err != nil {
 		t.Fatalf("remote apply: %+v", result)
 	}
-	feature.runtime.mu.Lock()
-	feature.runtime.closing = newResolverOwner(&DNS{clients: []*Client{{server: NewLocalNameServer()}}})
-	feature.runtime.mu.Unlock()
+	feature.mu.Lock()
+	feature.pending = dnsTestResolver(feature, &resolver{clients: []*Client{{server: NewLocalNameServer()}}})
+	feature.mu.Unlock()
 	if _, err := feature.AcquireSystemDNS(); err == nil {
 		t.Fatal("takeover accepted an unfinished local resolver")
 	}
-	feature.runtime.mu.Lock()
-	feature.runtime.closing = nil
-	feature.runtime.mu.Unlock()
+	feature.mu.Lock()
+	feature.pending = nil
+	feature.mu.Unlock()
 	if err := feature.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestSystemDNSGuardRejectsClosingAndClosedResolver(t *testing.T) {
 func TestSystemDNSGuardLocalHostnameBootstrap(t *testing.T) {
 	for _, scheme := range []string{"tcp+local", "https+local", "h2c+local", "quic+local"} {
 		t.Run(scheme, func(t *testing.T) {
-			feature, err := New(context.Background(), &Config{})
+			feature, err := New(dnsTestContext(t), &Config{})
 			if err != nil {
 				t.Fatal(err)
 			}

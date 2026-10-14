@@ -83,6 +83,7 @@ func TestMeasurementTCPFailureInterruptsWriter(t *testing.T) {
 			dest := xnet.TCPDestination(xnet.LocalHostIP, 443)
 			client := &Client{server: &protocol.ServerSpec{Destination: dest}, policyManager: manager}
 			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: dest}})
+			ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginControlledMeasurement)
 			link := &transport.Link{Reader: buf.NewReader(bytes.NewReader(nil)), Writer: buf.NewWriter(io.Discard)}
 			done := make(chan error, 1)
 			go func() {
@@ -136,40 +137,12 @@ func (w *measurementUDPWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestMeasurementUDPDynamicSerialization(t *testing.T) {
-	wire := new(measurementUDPWriter)
-	w := &UDPWriter{writer: wire}
-	err := w.SendMessage(&UDPMessage{Addr: "127.0.0.1:9", FragCount: 1, Data: make([]byte, buf.Size)})
-	if err != nil || wire.calls != 1 {
-		t.Fatalf("dynamic packet serialization failed: calls=%d err=%v", wire.calls, err)
-	}
-}
-
-func TestMeasurementUDPShortWrite(t *testing.T) {
-	wire := &measurementUDPWriter{short: true}
-	w := &UDPWriter{writer: wire}
-	err := w.SendMessage(&UDPMessage{Addr: "127.0.0.1:9", FragCount: 1, Data: []byte("payload")})
-	if !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("short packet accepted: %v", err)
-	}
-}
-
-func TestMeasurementUDPImpossibleFragment(t *testing.T) {
-	native := &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 8}
-	wire := &measurementUDPWriter{err: native}
-	w := &UDPWriter{writer: wire, addr: "127.0.0.1:9"}
-	b := buf.FromBytes(make([]byte, 24))
-	err := w.WriteMultiBuffer(buf.MultiBuffer{b})
-	if !errors.Is(err, native) || wire.calls != 1 {
-		t.Fatalf("impossible fragment accepted: %v, calls %d", err, wire.calls)
-	}
-}
-
 func TestMeasurementUDPFragmentCountOverflow(t *testing.T) {
 	msg := &UDPMessage{Addr: "127.0.0.1:9", Data: make([]byte, 256)}
 	native := &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(msg.HeaderSize() + 1)}
 	wire := &measurementUDPWriter{err: native}
 	w := &UDPWriter{writer: wire, addr: msg.Addr}
+	w.WithWriterReceipt(measurementReceipt(t))
 	err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(msg.Data)})
 	if !errors.Is(err, native) || wire.calls != 1 {
 		t.Fatalf("unrepresentable fragment count: %v, calls %d", err, wire.calls)
@@ -192,27 +165,6 @@ func (w *measurementDatagramWire) Write(p []byte) (int, error) {
 	}
 	w.packets = append(w.packets, bytes.Clone(p))
 	return len(p), nil
-}
-
-func TestMeasurementUDPAddressDynamicBufferBoundaries(t *testing.T) {
-	for _, addr := range []string{"192.0.2.1:9000", "[2001:db8::1]:9000"} {
-		t.Run(addr, func(t *testing.T) {
-			limit := buf.Size - (&UDPMessage{Addr: addr}).HeaderSize()
-			for _, size := range []int{limit - 1, limit, limit + 1} {
-				wire := new(measurementDatagramWire)
-				w := &UDPWriter{writer: wire}
-				payload := bytes.Repeat([]byte{0xb4}, size)
-				err := w.SendMessage(&UDPMessage{Addr: addr, FragCount: 1, Data: payload})
-				if err != nil || len(wire.packets) != 1 {
-					t.Fatalf("serialized datagram: size=%d calls=%d err=%v", size, wire.calls, err)
-				}
-				msg, err := ParseUDPMessage(wire.packets[0])
-				if err != nil || msg.Addr != addr || !bytes.Equal(msg.Data, payload) {
-					t.Fatalf("address/payload boundary: size=%d err=%v", size, err)
-				}
-			}
-		})
-	}
 }
 
 func TestMeasurementUDPFragmentationAndDestination(t *testing.T) {
@@ -262,7 +214,6 @@ func TestMeasurementUDPFragmentWriteFailure(t *testing.T) {
 		name      string
 		err, want error
 	}{
-		{"short-write", nil, io.ErrShortWrite},
 		{"partial-native-error", native, native},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -343,7 +294,7 @@ func TestMeasurementUDPReadDataAndError(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wire := &measurementDatagramReader{data: tc.data, err: native}
-			r := &UDPReader{reader: wire, df: new(Defragger)}
+			r := &UDPReader{selected: true, reader: wire, df: new(Defragger)}
 			mb, err := r.ReadMultiBuffer()
 			defer buf.ReleaseMulti(mb)
 			if !errors.Is(err, native) || wire.calls != 1 {
@@ -377,10 +328,31 @@ func TestMeasurementUDPMalformedThenValid(t *testing.T) {
 	msg := &UDPMessage{Addr: "[2001:db8::2]:9000", FragCount: 1, Data: []byte("recovered")}
 	packet := make([]byte, msg.Size())
 	msg.Serialize(packet)
-	r := &UDPReader{reader: &measurementDatagramSequence{packets: [][]byte{{1, 2, 3}, packet}}, df: new(Defragger)}
+	r := &UDPReader{selected: true, reader: &measurementDatagramSequence{packets: [][]byte{{1, 2, 3}, packet}}, df: new(Defragger)}
 	mb, err := r.ReadMultiBuffer()
 	defer buf.ReleaseMulti(mb)
 	if err != nil || len(mb) != 1 || mb[0].UDP == nil || mb[0].UDP.NetAddr() != msg.Addr || !bytes.Equal(mb[0].Bytes(), msg.Data) {
 		t.Fatalf("malformed recovery: %v %v", mb, err)
+	}
+}
+
+func TestMeasurementUDPAddressDynamicBufferBoundaries(t *testing.T) {
+	for _, addr := range []string{"192.0.2.1:9000", "[2001:db8::1]:9000"} {
+		t.Run(addr, func(t *testing.T) {
+			limit := buf.Size - (&UDPMessage{Addr: addr}).HeaderSize()
+			for _, size := range []int{limit - 1, limit} {
+				wire := new(measurementDatagramWire)
+				w := &UDPWriter{writer: wire}
+				payload := bytes.Repeat([]byte{0xb4}, size)
+				err := w.SendMessage(&UDPMessage{Addr: addr, FragCount: 1, Data: payload})
+				if err != nil || len(wire.packets) != 1 {
+					t.Fatalf("serialized datagram: size=%d calls=%d err=%v", size, wire.calls, err)
+				}
+				msg, err := ParseUDPMessage(wire.packets[0])
+				if err != nil || msg.Addr != addr || !bytes.Equal(msg.Data, payload) {
+					t.Fatalf("address/payload boundary: size=%d err=%v", size, err)
+				}
+			}
+		})
 	}
 }

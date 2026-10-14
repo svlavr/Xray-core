@@ -70,7 +70,7 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 	tConfig := tls.ConfigFromStreamSettings(streamSettings)
 	if tConfig != nil {
 		protocol = "wss"
-		tlsConfig := tConfig.GetTLSConfig(tls.WithClient(), tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
+		tlsConfig := tConfig.GetTLSConfig(tls.WithDestination(dest), tls.WithNextProto("http/1.1"))
 		dialer.TLSClientConfig = tlsConfig
 		if fingerprint := tls.GetFingerprint(tConfig.Fingerprint); fingerprint != nil {
 			dialer.NetDialTLSContext = func(_ context.Context, _, addr string) (net.Conn, error) {
@@ -122,7 +122,9 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 			return nil, err
 		}
 
-		return NewConnection(conn, conn.RemoteAddr(), nil, wsSettings.HeartbeatPeriod), nil
+		result := NewConnection(conn, conn.RemoteAddr(), nil, wsSettings.HeartbeatPeriod)
+		result.selected = internet.MUSelected(ctx)
+		return result, nil
 	}
 
 	host := dest.Address.String()
@@ -154,7 +156,9 @@ func dialWebSocket(ctx context.Context, dest net.Destination, streamSettings *in
 		return nil, errors.New("failed to dial to (", uri, "): ", reason).Base(err)
 	}
 
-	return NewConnection(conn, conn.RemoteAddr(), nil, wsSettings.HeartbeatPeriod), nil
+	result := NewConnection(conn, conn.RemoteAddr(), nil, wsSettings.HeartbeatPeriod)
+	result.selected = internet.MUSelected(ctx)
+	return result, nil
 }
 
 type delayDialConn struct {

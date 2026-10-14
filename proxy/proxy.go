@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"runtime"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -103,7 +102,6 @@ type GetOutbound interface {
 // TrafficState is used to track uplink and downlink of one connection
 // It is used by XTLS to determine if switch to raw copy mode, It is used by Vision to calculate padding
 type TrafficState struct {
-	mu                     sync.Mutex // classifier/transform state; never held across socket I/O
 	UserUUID               []byte
 	NumberOfPacketToFilter int
 	EnableXtls             bool
@@ -207,8 +205,6 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if buffer.IsEmpty() {
 		return buffer, err
 	}
-	w.trafficState.mu.Lock()
-	defer w.trafficState.mu.Unlock()
 
 	var withinPaddingBuffers *bool
 	var remainingContent *int32
@@ -330,7 +326,6 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if w.receipt != nil {
 		payload = uint64(mb.Len())
 	}
-	w.trafficState.mu.Lock()
 	var isPadding *bool
 	var switchToDirectCopy *bool
 	var spliceReadyInbound *session.Inbound
@@ -409,7 +404,6 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 	}
-	w.trafficState.mu.Unlock()
 	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
 		return err
 	}

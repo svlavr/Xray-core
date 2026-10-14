@@ -457,41 +457,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	return nil
 }
 
-type fixedPacketWriter struct {
-	writer           buf.Writer
-	target, override net.Destination
-}
-
-func (w *fixedPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	for len(mb) > 0 {
-		rest, b := buf.SplitFirst(mb)
-		mb = rest
-		if b == nil {
-			continue
-		}
-		target := w.target
-		if b.UDP != nil {
-			target = *b.UDP
-		}
-		if w.override.Address != nil {
-			target.Address = w.override.Address
-		}
-		if w.override.Port != 0 {
-			target.Port = w.override.Port
-		}
-		if target != w.target {
-			b.Release()
-			buf.ReleaseMulti(mb)
-			return errors.New("dialerProxy UDP link cannot change destination")
-		}
-		if err := w.writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
-			buf.ReleaseMulti(mb)
-			return err
-		}
-	}
-	return nil
-}
-
 func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverride net.Destination, DialDest net.Destination) buf.Reader {
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
@@ -502,7 +467,7 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 	if statConn != nil {
 		counter = statConn.ReadCounter
 	}
-	if c, ok := iConn.(*net.PacketConnWrapper); ok && !h.usesDialerProxy {
+	if c, ok := iConn.(*net.PacketConnWrapper); ok {
 		isOverridden := false
 		if UDPOverride.Address != nil || UDPOverride.Port != 0 {
 			isOverridden = true
@@ -577,7 +542,7 @@ func NewPacketWriter(ctx context.Context, conn net.Conn, h *Handler, defaultRule
 	if statConn != nil {
 		counter = statConn.WriteCounter
 	}
-	if c, ok := iConn.(*net.PacketConnWrapper); ok && !h.usesDialerProxy {
+	if c, ok := iConn.(*net.PacketConnWrapper); ok {
 		// If DialDest is a domain, it will be resolved in dialer
 		// check this behavior and add it to map
 		resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
@@ -594,9 +559,6 @@ func NewPacketWriter(ctx context.Context, conn net.Conn, h *Handler, defaultRule
 			ResolvedUDPAddr:   resolvedUDPAddr,
 			OutGateway:        outGateway,
 		}
-	}
-	if h.usesDialerProxy {
-		return &fixedPacketWriter{writer: &buf.SequentialWriter{Writer: conn}, target: DialDest, override: UDPOverride}
 	}
 	return &buf.SequentialWriter{Writer: conn}
 }

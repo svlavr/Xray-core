@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -98,7 +99,7 @@ func TestUDPDispatcherDeliversPacketsBeforeReadError(t *testing.T) {
 			dest := net.UDPDestination(net.LocalHostIP, 53)
 			other := net.UDPDestination(net.LocalHostIP, 5353)
 			second.UDP = &other
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(internet.ContextWithMUTransport(context.Background()))
 			defer cancel()
 			entry := &connEntry{
 				link: &transport.Link{Reader: &lifecycleResultReader{

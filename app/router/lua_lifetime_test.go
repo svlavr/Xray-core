@@ -10,8 +10,12 @@ import (
 	"time"
 
 	mdns "github.com/miekg/dns"
+	"github.com/xtls/xray-core/app/dispatcher"
 	appdns "github.com/xtls/xray-core/app/dns"
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
 )
@@ -48,7 +52,7 @@ func m3RouterConfig(address string, ids ...string) *appdns.Config {
 func TestM3RouterSavedLuaInventoryAndStateAcrossReplacement(t *testing.T) {
 	first := m3RouterTCP(t, "192.0.2.61")
 	second := m3RouterTCP(t, "192.0.2.62")
-	client, err := appdns.New(context.Background(), &appdns.Config{})
+	client, err := appdns.New(m3RouterReadyDNSContext(t), &appdns.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +188,7 @@ func TestM3RouterGrowingFactoryRetirementDoesNotReplayOnNewOwner(t *testing.T) {
 	go func() { served <- server.ActivateAndServe() }()
 	<-ready
 	t.Cleanup(func() { unblock(); server.Shutdown(); <-served })
-	client, err := appdns.New(context.Background(), &appdns.Config{})
+	client, err := appdns.New(m3RouterReadyDNSContext(t), &appdns.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,4 +246,18 @@ end`, client, nil)
 		t.Fatalf("old owner factory rerun after retirement: %d", initialized.Load())
 	}
 	unblock()
+}
+
+// Manual DNS features still use the native ready dependency pipeline.
+func m3RouterReadyDNSContext(t *testing.T) context.Context {
+	t.Helper()
+	instance, err := core.New(&core.Config{App: []*serial.TypedMessage{
+		serial.ToTypedMessage(&dispatcher.Config{}),
+		serial.ToTypedMessage(&proxyman.OutboundConfig{}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.Close() })
+	return context.WithValue(context.Background(), core.XrayKey(1), instance)
 }

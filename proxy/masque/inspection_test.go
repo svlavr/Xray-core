@@ -203,7 +203,7 @@ func TestInspectionMasqueStopVirtualAssociation(t *testing.T) {
 	}
 	shared := &tunnel{dev: dev, tnet: tnet, done: make(chan struct{}), onClose: client.removeTunnel}
 	client.tunnels[shared] = struct{}{}
-	client.xmux = splithttp.NewXmuxManager(nil, func() splithttp.XmuxConn { return shared })
+	client.xmux = splithttp.NewXmuxManager(splithttp.XmuxConfig{}, func() splithttp.XmuxConn { return shared })
 	manager := new(appstats.Manager)
 	view, err := manager.EnableInspection(fs.ObservationOptions{})
 	if err != nil {
@@ -314,7 +314,7 @@ func TestInspectionMasqueCanceledAdmissionReleasesXmux(t *testing.T) {
 			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: target}})
 			shared := &tunnel{done: make(chan struct{}), onClose: client.removeTunnel}
 			client.tunnels[shared] = struct{}{}
-			client.xmux = splithttp.NewXmuxManager(nil, func() splithttp.XmuxConn {
+			client.xmux = splithttp.NewXmuxManager(splithttp.XmuxConfig{}, func() splithttp.XmuxConn {
 				cancel()
 				return shared
 			})

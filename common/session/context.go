@@ -46,7 +46,10 @@ const (
 
 // ContextWithTrafficOrigin records the explicit origin of routed traffic.
 func ContextWithTrafficOrigin(ctx context.Context, origin TrafficOrigin) context.Context {
-	return context.WithValue(ctx, trafficOriginKey, normalizeTrafficOrigin(origin))
+	if origin < TrafficOriginUser || origin > TrafficOriginControlledMeasurement {
+		origin = TrafficOriginUnknown
+	}
+	return context.WithValue(ctx, trafficOriginKey, origin)
 }
 
 // TrafficOriginFromContext returns the explicit origin, or Unknown when none
@@ -54,15 +57,6 @@ func ContextWithTrafficOrigin(ctx context.Context, origin TrafficOrigin) context
 func TrafficOriginFromContext(ctx context.Context) TrafficOrigin {
 	origin, _ := ctx.Value(trafficOriginKey).(TrafficOrigin)
 	return origin
-}
-
-func normalizeTrafficOrigin(origin TrafficOrigin) TrafficOrigin {
-	switch origin {
-	case TrafficOriginUser, TrafficOriginInternal, TrafficOriginControlledMeasurement:
-		return origin
-	default:
-		return TrafficOriginUnknown
-	}
 }
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -238,9 +232,7 @@ func StreamSettingsFromContext(ctx context.Context) any {
 	return ctx.Value(streamSettingsKey)
 }
 
-type (
-	logicalObservationKey struct{}
-)
+type logicalObservationKey struct{}
 
 // LogicalObservation is the endpoint owner's receipt binding.
 type LogicalObservation struct {

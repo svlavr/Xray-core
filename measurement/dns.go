@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 )
 
@@ -60,7 +59,10 @@ type DNSRequest struct {
 // Message follows complete framing and matching ID/available-question checks.
 // Stream transports permit an omitted question; UDP still requires an echo.
 // RCODE and TC/AD are observed facts; no fallback, health or DNSSEC verdict exists.
-// WrittenBytes is logical DNS payload writer acceptance, excluding TCP framing.
+// WrittenBytes is the cumulative DNS payload count reported by Write, excluding
+// TCP/DoT framing. Nil means no count was collected, including for DoH.
+// Some adapters report the supplied length even with an error; this count does
+// not establish independently observed downstream acceptance or delivery.
 type DNSReceipt struct {
 	QueryID          uint16
 	Wire             []byte
@@ -90,8 +92,6 @@ func validateDNS(request DNSRequest) error {
 	return nil
 }
 
-// DNSQuery performs one wire exchange. It never calls the ordinary DNS client,
-// modifies a resolver/cache, follows a redirect, retries, or falls back to TCP.
 func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DNSReceipt, resultErr error) {
 	if ctx == nil {
 		return receipt, errors.New("nil request context")
@@ -119,8 +119,6 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 	if err != nil {
 		return receipt, err
 	}
-	// Compare the expected question in its actual wire representation. DNS
-	// presentation escapes may have several spellings for the same label.
 	if err := query.Unpack(wire); err != nil {
 		return receipt, err
 	}
@@ -129,11 +127,10 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 		dest.Network = xnet.Network_UDP
 	}
 	if request.Transport == DNSDoH {
-		options := &httpExchangeOptions{destination: dest, body: bytes.NewReader(wire), headers: http.Header{"Accept": {"application/dns-message"}, "Content-Type": {"application/dns-message"}}}
+		plan := httpPlan{method: http.MethodPost, secure: true, destination: &dest, body: bytes.NewReader(wire), headers: http.Header{"Accept": {"application/dns-message"}, "Content-Type": {"application/dns-message"}}}
 		https := HTTPSRequest{Route: request.Route, URL: "https://" + net.JoinHostPort(request.ServerName, strconv.Itoa(int(request.Resolver.Port()))) + request.DoHPath, Timeout: request.Timeout, MaxBodyBytes: int64(request.MaxResponseBytes), MaxHeaderBytes: request.MaxHeaderBytes, RootCAs: request.RootCAs}
-		// The POST body has a finite known length. No upload acknowledgment is inferred.
-		r, err := e.exchangeHTTP(ctx, https, http.MethodPost, nil, options, func(ctx context.Context, response *http.Response, r *HTTPSReceipt) error {
-			readErr := readHTTPSBody(response, r, https.MaxBodyBytes)
+		plan.consume = func(ctx *operation, response *http.Response, r *HTTPSReceipt) error {
+			readErr := readHTTPSBody(ctx, response, r, https.MaxBodyBytes)
 			media, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
 			if response.StatusCode < 200 || response.StatusCode >= 300 || mediaErr != nil || media != "application/dns-message" {
 				return errors.Join(readErr, ErrDNSResponse)
@@ -144,36 +141,28 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 			var err error
 			receipt.Message, err = parseDNSResponse(ctx, r.Body, query, request.Transport)
 			return err
-		})
+		}
+		r, err := e.http(ctx, https, plan)
 		receipt.Wire, receipt.ResponseComplete = r.Body, r.BodyComplete
 		receipt.Elapsed, receipt.EndpointTLS = r.Elapsed, r.EndpointTLS
 		receipt.OutboundError = r.OutboundError
 		receipt.HTTPStatus, receipt.HTTPContentType = r.StatusCode, r.Header.Get("Content-Type")
-		// net/http does not expose an independent POST payload writer count here.
 		return receipt, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, request.Timeout)
-	defer cancel()
-	if err := e.acquire(ctx); err != nil {
+	o, err := e.begin(ctx, request.Timeout)
+	if err != nil {
 		return receipt, err
 	}
-	defer func() { <-e.slots }()
-	started := time.Now()
-	o := new(operation)
-	ctx = measurementContext(ctx, o)
+	defer o.end()
+	ctx = o
 	defer func() {
-		receipt.Elapsed = time.Since(started)
-		o.mu.Lock()
-		receipt.OutboundError = o.nativeError
-		o.mu.Unlock()
+		receipt.Elapsed, receipt.OutboundError = time.Since(o.started), o.outboundError()
 	}()
 	rawConn, err := e.open(ctx, request.Route, dest)
 	if err != nil {
 		return receipt, err
 	}
-	stopClose := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
-	defer stopClose()
-	defer rawConn.Close()
+	defer closeOnCancel(ctx, rawConn)()
 	conn := rawConn
 	if request.Transport == DNSDoT {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: request.ServerName, MinVersion: tls.VersionTLS12, RootCAs: request.RootCAs})
@@ -193,8 +182,6 @@ func (e *Executor) DNSQuery(ctx context.Context, request DNSRequest) (receipt DN
 	return receipt, resultErr
 }
 
-// exchangeDNSWire writes raw facts directly into the operation's receipt,
-// retaining positive partial writes and response bytes even with native errors.
 func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DNSReceipt) error {
 	payloadWritten := 0
 	receipt.WrittenBytes = &payloadWritten
@@ -207,39 +194,19 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 		if n != len(wire) {
 			return io.ErrShortWrite
 		}
-		var packet []byte
-		var readErr error
-		var sourceErr error
-		if pc, ok := conn.(net.PacketConn); ok {
-			packet = make([]byte, 65536)
-			n, addr, err := pc.ReadFrom(packet)
-			packet = packet[:n]
-			readErr = err
-			source, ok := addr.(*net.UDPAddr)
-			if !ok || netip.AddrPortFrom(source.AddrPort().Addr().Unmap(), source.AddrPort().Port()) != request.Resolver {
-				sourceErr = ErrDNSResponse
+		_, nativeErr, visitErr := readPacketBatch(conn, make([]byte, 65536), func(packet []byte, source netip.AddrPort) error {
+			receipt.Wire = append([]byte(nil), packet[:min(len(packet), request.MaxResponseBytes)]...)
+			var issue error
+			if len(packet) > request.MaxResponseBytes {
+				issue = ErrDNSLimit
 			}
-		} else if reader, ok := conn.(buf.Reader); ok {
-			mb, err := reader.ReadMultiBuffer()
-			readErr = err
-			defer buf.ReleaseMulti(mb)
-			if len(mb) > 0 {
-				b := mb[0]
-				packet = b.Bytes()
-				if b.UDP == nil || b.UDP.Address.String() != request.Resolver.Addr().String() || uint16(b.UDP.Port) != request.Resolver.Port() {
-					sourceErr = ErrDNSResponse
-				}
+			if source != request.Resolver {
+				issue = errors.Join(issue, ErrDNSResponse)
 			}
-		} else {
-			return ErrUnsupported
-		}
-		receipt.Wire = append([]byte(nil), packet[:min(len(packet), request.MaxResponseBytes)]...)
-		if len(packet) > request.MaxResponseBytes {
-			readErr = errors.Join(readErr, ErrDNSLimit)
-		} else {
-			receipt.ResponseComplete = readErr == nil
-		}
-		return errors.Join(readErr, sourceErr)
+			return issue
+		}, true)
+		receipt.ResponseComplete = nativeErr == nil && !errors.Is(visitErr, ErrDNSLimit)
+		return errors.Join(nativeErr, visitErr)
 	}
 	frame := make([]byte, len(wire)+2)
 	binary.BigEndian.PutUint16(frame, uint16(len(wire)))
@@ -272,8 +239,6 @@ func exchangeDNSWire(conn net.Conn, wire []byte, request DNSRequest, receipt *DN
 }
 
 func parseDNSResponse(ctx context.Context, wire []byte, query *dns.Msg, transport DNSTransport) (response *dns.Msg, resultErr error) {
-	// Linearize completion before our caller's deferred cancellation. A result
-	// queued by the wire worker must not hide cancellation at final handoff.
 	defer func() { resultErr = errors.Join(resultErr, ctx.Err()) }()
 	if len(wire) > dns.MaxMsgSize {
 		return nil, errors.Join(ErrDNSResponse, ErrDNSLimit)

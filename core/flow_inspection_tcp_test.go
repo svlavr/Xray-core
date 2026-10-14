@@ -209,7 +209,15 @@ func TestFlowInspectionTCPAdmissionsDisabled(t *testing.T) {
 			instance, _, address := inspectionTCPInbound(t, kind, destination, false, false)
 			provider := instance.GetFeature(fs.ManagerType()).(fs.ObservationProvider)
 			payload := bytes.Repeat([]byte("collection off"), 1024)
-			conn := inspectionTCPClient(t, kind, address, destination, payload)
+			var conn net.Conn
+			if kind == "socks-http-connect" {
+				conn = inspectionTCPClient(t, kind, address, destination, nil)
+				if _, err := conn.Write(payload); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				conn = inspectionTCPClient(t, kind, address, destination, payload)
+			}
 			response := make([]byte, len(payload))
 			if n, err := io.ReadFull(conn, response); err != nil {
 				t.Fatalf("disabled response: got %d of %d bytes: %v", n, len(payload), err)

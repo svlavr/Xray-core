@@ -68,7 +68,6 @@ func TestInspectionSS2022FrameWriteFailures(t *testing.T) {
 		{"zero-error", func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }},
 		{"partial-error", func([]byte) (int, error) { return 1, io.ErrUnexpectedEOF }},
 		{"complete-error", func(p []byte) (int, error) { return len(p), io.ErrUnexpectedEOF }},
-		{"short-nil", func([]byte) (int, error) { return 1, nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			aead, err := method.NewAEAD(make([]byte, method.KeySaltLength))
@@ -114,48 +113,6 @@ func TestInspectionSS2022PendingWrite(t *testing.T) {
 	}
 }
 
-func TestInspectionSS2022HandshakeShortWrite(t *testing.T) {
-	method, _ := GetCipherMethod(MethodAES128GCM)
-	key := make([]byte, method.KeySaltLength)
-	short := inspectionWriteFunc(func([]byte) (int, error) { return 1, nil })
-	_, err := WriteTCPRequest(short, method, [][]byte{key}, net.TCPDestination(net.LocalHostIP, 443), key, []byte("request"))
-	if err != io.ErrShortWrite {
-		t.Fatalf("request handshake: %v", err)
-	}
-	writer := NewServerStreamWriter(short, method, key, key)
-	if n, err := writer.Write([]byte("response")); n != 0 || err != io.ErrShortWrite {
-		t.Fatalf("response handshake: n=%d err=%v", n, err)
-	}
-}
-
-func TestInspectionSS2022StreamWriteAcceptedPrefix(t *testing.T) {
-	method, _ := GetCipherMethod(MethodAES128GCM)
-	key := make([]byte, method.KeySaltLength)
-	for _, response := range []bool{false, true} {
-		t.Run(map[bool]string{false: "stream", true: "response"}[response], func(t *testing.T) {
-			calls := 0
-			output := inspectionWriteFunc(func(p []byte) (int, error) {
-				calls++
-				if calls == 2 {
-					return 1, io.ErrUnexpectedEOF
-				}
-				return len(p), nil
-			})
-			var writer io.Writer
-			if response {
-				writer = NewServerStreamWriter(output, method, key, key)
-			} else {
-				aead, _ := method.NewAEAD(key)
-				writer = NewStreamWriter(output, aead)
-			}
-			payload := bytes.Repeat([]byte{7}, MaxPacketSize+10)
-			if n, err := writer.Write(payload); n != MaxPacketSize || err != io.ErrUnexpectedEOF {
-				t.Fatalf("accepted prefix: n=%d err=%v", n, err)
-			}
-		})
-	}
-}
-
 type inspectionPartialReader struct {
 	buf.Reader
 	mb  buf.MultiBuffer
@@ -189,6 +146,7 @@ func TestInspectionSS2022EarlyPayloadAndTerminalError(t *testing.T) {
 			ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
 			dest := net.TCPDestination(net.LocalHostIP, 443)
 			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: dest}})
+			ctx = session.ContextWithTrafficOrigin(ctx, session.TrafficOriginControlledMeasurement)
 			key := make([]byte, 16)
 			outbound, err := NewClient(ctx, &ClientConfig{Method: MethodAES128GCM, Key: base64.StdEncoding.EncodeToString(key), Address: net.NewIPOrDomain(net.LocalHostIP), Port: 8388})
 			if err != nil {

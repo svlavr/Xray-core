@@ -34,7 +34,7 @@ func newScriptEngineProgram(program *xlua.Program) *scriptEngine {
 	return &scriptEngine{program: program}
 }
 
-func (e *scriptEngine) start(server *DNS) error {
+func (e *scriptEngine) start(server *resolver) error {
 	ctx, cancel := context.WithCancel(server.ctx)
 	pool, err := xlua.NewPool(ctx, scriptExecutionTimeout, e.program.NewStateFactory(
 		scriptExecutionTimeout*20,

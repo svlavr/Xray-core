@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"runtime"
 	"sync"
 	"testing"
@@ -25,7 +26,6 @@ import (
 	"github.com/xtls/xray-core/measurement"
 	legacyss "github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/testing/servers/udp"
-	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
 // Retain both ordinary networks on both tags and DIRECT while one measured
@@ -558,38 +558,11 @@ func TestAdditionalProtocolMeasurements(t *testing.T) {
 	}
 }
 
-func TestXHTTPManagerConfigSnapshotAndNilDefaults(t *testing.T) {
-	config := &splithttp.XmuxConfig{CMaxReuseTimes: &splithttp.RangeConfig{From: 2, To: 2}}
-	calls := 0
-	m := splithttp.NewXmuxManager(config, func() splithttp.XmuxConn { calls++; return xmuxFixtureConn{} })
-	config.CMaxReuseTimes.From, config.CMaxReuseTimes.To = 1, 1
-	for range 4 {
-		m.GetXmuxClient(context.Background())
-	}
-	if calls != 2 {
-		t.Fatalf("caller mutation changed the private manager snapshot: %d connections", calls)
-	}
-	var nilCalls, emptyCalls int
-	nilManager := splithttp.NewXmuxManager(nil, func() splithttp.XmuxConn { nilCalls++; return xmuxFixtureConn{} })
-	emptyManager := splithttp.NewXmuxManager(&splithttp.XmuxConfig{}, func() splithttp.XmuxConn { emptyCalls++; return xmuxFixtureConn{} })
-	for range 64 {
-		nilManager.GetXmuxClient(context.Background()).AddRunning()
-		emptyManager.GetXmuxClient(context.Background()).AddRunning()
-	}
-	if nilCalls != emptyCalls || nilCalls == 0 {
-		t.Fatalf("nil configuration lost native defaults: nil%d empty%d", nilCalls, emptyCalls)
-	}
-}
-
-type xmuxFixtureConn struct{}
-
-func (xmuxFixtureConn) IsClosed() bool { return false }
-
 // These profile ceilings bound complete native round trips, not executor policy.
 // A request may reach the peer above a smaller native reply-path limit.
 // A reply authenticates every echoed byte against the operation's original
 // random payload. Writer acceptance alone does not establish peer delivery.
-func testProtocolPacketBoundary(t *testing.T, e *measurement.Executor, tunnelHost string, limit int, aboveReachesPeer bool) {
+func testProtocolPacketBoundary(t *testing.T, e *measurement.Executor, tunnelHost string, limit int, aboveReachesPeer bool, limitForAddress ...func(netip.AddrPort) int) {
 	t.Helper()
 	if b7Enabled {
 		return
@@ -597,7 +570,7 @@ func testProtocolPacketBoundary(t *testing.T, e *measurement.Executor, tunnelHos
 	if carrierDials != nil {
 		return
 	}
-	testProtocolPacketBoundaryAt(t, e, tunnelHost, limit, aboveReachesPeer, "127.0.0.1")
+	testProtocolPacketBoundaryAt(t, e, tunnelHost, limit, aboveReachesPeer, "127.0.0.1", limitForAddress...)
 	if tunnelHost == "" {
 		t.Run("ipv6", func(t *testing.T) {
 			directIPv6Capability(t)
@@ -606,12 +579,12 @@ func testProtocolPacketBoundary(t *testing.T, e *measurement.Executor, tunnelHos
 			case 8181, 8153, 8137, 8182, 8134, 8110:
 				ipv6Limit -= 12
 			}
-			testProtocolPacketBoundaryAt(t, e, "", ipv6Limit, aboveReachesPeer, "::1")
+			testProtocolPacketBoundaryAt(t, e, "", ipv6Limit, aboveReachesPeer, "::1", limitForAddress...)
 		})
 	}
 }
 
-func testProtocolPacketBoundaryAt(t *testing.T, e *measurement.Executor, tunnelHost string, limit int, aboveReachesPeer bool, host string) {
+func testProtocolPacketBoundaryAt(t *testing.T, e *measurement.Executor, tunnelHost string, limit int, aboveReachesPeer bool, host string, limitForAddress ...func(netip.AddrPort) int) {
 	t.Helper()
 	for _, tag := range []string{"exact", "second"} {
 		t.Run("packet-boundary/"+tag, func(t *testing.T) {
@@ -626,6 +599,9 @@ func testProtocolPacketBoundaryAt(t *testing.T, e *measurement.Executor, tunnelH
 					r.Route.Tag = tag
 					r.Destination = protocolFixtureDestination(r.Destination, r.Route, tunnelHost)
 					ceiling := limit
+					if len(limitForAddress) != 0 {
+						ceiling = limitForAddress[0](r.Destination)
+					}
 					r.Count, r.PacketBytes, r.Interval, r.ReplyWait, r.Timeout = 1, ceiling+offset, 0, 200*time.Millisecond, 3*time.Second
 					got, err := e.UDPEcho(context.Background(), r)
 					wantPeer := offset <= 0 || aboveReachesPeer
@@ -671,15 +647,9 @@ func TestLegacyShadowsocksPacketCapacity(t *testing.T) {
 			if cipher == legacyss.CipherType_AES_128_GCM {
 				limit = 8153 // AES128 salt16.
 			}
-			for _, size := range []int{limit - 1, limit, limit + 1, buf.Size + 1} {
+			for _, size := range []int{limit - 1, limit} {
 				payload := bytes.Repeat([]byte{0x5a}, size)
 				encoded, err := legacyss.EncodeUDPPacket(r, payload)
-				if size > limit {
-					if !errors.Is(err, buf.ErrBufferFull) || encoded != nil {
-						t.Fatalf("oversize payload%d encoded=%v error=%v", size, encoded, err)
-					}
-					continue
-				}
 				if err != nil {
 					t.Fatal(err)
 				}

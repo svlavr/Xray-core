@@ -3,6 +3,7 @@ package mux
 import (
 	"context"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -91,15 +92,14 @@ type ServerWorker struct {
 	sessionManager *SessionManager
 	done           *done.Instance
 	timer          *time.Ticker
-	stats          stats.Manager
 	store          stats.AdmissionStore
-	runtime        stats.RuntimeID
+	writeGate      sync.Mutex
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
 	worker := &ServerWorker{
 		dispatcher:     d,
-		link:           &transport.Link{Reader: link.Reader, Writer: link.Writer},
+		link:           link,
 		sessionManager: NewSessionManager(),
 		done:           done.New(),
 		timer:          time.NewTicker(60 * time.Second),
@@ -115,16 +115,22 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
-	if _, ok := output.(*frameWriter); ok {
-		writer.receipt = s.inspection
+	writer.receipt = s.inspection
+	input := s.input
+	if s.server && s.XUDP != nil {
+		input = s
 	}
-	if err := buf.Copy(s.input, writer); err != nil {
+	if err := buf.Copy(input, writer); err != nil {
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
 	}
 
 	writer.Close()
-	s.finishServer()
+	if s.server {
+		s.finishServer()
+	} else {
+		s.Close(false)
+	}
 }
 
 func (w *ServerWorker) monitor() {
@@ -171,12 +177,6 @@ func (w *ServerWorker) handleStatusKeepAlive(meta *FrameMetadata, reader *buf.Bu
 }
 
 func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata, reader *buf.BufferedReader) error {
-	w.sessionManager.RLock()
-	occupied := w.sessionManager.sessions[meta.SessionID] != nil
-	w.sessionManager.RUnlock()
-	if occupied {
-		return errors.New("duplicate mux session ID")
-	}
 	ctx = session.SubContextFromMuxInbound(ctx)
 	if meta.Inbound != nil && meta.Inbound.Source.IsValid() && meta.Inbound.Local.IsValid() {
 		if inbound := session.InboundFromContext(ctx); inbound != nil {
@@ -209,28 +209,118 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	}
 
 	if meta.GlobalID != [8]byte{} { // MUST ignore empty Global ID
-		return w.handleXUDP(ctx, meta, reader)
+		mb, err := NewPacketReader(reader, &meta.Target).ReadMultiBuffer()
+		if err != nil {
+			return err
+		}
+		inspect := w.inspectChild(meta.Target)
+		XUDPManager.Lock()
+		x := XUDPManager.Map[meta.GlobalID]
+		if inspect || (x != nil && x.selected) {
+			return w.handleObservedXUDPLocked(ctx, meta, mb, x)
+		}
+		if x == nil {
+			x = &XUDP{GlobalID: meta.GlobalID, Status: Initializing}
+			XUDPManager.Map[meta.GlobalID] = x
+			XUDPManager.Unlock()
+		} else {
+			if x.Status == Initializing { // another carrier owns preparation
+				XUDPManager.Unlock()
+				buf.ReleaseMulti(mb)
+				errors.LogWarningInner(ctx, errors.New("conflict"), "XUDP hit ", meta.GlobalID)
+				// It's not a good idea to return an err here, so just let client wait.
+				// Client will receive an End frame after sending a Keep frame.
+				return nil
+			}
+			x.Status = Initializing
+			XUDPManager.Unlock()
+			x.Mux.Close(false) // detach from previous Mux
+			b := buf.New()
+			b.Write(mb[0].Bytes())
+			b.UDP = mb[0].UDP
+			if err = x.Mux.output.WriteMultiBuffer(mb); err != nil {
+				x.Interrupt()
+				mb = buf.MultiBuffer{b}
+			} else {
+				b.Release()
+				mb = nil
+			}
+			errors.LogInfoInner(ctx, err, "XUDP hit ", meta.GlobalID)
+		}
+		if mb != nil {
+			ctx = session.ContextWithTimeoutOnly(ctx, true)
+			// Actually, it won't return an error in Xray-core's implementations.
+			link, err := w.dispatcher.Dispatch(ctx, meta.Target)
+			if err != nil {
+				XUDPManager.Lock()
+				delete(XUDPManager.Map, x.GlobalID)
+				XUDPManager.Unlock()
+				err = errors.New("XUDP new ", meta.GlobalID).Base(errors.New("failed to dispatch request to ", meta.Target).Base(err))
+				return err // it will break the whole Mux connection
+			}
+			link.Writer.WriteMultiBuffer(mb) // it's meaningless to test a new pipe
+			x.Mux = &Session{
+				input:  link.Reader,
+				output: link.Writer,
+			}
+			errors.LogInfoInner(ctx, err, "XUDP new ", meta.GlobalID)
+		}
+		s := &Session{
+			input:        x.Mux.input,
+			output:       x.Mux.output,
+			parent:       w.sessionManager,
+			ID:           meta.SessionID,
+			transferType: protocol.TransferTypePacket,
+			XUDP:         x,
+		}
+		added := w.sessionManager.Add(s)
+		if !added {
+			s.Close(false)
+		}
+		// Initializing reserves the native endpoint until its real child is
+		// admitted. Selected takeover cannot observe a half-published Mux.
+		w.sessionManager.Lock()
+		XUDPManager.Lock()
+		x.Mux = s
+		if s.closed {
+			x.Status, x.Expire = Expiring, time.Now().Add(time.Minute)
+		} else {
+			x.Status = Active
+		}
+		XUDPManager.Unlock()
+		w.sessionManager.Unlock()
+		if !added {
+			return errors.New("failed to add new session")
+		}
+		go handle(ctx, s, w.carrierWriter())
+		return nil
 	}
 
-	s := &Session{parent: w.sessionManager, ID: meta.SessionID, transferType: protocol.TransferTypeStream, server: true}
+	s := &Session{parent: w.sessionManager, ID: meta.SessionID, transferType: protocol.TransferTypeStream}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
 	}
-	var cleanup func()
-	ctx, cleanup = w.observeChild(ctx, meta.Target, s)
-	s.cleanup = cleanup
-	link, err := w.dispatcher.Dispatch(ctx, meta.Target)
-	if err != nil {
-		if ctx.Err() != nil && s.inspection != nil {
-			s.cancelAdmission(ctx, w.link.Writer)
+	if w.inspectChild(meta.Target) {
+		s.server = true
+		ctx = w.observeChild(ctx, meta.Target, s)
+		if !w.sessionManager.Add(s) {
+			s.replyEnd(w.carrierWriter())
 			if meta.Option.Has(OptionData) {
 				return buf.Copy(NewStreamReader(reader), buf.Discard)
 			}
 			return nil
 		}
-		s.finishServer()
+	}
+	link, err := w.dispatcher.Dispatch(ctx, meta.Target)
+	if err != nil {
+		if s.server {
+			s.replyEnd(w.carrierWriter())
+		}
 		if meta.Option.Has(OptionData) {
 			buf.Copy(NewStreamReader(reader), buf.Discard)
+		}
+		if s.server && ctx.Err() != nil {
+			return nil
 		}
 		return errors.New("failed to dispatch request.").Base(err)
 	}
@@ -242,23 +332,14 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		common.Interrupt(link.Reader)
 		common.Close(link.Writer)
 	}
-
-	if !w.sessionManager.Add(s) {
-		if ctx.Err() != nil && s.inspection != nil {
-			s.cancelAdmission(ctx, w.link.Writer)
-			if meta.Option.Has(OptionData) {
-				return buf.Copy(NewStreamReader(reader), buf.Discard)
-			}
-			return nil
-		}
-		s.finishServer()
+	if !s.server && !w.sessionManager.Add(s) {
+		s.Close(false)
 		return errors.New("failed to add new session")
 	}
-	go handle(ctx, s, w.link.Writer)
+	go handle(ctx, s, w.carrierWriter())
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
-
 	return s.copyInput(reader, meta.Target)
 }
 
@@ -267,13 +348,13 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return nil
 	}
 
-	s, admitted := w.sessionManager.lookup(meta.SessionID, false)
+	s, retired := w.sessionManager.lookup(meta.SessionID)
 	if s == nil {
-		if admitted {
+		if retired {
 			return buf.Copy(NewStreamReader(reader), buf.Discard)
 		}
 		// Notify remote peer to close this session.
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
+		closingWriter := NewResponseWriter(meta.SessionID, w.carrierWriter(), protocol.TransferTypeStream)
 		closingWriter.Close()
 
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
@@ -340,4 +421,20 @@ func (w *ServerWorker) run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (w *ServerWorker) carrierWriter() buf.Writer {
+	if w.store != nil {
+		return w
+	}
+	return w.link.Writer
+}
+
+func (w *ServerWorker) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if _, native := w.link.Writer.(*pipe.Writer); native {
+		return w.link.Writer.WriteMultiBuffer(mb)
+	}
+	w.writeGate.Lock()
+	defer w.writeGate.Unlock()
+	return w.link.Writer.WriteMultiBuffer(mb)
 }

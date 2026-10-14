@@ -1,24 +1,27 @@
 package mux
 
 import (
+	"context"
+	"io"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/transport/pipe"
 )
 
 type SessionManager struct {
 	sync.RWMutex
 	sessions map[uint16]*Session
-	active   int // closed server wire-ID reservations are not active sessions
 	count    uint16
 	closed   bool
-	seen     []uint64 // server's peer-supplied wire IDs; at most 1024 words
 }
 
 func NewSessionManager() *SessionManager {
@@ -39,7 +42,7 @@ func (m *SessionManager) Size() int {
 	m.RLock()
 	defer m.RUnlock()
 
-	return m.active
+	return len(m.sessions)
 }
 
 func (m *SessionManager) Count() int {
@@ -53,8 +56,6 @@ func (m *SessionManager) Allocate(Strategy *ClientStrategy, input buf.Reader, ou
 	return m.allocate(Strategy, &Session{input: input, output: output})
 }
 
-// allocate publishes only initialized client endpoints. Close/Get may run as
-// soon as the manager lock is released.
 func (m *SessionManager) allocate(Strategy *ClientStrategy, s *Session) *Session {
 	m.Lock()
 	defer m.Unlock()
@@ -62,16 +63,13 @@ func (m *SessionManager) allocate(Strategy *ClientStrategy, s *Session) *Session
 	MaxConcurrency := int(Strategy.MaxConcurrency)
 	MaxConnection := uint16(Strategy.MaxConnection)
 
-	if m.closed || m.count == ^uint16(0) || (MaxConcurrency > 0 && m.active >= MaxConcurrency) || (MaxConnection > 0 && m.count >= MaxConnection) {
+	if m.closed || (s.inspection != nil && m.sessions[m.count+1] != nil) || (MaxConcurrency > 0 && len(m.sessions) >= MaxConcurrency) || (MaxConnection > 0 && m.count >= MaxConnection) {
 		return nil
 	}
 
 	m.count++
-	s.ID = m.count
-	s.parent = m
-	s.done = done.New()
+	s.ID, s.parent, s.done = m.count, m, done.New()
 	m.sessions[s.ID] = s
-	m.active++
 	return s
 }
 
@@ -79,14 +77,12 @@ func (m *SessionManager) Add(s *Session) bool {
 	m.Lock()
 	defer m.Unlock()
 
-	if m.closed || s.closed || m.sessions[s.ID] != nil {
+	if m.closed || (s.server && (s.closed || m.sessions[s.ID] != nil)) {
 		return false
 	}
 
 	m.count++
 	m.sessions[s.ID] = s
-	m.active++
-	m.markSeenLocked(s.ID)
 	return true
 }
 
@@ -101,9 +97,6 @@ func (m *SessionManager) Remove(locked bool, id uint16) {
 		return
 	}
 
-	if s := m.sessions[id]; s != nil && !s.closed {
-		m.active--
-	}
 	delete(m.sessions, id)
 
 	/*
@@ -114,36 +107,22 @@ func (m *SessionManager) Remove(locked bool, id uint16) {
 }
 
 func (m *SessionManager) Get(id uint16) (*Session, bool) {
-	s, _ := m.lookup(id, false)
+	s, _ := m.lookup(id)
 	return s, s != nil
 }
 
-// lookup distinguishes an ended native child (which already owns its END)
-// from an ID that this carrier never admitted. The lookup/close race is atomic.
-func (m *SessionManager) lookup(id uint16, sequentialIDs bool) (*Session, bool) {
+// lookup retains only the existing selected END owner; no ID history is kept.
+func (m *SessionManager) lookup(id uint16) (*Session, bool) {
 	m.RLock()
 	defer m.RUnlock()
-	if s := m.sessions[id]; !m.closed && s != nil && !s.closed {
-		return s, true
+	if m.closed {
+		return nil, false
 	}
-	if sequentialIDs {
-		// Client IDs are nonzero, monotonic, and never wrap or reuse.
-		return nil, id != 0 && id <= m.count
+	s := m.sessions[id]
+	if s != nil && s.closed && (s.server || s.inspection != nil) {
+		return nil, true
 	}
-	word := int(id) / 64
-	return nil, word < len(m.seen) && m.seen[word]&(uint64(1)<<(id%64)) != 0
-}
-
-func (m *SessionManager) markSeenLocked(id uint16) {
-	n := int(id)/64 + 1
-	if n > cap(m.seen) {
-		grown := make([]uint64, n, min(1024, max(n, 2*cap(m.seen))))
-		copy(grown, m.seen)
-		m.seen = grown
-	} else if n > len(m.seen) {
-		m.seen = m.seen[:n]
-	}
-	m.seen[int(id)/64] |= uint64(1) << (id % 64)
+	return s, false
 }
 
 func (m *SessionManager) CloseIfNoSessionAndIdle(checkSize int, checkCount int) bool {
@@ -154,7 +133,7 @@ func (m *SessionManager) CloseIfNoSessionAndIdle(checkSize int, checkCount int) 
 		return true
 	}
 
-	if m.active != 0 || checkSize != 0 || checkCount != int(m.count) {
+	if len(m.sessions) != 0 || checkSize != 0 || checkCount != int(m.count) {
 		return false
 	}
 
@@ -179,7 +158,6 @@ func (m *SessionManager) Close() error {
 	}
 
 	m.sessions = nil
-	m.active = 0
 	return nil
 }
 
@@ -193,10 +171,10 @@ type Session struct {
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
-	xudp         *xudpBinding
-	server       bool           // retain wire ID until the server response worker returns
-	inspection   stats.Exchange // existing client admission; never the carrier
-	cleanup      func()         // ordinary server admission, after response return
+	server       bool
+	inspection   stats.Exchange
+	cleanup      func()
+	ioGate       sync.RWMutex
 }
 
 // Close closes all resources associated with this session.
@@ -210,9 +188,6 @@ func (s *Session) Close(locked bool) error {
 		return nil
 	}
 	s.closed = true
-	if s.parent.sessions[s.ID] == s {
-		s.parent.active--
-	}
 	if s.done != nil {
 		s.done.Close()
 	}
@@ -220,21 +195,33 @@ func (s *Session) Close(locked bool) error {
 		common.Interrupt(s.input)
 		common.Close(s.output)
 	} else {
-		if s.xudp != nil {
-			s.xudp.cancel()
+		// Stop existing handle(), then trigger writer.Close().
+		// Note that s.output may be dispatcher.SizeStatWriter.
+		s.input.(*pipe.Reader).ReturnAnError(io.EOF)
+		if s.server {
+			// done revokes new calls; the gate joins pipe access only.
+			s.ioGate.Lock()
+			s.input.(*pipe.Reader).Recover()
+			s.ioGate.Unlock()
+		} else {
+			runtime.Gosched()
+			s.input.(*pipe.Reader).Recover()
 		}
 		XUDPManager.Lock()
-		if XUDPManager.Map[s.XUDP.GlobalID] == s.XUDP && s.XUDP.Mux == s && s.XUDP.Status == Active {
+		if s.XUDP.Status == Active && (!s.server || s.XUDP.Mux == s) {
 			s.XUDP.Expire = time.Now().Add(time.Minute)
 			s.XUDP.Status = Expiring
+			errors.LogDebug(context.Background(), "XUDP put ", s.XUDP.GlobalID)
 		}
 		XUDPManager.Unlock()
 	}
-	if !s.server && s.parent.sessions[s.ID] == s {
-		delete(s.parent.sessions, s.ID)
-	}
-	if !s.server && s.inspection != nil {
-		s.inspection.Finish()
+	if !s.server {
+		if s.inspection == nil {
+			s.parent.Remove(locked, s.ID)
+		}
+		if s.inspection != nil {
+			s.inspection.Finish()
+		}
 	}
 	return nil
 }
@@ -247,18 +234,59 @@ func (s *Session) NewReader(reader *buf.BufferedReader, dest *net.Destination) b
 	return NewPacketReader(reader, dest)
 }
 
-// finishServer releases the wire ID only after the old response writer (including
-// END) has returned. A delayed old frame must not address a new same-ID child.
-func (s *Session) finishServer() {
-	s.Close(false)
-	s.parent.Lock()
-	if s.parent.sessions[s.ID] == s {
-		delete(s.parent.sessions, s.ID)
+const (
+	Initializing = 0
+	Active       = 1
+	Expiring     = 2
+)
+
+type XUDP struct {
+	GlobalID   [8]byte
+	Status     uint64
+	Expire     time.Time
+	Mux        *Session
+	selected   bool
+	inspection stats.Exchange
+	cancel     context.CancelFunc
+}
+
+func (x *XUDP) Interrupt() {
+	if x.selected {
+		x.stop()
+		return
 	}
-	cleanup := s.cleanup
-	s.cleanup = nil
-	s.parent.Unlock()
-	if cleanup != nil {
-		cleanup()
-	}
+	common.Interrupt(x.Mux.input)
+	common.Close(x.Mux.output)
+}
+
+var XUDPManager struct {
+	sync.Mutex
+	Map map[[8]byte]*XUDP
+}
+
+func init() {
+	XUDPManager.Map = make(map[[8]byte]*XUDP)
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			now := time.Now()
+			var selected []*XUDP
+			XUDPManager.Lock()
+			for id, x := range XUDPManager.Map {
+				if x.Status == Expiring && now.After(x.Expire) {
+					if x.selected {
+						selected = append(selected, x)
+					} else {
+						x.Interrupt()
+					}
+					delete(XUDPManager.Map, id)
+					errors.LogDebug(context.Background(), "XUDP del ", id)
+				}
+			}
+			XUDPManager.Unlock()
+			for _, x := range selected {
+				x.stop()
+			}
+		}
+	}()
 }
