@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	featuredns "github.com/xtls/xray-core/features/dns"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	featuredns "github.com/xtls/xray-core/features/dns"
 )
 
 // Blocking only a test context method controls the scheduling window without

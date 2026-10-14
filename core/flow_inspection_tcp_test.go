@@ -344,6 +344,7 @@ func (c *inspectionHTTPResponseWire) Read(p []byte) (int, error) {
 	c.read += uint64(n)
 	return n, err
 }
+
 func inspectionHTTPActiveRequest(t *testing.T, view fs.FlowInspection, conn net.Conn, destination cnet.Destination, downlink uint64) fs.FlowRecord {
 	t.Helper()
 	var row fs.FlowRecord

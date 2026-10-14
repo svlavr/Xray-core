@@ -3,12 +3,13 @@ package dns
 import (
 	"context"
 	"errors"
-	xnet "github.com/xtls/xray-core/common/net"
-	fdns "github.com/xtls/xray-core/features/dns"
-	"golang.org/x/net/dns/dnsmessage"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	xnet "github.com/xtls/xray-core/common/net"
+	fdns "github.com/xtls/xray-core/features/dns"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 type candidateNameserver struct {
@@ -20,11 +21,13 @@ func (s *candidateNameserver) getCacheController() *CacheController { return s.c
 func (s *candidateNameserver) sendQuery(ctx context.Context, ch chan<- error, fqdn string, opt fdns.IPOption) {
 	s.send(ctx, ch, fqdn, opt)
 }
+
 func candidateCache(t *testing.T) *CacheController {
 	c := NewCacheController(t.Name(), false, false, 0)
 	t.Cleanup(c.Close)
 	return c
 }
+
 func publishCandidate(c *CacheController, fqdn string, code dnsmessage.RCode) {
 	rec := &IPRecord{Expire: time.Now().Add(time.Minute), RCode: code}
 	if code == dnsmessage.RCodeSuccess {
@@ -32,6 +35,7 @@ func publishCandidate(c *CacheController, fqdn string, code dnsmessage.RCode) {
 	}
 	c.pub.Publish(c.keyPrefix+fqdn+"4", rec)
 }
+
 func TestCandidateDNSConfiguredDeadline(t *testing.T) {
 	c := candidateCache(t)
 	s := &candidateNameserver{cache: c}
@@ -49,6 +53,7 @@ func TestCandidateDNSConfiguredDeadline(t *testing.T) {
 		t.Fatalf("ips=%v err=%v", ips, err)
 	}
 }
+
 func TestCandidateDNSIndependentWaiterCancellation(t *testing.T) {
 	c := candidateCache(t)
 	entered := make(chan struct{})
@@ -89,6 +94,7 @@ func TestCandidateDNSIndependentWaiterCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestCandidateDNSLiveFollowerAfterLeaderDeadline(t *testing.T) {
 	c := candidateCache(t)
 	entered := make(chan struct{})
@@ -117,6 +123,7 @@ func TestCandidateDNSLiveFollowerAfterLeaderDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestCandidateDNSNegativeResultStaysTerminal(t *testing.T) {
 	c := candidateCache(t)
 	s := &candidateNameserver{cache: c}

@@ -185,7 +185,6 @@ func TestGRPCReconnectAfterFirstCallerCancellation(t *testing.T) {
 	})
 
 	// Pool retirement follows the native channel owner; no handler-wide Owner exists.
-
 }
 
 func TestGRPCStandaloneStreamClosesClient(t *testing.T) {

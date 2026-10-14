@@ -118,6 +118,7 @@ func (r *responseBlockingReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	close(r.entered)
 	return r.Reader.ReadMultiBuffer()
 }
+
 func TestNativeUDPResponsesExplicitCloseUnblocksRead(t *testing.T) {
 	r, w := pipe.New()
 	defer w.Close()

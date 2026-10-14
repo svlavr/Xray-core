@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	featuredns "github.com/xtls/xray-core/features/dns"
-	"golang.org/x/net/dns/dnsmessage"
 	"runtime"
 	"testing"
 	"time"
+
+	featuredns "github.com/xtls/xray-core/features/dns"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // A real terminal A outcome is selected first; only the unanswered AAAA family

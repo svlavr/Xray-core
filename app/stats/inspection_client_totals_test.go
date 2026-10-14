@@ -31,7 +31,6 @@ func TestInspectionClientTotalsAdmissionAndOrigin(t *testing.T) {
 	if got.User != (fs.ClientTotals{Uplink: 7, Downlink: 3}) || got.BucketsOmitted != 0 || len(got.Rows) != 1 || got.Rows[0].Origin != fs.TrafficOriginUser || got.Rows[0].Uplink != 0 || got.Rows[0].Downlink != 0 {
 		t.Fatalf("origin isolation/capacity: %+v", got)
 	}
-
 }
 
 func TestInspectionClientTotalsPreparedFailureAndCarrier(t *testing.T) {

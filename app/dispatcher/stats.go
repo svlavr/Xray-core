@@ -1,10 +1,11 @@
 package dispatcher
 
 import (
+	"io"
+
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/features/stats"
-	"io"
 )
 
 type SizeStatWriter struct {

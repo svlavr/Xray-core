@@ -386,5 +386,7 @@ func borrowedDNSWait(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
-var _ featuredns.Client = (*borrowedDNSClient)(nil)
-var _ featuredns.ContextClient = (*borrowedDNSClient)(nil)
+var (
+	_ featuredns.Client        = (*borrowedDNSClient)(nil)
+	_ featuredns.ContextClient = (*borrowedDNSClient)(nil)
+)

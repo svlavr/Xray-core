@@ -3,9 +3,10 @@ package hysteria
 import (
 	"bytes"
 	"errors"
-	"github.com/apernet/quic-go"
 	"io"
 	"testing"
+
+	"github.com/apernet/quic-go"
 
 	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"

@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+
 	"github.com/xtls/xray-core/common/net"
 	featuredns "github.com/xtls/xray-core/features/dns"
 )

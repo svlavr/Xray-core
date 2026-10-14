@@ -2,12 +2,13 @@ package dns
 
 import (
 	"context"
+	"reflect"
+	"testing"
+
 	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/core"
 	featuredns "github.com/xtls/xray-core/features/dns"
 	"google.golang.org/protobuf/proto"
-	"reflect"
-	"testing"
 )
 
 func dnsTestContext(t testing.TB) context.Context {

@@ -2,13 +2,14 @@ package dns
 
 import (
 	"context"
+	"strings"
+
 	"github.com/xtls/xray-core/common/errors"
 	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/common/net"
 	featureDNS "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/dns/localdns"
 	lua "github.com/yuin/gopher-lua"
-	"strings"
 )
 
 type luaDNSQuery func(context.Context, string, featureDNS.IPOption) ([]net.IP, uint32, error)

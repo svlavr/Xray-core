@@ -275,6 +275,7 @@ func (sharedOriginEchoServer) Tun(stream encoding.GRPCService_TunServer) error {
 		}
 	}
 }
+
 func (sharedOriginEchoServer) TunMulti(stream encoding.GRPCService_TunMultiServer) error {
 	for {
 		h, err := stream.Recv()

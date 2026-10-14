@@ -93,6 +93,7 @@ jobs:
         if: runner.os == 'Linux'
         run: go test -mod=readonly -race -timeout 5m -count=10 -p 1 -run '^TestAdditionalProtocolMeasurements$/^socks$/^(packet-boundary|ipv6)$' ./measurement
       - name: Test
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail

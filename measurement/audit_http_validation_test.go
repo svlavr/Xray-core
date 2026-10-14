@@ -31,6 +31,7 @@ func (*auditHTTPMemoryConn) Close() error                { return nil }
 func (*auditHTTPMemoryConn) LocalAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 }
+
 func (*auditHTTPMemoryConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 80}
 }
@@ -51,6 +52,7 @@ func (c *auditHTTPGatedConn) Read([]byte) (int, error) {
 	<-c.released
 	return 0, auditHTTPReadSentinel
 }
+
 func (c *auditHTTPGatedConn) Close() error {
 	c.closeOnce.Do(func() { close(c.released) })
 	return nil

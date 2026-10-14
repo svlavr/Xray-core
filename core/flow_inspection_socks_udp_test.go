@@ -2,10 +2,11 @@ package core_test
 
 import (
 	"context"
-	"github.com/xtls/xray-core/features/routing"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/xtls/xray-core/features/routing"
 
 	"github.com/xtls/xray-core/app/proxyman"
 	cnet "github.com/xtls/xray-core/common/net"

@@ -28,9 +28,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
-const gatewaySource = "192.0.2.1"
-const gatewayAddress = "192.0.2.2"
-const gatewayInbound = "system-dns-tun"
+const (
+	gatewaySource  = "192.0.2.1"
+	gatewayAddress = "192.0.2.2"
+	gatewayInbound = "system-dns-tun"
+)
 
 type gatewayUnknownClient struct{}
 
@@ -60,6 +62,7 @@ type gatewayProxy struct {
 func (*gatewayProxy) Process(context.Context, *transport.Link, internet.Dialer) error {
 	return errors.New("message transport is covered by the core composition tests")
 }
+
 func (p *gatewayProxy) VerifySystemDNS(ctx context.Context, target xnet.Destination) error {
 	return p.check(ctx, target)
 }

@@ -3,7 +3,6 @@ package dns
 import (
 	"context"
 	go_errors "errors"
-	"github.com/apernet/quic-go"
 	"io"
 	stdnet "net"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/apernet/quic-go"
 
 	mdns "github.com/miekg/dns"
 	"github.com/xtls/xray-core/app/dispatcher"
