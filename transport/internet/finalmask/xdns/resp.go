@@ -22,14 +22,17 @@ type Resp struct {
 }
 
 func NewResp(msg dnsmessage.Message, domain *Domain, edns0 uint16) *Resp {
+	size := min(max(int(edns0), 512), max(int(domain.edns0), 512))
+	return newResp(msg, domain, edns0, size)
+}
+
+func newResp(msg dnsmessage.Message, domain *Domain, edns0 uint16, size int) *Resp {
 	if msg.Header.Response {
 		return &Resp{
 			msg:    msg,
 			domain: domain,
 		}
 	}
-
-	size := min(max(int(edns0), 512), max(int(domain.edns0), 512))
 
 	left := size - 12 - int(msg.Questions[0].Name.Length) - 1 - 2 - 2
 	if edns0 > 0 {

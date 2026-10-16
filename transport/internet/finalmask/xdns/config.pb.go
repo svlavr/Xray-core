@@ -177,10 +177,12 @@ func (x *ResolverProto) GetQuicConfig() *internet.QuicParams {
 }
 
 type Config struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Domains       []*DomainProto         `protobuf:"bytes,1,rep,name=domains,proto3" json:"domains,omitempty"`
-	Resolvers     []*ResolverProto       `protobuf:"bytes,2,rep,name=resolvers,proto3" json:"resolvers,omitempty"`
-	ExtraPoll     int32                  `protobuf:"varint,3,opt,name=extra_poll,json=extraPoll,proto3" json:"extra_poll,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Domains   []*DomainProto         `protobuf:"bytes,1,rep,name=domains,proto3" json:"domains,omitempty"`
+	Resolvers []*ResolverProto       `protobuf:"bytes,2,rep,name=resolvers,proto3" json:"resolvers,omitempty"`
+	ExtraPoll int32                  `protobuf:"varint,3,opt,name=extra_poll,json=extraPoll,proto3" json:"extra_poll,omitempty"`
+	// Server-side: require TCP for payloads; UDP queries receive TC for retry.
+	TcpOnly       bool `protobuf:"varint,4,opt,name=tcp_only,json=tcpOnly,proto3" json:"tcp_only,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -236,6 +238,13 @@ func (x *Config) GetExtraPoll() int32 {
 	return 0
 }
 
+func (x *Config) GetTcpOnly() bool {
+	if x != nil {
+		return x.TcpOnly
+	}
+	return false
+}
+
 var File_transport_internet_finalmask_xdns_config_proto protoreflect.FileDescriptor
 
 const file_transport_internet_finalmask_xdns_config_proto_rawDesc = "" +
@@ -255,12 +264,13 @@ const file_transport_internet_finalmask_xdns_config_proto_rawDesc = "" +
 	"\n" +
 	"tls_config\x18\x04 \x01(\v2#.xray.transport.internet.tls.ConfigR\ttlsConfig\x12D\n" +
 	"\vquic_config\x18\x05 \x01(\v2#.xray.transport.internet.QuicParamsR\n" +
-	"quicConfig\"\xcb\x01\n" +
+	"quicConfig\"\xe6\x01\n" +
 	"\x06Config\x12M\n" +
 	"\adomains\x18\x01 \x03(\v23.xray.transport.internet.finalmask.xdns.DomainProtoR\adomains\x12S\n" +
 	"\tresolvers\x18\x02 \x03(\v25.xray.transport.internet.finalmask.xdns.ResolverProtoR\tresolvers\x12\x1d\n" +
 	"\n" +
-	"extra_poll\x18\x03 \x01(\x05R\textraPollB\x94\x01\n" +
+	"extra_poll\x18\x03 \x01(\x05R\textraPoll\x12\x19\n" +
+	"\btcp_only\x18\x04 \x01(\bR\atcpOnlyB\x94\x01\n" +
 	"*com.xray.transport.internet.finalmask.xdnsP\x01Z;github.com/xtls/xray-core/transport/internet/finalmask/xdns\xaa\x02&Xray.Transport.Internet.Finalmask.Xdnsb\x06proto3"
 
 var (

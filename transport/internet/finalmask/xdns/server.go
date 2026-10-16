@@ -34,15 +34,25 @@ type xdnsServer struct {
 	fragManager *FragManager
 	sendManager *SendManager
 
-	readCh  chan packet
-	recCh   chan *Rec
-	drCh    chan resp
-	closeCh chan struct{}
-	wg      sync.WaitGroup
-	mu      sync.RWMutex
+	readCh   chan packet
+	recCh    chan *Rec
+	drCh     chan resp
+	closeCh  chan struct{}
+	done     chan struct{}
+	wg       sync.WaitGroup
+	mu       sync.RWMutex
+	listener net.Listener
+	conns    map[*tcpServerConn]struct{}
 }
 
 func NewServer(c *Config, raw net.PacketConn) (net.PacketConn, error) {
+	return newServer(c, raw, nil)
+}
+
+func newServer(c *Config, raw net.PacketConn, listener net.Listener) (net.PacketConn, error) {
+	if c.TcpOnly && listener == nil {
+		return nil, errors.New("tcpOnly requires a TCP listener")
+	}
 	if len(c.Domains) == 0 {
 		return nil, errors.New("empty domains")
 	}
@@ -68,10 +78,18 @@ func NewServer(c *Config, raw net.PacketConn) (net.PacketConn, error) {
 		fragManager: NewFragManager(),
 		sendManager: NewSendManager(),
 
-		readCh:  make(chan packet),
-		recCh:   make(chan *Rec, 255),
-		drCh:    make(chan resp),
-		closeCh: make(chan struct{}),
+		readCh:   make(chan packet),
+		recCh:    make(chan *Rec, 255),
+		drCh:     make(chan resp),
+		closeCh:  make(chan struct{}),
+		done:     make(chan struct{}),
+		listener: listener,
+		conns:    make(map[*tcpServerConn]struct{}),
+	}
+	server.wg.Add(3)
+	if listener != nil {
+		server.wg.Add(1)
+		go server.acceptTCP()
 	}
 	go server.run()
 	return server, nil
@@ -87,6 +105,14 @@ func (c *xdnsServer) closed() bool {
 }
 
 func (c *xdnsServer) decref(msg dnsmessage.Message, addr net.Addr) {
+	if conn, ok := addr.(*tcpServerConn); ok {
+		select {
+		case c.drCh <- resp{msg: msg, addr: addr}:
+		case <-conn.done:
+		case <-c.closeCh:
+		}
+		return
+	}
 	select {
 	case c.drCh <- resp{msg: msg, addr: addr}:
 	default:
@@ -184,7 +210,20 @@ func (c *xdnsServer) read(buf []byte, addr net.Addr) {
 	}
 	clientID := ClientIDFromRaw([8]byte(decoded[:8]))
 
+	_, stream := addr.(*tcpServerConn)
+	if c.listener != nil && !stream {
+		// A recursive resolver must retry before this query consumes or delivers
+		// payloads. Processing both transports would duplicate uploads or lose replies.
+		msg.Header.Response = true
+		msg.Header.Authoritative = true
+		msg.Header.Truncated = true
+		c.writeDNS(common.Must2(msg.AppendPack(nil)), addr)
+		return
+	}
 	r := NewResp(msg, domain, edns0)
+	if stream {
+		r = newResp(msg, domain, edns0, maxDNSMessageSize)
+	}
 	if r == nil {
 		msg.Header.Response = true
 		msg.Header.Authoritative = true
@@ -229,13 +268,10 @@ func (c *xdnsServer) read(buf []byte, addr net.Addr) {
 }
 
 func (c *xdnsServer) run() {
-	c.wg.Add(1)
 	go c.recv()
 
-	c.wg.Add(1)
 	go c.send()
 
-	c.wg.Add(1)
 	go c.dr()
 
 	c.wg.Wait()
@@ -244,6 +280,7 @@ func (c *xdnsServer) run() {
 	close(c.drCh)
 	c.fragManager.Close()
 	c.sendManager.Close()
+	close(c.done)
 }
 
 func (c *xdnsServer) recv() {
@@ -330,7 +367,7 @@ func (c *xdnsServer) send() {
 			d = append(d, []byte{byte(l >> 8), byte(l)}...)
 			d = append(d, ps[i]...)
 		}
-		_, _ = c.PacketConn.WriteTo(rec.resp.Encode(buf[:0], d), rec.addr)
+		c.writeDNS(rec.resp.Encode(buf[:0], d), rec.addr)
 	}
 }
 
@@ -343,7 +380,7 @@ func (c *xdnsServer) dr() {
 		case <-c.closeCh:
 			return
 		case r := <-c.drCh:
-			_, _ = c.PacketConn.WriteTo(common.Must2(r.msg.AppendPack(buf[:0])), r.addr)
+			c.writeDNS(common.Must2(r.msg.AppendPack(buf[:0])), r.addr)
 		}
 	}
 }
@@ -359,6 +396,8 @@ func (c *xdnsServer) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 func (c *xdnsServer) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed() {
 		return 0, io.ErrClosedPipe
 	}
@@ -372,12 +411,18 @@ func (c *xdnsServer) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 func (c *xdnsServer) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed() {
-		return nil
+	if !c.closed() {
+		close(c.closeCh)
+		_ = c.PacketConn.Close()
+		if c.listener != nil {
+			_ = c.listener.Close()
+		}
+		for conn := range c.conns {
+			_ = conn.Close()
+		}
 	}
-	close(c.closeCh)
-	_ = c.PacketConn.Close()
+	c.mu.Unlock()
+	<-c.done
 	return nil
 }
 

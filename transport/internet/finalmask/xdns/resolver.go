@@ -3,9 +3,19 @@ package xdns
 import (
 	"errors"
 	"net"
+	"sync"
 
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 )
+
+const maxDNSMessageSize = 65535
+
+// DNS-message storage is separate from the application/reassembly pool4K.
+var poolDNSMessage = sync.Pool{
+	New: func() any {
+		return make([]byte, maxDNSMessageSize)
+	},
+}
 
 type Resolver interface {
 	Addr() *net.UDPAddr

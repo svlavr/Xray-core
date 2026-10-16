@@ -30,4 +30,6 @@ message Config {
   repeated DomainProto domains = 1;
   repeated ResolverProto resolvers = 2;
   int32 extra_poll = 3;
+  // Server-side: require TCP for payloads; UDP queries receive TC for retry.
+  bool tcp_only = 4;
 }

@@ -197,7 +197,7 @@ func (r *DOHResolver) do(p []byte) error {
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:
-		p := pool4K.Get().([]byte)
+		p := poolDNSMessage.Get().([]byte)
 		off := 0
 		for {
 			n, err := resp.Body.Read(p[off:])
@@ -206,7 +206,7 @@ func (r *DOHResolver) do(p []byte) error {
 			}
 			if off == len(p) || err != nil {
 				if err != io.EOF {
-					pool4K.Put(p[:cap(p)])
+					poolDNSMessage.Put(p[:cap(p)])
 					return err
 				}
 				break
@@ -214,7 +214,7 @@ func (r *DOHResolver) do(p []byte) error {
 		}
 		select {
 		case <-r.closeCh:
-			pool4K.Put(p[:cap(p)])
+			poolDNSMessage.Put(p[:cap(p)])
 		case r.readCh <- p[:off]:
 		}
 		return nil
@@ -264,7 +264,7 @@ func (r *DOHResolver) Read(p []byte) (n int, err error) {
 	packet, ok := <-r.readCh
 	if ok {
 		n = copy(p, packet)
-		pool4K.Put(packet[:cap(packet)])
+		poolDNSMessage.Put(packet[:cap(packet)])
 		return n, nil
 	}
 	return 0, io.ErrClosedPipe

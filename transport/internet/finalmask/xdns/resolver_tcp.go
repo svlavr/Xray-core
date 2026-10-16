@@ -73,26 +73,25 @@ func (r *TCPResolver) dial() error {
 func (r *TCPResolver) recv(conn net.Conn) {
 	defer r.wg.Done()
 
-	var buf [4096]byte
+	var prefix [2]byte
 	for {
-		_, err := io.ReadFull(conn, buf[:2])
+		_, err := io.ReadFull(conn, prefix[:])
 		if err != nil {
 			break
 		}
-		n := binary.BigEndian.Uint16(buf[:2])
-		if n == 0 || n > 4096 {
-			io.CopyN(io.Discard, conn, int64(n))
+		n := int(binary.BigEndian.Uint16(prefix[:]))
+		if n == 0 {
 			continue
 		}
-		_, err = io.ReadFull(conn, buf[:n])
+		p := poolDNSMessage.Get().([]byte)
+		_, err = io.ReadFull(conn, p[:n])
 		if err != nil {
+			poolDNSMessage.Put(p[:cap(p)])
 			break
 		}
-		p := pool4K.Get().([]byte)
-		copy(p, buf[:n])
 		select {
 		case <-r.closeCh:
-			pool4K.Put(p[:cap(p)])
+			poolDNSMessage.Put(p[:cap(p)])
 		case r.readCh <- p[:n]:
 		}
 	}
@@ -112,20 +111,30 @@ func (r *TCPResolver) Read(p []byte) (n int, err error) {
 	packet, ok := <-r.readCh
 	if ok {
 		n = copy(p, packet)
-		pool4K.Put(packet[:cap(packet)])
+		poolDNSMessage.Put(packet[:cap(packet)])
 		return n, nil
 	}
 	return 0, io.ErrClosedPipe
 }
 
 func (r *TCPResolver) Send(p []byte) {
+	if len(p) == 0 || len(p) > maxDNSMessageSize {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.dial() != nil {
 		return
 	}
-	_ = binary.Write(r.conn, binary.BigEndian, len(p))
-	_, _ = r.conn.Write(p)
+	var prefix [2]byte
+	binary.BigEndian.PutUint16(prefix[:], uint16(len(p)))
+	if n, err := r.conn.Write(prefix[:]); err != nil || n != len(prefix) {
+		_ = r.conn.Close()
+		return
+	}
+	if n, err := r.conn.Write(p); err != nil || n != len(p) {
+		_ = r.conn.Close()
+	}
 }
 
 func (r *TCPResolver) Close() {

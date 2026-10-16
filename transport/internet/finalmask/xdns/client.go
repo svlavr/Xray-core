@@ -248,8 +248,12 @@ func (c *xdnsClient) read(buf []byte, addr net.Addr) bool {
 
 	resp := NewResp(msg, domain, 0)
 
-	p := pool4K.Get().([]byte)
+	p := poolDNSMessage.Get().([]byte)
 	n := resp.Decode(p)
+	if n > maxDNSMessageSize {
+		poolDNSMessage.Put(p[:cap(p)])
+		return false
+	}
 	p = p[:n]
 
 	b := p
@@ -258,7 +262,7 @@ func (c *xdnsClient) read(buf []byte, addr net.Addr) bool {
 		last := b[0]&0xC0 == 0xC0
 		length := int(b[0]&0x3F)<<8 | int(b[1])
 		b = b[2:]
-		if length > len(b) {
+		if length > 4096 || length > len(b) {
 			bs = nil
 			break
 		}
@@ -273,7 +277,7 @@ func (c *xdnsClient) read(buf []byte, addr net.Addr) bool {
 			bs = nil
 		}
 	}
-	pool4K.Put(p[:cap(p)])
+	poolDNSMessage.Put(p[:cap(p)])
 
 	for i := range bs {
 		select {
@@ -302,9 +306,10 @@ func (c *xdnsClient) run() {
 func (c *xdnsClient) recv(i int) {
 	defer c.wg.Done()
 
-	var buf [4096]byte
+	buf := poolDNSMessage.Get().([]byte)
+	defer poolDNSMessage.Put(buf[:cap(buf)])
 	for {
-		n, err := c.resolvers[i].Read(buf[:])
+		n, err := c.resolvers[i].Read(buf[:maxDNSMessageSize])
 		if err != nil {
 			if c.closed() {
 				return

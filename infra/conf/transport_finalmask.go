@@ -828,6 +828,7 @@ type XDNS struct {
 	Domains   []XDNSDomain   `json:"domains"`
 	Resolvers []XDNSResolver `json:"resolvers"`
 	ExtraPoll int32          `json:"extraPoll"`
+	TCPOnly   bool           `json:"tcpOnly"`
 }
 
 func (c *XDNS) Build() (proto.Message, error) {
@@ -907,7 +908,7 @@ func (c *XDNS) Build() (proto.Message, error) {
 	if c.ExtraPoll < 0 || c.ExtraPoll > 3 {
 		return nil, errors.New("c.ExtraPoll < 0 || c.ExtraPoll > 3")
 	}
-	return &xdns.Config{Domains: domains, Resolvers: resolvers, ExtraPoll: c.ExtraPoll}, nil
+	return &xdns.Config{Domains: domains, Resolvers: resolvers, ExtraPoll: c.ExtraPoll, TcpOnly: c.TCPOnly}, nil
 }
 
 type XMC struct {
