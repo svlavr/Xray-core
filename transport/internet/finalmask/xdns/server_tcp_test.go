@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -95,6 +96,7 @@ type recursiveForwarder struct {
 	target                 string
 	udp, tcp, maxWire      atomic.Int32
 	payloadUDP, payloadTCP atomic.Int32
+	maxBatch               atomic.Int32
 	beforeTCP              func()
 }
 
@@ -130,6 +132,32 @@ func (f *recursiveForwarder) exchange(q *mdns.Msg) (*mdns.Msg, error) {
 		p, e := r.Pack()
 		if e != nil {
 			return nil, e
+		}
+		var reply dnsmessage.Message
+		if reply.Unpack(p) == nil && len(reply.Answers) == 1 {
+			if txt, ok := reply.Answers[0].Body.(*dnsmessage.TXTResource); ok {
+				data := []byte(strings.Join(txt.TXT, ""))
+				count := 0
+				for len(data) >= 2 {
+					last := data[0]&0xc0 == 0xc0
+					n := int(data[0]&0x3f)<<8 | int(data[1])
+					data = data[2:]
+					if n > len(data) {
+						count = 0
+						break
+					}
+					count++
+					data = data[n:]
+					if last {
+						break
+					}
+				}
+				for old := f.maxBatch.Load(); int32(count) > old; old = f.maxBatch.Load() {
+					if f.maxBatch.CompareAndSwap(old, int32(count)) {
+						break
+					}
+				}
+			}
 		}
 		for old := f.maxWire.Load(); int32(len(p)) > old; old = f.maxWire.Load() {
 			if f.maxWire.CompareAndSwap(old, int32(len(p))) {
@@ -218,80 +246,85 @@ func testRead(t *testing.T, pc net.PacketConn, want []byte) {
 
 func TestServerLargeDNSResponse(t *testing.T) {
 	for _, protocol := range []string{"tcp", "https"} {
-		t.Run(protocol, func(t *testing.T) {
-			s := testServer(t, true)
-			f := &recursiveForwarder{target: s.LocalAddr().String()}
-			var rc *ResolverProto
-			if protocol == "https" {
-				rc = testDoH(t, f)
-			} else {
-				rc = testTCPFrontend(t, f)
-			}
-			c := testClient(t, rc)
-			var wants [][]byte
-			for i := range 16 {
-				p := bytes.Repeat([]byte{byte(i + 1)}, 4000)
-				wants = append(wants, p)
-				if _, err := s.WriteTo(p, c.clientID.Addr()); err != nil {
+		for _, packetSize := range []int{24, 4000} {
+			t.Run(fmt.Sprintf("%s/%d", protocol, packetSize), func(t *testing.T) {
+				s := testServer(t, true)
+				f := &recursiveForwarder{target: s.LocalAddr().String()}
+				var rc *ResolverProto
+				if protocol == "https" {
+					rc = testDoH(t, f)
+				} else {
+					rc = testTCPFrontend(t, f)
+				}
+				c := testClient(t, rc)
+				var wants [][]byte
+				for i := range 16 {
+					p := bytes.Repeat([]byte{byte(i + 1)}, packetSize)
+					wants = append(wants, p)
+					if _, err := s.WriteTo(p, c.clientID.Addr()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var uploaded atomic.Int32
+				uploads := make(chan []byte, 2)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					p := make([]byte, 4096)
+					for {
+						n, _, err := s.ReadFrom(p)
+						if err != nil {
+							return
+						}
+						uploaded.Add(1)
+						select {
+						case uploads <- append([]byte(nil), p[:n]...):
+						default:
+						}
+					}
+				}()
+				t.Cleanup(func() { _ = s.Close(); <-done })
+				var earlyUpload atomic.Bool
+				f.beforeTCP = func() {
+					if uploaded.Load() != 0 {
+						earlyUpload.Store(true)
+					}
+				}
+				upload := []byte("deliver-once")
+				if _, err := c.WriteTo(upload, nil); err != nil {
 					t.Fatal(err)
 				}
-			}
-			var uploaded atomic.Int32
-			uploads := make(chan []byte, 2)
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				p := make([]byte, 4096)
-				for {
-					n, _, err := s.ReadFrom(p)
-					if err != nil {
-						return
+				for _, want := range wants {
+					testRead(t, c, want)
+				}
+				select {
+				case got := <-uploads:
+					if !bytes.Equal(got, upload) {
+						t.Fatal("upload changed")
 					}
-					uploaded.Add(1)
-					select {
-					case uploads <- append([]byte(nil), p[:n]...):
-					default:
-					}
+				case <-time.After(time.Second):
+					t.Fatal("upload absent")
 				}
-			}()
-			t.Cleanup(func() { _ = s.Close(); <-done })
-			var earlyUpload atomic.Bool
-			f.beforeTCP = func() {
-				if uploaded.Load() != 0 {
-					earlyUpload.Store(true)
+				if earlyUpload.Load() {
+					t.Fatal("UDP TC consumed upload before TCP retry")
 				}
-			}
-			upload := []byte("deliver-once")
-			if _, err := c.WriteTo(upload, nil); err != nil {
-				t.Fatal(err)
-			}
-			for _, want := range wants {
-				testRead(t, c, want)
-			}
-			select {
-			case got := <-uploads:
-				if !bytes.Equal(got, upload) {
-					t.Fatal("upload changed")
+				if f.payloadUDP.Load() != 1 || f.payloadTCP.Load() != 1 {
+					t.Fatalf("expected one payload query with TCP retry; UDP=%d TCP=%d", f.payloadUDP.Load(), f.payloadTCP.Load())
 				}
-			case <-time.After(time.Second):
-				t.Fatal("upload absent")
-			}
-			if earlyUpload.Load() {
-				t.Fatal("UDP TC consumed upload before TCP retry")
-			}
-			if f.payloadUDP.Load() != 1 || f.payloadTCP.Load() != 1 {
-				t.Fatalf("expected one payload query with TCP retry; UDP=%d TCP=%d", f.payloadUDP.Load(), f.payloadTCP.Load())
-			}
-			if f.maxWire.Load() <= 64000 || f.maxWire.Load() > maxDNSMessageSize {
-				t.Fatalf("wire size %d", f.maxWire.Load())
-			}
-			// Give an erroneously repeated upload time to reach the application reader.
-			time.Sleep(20 * time.Millisecond)
-			if uploaded.Load() != 1 {
-				t.Fatalf("upload delivered %d times", uploaded.Load())
-			}
-			t.Logf("64000 bytes in16 exact4000-byte packets; one%d-byte DNS response; UDP1232 TC -> nativeTCP -> %s", f.maxWire.Load(), protocol)
-		})
+				if (packetSize == 4000 && f.maxWire.Load() <= 64000) || f.maxWire.Load() > maxDNSMessageSize {
+					t.Fatalf("wire size %d", f.maxWire.Load())
+				}
+				if f.maxBatch.Load() != 16 {
+					t.Fatalf("maximum batch %d want16", f.maxBatch.Load())
+				}
+				// Give an erroneously repeated upload time to reach the application reader.
+				time.Sleep(20 * time.Millisecond)
+				if uploaded.Load() != 1 {
+					t.Fatalf("upload delivered %d times", uploaded.Load())
+				}
+				t.Logf("%d bytes in16 exact%d-byte packets; one%d-byte DNS response; UDP1232 TC -> nativeTCP -> %s", 16*packetSize, packetSize, f.maxWire.Load(), protocol)
+			})
+		}
 	}
 }
 

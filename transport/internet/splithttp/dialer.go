@@ -227,9 +227,11 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 				conn, err := tr.DialEarly(ctx, udpAddr, tlsCfg, cfg)
 				if err != nil {
+					_ = pktConn.Close()
+					_ = tr.Close()
 					return nil, err
 				}
-				context.AfterFunc(conn.Context(), func() { tr.Close(); pktConn.Close() })
+				context.AfterFunc(conn.Context(), func() { pktConn.Close(); tr.Close() })
 
 				switch quicParams.Congestion {
 				case "reno":
