@@ -71,6 +71,8 @@ func stageBTCPResolver(t *testing.T, answer string, records map[string]bool) (st
 		}
 		_ = w.WriteMsg(response)
 	})}
+	ready := make(chan struct{})
+	server.NotifyStartedFunc = func() { close(ready) }
 	done := make(chan error, 1)
 	go func() { done <- server.ActivateAndServe() }()
 	t.Cleanup(func() {
@@ -81,6 +83,12 @@ func stageBTCPResolver(t *testing.T, answer string, records map[string]bool) (st
 			t.Error("TCP DNS server did not stop")
 		}
 	})
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		_ = listener.Close()
+		t.Fatal("TCP DNS server did not start")
+	}
 	return listener.Addr().String(), calls
 }
 
