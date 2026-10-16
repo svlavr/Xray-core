@@ -36,7 +36,7 @@ func dnsTestFeature(t testing.TB, r *resolver) *DNS {
 		return r.owner
 	}
 	s := &DNS{ctx: dnsTestContext(t), pub: pubsub.NewService()}
-	s.active.Store(dnsTestResolver(s, r))
+	s.active = dnsTestResolver(s, r)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
@@ -58,7 +58,7 @@ func dnsTestPrepare(t testing.TB, c *Config, d *preparationDispatcher, f feature
 	}
 	r, err := s.newResolver(proto.Clone(c).(*Config), nil)
 	if err == nil {
-		s.active.Store(r)
+		s.active = r
 		t.Cleanup(func() { _ = s.Close() })
 	}
 	return r, err

@@ -178,9 +178,8 @@ func (e *Executor) http(ctx context.Context, request HTTPSRequest, plan httpPlan
 	if err != nil {
 		return receipt, err
 	}
-	req.Header = plan.headers.Clone()
-	if req.Header == nil {
-		req.Header = make(http.Header)
+	if plan.headers != nil {
+		req.Header = plan.headers.Clone()
 	}
 	req.GetBody = nil
 	if _, ok := plan.body.(*uploadBody); ok {

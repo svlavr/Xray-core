@@ -129,7 +129,7 @@ func TestLuaDNSServerQuery(t *testing.T) {
 	option := featureDNS.IPOption{IPv4Enable: true}
 	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("8.8.8.8")}
 	server := &resolver{clients: []*Client{{server: &benchmarkLuaNameServer{ips: ips}, ipOption: &option, timeoutMs: time.Second}}}
-	dnsTestFeature(t, server).active.Load().registerLua(L)
+	dnsTestFeature(t, server).active.registerLua(L)
 	if err := L.DoString(`
 local server = require("xray.dns").Servers[1]
 local matcher = require("xray.geodata").BuildIPMatcher("127.0.0.0/8")

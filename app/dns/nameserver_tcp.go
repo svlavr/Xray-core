@@ -309,7 +309,6 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 }
 
 func (s *TCPNameServer) Close() error {
-	s.cacheController.cancel()
 	// Each admitted worker closes its own connection; the cache joins all work.
 	s.cacheController.Close()
 	return nil

@@ -44,7 +44,7 @@ func TestMeasurementTCPBlockedWriteDeadlinePreservesSibling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn := &stat.CounterConnection{Connection: &interConn{stream: stream}}
+	conn := &stat.CounterConnection{Connection: &interConn{stream: stream, lock: make(chan struct{}, 1)}}
 	type result struct {
 		n   int
 		err error

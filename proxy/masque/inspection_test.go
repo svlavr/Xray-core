@@ -197,7 +197,7 @@ func TestInspectionMasqueFirstRequestStopDuringEstablishment(t *testing.T) {
 
 func TestInspectionMasqueStopVirtualAssociation(t *testing.T) {
 	client, _ := newInspectionClient(t)
-	dev, tnet, _, err := wireguard.CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.232.79.2")}, nil, transmasque.MinPacketSize, true)
+	dev, tnet, err := wireguard.CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.232.79.2")}, nil, transmasque.MinPacketSize, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

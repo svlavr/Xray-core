@@ -59,7 +59,7 @@ func TestDNSPreparationDependencyOrderRules(t *testing.T) {
 			t.Cleanup(func() { instance.Close() })
 			resolver := instance.GetFeature(fdns.ClientType()).(*DNS)
 			for name, want := range map[string]string{"specific.example": "preferred", "printer.local": "local", "ordinary.example.net": "default"} {
-				clients := resolver.active.Load().sortClients(name)
+				clients := resolver.active.sortClients(name)
 				if len(clients) == 0 || clients[0].tag != want {
 					t.Fatalf("%s selected %v, want %s", name, clients, want)
 				}
@@ -203,7 +203,7 @@ func TestDNSPreparationInputSnapshot(t *testing.T) {
 	if err := instance.AddFeature(new(preparationDispatcher)); err != nil {
 		t.Fatal(err)
 	}
-	clients := resolver.active.Load().sortClients("snapshot.example.net")
+	clients := resolver.active.sortClients("snapshot.example.net")
 	if len(clients) != 2 || clients[0].tag != "original" {
 		t.Fatalf("deferred preparation used caller-mutated rules: %+v", clients)
 	}
@@ -252,7 +252,7 @@ func TestDNSApplyUsesNativePerServerStrategyInheritance(t *testing.T) {
 	if !result.Applied || result.Err != nil {
 		t.Fatalf("native per-server strategy inheritance: %+v", result)
 	}
-	option := feature.active.Load().clients[0].ipOption
+	option := feature.active.clients[0].ipOption
 	if option == nil || !option.IPv4Enable || option.IPv6Enable {
 		t.Fatalf("server did not inherit global IPv4 strategy: %+v", option)
 	}
@@ -273,7 +273,7 @@ func TestDNSApplyUsesOwningCoreReadyFakeDNS(t *testing.T) {
 		t.Fatalf("ready FakeDNS apply: %+v", result)
 	}
 	fake := instance.GetFeature((*fdns.FakeDNSEngine)(nil)).(fdns.FakeDNSEngine)
-	server := feature.active.Load().clients[0].server.(*FakeDNSServer)
+	server := feature.active.clients[0].server.(*FakeDNSServer)
 	if server.fakeDNSEngine != fake {
 		t.Fatal("applied resolver did not use its owning core's ready FakeDNS")
 	}
@@ -296,7 +296,7 @@ func TestDNSPreparationDeferredScriptSnapshot(t *testing.T) {
 			}
 			server := object.(*DNS)
 			defer server.Close()
-			if server.active.Load() != nil {
+			if server.active != nil {
 				t.Fatal("dispatcher dependency unexpectedly resolved")
 			}
 			config.Script = "missing-after-construction.lua"
@@ -312,7 +312,7 @@ func TestDNSPreparationDeferredScriptSnapshot(t *testing.T) {
 			if err := instance.AddFeature(dispatcher); err != nil {
 				t.Fatal(err)
 			}
-			if server.active.Load() == nil || server.active.Load().script.Load() != nil {
+			if server.active == nil || server.active.script.Load() != nil {
 				t.Fatal("dependency resolution activated Lua")
 			}
 			if err := server.Start(); err != nil {

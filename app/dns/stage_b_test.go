@@ -355,7 +355,7 @@ func TestStageBTimedCleanupKeepsBoundedOwner(t *testing.T) {
 	block := make(chan struct{})
 	old := &stageBBlockingServer{started: make(chan struct{}), closeBlock: block}
 	feature := stageBManualFeature(t, old)
-	feature.active.Load().clients[0].tag = "old"
+	feature.active.clients[0].tag = "old"
 	t.Cleanup(func() {
 		select {
 		case <-block:
@@ -428,7 +428,7 @@ func TestStageBReplacementAndFeatureCloseShareRetirement(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		feature.mu.Lock()
-		captured := feature.active.Load().ctx.Err() != nil
+		captured := feature.active.ctx.Err() != nil
 		feature.mu.Unlock()
 		if captured {
 			break
@@ -825,7 +825,7 @@ func TestStageBDNSNoInternalRowsOffOn(t *testing.T) {
 
 func TestStageBNativeOwnLinkTag(t *testing.T) {
 	client := stageBManualFeature(t, &stageBBlockingServer{started: make(chan struct{})})
-	client.active.Load().clients[0].tag = "resolver"
+	client.active.clients[0].tag = "resolver"
 	ctx := session.ContextWithInbound(context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance)), &session.Inbound{Tag: "resolver"})
 	if !client.IsOwnLink(ctx) || !client.IsOwnLink(toDnsContext(ctx, ctx, "resolver.test")) {
 		t.Fatal("native resolver tag lost from routed DNS context")

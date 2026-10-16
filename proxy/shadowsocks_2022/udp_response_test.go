@@ -1,12 +1,14 @@
 package shadowsocks_2022
 
 import (
+	"context"
 	"io"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -48,6 +50,8 @@ func TestNativeUDPResponsesDestinationsAndEncoding(t *testing.T) {
 	var got []string
 	conn.write = func(p []byte) (int, error) { got = append(got, string(p)); return len(p), nil }
 	s := new(ServerUDPSession)
+	s.timer = signal.CancelAfterInactivity(context.Background(), func() {}, time.Minute)
+	t.Cleanup(func() { s.timer.SetTimeout(0) })
 	s.UpdateConn(conn)
 	var destinations []net.Destination
 	handleUDPResponse(s, link, fallback, func(dest net.Destination, payload []byte) ([]byte, error) {
@@ -95,6 +99,8 @@ func TestNativeUDPResponsesWriteFailureReleasesBatch(t *testing.T) {
 			return 1, io.ErrClosedPipe
 		}}
 		s := new(ServerUDPSession)
+		s.timer = signal.CancelAfterInactivity(context.Background(), func() {}, time.Minute)
+		t.Cleanup(func() { s.timer.SetTimeout(0) })
 		s.UpdateConn(conn)
 		handleUDPResponse(s, link, net.UDPDestination(net.LocalHostIP, 1001), nil)
 		conn.Close()
@@ -125,6 +131,8 @@ func TestNativeUDPResponsesExplicitCloseUnblocksRead(t *testing.T) {
 	reader := &responseBlockingReader{Reader: r, entered: make(chan struct{})}
 	link := &transport.Link{Reader: reader, Writer: w}
 	s := new(ServerUDPSession)
+	s.timer = signal.CancelAfterInactivity(context.Background(), func() {}, time.Minute)
+	t.Cleanup(func() { s.timer.SetTimeout(0) })
 	s.link.Store(link)
 	finished := make(chan struct{})
 	go func() { handleUDPResponse(s, link, net.UDPDestination(net.LocalHostIP, 1001), nil); close(finished) }()

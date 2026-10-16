@@ -45,7 +45,7 @@ func (e *scriptEngine) start(router *Router) error {
 			ctx, cancel := context.WithTimeout(ctx, scriptExecutionTimeout*20)
 			defer cancel()
 			var createErr error
-			state, createErr = e.program.NewState(ctx, func(L *lua.LState) {
+			state, createErr = e.program.NewState(ctx, 256, func(L *lua.LState) {
 				geodata.RegisterLua(L)
 				log.RegisterLua(L)
 				router.RegisterLua(L)

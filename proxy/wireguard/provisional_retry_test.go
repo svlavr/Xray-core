@@ -8,10 +8,9 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
-func TestWireGuardSelectedProvisionalFailureRecreatesNativeTUN(t *testing.T) {
+func TestWireGuardSelectedProvisionalFailureRetainsNativeDevice(t *testing.T) {
 	instance, err := core.New(&core.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -27,35 +26,31 @@ func TestWireGuardSelectedProvisionalFailureRecreatesNativeTUN(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = h.Close() })
 	ctx := session.ContextWithOutbounds(internet.ContextWithMUTransport(base), []*session.Outbound{{}})
-	// Construct a real native device, then make its configuration fail.
-	conf.SecretKey = "invalid"
-	if err := h.init(ctx); err == nil {
+	device, stack, ipc := h.dev, h.tnet, h.ipc
+	h.ipc = "private_key=invalid\n"
+	if err := h.up(ctx); err == nil {
 		t.Fatal("invalid provisional device configuration succeeded")
 	}
-	if h.dev != nil || h.tun != nil || h.tnet != nil || h.newTun == nil {
-		t.Fatal("failed provisional initialization retained resources or lost retry constructor")
+	if h.dev != device || h.tnet != stack || h.ipc == "" {
+		t.Fatal("failed setup lost native device, stack or retry configuration")
 	}
-	construct := h.newTun
-	calls := 0
-	h.newTun = func() (tun.Device, *Net, error) { calls++; return construct() }
-	conf.SecretKey = strings.Repeat("01", 32)
-	if err := h.init(ctx); err != nil {
+	h.ipc = ipc
+	if err := h.up(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 || h.dev == nil || h.tun == nil || h.tnet == nil {
-		t.Fatal("retry did not recreate the real native TUN/device")
+	if h.dev != device || h.tnet != stack || h.ipc != "" {
+		t.Fatal("retry replaced native owner or retained applied IPC")
 	}
-	device := h.dev
-	if err := h.init(ctx); err != nil || h.dev != device || calls != 1 {
-		t.Fatalf("ready retry replaced native device: %v", err)
+	if err := h.up(ctx); err != nil || h.dev != device {
+		t.Fatalf("ready retry replaced device: %v", err)
 	}
 	if err := h.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if h.newTun != nil || h.tun != nil || h.dev != nil {
-		t.Fatal("terminal close retained native retry admission")
+	if h.dev != nil {
+		t.Fatal("terminal close retained device")
 	}
-	if err := h.init(ctx); err == nil || calls != 1 {
-		t.Fatal("terminal close reconstructed a device")
+	if err := h.up(ctx); err == nil {
+		t.Fatal("terminal close admitted retry")
 	}
 }

@@ -62,7 +62,7 @@ end
 `
 	L := lua.NewState()
 	b.Cleanup(L.Close)
-	dnsTestFeature(b, server).active.Load().registerLua(L)
+	dnsTestFeature(b, server).active.registerLua(L)
 	if err := L.DoString(script); err != nil {
 		b.Fatal(err)
 	}

@@ -20,7 +20,8 @@ func inspectionNativeTCP(t *testing.T, tun Tun) *tcpConn {
 	t.Helper()
 	s := &stack{tun: tun, mtu: testMTU, window: tcpWindow, conns: make(map[flow]*tcpConn)}
 	f := flow{src: netip.MustParseAddrPort("10.0.0.2:1234"), dst: netip.MustParseAddrPort("10.0.0.1:443")}
-	c := newTCPConn(s, f, segment{seq: 1, window: 65535})
+	c := newTCPConn(s, f)
+	c.synchronize(segment{seq: 1, window: 65535})
 	c.established = true
 	c.sndUna, c.sndBase = c.sndNxt, c.sndNxt
 	s.conns[f] = c
@@ -65,7 +66,7 @@ func TestInspectionTCPNativeAcceptedPrefixOnStop(t *testing.T) {
 			c := inspectionNativeTCP(t, l)
 			c.sndWnd = 4
 			counter := new(testCounter)
-			var writer buf.Writer = &tunTCPWriter{writer: c, counter: counter}
+			var writer buf.Writer = &TCPWriter{Writer: c, Counter: counter}
 			var flow fs.Exchange
 			var view fs.FlowInspection
 			if inspected {
@@ -132,7 +133,7 @@ func TestInspectionTCPNativeRetryCountsApplicationOnce(t *testing.T) {
 	c := inspectionNativeTCP(t, l)
 	flow, view := inspectionNativeFlow(t, c)
 	counter := new(testCounter)
-	writer := buf.AttachWriterReceipt(&tunTCPWriter{writer: c, counter: counter}, flow)
+	writer := buf.AttachWriterReceipt(&TCPWriter{Writer: c, Counter: counter}, flow)
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("head")), buf.FromBytes([]byte("tail"))}); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +161,7 @@ func TestInspectionUDPQueueDropAndRetirementRelease(t *testing.T) {
 	defer manager.Close()
 	flow := manager.Observation().Begin(net.Network_UDP, fs.TrafficOriginUser, src, dst, nil)
 	defer flow.Finish()
-	c := &udpConn{handler: u, src: src, dst: dst, egress: make(chan *buf.Buffer, 1), receipt: flow}
+	c := &udpConn{handler: u, src: src, dst: dst, queue: newPacketQueue(1), receipt: flow}
 	u.udpConns[src] = c
 	queued, dropped := inspectionOwnedPacket("queued"), inspectionOwnedPacket("dropped")
 	u.HandlePacket(src, dst, queued)
@@ -183,7 +184,7 @@ func TestInspectionTCPNativeSegmenterCountsDecodedOnce(t *testing.T) {
 	c.stack.segmenter = l
 	flow, view := inspectionNativeFlow(t, c)
 	counter := new(testCounter)
-	writer := buf.AttachWriterReceipt(&tunTCPWriter{writer: c, counter: counter}, flow)
+	writer := buf.AttachWriterReceipt(&TCPWriter{Writer: c, Counter: counter}, flow)
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("head")), buf.FromBytes(nil), buf.FromBytes([]byte("tail"))}); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +203,7 @@ func TestInspectionTCPNativeZeroAcceptanceAfterClose(t *testing.T) {
 	c := inspectionNativeTCP(t, l)
 	flow, view := inspectionNativeFlow(t, c)
 	counter := new(testCounter)
-	writer := buf.AttachWriterReceipt(&tunTCPWriter{writer: c, counter: counter}, flow)
+	writer := buf.AttachWriterReceipt(&TCPWriter{Writer: c, Counter: counter}, flow)
 	c.Close()
 	abandoned := inspectionOwnedPacket("abandoned")
 	if err := writer.WriteMultiBuffer(buf.MultiBuffer{abandoned}); !errors.Is(err, io.ErrClosedPipe) {

@@ -235,7 +235,26 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=1 https://github.com/svlavr/Xray-core.git c9a691a3d477a85168f8a1519444b88f258d4cd6
           git show c9a691a3d477a85168f8a1519444b88f258d4cd6:common/buf/writer.go > "$RUNNER_TEMP/native-writer-before.go"
-          python -c 'import json, os; from pathlib import Path; p=Path(os.environ["RUNNER_TEMP"]); (p/"native-before.json").write_text(json.dumps({"Replace": {str(Path("common/buf/writer.go").resolve()): str(p/"native-writer-before.go")}}))'
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ["RUNNER_TEMP"])
+          current_path = Path("common/buf/writer.go").resolve()
+          current = current_path.read_text()
+          historical = (p / "native-writer-before.go").read_text()
+          signature = "func (w *BufferToBytesWriter) Write(payload []byte) (int, error) {"
+          def scalar_span(text):
+              if text.count(signature) != 1:
+                  raise SystemExit("Expected exactly one native scalar writer")
+              start = text.index(signature)
+              return start, text.index("\n}\n", start) + 3
+          start, end = scalar_span(current)
+          old_start, old_end = scalar_span(historical)
+          # Reproduce only the original scalar-counter bug. Keep the current
+          # batch writer and helpers so compilation cannot stand in for failure.
+          (p / "native-writer-before.go").write_text(current[:start] + historical[old_start:old_end] + current[end:])
+          (p / "native-before.json").write_text(json.dumps({"Replace": {str(current_path): str(p / "native-writer-before.go")}}))
+          PY
           set +e
           go test -mod=readonly -race -timeout 5m -count=1 -overlay "$RUNNER_TEMP/native-before.json" -run '^TestNativeCounterWriterScalarResult$' ./common/buf > "$RUNNER_TEMP/native-before.log" 2>&1
           before_status=$?

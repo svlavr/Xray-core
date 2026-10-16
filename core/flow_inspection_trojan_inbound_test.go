@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	fout "github.com/xtls/xray-core/features/outbound"
 	frouting "github.com/xtls/xray-core/features/routing"
+	fs "github.com/xtls/xray-core/features/stats"
 )
 
 func TestFlowInspectionTrojanInboundTCP(t *testing.T) {
@@ -41,10 +42,9 @@ func TestFlowInspectionTrojanInboundUnclaimedOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.Close()
-	inspectionWait(t, func() bool {
-		totals, err := view.ReadTotals()
-		return err == nil && totals.User.Uplink == uint64(len(payload))
-	})
+	// Sniffed USER custody precedes selected replay consumption; await both facts.
+	inspectionByteTotals(t, view, outbound.Tag,
+		fs.ClientTotals{Uplink: uint64(len(payload))}, fs.ClientTotals{Uplink: uint64(len(payload))})
 
 	totals, err := view.ReadTotals()
 	if err != nil {

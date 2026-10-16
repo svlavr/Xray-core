@@ -549,6 +549,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 
 	var input *bytes.Reader
 	var rawInput *bytes.Buffer
+	var rawInputPointer **bytes.Buffer
 	switch requestAddons.Flow {
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
@@ -580,10 +581,20 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 				} else {
 					return errors.New("XTLS only supports TLS and REALITY directly for now.")
 				}
-				i, _ := t.FieldByName("input")
-				r, _ := t.FieldByName("rawInput")
+				i, inputOK := t.FieldByName("input")
+				r, rawOK := t.FieldByName("rawInput")
+				if !inputOK || !rawOK || i.Type != reflect.TypeFor[bytes.Reader]() {
+					return errors.New("incompatible Vision TLS input layout")
+				}
 				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				switch r.Type {
+				case reflect.TypeFor[*bytes.Buffer]():
+					rawInputPointer = (**bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				case reflect.TypeFor[bytes.Buffer]():
+					rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				default:
+					return errors.New("incompatible Vision TLS record buffer layout")
+				}
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow)
@@ -612,7 +623,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	trafficState := proxy.NewTrafficState(userSentID)
 	clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 	if requestAddons.Flow == vless.XRV {
-		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, connection, input, rawInput, nil)
+		visionReader := proxy.NewVisionReader(clientReader, trafficState, true, ctx, connection, input, rawInput, nil)
+		visionReader.BindRawInputPointer(rawInputPointer)
+		clientReader = visionReader
 	}
 
 	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))

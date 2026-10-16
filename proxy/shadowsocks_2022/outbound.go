@@ -185,8 +185,8 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			return buf.Copy(responseReader, link.Writer, buf.UpdateActivity(timer))
 		}
 
-		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
+		responseDonePost := task.OnSuccess(responseDone, task.Close(link.Writer))
+		if err := task.Run(ctx, requestDone, responseDonePost); err != nil {
 			return errors.New("connection ends").Base(err)
 		}
 
@@ -229,8 +229,8 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			return nil
 		}
 
-		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
-		if err := task.Run(ctx, requestDone, responseDoneAndCloseWriter); err != nil {
+		responseDonePost := task.OnSuccess(responseDone, task.Close(link.Writer))
+		if err := task.Run(ctx, requestDone, responseDonePost); err != nil {
 			return errors.New("connection ends").Base(err)
 		}
 

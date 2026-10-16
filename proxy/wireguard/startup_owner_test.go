@@ -3,7 +3,6 @@ package wireguard
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -12,24 +11,11 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/transport/internet"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 type startupWGForeignHandler struct{ outbound.Handler }
 
 func (*startupWGForeignHandler) Tag() string { return "foreign-request-handler" }
-
-// Observe the real native event worker while keeping the original TUN event stream.
-type startupWGEventTUN struct {
-	tun.Device
-	eventsRead chan struct{}
-	once       sync.Once
-}
-
-func (t *startupWGEventTUN) Events() <-chan tun.Event {
-	t.once.Do(func() { close(t.eventsRead) })
-	return t.Device.Events()
-}
 
 func TestWireGuardStartupUsesConstructorOwnerForSelectedBind(t *testing.T) {
 	for _, mode := range []string{"native", "selected-missing-handler", "selected-foreign-handler"} {
@@ -60,18 +46,15 @@ func TestWireGuardStartupUsesConstructorOwnerForSelectedBind(t *testing.T) {
 			}
 			// Native proxyman supplies FullHandler only to construction. Measurement
 			// Process requests may omit it; a request value cannot replace the owner.
-			eventTUN := &startupWGEventTUN{Device: h.tun, eventsRead: make(chan struct{})}
-			h.tun = eventTUN
+			device := h.dev
 			dialer := &inspectionWGDialer{contexts: make(chan context.Context, 8)}
 			internet.UseAlternativeSystemDialer(dialer)
 			defer internet.UseAlternativeSystemDialer(nil)
-			if err := h.init(request); err != nil {
+			if err := h.up(request); err != nil {
 				t.Fatal(err)
 			}
-			select {
-			case <-eventTUN.eventsRead:
-			case <-time.After(3 * time.Second):
-				t.Fatal("real native TUN event worker did not start")
+			if h.dev != device || !h.canup.Load() {
+				t.Fatal("startup replaced native owner or failed to admit EventUp")
 			}
 			var physical context.Context
 			select {

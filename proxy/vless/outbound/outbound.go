@@ -254,6 +254,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	var input *bytes.Reader
 	var rawInput *bytes.Buffer
+	var rawInputPointer **bytes.Buffer
 	allowUDP443 := false
 	switch requestAddons.Flow {
 	case vless.XRV + "-udp443":
@@ -290,10 +291,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			} else {
 				return errors.New("XTLS only supports TLS and REALITY directly for now.")
 			}
-			i, _ := t.FieldByName("input")
-			r, _ := t.FieldByName("rawInput")
+			i, inputOK := t.FieldByName("input")
+			r, rawOK := t.FieldByName("rawInput")
+			if !inputOK || !rawOK || i.Type != reflect.TypeFor[bytes.Reader]() {
+				return errors.New("incompatible Vision TLS input layout")
+			}
 			input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-			rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+			switch r.Type {
+			case reflect.TypeFor[bytes.Buffer]():
+				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+			case reflect.TypeFor[*bytes.Buffer]():
+				rawInputPointer = (**bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+			default:
+				return errors.New("incompatible Vision TLS record buffer layout")
+			}
 		default:
 			panic("unknown VLESS request command")
 		}
@@ -399,7 +410,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		// default: serverReader := buf.NewReader(conn)
 		serverReader := encoding.DecodeBodyAddons(conn, request, responseAddons)
 		if requestAddons.Flow == vless.XRV {
-			serverReader = proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
+			visionReader := proxy.NewVisionReader(serverReader, trafficState, false, ctx, conn, input, rawInput, ob)
+			visionReader.BindRawInputPointer(rawInputPointer)
+			serverReader = visionReader
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			if requestAddons.Flow == vless.XRV {

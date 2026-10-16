@@ -27,17 +27,14 @@ func newScriptEngine(script string) (*scriptEngine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newScriptEngineProgram(program), nil
-}
-
-func newScriptEngineProgram(program *xlua.Program) *scriptEngine {
-	return &scriptEngine{program: program}
+	return &scriptEngine{program: program}, nil
 }
 
 func (e *scriptEngine) start(server *resolver) error {
 	ctx, cancel := context.WithCancel(server.ctx)
 	pool, err := xlua.NewPool(ctx, scriptExecutionTimeout, e.program.NewStateFactory(
 		scriptExecutionTimeout*20,
+		256,
 		func(L *lua.LState) {
 			geodata.RegisterLua(L)
 			log.RegisterLua(L)

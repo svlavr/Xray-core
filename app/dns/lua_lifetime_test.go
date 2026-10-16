@@ -1,12 +1,15 @@
 package dns
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -98,9 +101,9 @@ end`)
 		t.Fatalf("initialization plus query count=%d", calls.Load())
 	}
 	config.Script = m3DNSFile(t, `local dns = require("xray.dns"); dns.Servers[1]:Query("init.example", true, false, false); error("after external action")`)
-	before := s.active.Load()
+	before := s.active
 	result = ApplyConfig(context.Background(), s, config)
-	if result.Applied || result.Err == nil || s.active.Load() != before {
+	if result.Applied || result.Err == nil || s.active != before {
 		t.Fatalf("failed activation: %+v", result)
 	}
 	if calls.Load() != 3 {
@@ -206,7 +209,7 @@ saved=dns.Servers[2]; query=saved.Query; general=dns.Query
 local ips,_,err=query(saved,"good.example",true,false,false);assert(not err and #ips==1)`); err != nil {
 		t.Fatal(err)
 	}
-	old := s.active.Load()
+	old := s.active
 	config := stageBConfig(stageBServer("127.0.0.1:53", "replacement"))
 	if result := ApplyConfig(context.Background(), s, config); !result.Applied || result.Err != nil {
 		t.Fatalf("apply: %+v", result)
@@ -222,7 +225,7 @@ local ips,_,err=query(saved,"good.example",true,false,false);assert(not err and 
 
 func TestM3DNSBindingSurvivesDetachedTransportAndCacheContext(t *testing.T) {
 	s := m3DNSFeature(t)
-	owner := s.active.Load()
+	owner := s.active
 	base := context.WithValue(context.Background(), core.XrayKey(1), new(core.Instance))
 	base = context.WithValue(base, resolverContextKey{}, owner)
 	ctx := toDnsContext(base, context.Background(), "dns")
@@ -262,7 +265,7 @@ func TestM3DNSActivationCancellationRetainsOwnedPendingSlot(t *testing.T) {
 			go func() { applied <- s.applyResolver(ctx, dnsTestResolver(s, candidate)) }()
 			m3DNSReceive(t, blocked.entered)
 			s.mu.Lock()
-			owner, old := s.pending, s.active.Load()
+			owner, old := s.pending, s.active
 			s.mu.Unlock()
 			if owner == nil || owner != candidate {
 				t.Fatal("activating candidate not owned")
@@ -289,7 +292,7 @@ func TestM3DNSActivationCancellationRetainsOwnedPendingSlot(t *testing.T) {
 			}
 			m3DNSReceive(t, blocked.closeSignal)
 			s.mu.Lock()
-			stillPending, current := s.pending == owner, s.active.Load()
+			stillPending, current := s.pending == owner, s.active
 			s.mu.Unlock()
 			if !stillPending || current != old {
 				t.Fatal("unfinished activation forgotten or publication changed")
@@ -352,20 +355,20 @@ func TestM3DNSNativeEngineCloseCancelsExplicitPoolContext(t *testing.T) {
 	m3DNSReceive(t, closed)
 }
 
-func TestM3DNSInlineApplyCancellationBeforePublication(t *testing.T) {
+func TestM3DNSFileApplyCancellationBeforePublication(t *testing.T) {
 	address, calls := stageBTCPResolver(t, "192.0.2.31", map[string]bool{"init.example.": true})
 	server := m3DNSFeature(t)
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}
-	old := server.active.Load()
-	config := stageBConfig(stageBServer(address, "inline"))
-	config.Script = "base64:" + base64.StdEncoding.EncodeToString([]byte(`
+	old := server.active
+	config := stageBConfig(stageBServer(address, "file"))
+	config.Script = m3DNSFile(t, `
  local s=require("xray.dns").Servers[1]
  local _,_,err=s:Query("init.example",true,false,false)
  assert(not err)
  while true do end
- function HandleDNSQuery(...) return s:Query(...) end`))
+ function HandleDNSQuery(...) return s:Query(...) end`)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan ApplyResult, 1)
@@ -377,9 +380,9 @@ func TestM3DNSInlineApplyCancellationBeforePublication(t *testing.T) {
 	for calls.Load() == 0 {
 		select {
 		case result := <-done:
-			t.Fatalf("inline initializer returned before query: %+v", result)
+			t.Fatalf("file initializer returned before query: %+v", result)
 		case <-deadline.C:
-			t.Fatal("inline initializer did not query its server")
+			t.Fatal("file initializer did not query its server")
 		case <-ticker.C:
 		}
 	}
@@ -387,18 +390,80 @@ func TestM3DNSInlineApplyCancellationBeforePublication(t *testing.T) {
 	pending := server.pending
 	server.mu.Unlock()
 	if pending == nil {
-		t.Fatal("inline activation was not owned")
+		t.Fatal("file activation was not owned")
 	}
 	cancel()
 	result := m3DNSReceive(t, done)
 	if result.Applied || !errors.Is(result.Err, context.Canceled) {
-		t.Fatalf("canceled inline apply: %+v", result)
+		t.Fatalf("canceled file apply: %+v", result)
 	}
 	m3DNSReceive(t, pending.done)
 	server.mu.Lock()
-	current, closing := server.active.Load(), server.pending
+	current, closing := server.active, server.pending
 	server.mu.Unlock()
 	if current != old || closing != nil || pending.script.Load() != nil {
-		t.Fatal("canceled inline activation changed publication or escaped retirement")
+		t.Fatal("canceled file activation changed publication or escaped retirement")
+	}
+}
+
+// Inline input is rejected by the adopted native compiler before either initial
+// construction or an explicit update can initialize or publish a resolver.
+func TestM3DNSRejectsInlineBeforeConstructionAndApply(t *testing.T) {
+	const source = `
+local server = require("xray.dns").Servers[1]
+server:Query("init.example", true, false, false)
+function HandleDNSQuery(...) return server:Query(...) end`
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write([]byte(source)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, script string
+	}{
+		{"base64", "base64:" + base64.StdEncoding.EncodeToString([]byte(source))},
+		{"base64+gzip", "base64+gzip:" + base64.StdEncoding.EncodeToString(compressed.Bytes())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			address, calls := stageBTCPResolver(t, "192.0.2.31", map[string]bool{"init.example.": true})
+			config := stageBConfig(stageBServer(address, "rejected-inline"))
+			config.Script = tc.script
+			created, err := New(dnsTestContext(t), config)
+			if created != nil {
+				t.Cleanup(func() {
+					if err := created.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				t.Fatal("constructor retained a resolver for rejected inline input")
+			}
+			if err == nil || !strings.Contains(err.Error(), "currently unavailable") {
+				t.Fatalf("constructor error = %v; want native inline-policy rejection", err)
+			}
+
+			server := m3DNSFeature(t)
+			if err := server.Start(); err != nil {
+				t.Fatal(err)
+			}
+			server.mu.Lock()
+			before := server.active
+			server.mu.Unlock()
+			result := ApplyConfig(context.Background(), server, config)
+			if result.Applied || result.Err == nil || !strings.Contains(result.Err.Error(), "currently unavailable") {
+				t.Fatalf("inline update = %+v; want native inline-policy rejection", result)
+			}
+			server.mu.Lock()
+			current, pending := server.active, server.pending
+			server.mu.Unlock()
+			if current != before || pending != nil {
+				t.Fatal("rejected inline update changed publication or retained activation")
+			}
+			if calls.Load() != 0 {
+				t.Fatal("rejected inline input executed its DNS initializer")
+			}
+		})
 	}
 }

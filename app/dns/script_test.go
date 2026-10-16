@@ -235,7 +235,7 @@ func TestDNSScriptRejectsInvalidStartup(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer server.Close()
-			if server.active.Load().prepared == nil || server.active.Load().script.Load() != nil {
+			if server.active.prepared == nil || server.active.script.Load() != nil {
 				t.Fatal("New did not compile the script without starting its pool")
 			}
 			closed, err := New(context.Background(), &Config{Script: path})
@@ -248,7 +248,7 @@ func TestDNSScriptRejectsInvalidStartup(t *testing.T) {
 			if err := server.Start(); err == nil || go_errors.Is(err, context.Canceled) {
 				t.Fatal("Start accepted an invalid DNS script")
 			}
-			if server.active.Load().script.Load() != nil {
+			if server.active.script.Load() != nil {
 				t.Fatal("Start retained a script pool after failure")
 			}
 		})
@@ -268,7 +268,7 @@ func TestDNSScriptProgramSnapshot(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.start(dnsTestFeature(t, &resolver{ctx: context.Background()}).active.Load()); err != nil {
+	if err := engine.start(dnsTestFeature(t, &resolver{ctx: context.Background()}).active); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := engine.query("example.com", featureDNS.IPOption{}); err == nil || !strings.Contains(err.Error(), "compiled") {
@@ -345,12 +345,12 @@ func TestDNSConstructorScriptSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	if server.active.Load().script.Load() != nil {
+	if server.active.script.Load() != nil {
 		t.Fatal("constructor activated Lua")
 	}
 	option := featureDNS.IPOption{IPv4Enable: true}
 	upstream := &scriptNameServer{name: "native", answers: map[string]net.IP{"native.example": net.ParseIP("192.0.2.31")}, ttl: 30}
-	server.active.Load().clients = []*Client{{server: upstream, ipOption: &option, timeoutMs: time.Second}}
+	server.active.clients = []*Client{{server: upstream, ipOption: &option, timeoutMs: time.Second}}
 	ips, ttl, err := server.LookupIP("native.example", option)
 	if err != nil || ttl != 30 || len(ips) != 1 || !ips[0].Equal(net.ParseIP("192.0.2.31")) {
 		t.Fatalf("pre-Start lookup = %v, TTL %d, %v; want native answer", ips, ttl, err)

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -21,11 +20,11 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-// This host witness records the native controller's current advisory-error
-// behavior. It does not propose changing that behavior or establish a proxy's
+// This host witness records fatal native controller errors after upstream #7173.
+// It does not establish a proxy's
 // destination-connect boundary. Global mutation stays in an isolated child,
 // following the external measurement_test dialer fixture convention.
-func TestAuditConnectControllerErrorStillConnects(t *testing.T) {
+func TestAuditConnectControllerErrorRejectsConnection(t *testing.T) {
 	const key = "XRAY_MEASUREMENT_AUDIT_CONNECT_CHILD"
 	if os.Getenv(key) != t.Name() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -99,18 +98,19 @@ func TestAuditConnectControllerErrorStillConnects(t *testing.T) {
 	r, err := e.TCPConnect(context.Background(), TCPConnectRequest{
 		Route: Route{Kind: Direct}, Destination: ln.Addr().(*net.TCPAddr).AddrPort(), Timeout: 2 * time.Second,
 	})
-	if err != nil || !r.DestinationConnected || calls.Load() != 1 || r.NativeDialElapsed == nil || *r.NativeDialElapsed < 0 || r.Elapsed != *r.NativeDialElapsed {
-		t.Fatalf("native connect after advisory controller error: %+v, %v, calls=%d", r, err, calls.Load())
+	if !errors.Is(err, controllerErr) || r.DestinationConnected || calls.Load() != 1 || r.NativeDialElapsed == nil || *r.NativeDialElapsed < 0 || r.Elapsed != *r.NativeDialElapsed {
+		t.Fatalf("native connect after fatal controller error: %+v, %v, calls=%d", r, err, calls.Load())
 	}
+	_ = ln.Close()
 	select {
 	case peer := <-peerDone:
-		if peer.n != 0 || !errors.Is(peer.err, io.EOF) {
-			t.Fatalf("peer expected EOF without application bytes: n=%d err=%v", peer.n, peer.err)
+		if peer.n != 0 || !errors.Is(peer.err, net.ErrClosed) {
+			t.Fatalf("listener accepted despite controller rejection: n=%d err=%v", peer.n, peer.err)
 		}
 	case <-time.After(4 * time.Second):
 		t.Fatal("native connect did not close its socket")
 	}
-	t.Logf("controller_calls=%d connected=%t peer_EOF=true application_bytes=0 native_dial=%s elapsed=%s", calls.Load(), r.DestinationConnected, *r.NativeDialElapsed, r.Elapsed)
+	t.Logf("controller_calls=%d connected=%t listener_closed=true application_bytes=0 native_dial=%s elapsed=%s", calls.Load(), r.DestinationConnected, *r.NativeDialElapsed, r.Elapsed)
 }
 
 // These are private exchange/parser and cancellation witnesses. Injecting

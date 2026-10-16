@@ -1,11 +1,8 @@
 package wireguard
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	stdnet "net"
 	"strings"
 	"testing"
@@ -23,108 +20,6 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 )
-
-func TestInspectionUDPLargePacketAndDestination(t *testing.T) {
-	destination := net.UDPDestination(net.LocalHostIP, 5353)
-	payload := bytes.Repeat([]byte{0x5a}, buf.Size+73)
-	queue := newPacketQueue(1)
-	if !queue.push(&packet{p: payload, dest: &destination}) {
-		t.Fatal("packet rejected")
-	}
-	queue.close()
-	c := &udpConn{queue: queue}
-	mb, err := c.ReadMultiBuffer()
-	defer buf.ReleaseMulti(mb)
-	if err != nil || len(mb) != 1 || !bytes.Equal(mb[0].Bytes(), payload) || mb[0].UDP == nil || *mb[0].UDP != destination {
-		t.Fatalf("packet lost or changed: %v %v", mb, err)
-	}
-}
-
-func TestInspectionUDPQueueRetirement(t *testing.T) {
-	for _, replaced := range []bool{false, true} {
-		t.Run(fmt.Sprint(replaced), func(t *testing.T) {
-			src := net.UDPDestination(net.LocalHostIP, 1234)
-			dst := net.UDPDestination(net.LocalHostIP, 5353)
-			retired := &udpConn{src: src, queue: newPacketQueue(udpQueueLimit)}
-			for i := 0; i < udpQueueLimit; i++ {
-				if !retired.queue.push(&packet{p: []byte{1}, dest: &dst}) {
-					t.Fatal("packet rejected below limit")
-				}
-			}
-			current := retired
-			if replaced {
-				current = &udpConn{src: src, queue: newPacketQueue(udpQueueLimit)}
-			}
-			manager := &udpManager{m: map[string]*udpConn{src.NetAddr(): current}}
-			manager.mutex.Lock()
-			manager.close(retired)
-			manager.close(retired)
-			manager.mutex.Unlock()
-			if retired.queue.items != nil || retired.queue.push(&packet{}) {
-				t.Fatal("retired queue retained packets or accepted new input")
-			}
-			if _, ok := retired.queue.pop(); ok {
-				t.Fatal("retired queue delivered pending input")
-			}
-			if replaced {
-				if manager.m[src.NetAddr()] != current || !current.queue.push(&packet{}) {
-					t.Fatal("retirement removed or closed replacement")
-				}
-			} else if len(manager.m) != 0 {
-				t.Fatal("retired owner remained indexed")
-			}
-		})
-	}
-}
-
-func TestInspectionUDPPrefixAndPendingWrite(t *testing.T) {
-	entered, release := make(chan struct{}), make(chan struct{})
-	dst := net.UDPDestination(net.LocalHostIP, 53)
-	alternate := net.UDPDestination(net.LocalHostIP, 5353)
-	calls := 0
-	write := func(payload []byte, from, to net.Destination) error {
-		calls++
-		if calls == 1 && from != dst {
-			t.Errorf("default destination: %v", from)
-		}
-		if calls == 2 {
-			if from != alternate {
-				t.Errorf("packet destination: %v", from)
-			}
-			close(entered)
-			<-release
-			return io.ErrUnexpectedEOF
-		}
-		return nil
-	}
-	c := &udpConn{writeFunc: write, dst: dst}
-	writer := c
-	done := make(chan error, 1)
-	first, second, tail := buf.New(), buf.New(), buf.New()
-	first.WriteString("ok")
-	second.WriteString("fail")
-	tail.WriteString("tail")
-	second.UDP = &alternate
-	go func() { done <- writer.WriteMultiBuffer(buf.MultiBuffer{first, second, tail, buf.FromBytes(nil)}) }()
-	select {
-	case <-entered:
-	case <-time.After(3 * time.Second):
-		close(release)
-		t.Fatal("native write did not start")
-	}
-	close(release)
-	if err := <-done; !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatal(err)
-	}
-	if calls != 2 {
-		t.Fatalf("native partial result: calls=%d", calls)
-	}
-	for _, b := range []*buf.Buffer{first, second, tail} {
-		if !b.IsEmpty() {
-			t.Fatal("native packet input not released")
-		}
-	}
-}
 
 type inspectionWGHandler struct{ outbound.Handler }
 
@@ -167,7 +62,7 @@ func TestInspectionWireGuardDeviceReconnectContext(t *testing.T) {
 	defer internet.UseAlternativeSystemDialer(nil)
 	defer h.Close()
 	initCtx := session.ContextWithOutbounds(parent, []*session.Outbound{{Gateway: net.LocalHostIP}})
-	if err = h.init(initCtx); err != nil {
+	if err = h.up(initCtx); err != nil {
 		t.Fatal(err)
 	}
 	first := <-dialer.contexts
@@ -218,7 +113,7 @@ func TestInspectionWireGuardDeviceReconnectContext(t *testing.T) {
 	if err = h.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if h.dev != nil || h.tun != nil || h.newTun != nil {
+	if h.dev != nil {
 		t.Fatal("native device close retained physical owner or retry admission")
 	}
 	for _, socket := range []net.Conn{firstSocket, nextSocket} {
@@ -261,7 +156,7 @@ func TestInspectionWireGuardProvisionalCallerCancellation(t *testing.T) {
 	defer internet.UseAlternativeSystemDialer(nil)
 	ctx := session.ContextWithOutbounds(parent, []*session.Outbound{{Gateway: net.LocalHostIP}})
 	result := make(chan error, 1)
-	go func() { result <- h.init(ctx) }()
+	go func() { result <- h.up(ctx) }()
 	var physical context.Context
 	select {
 	case physical = <-dialer.entered:
@@ -282,8 +177,8 @@ func TestInspectionWireGuardProvisionalCallerCancellation(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("provisional initialization survived caller cancellation")
 	}
-	if h.dev != nil || h.tun != nil || h.tnet != nil || h.newTun == nil {
-		t.Fatal("canceled provisional bind retained native resources or lost retry")
+	if h.dev == nil || h.tnet == nil {
+		t.Fatal("canceled provisional bind lost the native retry owner")
 	}
 }
 
@@ -310,9 +205,9 @@ func TestInspectionWireGuardStopPendingVirtualDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer h.Close()
-	h.policyManager = inspectionWGPolicy{}
+	h.p = inspectionWGPolicy{}
 	initCtx := session.ContextWithOutbounds(base, []*session.Outbound{{}})
-	if err = h.init(initCtx); err != nil {
+	if err = h.up(initCtx); err != nil {
 		t.Fatal(err)
 	}
 	manager := new(appstats.Manager)

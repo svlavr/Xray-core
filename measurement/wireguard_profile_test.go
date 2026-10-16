@@ -7,11 +7,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"runtime"
 	"testing"
 
 	appdns "github.com/xtls/xray-core/app/dns"
 	"github.com/xtls/xray-core/app/proxyman"
+	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -24,8 +24,7 @@ import (
 )
 
 func TestWireGuardProtocolMeasurements(t *testing.T) {
-	// gVisor rejects loopback addresses arriving through a tunnel NIC. The inner
-	// target is non-loopback; native Freedom redirects only its address to the
+	// The inner target is non-loopback; native Freedom redirects only its address to the
 	// real local fixture, preserving its port. No host interface/TUN is required.
 	const target = "198.18.0.1"
 	const target6 = "fd00::1"
@@ -83,19 +82,12 @@ func TestWireGuardProtocolMeasurements(t *testing.T) {
 	// The native queue preserves larger requests; the client reply reader is
 	// bounded to buf.Size. Above this round-trip limit the peer still gets the
 	// complete request, but its echo must not become a valid full reply.
-	limit, abovePeer := 8192, true
-	if runtime.GOOS == "windows" {
-		// The pinned native device receives 2016 wire bytes on Windows. With
-		// MTU 1420, IPv4/UDP 28, WG 32 and native 16-byte padding, 1952 echoes fit;
-		// 1953 reaches the endpoint, but its unfragmented raw reply is 2028 bytes.
-		limit, abovePeer = 1952, true
-	}
+	// The shared native stack fragments/reassembles across the tunnel MTU on
+	// every OS. The remaining reply ceiling is UDPConnClient's buf.Size reader.
+	limit, abovePeer := buf.Size, true
 	testProtocolPacketBoundary(t, e, target, limit, abovePeer)
 	if carrierDials == nil {
 		t.Run("ipv6-inner", func(t *testing.T) {
-			if runtime.GOOS == "windows" {
-				limit -= 20
-			}
 			testProtocolPacketBoundaryAt(t, e, target6, limit, abovePeer, "127.0.0.1")
 		})
 	}

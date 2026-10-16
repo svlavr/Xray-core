@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/signal/pubsub"
 	"github.com/xtls/xray-core/core"
@@ -20,7 +19,7 @@ type DNS struct {
 	ctx         context.Context
 	pub         *pubsub.Service
 	mu          sync.Mutex
-	active      atomic.Pointer[resolver]
+	active      *resolver
 	pending     *resolver
 	started     bool
 	closed      bool
@@ -62,7 +61,7 @@ func (s *DNS) begin(ctx context.Context, exact *resolver) (*resolver, context.Co
 	if exact == nil {
 		exact, _ = ctx.Value(resolverContextKey{}).(*resolver)
 		if exact == nil || exact.owner != s {
-			exact = s.active.Load()
+			exact = s.active
 		}
 	}
 	if s.closed || exact == nil || exact.owner != s || exact.ctx.Err() != nil {
@@ -134,7 +133,7 @@ func (r *resolver) retire() {
 
 func (s *DNS) Start() error {
 	s.mu.Lock()
-	r := s.active.Load()
+	r := s.active
 	if s.closed || r == nil || r.ctx.Err() != nil {
 		s.mu.Unlock()
 		return context.Canceled
@@ -155,7 +154,7 @@ func (s *DNS) Start() error {
 	err := <-r.initialize()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err == nil && !s.closed && s.active.Load() == r && r.ctx.Err() == nil {
+	if err == nil && !s.closed && s.active == r && r.ctx.Err() == nil {
 		s.started = true
 		return nil
 	}
@@ -168,7 +167,7 @@ func (s *DNS) Start() error {
 func (s *DNS) Close() error {
 	s.mu.Lock()
 	s.closed = true
-	current, pending := s.active.Load(), s.pending
+	current, pending := s.active, s.pending
 	for _, r := range []*resolver{current, pending} {
 		if r != nil {
 			r.cancel()
@@ -188,7 +187,7 @@ func (s *DNS) Close() error {
 		}
 	}
 	s.mu.Lock()
-	s.active.Store(nil)
+	s.active = nil
 	s.mu.Unlock()
 	if s.pub != nil {
 		errs = append(errs, s.pub.Close())
@@ -243,7 +242,7 @@ func (s *DNS) applyResolver(ctx context.Context, r *resolver) ApplyResult {
 	switch {
 	case ctx.Err() != nil:
 		err = ctx.Err()
-	case s.closed || s.active.Load() == nil:
+	case s.closed || s.active == nil:
 		err = context.Canceled
 	case s.pending != nil:
 		err = fmt.Errorf("previous DNS activation or cleanup incomplete")
@@ -266,7 +265,7 @@ func (s *DNS) applyResolver(ctx context.Context, r *resolver) ApplyResult {
 		// The caller may stop waiting even if a native Go callback ignores ctx.
 		stop := context.AfterFunc(ctx, func() {
 			s.mu.Lock()
-			if s.pending == r && s.active.Load() != r {
+			if s.pending == r && s.active != r {
 				r.cancel()
 			}
 			s.mu.Unlock()
@@ -299,7 +298,8 @@ func (s *DNS) applyResolver(ctx context.Context, r *resolver) ApplyResult {
 		// Acquire checks pending until locked publication replaces the value.
 		unsafe = false
 	}
-	old := s.active.Swap(r)
+	old := s.active
+	s.active = r
 	s.pending = old
 	old.cancel()
 	s.mu.Unlock()

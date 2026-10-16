@@ -28,9 +28,9 @@ func TestXDNSConfigMigration(t *testing.T) {
 			{Name: "b.example", LenLimit: 255, LabelLimit: 63, Types: []int32{16, 28}, Edns0: 1232},
 		},
 		Resolvers: []*xdns.ResolverProto{
-			{Type: "udp", Addr: "127.0.0.1:53"},
-			{Type: "tcp", Addr: "127.0.0.1:5353"},
-			{Type: "udp", Addr: "[::1]:53"},
+			{Type: "udp", Addr: "127.0.0.1:53", Worker: 32},
+			{Type: "tcp", Addr: "127.0.0.1:5353", Worker: 32},
+			{Type: "udp", Addr: "[::1]:53", Worker: 32},
 		},
 		ExtraPoll: 2,
 	}
@@ -52,8 +52,21 @@ func TestXDNSConfigDefaultTypes(t *testing.T) {
 }
 
 func TestXDNSConfigRejectsUnsupportedResolverScheme(t *testing.T) {
-	config := &conf.XDNS{Resolvers: []conf.XDNSResolver{{Addrs: []string{"https://127.0.0.1"}}}}
+	config := &conf.XDNS{Resolvers: []conf.XDNSResolver{{Addrs: []string{"ftp://127.0.0.1"}}}}
 	if _, err := config.Build(); err == nil {
 		t.Fatal("unsupported resolver scheme accepted")
+	}
+}
+
+func TestXDNSConfigHTTPSResolver(t *testing.T) {
+	const address = "https://resolver.example/dns-query?profile=one"
+	config := &conf.XDNS{Resolvers: []conf.XDNSResolver{{Addrs: []string{address}}}}
+	message, err := config.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := message.(*xdns.Config)
+	if len(got.Resolvers) != 1 || got.Resolvers[0].Type != "https" || got.Resolvers[0].Addr != address {
+		t.Fatalf("HTTPS resolver changed: %v", got)
 	}
 }

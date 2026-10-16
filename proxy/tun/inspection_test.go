@@ -18,7 +18,7 @@ import (
 
 func TestInspectionUDPStaleClosePreservesReplacement(t *testing.T) {
 	created := make(chan *udpConn, 2)
-	u := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) { created <- c.(*udpConn) }, func([]byte, net.Destination, net.Destination) error { return nil })
+	u := newUdpConnectionHandler(func(c net.Conn, _ net.Destination) { created <- c.(*udpConn) }, func(context.Context, []byte, net.Destination, net.Destination) error { return nil })
 	src := net.UDPDestination(net.LocalHostIP, 1234)
 	dst := net.UDPDestination(net.LocalHostIP, 53)
 	u.HandlePacket(src, dst, buf.FromBytes([]byte("old")))
@@ -38,7 +38,7 @@ func TestInspectionUDPStaleClosePreservesReplacement(t *testing.T) {
 
 func TestInspectionUDPScalarWritePreservesError(t *testing.T) {
 	want := io.ErrUnexpectedEOF
-	u := newUdpConnectionHandler(nil, func([]byte, net.Destination, net.Destination) error { return want })
+	u := newUdpConnectionHandler(nil, func(context.Context, []byte, net.Destination, net.Destination) error { return want })
 	manager := new(appstats.Manager)
 	_, err := manager.EnableInspection(fs.ObservationOptions{})
 	if err != nil {
@@ -57,13 +57,13 @@ func TestInspectionUDPScalarWritePreservesError(t *testing.T) {
 func TestInspectionUDPLargePacketAndDestination(t *testing.T) {
 	destination := net.UDPDestination(net.LocalHostIP, 5353)
 	payload := bytes.Repeat([]byte{0x5a}, buf.Size+73)
-	queue := make(chan *buf.Buffer, 1)
+	queue := newPacketQueue(1)
 	b := buf.NewWithSize(int32(len(payload)))
 	b.Write(payload)
 	b.UDP = &destination
-	queue <- b
-	close(queue)
-	c := &udpConn{egress: queue}
+	queue.push(b)
+	queue.close()
+	c := &udpConn{queue: queue}
 	mb, err := c.ReadMultiBuffer()
 	defer buf.ReleaseMulti(mb)
 	if err != nil || len(mb) != 1 || !bytes.Equal(mb[0].Bytes(), payload) || mb[0].UDP == nil || *mb[0].UDP != destination {
@@ -89,7 +89,7 @@ func testInspectionUDPPrefixAndPendingWrite(t *testing.T, withCounter bool) {
 	dst := net.UDPDestination(net.LocalHostIP, 53)
 	alternate := net.UDPDestination(net.LocalHostIP, 5353)
 	calls := 0
-	write := func(payload []byte, from, to net.Destination) error {
+	write := func(_ context.Context, payload []byte, from, to net.Destination) error {
 		calls++
 		if calls == 1 && from != dst {
 			t.Errorf("default destination: %v", from)
@@ -191,12 +191,12 @@ func TestInspectionTUNHandlerEnabledAndDisabled(t *testing.T) {
 			var reply string
 			if udp {
 				destination.Network = net.Network_UDP
-				queue := make(chan *buf.Buffer, 1)
+				queue := newPacketQueue(1)
 				b := buf.FromBytes([]byte("uplink"))
 				b.UDP = &destination
-				queue <- b
-				native := newUdpConnectionHandler(nil, func(p []byte, _, _ net.Destination) error { reply = string(p); return nil })
-				uc := &udpConn{handler: native, src: net.UDPDestination(net.LocalHostIP, 1234), dst: destination, egress: queue}
+				queue.push(b)
+				native := newUdpConnectionHandler(nil, func(_ context.Context, p []byte, _, _ net.Destination) error { reply = string(p); return nil })
+				uc := &udpConn{handler: native, src: net.UDPDestination(net.LocalHostIP, 1234), dst: destination, queue: queue}
 				native.udpConns[uc.src] = uc
 				conn = uc
 			}
@@ -227,7 +227,7 @@ func TestInspectionTUNStopKeepsSiblingAssociation(t *testing.T) {
 	dispatcher := &inspectionDispatcher{entered: make(chan context.Context, 2), wait: true}
 	handler := &Handler{ctx: context.Background(), config: &Config{}, dispatcher: dispatcher, statsManager: manager}
 	finished := make(chan struct{}, 2)
-	native := newUdpConnectionHandler(func(c net.Conn, d net.Destination) { handler.HandleConnection(c, d); finished <- struct{}{} }, func([]byte, net.Destination, net.Destination) error { return nil })
+	native := newUdpConnectionHandler(func(c net.Conn, d net.Destination) { handler.HandleConnection(c, d); finished <- struct{}{} }, func(context.Context, []byte, net.Destination, net.Destination) error { return nil })
 	destination := net.UDPDestination(net.LocalHostIP, 53)
 	first, second := net.UDPDestination(net.LocalHostIP, 1234), net.UDPDestination(net.LocalHostIP, 1235)
 	native.HandlePacket(first, destination, buf.FromBytes([]byte("first")))
@@ -276,7 +276,7 @@ func TestInspectionTUNCounterStopBetweenBatchAndPacket(t *testing.T) {
 	flow.Route(fs.OutboundRef{Tag: "direct"})
 	entered, release := make(chan struct{}), make(chan struct{})
 	calls := 0
-	c := &udpConn{handler: newUdpConnectionHandler(nil, func([]byte, net.Destination, net.Destination) error {
+	c := &udpConn{handler: newUdpConnectionHandler(nil, func(context.Context, []byte, net.Destination, net.Destination) error {
 		calls++
 		if calls == 2 {
 			close(entered)

@@ -74,7 +74,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 				r.cancel()
 				err = context.Canceled
 			} else {
-				s.active.Store(r)
+				s.active = r
 			}
 			s.mu.Unlock()
 		}
@@ -266,7 +266,7 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, r := range []*resolver{s.active.Load(), s.pending} {
+	for _, r := range []*resolver{s.active, s.pending} {
 		if r != nil {
 			for _, client := range r.clients {
 				if inbound.Tag == client.tag {
@@ -281,7 +281,7 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 func (s *DNS) MayUseSystemResolver() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.closed || resolverMayUseSystem(s.active.Load()) || (s.pending != nil && resolverMayUseSystem(s.pending))
+	return s.closed || resolverMayUseSystem(s.active) || (s.pending != nil && resolverMayUseSystem(s.pending))
 }
 
 func resolverMayUseSystem(s *resolver) bool {
