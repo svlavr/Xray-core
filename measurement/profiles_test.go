@@ -593,7 +593,8 @@ func testProtocolPacketBoundaryAt(t *testing.T, e *measurement.Executor, tunnelH
 					packets := make(chan []byte, 4)
 					pc := udpFixtureAt(t, net.JoinHostPort(host, "0"), func(pc net.PacketConn, b []byte, source net.Addr) {
 						packets <- b
-						_, _ = pc.WriteTo(b, source)
+						n, err := pc.WriteTo(b, source)
+						t.Logf("boundary fixture bind=%v source=%v request=%d echo=%d error=%v", pc.LocalAddr(), source, len(b), n, err)
 					})
 					r := udpRequest(pc.LocalAddr(), measurement.ExactOutbound)
 					r.Route.Tag = tag

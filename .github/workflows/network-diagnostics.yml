@@ -18,7 +18,7 @@ jobs:
         include:
           - { name: Linux, os: ubuntu-latest, go: '1.27.0' }
           - { name: Windows, os: windows-latest, go: '1.27.0' }
-          - { name: macOS, os: macos-latest, go: '1.27.1' }
+          - { name: macOS, os: macos-latest, go: '1.27.2' }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -32,3 +32,6 @@ jobs:
         env:
           XRAY_NATIVE_UDP_DIAGNOSTICS: '1'
         run: go test -mod=readonly -race -v -count=1 -timeout 3m -run '^TestSystemUDP' ./transport/internet
+      - name: Observe Freedom packet boundary echo return
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: go test -mod=readonly -v -count=20 -timeout 3m -run '^TestFreedomProtocolMeasurements$/^packet-boundary' ./measurement

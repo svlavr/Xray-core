@@ -3,7 +3,10 @@ package internet
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"net"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -69,5 +72,123 @@ func TestSystemUDPAlternateIPv4Packets(t *testing.T) {
 		if actual.String() != other.LocalAddr().String() {
 			t.Fatalf("actual source=%v want=%v", actual, other.LocalAddr())
 		}
+	}
+}
+
+// TestSystemUDPSamePortEchoDiagnostics preserves the plain Measurement fixture.
+// Same-port bind refusal is inconclusive for the observed ephemeral allocation.
+// It does not alter global controllers, dialers, sysctls, or runtime behavior.
+func TestSystemUDPSamePortEchoDiagnostics(t *testing.T) {
+	if os.Getenv("XRAY_NATIVE_UDP_DIAGNOSTICS") != "1" {
+		t.Skip("requires XRAY_NATIVE_UDP_DIAGNOSTICS=1")
+	}
+	if len(Controllers) != 0 {
+		t.Fatal("default-socket control requires no registered dialer controllers")
+	}
+	type observation struct {
+		who  string
+		data []byte
+		from net.Addr
+		err  error
+		at   time.Time
+	}
+	read := func(who string, pc net.PacketConn) observation {
+		r := observation{who: who}
+		if r.err = pc.SetReadDeadline(time.Now().Add(time.Second)); r.err != nil {
+			return r
+		}
+		b := make([]byte, 65536)
+		var n int
+		n, r.from, r.err = pc.ReadFrom(b)
+		r.data, r.at = b[:n], time.Now()
+		return r
+	}
+	for _, allocation := range []string{"forced-same-port", "default-distinct-port"} {
+		const size = 8191
+		t.Run(allocation, func(t *testing.T) {
+			ctx := context.Background()
+			peer, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = peer.Close() })
+			peerAddr := peer.LocalAddr().(*net.UDPAddr)
+			var sender net.PacketConn
+			if allocation == "forced-same-port" {
+				// DefaultSystemDialer's native input is network udp and
+				// wildcard 0.0.0.0:0. Fix only its port for this control.
+				var lc net.ListenConfig
+				sender, err = lc.ListenPacket(ctx, "udp",
+					net.JoinHostPort("0.0.0.0", strconv.Itoa(peerAddr.Port)))
+				if err != nil {
+					t.Logf("INCONCLUSIVE SAME_PORT_BIND_REFUSED fixture=%v error=%v; natural ephemeral collision remains untested", peerAddr, err)
+					return
+				}
+			} else {
+				dest := xnet.UDPDestination(xnet.LocalHostIP, xnet.Port(peerAddr.Port))
+				conn, dialErr := new(DefaultSystemDialer).Dial(ctx, nil, dest, nil)
+				if dialErr != nil {
+					t.Fatal(dialErr)
+				}
+				sender = conn.(*xnet.PacketConnWrapper).PacketConn
+			}
+			t.Cleanup(func() { _ = sender.Close() })
+			if allocation == "default-distinct-port" && sender.LocalAddr().(*net.UDPAddr).Port == peerAddr.Port {
+				t.Logf("INCONCLUSIVE DISTINCT_CONTROL_COLLIDED fixture=%v sender=%v; no retry", peerAddr, sender.LocalAddr())
+				return
+			}
+			payload := bytes.Repeat([]byte{0x5a}, size)
+			if err := sender.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			n, writeErr := sender.WriteTo(payload, peerAddr)
+			t.Logf("REQUEST fixture=%v sender=%v n=%d error=%v size=%d hash=%x", peerAddr, sender.LocalAddr(), n, writeErr, size, sha256.Sum256(payload))
+			if writeErr != nil || n != size {
+				t.Fatalf("REQUEST_WRITE_FAILED n=%d error=%v", n, writeErr)
+			}
+			request := read("fixture-request", peer)
+			t.Logf("REQUEST_READ at=%s source=%v n=%d error=%v hash=%x", request.at.Format(time.RFC3339Nano), request.from, len(request.data), request.err, sha256.Sum256(request.data))
+			if request.err != nil || !bytes.Equal(request.data, payload) {
+				t.Fatal("REQUEST_NOT_RECEIVED_INTACT")
+			}
+			source := request.from.(*net.UDPAddr).AddrPort()
+			local := peerAddr.AddrPort()
+			echoTargetsFixture := source.Port() == local.Port() && source.Addr().Unmap() == local.Addr().Unmap()
+			if err := peer.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			results := make(chan observation, 2)
+			go func() { results <- read("sender-return", sender) }()
+			go func() { results <- read("fixture-again", peer) }()
+			n, writeErr = peer.WriteTo(request.data, request.from)
+			t.Logf("ONE_ECHO to=%v targetsFixture=%t n=%d error=%v", request.from, echoTargetsFixture, n, writeErr)
+			var returned, again observation
+			for range 2 {
+				r := <-results
+				t.Logf("READ who=%s at=%s source=%v n=%d error=%v hash=%x", r.who, r.at.Format(time.RFC3339Nano), r.from, len(r.data), r.err, sha256.Sum256(r.data))
+				if r.who == "sender-return" {
+					returned = r
+				} else {
+					again = r
+				}
+			}
+			if writeErr != nil || n != size {
+				t.Fatalf("ECHO_WRITE_FAILED n=%d error=%v", n, writeErr)
+			}
+			if again.err == nil && bytes.Equal(again.data, payload) {
+				t.Fatal("FIXTURE_SELF_ECHO_REPRODUCED")
+			}
+			if returned.err != nil || !bytes.Equal(returned.data, payload) {
+				t.Fatal("NATIVE_RETURN_ABSENT_WITH_SUCCESSFUL_ECHO_WRITE")
+			}
+			if timeout, ok := again.err.(net.Error); !ok || !timeout.Timeout() || len(again.data) != 0 {
+				t.Fatalf("unexpected fixture return: n=%d error=%v", len(again.data), again.err)
+			}
+			actual := returned.from.(*net.UDPAddr).AddrPort()
+			if actual.Port() != local.Port() || actual.Addr().Unmap() != local.Addr().Unmap() {
+				t.Fatalf("RETURN_SOURCE_CHANGED actual=%v expected=%v", actual, local)
+			}
+			t.Log("NATIVE_RETURN_INTACT")
+		})
 	}
 }
