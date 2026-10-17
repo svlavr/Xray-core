@@ -53,17 +53,72 @@ func (g *nativeH2Gate) wait(t *testing.T) {
 	}
 }
 
+// Only server-side raw sockets are wrapped: the native client TLS connection
+// must retain its concrete type and its lazy/eager handshake behavior.
+type nativeH2Conn struct {
+	net.Conn
+	id        int64
+	bytesRead atomic.Int64
+	closed    chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (c *nativeH2Conn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.bytesRead.Add(int64(n))
+	return n, err
+}
+
+func (c *nativeH2Conn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.Conn.Close()
+		close(c.closed)
+	})
+	return c.closeErr
+}
+
 type nativeH2Listener struct {
 	net.Listener
-	accepts atomic.Int64
+	accepts  atomic.Int64
+	mu       sync.Mutex
+	conns    []*nativeH2Conn
+	accepted chan struct{}
 }
 
 func (l *nativeH2Listener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
-	if err == nil {
-		l.accepts.Add(1)
+	if err != nil {
+		return nil, err
 	}
-	return c, err
+	l.mu.Lock()
+	raw := &nativeH2Conn{Conn: c, id: l.accepts.Add(1), closed: make(chan struct{})}
+	l.conns = append(l.conns, raw)
+	l.mu.Unlock()
+	select {
+	case l.accepted <- struct{}{}:
+	default:
+	}
+	return raw, nil
+}
+
+func (l *nativeH2Listener) connections() []*nativeH2Conn {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]*nativeH2Conn(nil), l.conns...)
+}
+
+func (l *nativeH2Listener) waitAccepts(t *testing.T, count int64) {
+	t.Helper()
+	timer := time.NewTimer(nativeH2Budget)
+	defer timer.Stop()
+	for l.accepts.Load() < count {
+		select {
+		case <-l.accepted:
+		case <-timer.C:
+			t.Fatalf("native H2 accepted %d connections, want at least %d", l.accepts.Load(), count)
+		}
+	}
 }
 
 type nativeH2Fixture struct {
@@ -82,7 +137,7 @@ func newNativeH2Fixture(t *testing.T, handler http.Handler, maxStreams uint32) *
 		})
 	}
 	f := &nativeH2Fixture{server: httptest.NewUnstartedServer(handler), gate: newNativeH2Gate()}
-	f.listener = &nativeH2Listener{Listener: f.server.Listener}
+	f.listener = &nativeH2Listener{Listener: f.server.Listener, accepted: make(chan struct{}, 32)}
 	f.server.Listener = f.listener
 	f.server.EnableHTTP2 = true
 	f.server.Config.ErrorLog = log.New(io.Discard, "", 0)
@@ -114,6 +169,38 @@ func newNativeH2Fixture(t *testing.T, handler http.Handler, maxStreams uint32) *
 		f.server.Close()
 	})
 	return f
+}
+
+// GotConn's client local address identifies the server raw peer without
+// wrapping the native client connection or relying on its pre-handshake TLS snapshot.
+// Call after verifying a successful H2 response from this pinned TLS server.
+func (f *nativeH2Fixture) peer(t *testing.T, result nativeH2Result) *nativeH2Conn {
+	t.Helper()
+	for _, raw := range f.listener.connections() {
+		if raw.RemoteAddr().String() != result.localAddr {
+			continue
+		}
+		return raw
+	}
+	t.Fatalf("native H2 response has no observed server peer: local address %q", result.localAddr)
+	return nil
+}
+
+func (f *nativeH2Fixture) unusedClosed(t *testing.T, used *nativeH2Conn) {
+	t.Helper()
+	for _, raw := range f.listener.connections() {
+		if raw == used {
+			continue
+		}
+		select {
+		case <-raw.closed:
+		case <-time.After(nativeH2Budget):
+			t.Fatalf("unused native H2 raw peer %d did not close before fixture teardown", raw.id)
+		}
+		if n := raw.bytesRead.Load(); n != 0 {
+			t.Fatalf("extra native H2 raw peer %d was used: bytes=%d", raw.id, n)
+		}
+	}
 }
 
 func (f *nativeH2Fixture) destination(t *testing.T) cnet.Destination {
@@ -167,9 +254,10 @@ func nativeH2Client(t *testing.T, dest cnet.Destination, settings *internet.Memo
 }
 
 type nativeH2Result struct {
-	body  string
-	proto int
-	err   error
+	body      string
+	proto     int
+	localAddr string
+	err       error
 }
 
 func nativeH2Request(ctx context.Context, client *DefaultDialerClient, url string) nativeH2Result {
@@ -177,6 +265,10 @@ func nativeH2Request(ctx context.Context, client *DefaultDialerClient, url strin
 	if err != nil {
 		return nativeH2Result{err: err}
 	}
+	var localAddr string
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		localAddr = info.Conn.LocalAddr().String()
+	}}))
 	resp, err := client.client.Do(req)
 	if err != nil {
 		return nativeH2Result{err: err}
@@ -186,7 +278,7 @@ func nativeH2Request(ctx context.Context, client *DefaultDialerClient, url strin
 	if resp.StatusCode != http.StatusOK && err == nil {
 		err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
-	return nativeH2Result{body: string(body), proto: resp.ProtoMajor, err: err}
+	return nativeH2Result{body: string(body), proto: resp.ProtoMajor, localAddr: localAddr, err: err}
 }
 
 func nativeH2Start(ctx context.Context, client *DefaultDialerClient, url string) <-chan nativeH2Result {
@@ -248,20 +340,155 @@ func TestNativeH2ColdPoolCoalescesAndReuses(t *testing.T) {
 			f.gate.wait(t)
 			// Hold an actual cold handshake while the synchronized requests overlap.
 			// The delay is fixture input, not an assertion about completion latency.
-			time.Sleep(150 * time.Millisecond)
+			select {
+			case <-time.After(150 * time.Millisecond):
+			case <-ctx.Done():
+				t.Fatal("cold native H2 overlap exceeded its budget")
+			}
 			f.gate.open()
+			var peer *nativeH2Conn
 			for range 8 {
-				nativeH2Success(t, nativeH2Await(t, cold), "native H2 response")
+				result := nativeH2Await(t, cold)
+				nativeH2Success(t, result, "native H2 response")
+				observed := f.peer(t, result)
+				if peer != nil && peer != observed {
+					t.Fatal("cold native H2 responses used different established peers")
+				}
+				peer = observed
 			}
-			if f.listener.accepts.Load() != 1 || f.hellos.Load() != 1 {
-				t.Fatalf("cold native H2: accepts=%d ClientHellos=%d want 1/1", f.listener.accepts.Load(), f.hellos.Load())
+			if f.hellos.Load() != 1 || (fingerprint == "chrome" && f.listener.accepts.Load() != 1) {
+				t.Fatalf("cold native H2: accepts=%d ClientHellos=%d", f.listener.accepts.Load(), f.hellos.Load())
 			}
+			// Standard TLS can return a lazy connection before the first AddConn
+			// finishes. Any duplicate must be unused and closed by the native pool.
+			f.unusedClosed(t, peer)
+			accepts, hellos := f.listener.accepts.Load(), f.hellos.Load()
 			warm := nativeH2Wave(ctx, client, f.server.URL, 8)
 			for range 8 {
-				nativeH2Success(t, nativeH2Await(t, warm), "native H2 response")
+				result := nativeH2Await(t, warm)
+				nativeH2Success(t, result, "native H2 response")
+				if f.peer(t, result) != peer {
+					t.Fatal("warm native H2 response used a different established peer")
+				}
 			}
-			if f.listener.accepts.Load() != 1 || f.hellos.Load() != 1 {
+			if f.listener.accepts.Load() != accepts || f.hellos.Load() != hellos {
 				t.Fatal("warm native H2 requests opened another connection")
+			}
+			f.unusedClosed(t, peer)
+		})
+	}
+}
+
+func TestNativeH2UnsafeLazyHandshakeHandoff(t *testing.T) {
+	f := newNativeH2Fixture(t, nil, 0)
+	client, _ := nativeH2Client(t, f.destination(t), f.settings("unsafe"))
+	ctx, cancel := context.WithTimeout(context.Background(), nativeH2Budget)
+	defer cancel()
+	first := nativeH2Start(ctx, client, f.server.URL)
+	f.gate.wait(t)
+	second := nativeH2Start(ctx, client, f.server.URL)
+	// The first custom dial has returned its lazy TLS connection, but AddConn
+	// is still handshaking. Observe the second accept before releasing it.
+	f.listener.waitAccepts(t, 2)
+	f.gate.open()
+	a, b := nativeH2Await(t, first), nativeH2Await(t, second)
+	nativeH2Success(t, a, "native H2 response")
+	nativeH2Success(t, b, "native H2 response")
+	peer := f.peer(t, a)
+	if f.peer(t, b) != peer || f.hellos.Load() != 1 {
+		t.Fatalf("lazy native H2 handoff: accepts=%d ClientHellos=%d", f.listener.accepts.Load(), f.hellos.Load())
+	}
+	f.unusedClosed(t, peer)
+}
+
+func TestNativeH2PendingCustomDialCoalesces(t *testing.T) {
+	for _, fingerprint := range []string{"chrome", "unsafe"} {
+		t.Run(fingerprint, func(t *testing.T) {
+			for _, uncoalesced := range []bool{false, true} {
+				name := "shared-transport"
+				if uncoalesced {
+					name = "uncoalesced-control"
+				}
+				t.Run(name, func(t *testing.T) {
+					f := newNativeH2Fixture(t, nil, 0)
+					f.gate.open()
+					dialGate := newNativeH2Gate()
+					t.Cleanup(dialGate.open)
+					var entries atomic.Int64
+					install := func(client *DefaultDialerClient) {
+						tr := client.client.Transport.(*http2.Transport)
+						original := tr.DialTLSContext
+						tr.DialTLSContext = func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
+							entries.Add(1)
+							dialGate.entered <- struct{}{}
+							select {
+							case <-dialGate.release:
+								// Preserve the native returned connection's concrete type.
+								return original(ctx, network, addr, cfg)
+							case <-ctx.Done():
+								return nil, ctx.Err()
+							}
+						}
+					}
+					var shared *DefaultDialerClient
+					if !uncoalesced {
+						shared, _ = nativeH2Client(t, f.destination(t), f.settings(fingerprint))
+						install(shared)
+					}
+					clients := make([]*DefaultDialerClient, 8)
+					for i := range clients {
+						clients[i] = shared
+						if uncoalesced {
+							// Distinct native transports are a deliberately broken
+							// coalescing control through the same observer and peer.
+							clients[i], _ = nativeH2Client(t, f.destination(t), f.settings(fingerprint))
+							install(clients[i])
+						}
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), nativeH2Budget)
+					defer cancel()
+					getConn := make(chan struct{}, len(clients))
+					ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GetConn: func(string) { getConn <- struct{}{} }})
+					results := make(chan nativeH2Result, len(clients))
+					for _, client := range clients {
+						go func() { results <- nativeH2Request(ctx, client, f.server.URL) }()
+					}
+					for range clients {
+						select {
+						case <-getConn:
+						case <-ctx.Done():
+							t.Fatal("requests did not all enter the native transport")
+						}
+					}
+					dialGate.wait(t)
+					if uncoalesced {
+						for range len(clients) - 1 {
+							dialGate.wait(t)
+						}
+					}
+					// GetConn is caller entry, not private queue enrollment. This
+					// bounded hold supplies overlap; the control checks sensitivity.
+					select {
+					case <-time.After(150 * time.Millisecond):
+					case <-ctx.Done():
+						t.Fatal("pending custom dial observation exceeded its budget")
+					}
+					pending := entries.Load()
+					coalesced := pending == 1
+					if coalesced == uncoalesced {
+						t.Fatalf("custom dial observer: pending=%d uncoalesced-control=%v", pending, uncoalesced)
+					}
+					select {
+					case result := <-results:
+						t.Fatalf("request completed while native custom dial was gated: %v", result.err)
+					default:
+					}
+					t.Logf("pending native custom dials=%d; coalescing predicate accepted=%v; uncoalesced-control=%v", pending, coalesced, uncoalesced)
+					dialGate.open()
+					for range clients {
+						nativeH2Success(t, nativeH2Await(t, results), "native H2 response")
+					}
+				})
 			}
 		})
 	}

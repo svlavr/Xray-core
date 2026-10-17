@@ -810,7 +810,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			if endpointWriterReceipt(writer) != nil {
+			if session.LogicalObservationFromContext(ctx) != nil || endpointWriterReceipt(writer) != nil {
 				return readV(ctx, reader, writer, timer, readCounter)
 			}
 			w, err := tc.ReadFrom(readerConn)

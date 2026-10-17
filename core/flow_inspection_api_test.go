@@ -325,6 +325,9 @@ func TestFlowInspectionNativeDialerProxyPhysicalContinuation(t *testing.T) {
 	if _, err = io.ReadFull(conn, response); err != nil {
 		t.Fatal(err)
 	}
+	if want := transformOutboundStatsTCPPayload(payload); !bytes.Equal(response, want) {
+		t.Fatalf("dialerProxy response = %q, want %q", response, want)
+	}
 	var flow fs.FlowRecord
 	inspectionWait(t, func() bool {
 		live, err := view.ReadLiveInto(nil)

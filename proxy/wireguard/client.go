@@ -237,7 +237,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	var newCtx context.Context
 	var newCancel context.CancelFunc
-	if session.TimeoutOnlyFromContext(ctx) {
+	if session.TimeoutOnlyFromContext(ctx) && !selected {
 		newCtx, newCancel = context.WithCancel(context.Background())
 	}
 
@@ -250,12 +250,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}, sessionPolicy.Timeouts.ConnectionIdle)
 
-	requestCtx := ctx
 	if newCtx != nil {
 		ctx = newCtx
-	}
-	if selected {
-		ctx = requestCtx
 	}
 
 	var reader buf.Reader

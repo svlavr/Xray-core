@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,63 @@ func rawSpliceContext(t *testing.T, dst net.Conn, ready int) (context.Context, *
 	timer := signal.CancelAfterInactivity(ctx, func() {}, time.Hour)
 	t.Cleanup(func() { timer.SetTimeout(0) })
 	return ctx, inbound, timer
+}
+
+type rawSpliceWriteProbe struct {
+	buf.Writer
+	calls atomic.Int64
+}
+
+func (w *rawSpliceWriteProbe) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	w.calls.Add(1)
+	return w.Writer.WriteMultiBuffer(mb)
+}
+
+func TestRawSpliceContextPreservesActualWriter(t *testing.T) {
+	for _, observed := range []bool{false, true} {
+		name := "native"
+		if observed {
+			name = "context-only"
+		}
+		t.Run(name, func(t *testing.T) {
+			sourceWriter, sourceReader := newRawTCPPair(t)
+			destinationWriter, destinationReader := newRawTCPPair(t)
+			ctx, _, timer := rawSpliceContext(t, destinationWriter, 1)
+			exchange := new(rawSpliceTestExchange)
+			if observed {
+				ctx = session.ContextWithLogicalObservation(ctx, &session.LogicalObservation{Exchange: exchange})
+			}
+			writer := &rawSpliceWriteProbe{Writer: buf.NewWriter(destinationWriter)}
+			result := make(chan error, 1)
+			go func() { result <- CopyRawConnIfExist(ctx, sourceReader, destinationWriter, writer, timer, nil) }()
+			payload := []byte("actual-writer-without-receipt")
+			if _, err := sourceWriter.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			if err := sourceWriter.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			destinationReader.SetReadDeadline(time.Now().Add(2 * time.Second))
+			got := make([]byte, len(payload))
+			if _, err := io.ReadFull(destinationReader, got); err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("actual writer payload = %q, error = %v", got, err)
+			}
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("raw copy did not complete at EOF")
+			}
+			if used := writer.calls.Load() > 0; used != observed {
+				t.Fatalf("actual writer used = %v, context observed = %v", used, observed)
+			}
+			if exchange.downlink.Load() != 0 {
+				t.Fatal("context alone credited bytes without an endpoint receipt")
+			}
+		})
+	}
 }
 
 // A completed Vision raw write makes native splice eligible. Observation keeps
@@ -196,12 +254,18 @@ func (c *rawSpliceReadSignalConn) Read(p []byte) (int, error) {
 // Ready raw admission extends both native timers before entering buffered
 // copying. The not-ready control must still obey its configured idle lifetime.
 func TestRawSpliceObservedReadyPreservesIdleTimers(t *testing.T) {
-	for _, ready := range []int{1, 2} {
-		name := "ready"
-		if ready != 1 {
-			name = "not-ready"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		ready       int
+		contextOnly bool
+	}{
+		{"ready", 1, false},
+		{"not-ready", 2, false},
+		{"context-ready", 1, true},
+		{"context-not-ready", 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ready := tc.ready
 			sourceWriter, sourceReader := newRawTCPPair(t)
 			destinationWriter, destinationReader := newRawTCPPair(t)
 			ctx, _, _ := rawSpliceContext(t, destinationWriter, ready)
@@ -218,7 +282,12 @@ func TestRawSpliceObservedReadyPreservesIdleTimers(t *testing.T) {
 			inTimer := signal.CancelAfterInactivity(ctx, cancel("inbound"), time.Hour)
 			t.Cleanup(func() { timer.SetTimeout(0); inTimer.SetTimeout(0) })
 			exchange := new(rawSpliceTestExchange)
-			writer := buf.AttachWriterReceipt(buf.NewWriter(destinationWriter), exchange)
+			writer := buf.NewWriter(destinationWriter)
+			if tc.contextOnly {
+				ctx = session.ContextWithLogicalObservation(ctx, &session.LogicalObservation{Exchange: exchange})
+			} else {
+				writer = buf.AttachWriterReceipt(writer, exchange)
+			}
 			result := make(chan error, 1)
 			timer.SetTimeout(idle)
 			inTimer.SetTimeout(idle)
@@ -271,7 +340,13 @@ func TestRawSpliceObservedReadyPreservesIdleTimers(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("ready raw copy did not complete at EOF")
 			}
-			assertRawSpliceReceipts(t, int64(len(payload)), exchange)
+			if tc.contextOnly {
+				if exchange.downlink.Load() != 0 {
+					t.Fatal("context-only timer path credited an inherited exchange")
+				}
+			} else {
+				assertRawSpliceReceipts(t, int64(len(payload)), exchange)
+			}
 		})
 	}
 }

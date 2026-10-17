@@ -186,6 +186,11 @@ jobs:
           text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
           suffixes = {
               "TestNativeH2ColdPoolCoalescesAndReuses": ["chrome", "unsafe"],
+              "TestNativeH2UnsafeLazyHandshakeHandoff": [],
+              "TestNativeH2PendingCustomDialCoalesces": [
+                  "chrome", "chrome/shared-transport", "chrome/uncoalesced-control",
+                  "unsafe", "unsafe/shared-transport", "unsafe/uncoalesced-control",
+              ],
               "TestNativeH2CanceledWaiterPreservesSibling": ["chrome", "unsafe"],
               "TestNativeH2FailedHandshakeCanRecover": ["chrome", "unsafe", "packet-xmux-replacement"],
               "TestNativeH2NativeMethodsRetainDetachedContext": ["stream", "packet"],
