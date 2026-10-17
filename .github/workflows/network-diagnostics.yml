@@ -16,8 +16,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: Linux, os: ubuntu-latest, go: '1.27.0' }
-          - { name: Windows, os: windows-latest, go: '1.27.0' }
+          - { name: Linux, os: ubuntu-latest, go: '1.27.2' }
+          - { name: Windows, os: windows-latest, go: '1.27.2' }
           - { name: macOS, os: macos-latest, go: '1.27.2' }
     steps:
       - uses: actions/checkout@v7
@@ -34,4 +34,7 @@ jobs:
         run: go test -mod=readonly -race -v -count=1 -timeout 3m -run '^TestSystemUDP' ./transport/internet
       - name: Observe Freedom packet boundary echo return
         if: ${{ !cancelled() && runner.os == 'macOS' }}
-        run: go test -mod=readonly -v -count=20 -timeout 3m -run '^TestFreedomProtocolMeasurements$/^packet-boundary' ./measurement
+        run: go test -mod=readonly -v -count=20 -timeout 3m -run '^TestFreedomProtocolMeasurements$/(^packet-boundary|^ipv6$)' ./measurement
+      - name: Validate native DNS publication and routed cache ownership
+        if: ${{ !cancelled() }}
+        run: go test -mod=readonly -v -count=10 -timeout 3m -run '^(TestCachedQueryPublishesBeforeCacheStore|TestM3RouterRoutedDNSCacheDisabled|TestM3RouterRoutedDNSProtocolsBindInventoryAndCache|TestM4RouterRoutedDNSRetirement)$' ./app/dns

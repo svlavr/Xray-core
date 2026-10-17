@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -103,17 +106,35 @@ func TestSystemUDPSamePortEchoDiagnostics(t *testing.T) {
 		r.data, r.at = b[:n], time.Now()
 		return r
 	}
-	for _, allocation := range []string{"forced-same-port", "default-distinct-port"} {
+	for _, allocation := range []string{"forced-same-port", "default-distinct-port", "ephemeral-same-port", "wildcard-fixture"} {
 		const size = 8191
 		t.Run(allocation, func(t *testing.T) {
 			ctx := context.Background()
-			peer, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			network, address := "udp4", "127.0.0.1:0"
+			if allocation == "wildcard-fixture" {
+				network, address = "udp", "0.0.0.0:0"
+			}
+			peer, err := net.ListenPacket(network, address)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = peer.Close() })
-			peerAddr := peer.LocalAddr().(*net.UDPAddr)
+			peerAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: peer.LocalAddr().(*net.UDPAddr).Port}
+			t.Logf("FIXTURE actual=%v target=%v", peer.LocalAddr(), peerAddr)
 			var sender net.PacketConn
+			if allocation == "wildcard-fixture" {
+				var lc net.ListenConfig
+				same, bindErr := lc.ListenPacket(ctx, "udp", net.JoinHostPort("0.0.0.0", strconv.Itoa(peerAddr.Port)))
+				if bindErr == nil {
+					same.Close()
+					t.Fatal("WILDCARD_FIXTURE_STILL_ADMITS_SAME_PORT")
+				}
+				// Winsock WSAEADDRINUSE is distinct from Go's compatibility errno.
+				if !errors.Is(bindErr, syscall.EADDRINUSE) && !(runtime.GOOS == "windows" && errors.Is(bindErr, syscall.Errno(10048))) {
+					t.Fatalf("INCONCLUSIVE WILDCARD_BIND_ERROR: %v", bindErr)
+				}
+				t.Logf("SAME_PORT_REJECTED_EADDRINUSE error=%v", bindErr)
+			}
 			if allocation == "forced-same-port" {
 				// DefaultSystemDialer's native input is network udp and
 				// wildcard 0.0.0.0:0. Fix only its port for this control.
@@ -122,6 +143,43 @@ func TestSystemUDPSamePortEchoDiagnostics(t *testing.T) {
 					net.JoinHostPort("0.0.0.0", strconv.Itoa(peerAddr.Port)))
 				if err != nil {
 					t.Logf("INCONCLUSIVE SAME_PORT_BIND_REFUSED fixture=%v error=%v; natural ephemeral collision remains untested", peerAddr, err)
+					return
+				}
+			} else if allocation == "ephemeral-same-port" {
+				// Exercise the unchanged native allocation leaf with port zero.
+				// Explicit-port bind admission can differ from ephemeral allocation.
+				searchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				var lc net.ListenConfig
+				var seen [1 << 16]bool
+				attempts, unique := 0, 0
+				started := time.Now()
+				for attempts < 65536 && searchCtx.Err() == nil {
+					candidate, bindErr := lc.ListenPacket(searchCtx, "udp", "0.0.0.0:0")
+					attempts++
+					if bindErr != nil {
+						if searchCtx.Err() != nil {
+							break
+						}
+						t.Fatalf("EPHEMERAL_BIND_ERROR: %v", bindErr)
+					}
+					port := candidate.LocalAddr().(*net.UDPAddr).Port
+					if !seen[port] {
+						seen[port] = true
+						unique++
+					}
+					if port == peerAddr.Port {
+						sender = candidate
+						break
+					}
+					if err := candidate.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cancel()
+				t.Logf("EPHEMERAL_SEARCH attempts=%d unique=%d elapsed=%v witnessed=%t", attempts, unique, time.Since(started), sender != nil)
+				if sender == nil {
+					t.Log("INCONCLUSIVE NO_EPHEMERAL_COLLISION_WITNESSED")
 					return
 				}
 			} else {
@@ -133,6 +191,9 @@ func TestSystemUDPSamePortEchoDiagnostics(t *testing.T) {
 				sender = conn.(*xnet.PacketConnWrapper).PacketConn
 			}
 			t.Cleanup(func() { _ = sender.Close() })
+			if allocation == "wildcard-fixture" && sender.LocalAddr().(*net.UDPAddr).Port == peerAddr.Port {
+				t.Fatal("WILDCARD_DEFAULT_ALLOCATION_COLLIDED")
+			}
 			if allocation == "default-distinct-port" && sender.LocalAddr().(*net.UDPAddr).Port == peerAddr.Port {
 				t.Logf("INCONCLUSIVE DISTINCT_CONTROL_COLLIDED fixture=%v sender=%v; no retry", peerAddr, sender.LocalAddr())
 				return
@@ -176,6 +237,9 @@ func TestSystemUDPSamePortEchoDiagnostics(t *testing.T) {
 				t.Fatalf("ECHO_WRITE_FAILED n=%d error=%v", n, writeErr)
 			}
 			if again.err == nil && bytes.Equal(again.data, payload) {
+				if timeout, ok := returned.err.(net.Error); !ok || !timeout.Timeout() || len(returned.data) != 0 {
+					t.Fatal("FIXTURE_SELF_ECHO_WITH_OTHER_SENDER_OUTCOME")
+				}
 				t.Fatal("FIXTURE_SELF_ECHO_REPRODUCED")
 			}
 			if returned.err != nil || !bytes.Equal(returned.data, payload) {

@@ -591,12 +591,19 @@ func testProtocolPacketBoundaryAt(t *testing.T, e *measurement.Executor, tunnelH
 			for _, offset := range []int{-1, 0, 1} {
 				t.Run(fmt.Sprint(offset), func(t *testing.T) {
 					packets := make(chan []byte, 4)
-					pc := udpFixtureAt(t, net.JoinHostPort(host, "0"), func(pc net.PacketConn, b []byte, source net.Addr) {
+					// Use the native wildcard bind namespace so the local sender
+					// cannot alias this fixture through another address family.
+					bindHost := "0.0.0.0"
+					if netip.MustParseAddr(host).Is6() {
+						bindHost = "::"
+					}
+					pc := udpFixtureAt(t, net.JoinHostPort(bindHost, "0"), func(pc net.PacketConn, b []byte, source net.Addr) {
 						packets <- b
 						n, err := pc.WriteTo(b, source)
 						t.Logf("boundary fixture bind=%v source=%v request=%d echo=%d error=%v", pc.LocalAddr(), source, len(b), n, err)
 					})
 					r := udpRequest(pc.LocalAddr(), measurement.ExactOutbound)
+					r.Destination = netip.AddrPortFrom(netip.MustParseAddr(host), r.Destination.Port())
 					r.Route.Tag = tag
 					r.Destination = protocolFixtureDestination(r.Destination, r.Route, tunnelHost)
 					ceiling := limit

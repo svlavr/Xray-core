@@ -26,7 +26,10 @@ func udpFixtureAt(t testing.TB, address string, handle func(net.PacketConn, []by
 	t.Helper()
 	network := "udp4"
 	host, _, _ := net.SplitHostPort(address)
-	if net.ParseIP(host).To4() == nil {
+	ip := net.ParseIP(host)
+	if ip.IsUnspecified() {
+		network = "udp"
+	} else if ip.To4() == nil {
 		network = "udp6"
 	}
 	pc, err := net.ListenPacket(network, address)

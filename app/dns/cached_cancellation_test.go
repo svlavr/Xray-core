@@ -344,3 +344,76 @@ func TestCachedFetchRetiredOwnerDoesNotRetry(t *testing.T) {
 		t.Fatalf("queries = %d, want none after retirement", n)
 	}
 }
+
+// Native response notification precedes storing the record. Keep the cache's
+// read lock after sendQuery admission so this ordering is deterministic.
+func TestCachedQueryPublishesBeforeCacheStore(t *testing.T) {
+	cache := NewCacheController(t.Name(), false, false, 0)
+	server := &cancellationCachedNameserver{cache: cache}
+	locked, release := make(chan struct{}), make(chan struct{})
+	unlocked, updated := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStore := func() { releaseOnce.Do(func() { close(release) }) }
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	t.Cleanup(func() {
+		cancel()
+		releaseStore()
+		cache.Close()
+		select {
+		case <-locked:
+			for _, done := range []<-chan struct{}{unlocked, updated} {
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					t.Error("native cache update did not join after releasing its read lock")
+				}
+			}
+		default:
+		}
+	})
+	var sends atomic.Int32
+	server.send = func(_ context.Context, errs chan<- error, fqdn string, _ dns_feature.IPOption) {
+		if sends.Add(1) != 1 {
+			errs <- errors.New("warm lookup started another native query")
+			return
+		}
+		cache.RLock()
+		close(locked)
+		go func() {
+			<-release
+			cache.RUnlock()
+			close(unlocked)
+		}()
+		go func() {
+			defer close(updated)
+			cache.updateRecord(&dnsRequest{reqType: dnsmessage.TypeA, domain: fqdn, start: time.Now()}, &IPRecord{
+				IP: []net.IP{{192, 0, 2, 83}}, Expire: time.Now().Add(time.Minute), RCode: dnsmessage.RCodeSuccess,
+			})
+		}()
+	}
+	const domain = "publication.example"
+	ips, ttl, err := queryIP(ctx, server, domain, cancellationTestOption)
+	if err != nil || ttl == 0 || len(ips) != 1 || ips[0].String() != "192.0.2.83" {
+		t.Fatalf("native cold result before cache store: ips=%v ttl=%d error=%v", ips, ttl, err)
+	}
+	select {
+	case <-locked:
+	default:
+		t.Fatal("native query completed before the cache read-lock barrier")
+	}
+	// The read lock remains held. Do not acquire another RLock while the native
+	// cache writer is waiting; inspect this protected map directly instead.
+	if cache.ips[Fqdn(domain)] != nil {
+		t.Fatal("cold query required the native cache store to complete")
+	}
+	releaseStore()
+	select {
+	case <-updated:
+	case <-ctx.Done():
+		t.Fatal("native cache store did not finish after releasing its read lock")
+	}
+	ips, ttl, err = queryIP(ctx, server, domain, cancellationTestOption)
+	if err != nil || ttl == 0 || len(ips) != 1 || ips[0].String() != "192.0.2.83" || sends.Load() != 1 {
+		t.Fatalf("warm native cache result: ips=%v ttl=%d sends=%d error=%v", ips, ttl, sends.Load(), err)
+	}
+}
