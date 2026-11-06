@@ -86,7 +86,7 @@ func TestInspectionBlackholePendingReadOwnerEnd(t *testing.T) {
 	cursor := link.Reader.(*buf.InspectionReader)
 	mb, err := cursor.ReadMultiBufferTimeout(time.Millisecond)
 	buf.ReleaseMulti(mb)
-	if err != nil {
+	if err != buf.ErrReadTimeout {
 		t.Fatal(err)
 	}
 	handler, err := blackhole.New(ctx, &blackhole.Config{})

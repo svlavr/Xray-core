@@ -26,6 +26,9 @@ func WithLuaDNS(ctx context.Context, client featuredns.Client, work func(context
 	return work(ctx, r)
 }
 
+// Err exposes owner retirement without waiting for context notification callbacks.
+func (r *resolver) Err() error { return r.ctx.Err() }
+
 // query accepts either the native resolver or one exact ordered server. Keeping
 // admission here protects saved Lua callbacks used outside the outer operation.
 func (r *resolver) query(ctx context.Context, client *Client, domain string, option featuredns.IPOption) ([]net.IP, uint32, error) {

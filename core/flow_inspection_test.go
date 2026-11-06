@@ -444,20 +444,9 @@ func TestFlowInspectionForwardingAttribution(t *testing.T) {
 	conn := inspectionSOCKS(t, address, destination, payload)
 	conn.Close()
 
-	totals, _ := view.ReadTotals()
-	var up, down uint64
-	for _, row := range totals.Rows {
-		if row.Outbound.Tag == "direct" {
-			t.Fatalf("recursive route replaced the first selection: %+v", row)
-		}
-		if row.Outbound.Tag == "forward" {
-			up += row.Uplink
-			down += row.Downlink
-		}
-	}
-	if up != uint64(len(payload)) || down != up {
-		t.Fatalf("first-selected totals %d/%d", up, down)
-	}
+	// Peer receipt does not join server-side receipt publication.
+	expected := fs.ClientTotals{Uplink: uint64(len(payload)), Downlink: uint64(len(payload))}
+	inspectionByteTotals(t, view, "forward", expected, expected)
 }
 
 // A native handler needs no confirmation hook to expose its selected label.

@@ -129,7 +129,11 @@ func (e *scriptEngine) pickRoute(ctx routing.Context) (route routing.Route, err 
 		// WithLuaDNS cancels bound during cleanup even on success. Inspect it
 		// here so only actual owner/caller retirement makes the result terminal.
 		defer func() {
-			if cause := bound.Err(); cause != nil {
+			cause := bound.Err()
+			if state, ok := owner.(interface{ Err() error }); cause == nil && ok {
+				cause = state.Err()
+			}
+			if cause != nil {
 				err = &routing.RouteUnavailableError{Cause: cause}
 			}
 		}()
