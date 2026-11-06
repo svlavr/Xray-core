@@ -143,11 +143,7 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 	}
 	dev := device.NewDevice(blockup, bind, logger)
 	bind.ctx = context.Background()
-	bind.resolveFunc = makeResolveLocal(d, streamSettings, func() context.Context {
-		bind.mu.Lock()
-		defer bind.mu.Unlock()
-		return bind.ctx
-	})
+	bind.resolveFunc = MakeResolveLocal(d, streamSettings)
 	bind.listenFunc = func(ctx context.Context) (net.PacketConn, error) {
 		dest, err := net.ParseDestination("udp:" + conf.Peers[0].Endpoint)
 		if err != nil {
@@ -367,27 +363,12 @@ func (h *Handler) up(ctx context.Context) error {
 	return nil
 }
 
-func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig) func(host string) (net.IP, error) {
-	return makeResolveLocal(d, streamSettings, nil)
-}
-
-func makeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig, currentContext func() context.Context) func(host string) (net.IP, error) {
-	return func(host string) (net.IP, error) {
+func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig) func(ctx context.Context, host string) (net.IP, error) {
+	return func(ctx context.Context, host string) (net.IP, error) {
 		if ip := net.ParseIP(host); ip != nil {
 			return ip, nil
 		}
-		var ips []net.IP
-		var err error
-		option := dns.IPOption{IPv4Enable: true, IPv6Enable: true}
-		var ctx context.Context
-		if currentContext != nil {
-			ctx = currentContext()
-		}
-		if ctx != nil && internet.MUSelected(ctx) {
-			ips, _, err = dns.LookupIPContext(ctx, d, host, option)
-		} else {
-			ips, _, err = d.LookupIP(host, option)
-		}
+		ips, err := lookupIPContext(ctx, d, host)
 		if err != nil {
 			return nil, err
 		}
@@ -424,6 +405,27 @@ func makeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig,
 			}
 		}
 		return got[dice.Roll(len(got))], nil
+	}
+}
+
+func lookupIPContext(ctx context.Context, d dns.Client, host string) ([]net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		ips []net.IP
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ips, _, err := dns.LookupIPContext(ctx, d, host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
+		done <- result{ips, err}
+	}()
+	select {
+	case r := <-done:
+		return r.ips, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

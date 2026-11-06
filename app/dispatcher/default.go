@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	stderrors "errors"
 	"strings"
 	"sync"
 	"time"
@@ -483,6 +484,12 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			observation.Exchange.Unassign()
 		}
 	}
+	if ctx.Err() != nil {
+		reject()
+		common.Close(link.Writer)
+		common.Interrupt(link.Reader)
+		return
+	}
 
 	routingLink := routing_session.AsRoutingContext(ctx)
 	inTag := routingLink.GetInboundTag()
@@ -522,10 +529,23 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			if err != common.ErrNoClue {
 				errors.LogErrorInner(ctx, err, "failed to pick route for ", destination)
 			}
+			var unavailable *routing.RouteUnavailableError
+			if stderrors.As(err, &unavailable) {
+				reject()
+				common.Close(link.Writer)
+				common.Interrupt(link.Reader)
+				return
+			}
 			errors.LogInfo(ctx, "default route for ", destination)
 		}
 	}
 
+	if ctx.Err() != nil {
+		reject()
+		common.Close(link.Writer)
+		common.Interrupt(link.Reader)
+		return
+	}
 	if handler == nil {
 		handler = d.ohm.GetDefaultHandler()
 	}

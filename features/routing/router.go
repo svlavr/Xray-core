@@ -6,6 +6,21 @@ import (
 	"github.com/xtls/xray-core/features"
 )
 
+// RouteUnavailableError means a routing decision lost its caller or an owner
+// required to make that decision. Dispatchers must not use a fallback outbound.
+// Ordinary no-match, script and DNS-server errors do not imply unavailability.
+type RouteUnavailableError struct {
+	Cause error
+}
+
+func (e *RouteUnavailableError) Error() string {
+	if e.Cause == nil {
+		return "routing decision unavailable"
+	}
+	return "routing decision unavailable: " + e.Cause.Error()
+}
+func (e *RouteUnavailableError) Unwrap() error { return e.Cause }
+
 // Router is a feature to choose an outbound tag for the given request.
 //
 // xray:api:stable

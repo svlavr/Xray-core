@@ -139,7 +139,7 @@ func (r *InspectionReader) nextLocked(timeout time.Duration, timed bool) (MultiB
 		select {
 		case <-p.done:
 		case <-timer.C:
-			return nil, nil
+			return nil, ErrReadTimeout
 		}
 	} else {
 		<-p.done
@@ -196,7 +196,11 @@ func (r *InspectionReader) Cache(b *Buffer, timeout time.Duration) error {
 	if !mb.IsEmpty() {
 		r.replay, _ = MergeMulti(r.replay, mb)
 	}
-	r.replayErr = err
+	// A timed wait leaves the lower read pending; only its terminal result
+	// belongs to replay. Retained bytes remain useful to the sniffer.
+	if err != ErrReadTimeout {
+		r.replayErr = err
+	}
 	b.Clear()
 	r.replay.Copy(b.Extend(min(r.replay.Len(), b.Cap())))
 	if !r.replay.IsEmpty() {

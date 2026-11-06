@@ -32,7 +32,7 @@ func TestInspectionCompletedPendingReadIsReleasedOnInterrupt(t *testing.T) {
 	lower := &pendingPayload{release: make(chan struct{}), data: payload}
 	receipt := new(pendingReceipt)
 	cursor := NewInspectionReader(&BufferedReader{Reader: lower}, receipt, func() {})
-	if mb, err := cursor.ReadMultiBufferTimeout(time.Millisecond); err != nil || len(mb) != 0 {
+	if mb, err := cursor.ReadMultiBufferTimeout(time.Millisecond); err != ErrReadTimeout || len(mb) != 0 {
 		t.Fatalf("pending: %v %v", mb, err)
 	}
 	cursor.mu.Lock()

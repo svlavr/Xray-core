@@ -31,18 +31,9 @@ jobs:
           check-latest: true
       - name: Check format
         run: go run ./infra/vformat/main.go -mode check -pwd ./
-      - name: Check proto version headers
+      - name: Check protobuf output
         if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          head -n 4 core/config.pb.go > ref.txt
-          find . -name "*.pb.go" ! -name "*_grpc.pb.go" -print0 | while IFS= read -r -d '' file; do
-            if ! cmp -s ref.txt <(head -n 4 "$file"); then
-              echo "Error: Header mismatch in $file"
-              head -n 4 "$file"
-              exit 1
-            fi
-          done
+        run: go run ./infra/vprotogen/main.go -mode check -pwd ./
       - name: Verify modules
         if: ${{ !cancelled() }}
         run: |
@@ -163,10 +154,27 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: sudo sysctl -w "net.ipv4.ping_group_range=$(id -g) $(id -g)"
+      - name: Upstream refresh consumer and construction races
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=readonly -json -race -timeout 10m -count=2 -p 1 -run '^(TestInspectionTimeoutReusesPendingRead|TestInspectionCacheTimeoutRetainsPrefixAndTerminalReplay|TestInspectionTimeoutInterruptReleasesLateResult|TestDispatchLinkContinuesAfterSniffTimeout|TestConfiguredLuaRouteAtInboundStart|TestConfiguredCloseCancelsActiveDNSAndLuaRoute|TestConfiguredCloseIngressDoesNotFallBackAfterLuaCancellation|TestRouteUnavailablePreservesNativeFallback|TestRouteUnavailableRetiredOwnerCannotMaskResult|TestRouteUnavailableCanceledCallerDoesNotFallBack|TestVisionDirectHandoffUsesGoTLSBuffers|TestWireGuardEndpointResolveCapableCancellation|TestWireGuardEndpointResolveLegacyCancellationKeepsSibling|TestWireGuardEndpointResolvePreCanceledAndLiteral|TestWireGuardEndpointResolveAddressFamily|TestRefreshH2ParamsConstructionCustody|TestSOCKSTempUDPConnCloseIsIdempotent|TestSOCKSTempUDPConnTimeoutInitialization|TestSOCKSTempUDPConnCloseBeforeSetTimeout|TestSOCKSTempUDPConnClosePreservesSocketError|TestSOCKSTempUDPConnConcurrentCloseAndTimeout|TestSOCKSTempUDPConnNativeTimeoutInitialization|TestSOCKSTempUDPConnLoopback|TestWebSocketCloseStatusBoundary|TestMeasurementWebSocketCloseUnblocksIO)$' ./common/buf ./app/dispatcher ./core ./proxy ./proxy/socks ./proxy/wireguard ./transport/internet/websocket ./transport/internet/splithttp 2>&1 | tee "$RUNNER_TEMP/refresh-races.jsonl"
+          python - "$RUNNER_TEMP/refresh-races.jsonl" <<'PY'
+          import collections, json, pathlib, sys
+          expected = set(['TestInspectionTimeoutReusesPendingRead', 'TestInspectionCacheTimeoutRetainsPrefixAndTerminalReplay', 'TestInspectionTimeoutInterruptReleasesLateResult', 'TestDispatchLinkContinuesAfterSniffTimeout', 'TestConfiguredLuaRouteAtInboundStart', 'TestConfiguredCloseCancelsActiveDNSAndLuaRoute', 'TestConfiguredCloseIngressDoesNotFallBackAfterLuaCancellation', 'TestRouteUnavailablePreservesNativeFallback', 'TestRouteUnavailableRetiredOwnerCannotMaskResult', 'TestRouteUnavailableCanceledCallerDoesNotFallBack', 'TestVisionDirectHandoffUsesGoTLSBuffers', 'TestWireGuardEndpointResolveCapableCancellation', 'TestWireGuardEndpointResolveLegacyCancellationKeepsSibling', 'TestWireGuardEndpointResolvePreCanceledAndLiteral', 'TestWireGuardEndpointResolveAddressFamily', 'TestRefreshH2ParamsConstructionCustody', 'TestSOCKSTempUDPConnCloseIsIdempotent', 'TestSOCKSTempUDPConnTimeoutInitialization', 'TestSOCKSTempUDPConnCloseBeforeSetTimeout', 'TestSOCKSTempUDPConnClosePreservesSocketError', 'TestSOCKSTempUDPConnConcurrentCloseAndTimeout', 'TestSOCKSTempUDPConnNativeTimeoutInitialization', 'TestSOCKSTempUDPConnLoopback', 'TestWebSocketCloseStatusBoundary', 'TestMeasurementWebSocketCloseUnblocksIO'])
+          rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.startswith("{")]
+          runs = collections.Counter(row.get("Test") for row in rows if row.get("Action") == "run")
+          passed = collections.Counter(row.get("Test") for row in rows if row.get("Action") == "pass")
+          incomplete = sorted(name for name in expected if runs[name] != 2 or passed[name] != 2)
+          if incomplete or any(row.get("Action") in ("skip", "fail") for row in rows):
+              raise SystemExit("Incomplete refresh race coverage: " + ", ".join(incomplete))
+          print(f"Refresh consumer races: {len(expected)} top-level tests x 2 PASS")
+          PY
       - name: Repeat control, statistics and DNS ownership regressions
         run: >-
           go test -mod=readonly -race -timeout 1h -count=2
-          -run '^(TestInspection|TestObservationCapture|TestObserve|TestVision|TestFlowInspection|TestControlStats|TestCleanControlStats|TestStageB|TestDNSPreparation|TestDNSApply|TestFeatureResolution|TestSystemDNS|TestOwnedPeriodic|TestCacheClose|TestTrackedTCPAndDoH|TestTCPAndDoH|TestQUICResource|TestQUICCanceled|TestQUICResolution|TestDoHResource|TestToDNSContext)'
+          -run '^(TestInspection|TestObserve|TestVision|TestFlowInspection|TestControlStats|TestCleanControlStats|TestStageB|TestDNSPreparation|TestDNSApply|TestFeatureResolution|TestSystemDNS|TestOwnedPeriodic|TestCacheClose|TestTrackedTCPAndDoH|TestTCPAndDoH|TestQUICResource|TestQUICCanceled|TestQUICResolution|TestDoHResource|TestToDNSContext)'
           ./app/stats ./app/dns ./core ./proxy ./proxy/blackhole ./proxy/dns ./testing/scenarios
       - name: Test shared transport and endpoint mechanisms
         if: ${{ !cancelled() }}
@@ -268,7 +276,7 @@ jobs:
           test "$before_status" -ne 0
           grep -q 'native accepted bytes: lower=6 counter=0 want=6' "$RUNNER_TEMP/native-before.log"
           go test -mod=readonly -race -timeout 5m -count=3 -run '^TestNativeCounterWriter' ./common/buf
-      - name: Smoke test API, packet accounting and capture benchmarks
+      - name: Smoke test API and packet accounting benchmarks
         if: ${{ !cancelled() }}
         shell: bash
         run: |

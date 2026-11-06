@@ -2,10 +2,10 @@ package socks
 
 import (
 	"context"
-	"net"
 	"sync/atomic"
 	"time"
 
+	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal"
 )
 
@@ -14,6 +14,9 @@ func NewTempUDPConn(udpConn net.PacketConn, tcpConn net.Conn, expectedRemote *ne
 		PacketConn:        udpConn,
 		AssociatedTCPConn: tcpConn,
 	}
+	t.Timer = signal.CancelAfterInactivity(context.Background(), func() {
+		t.Close()
+	}, net.ConnIdleTimeout)
 	t.ExpectedRemote.Store(expectedRemote)
 	return t
 }
@@ -62,31 +65,14 @@ func (c *TempUDPConn) RemoteAddr() net.Addr {
 }
 
 func (c *TempUDPConn) SetTimeout(d time.Duration) {
-	c.Timer = signal.CancelAfterInactivity(context.Background(), func() {
-		if c.observed {
-			c.close(false)
-		} else {
-			c.Close()
-		}
-	}, d)
+	c.Timer.SetTimeout(d)
 }
 
 func (c *TempUDPConn) Close() error {
-	if !c.observed {
-		c.Timer.SetTimeout(0)
-		c.AssociatedTCPConn.Close()
-		return c.PacketConn.Close()
-	}
-	return c.close(true)
-}
-
-func (c *TempUDPConn) close(stopTimer bool) error {
-	if c.closed.Swap(true) {
+	if c.observed && c.closed.Swap(true) {
 		return nil
 	}
-	if stopTimer && c.Timer != nil {
-		c.Timer.SetTimeout(0)
-	}
+	c.Timer.SetTimeout(0)
 	c.AssociatedTCPConn.Close()
 	return c.PacketConn.Close()
 }

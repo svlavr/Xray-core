@@ -41,8 +41,7 @@ func TestVisionDirectHandoffFollowsReplacedRawInput(t *testing.T) {
 					raw = bytes.NewBufferString("raw")
 				}
 			}}
-			reader := NewVisionReader(lower, NewTrafficState(uuid), true, context.Background(), left, input, nil, nil)
-			reader.BindRawInputPointer(&raw)
+			reader := NewVisionReader(lower, NewTrafficState(uuid), true, context.Background(), left, input, &raw, nil)
 			// REALITY may return the previous buffer to its pool before direct handoff.
 			mb, _ := reader.ReadMultiBuffer()
 			defer buf.ReleaseMulti(mb)
@@ -53,7 +52,7 @@ func TestVisionDirectHandoffFollowsReplacedRawInput(t *testing.T) {
 			if mb.String() != want || stale.String() != "stale" || input.Len() != 0 {
 				t.Fatalf("handoff changed byte ownership: got %q want %q stale %q", mb.String(), want, stale.String())
 			}
-			if reader.rawInputPointer != nil || reader.rawInput != nil || reader.input != nil || !reader.trafficState.Inbound.UplinkReaderDirectCopy {
+			if reader.rawInput != nil || reader.input != nil || !reader.trafficState.Inbound.UplinkReaderDirectCopy {
 				t.Fatal("handoff retained TLS buffers or did not select direct copy")
 			}
 		})

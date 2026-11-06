@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,6 +103,110 @@ func TestMeasurementWebSocketExtraReaderBytesWithEOF(t *testing.T) {
 	}
 	if err := <-peerDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWebSocketCloseStatusBoundary(t *testing.T) {
+	for _, selected := range []bool{false, true} {
+		mode := "native"
+		if selected {
+			mode = "selected"
+		}
+		for _, status := range []int{gorilla.CloseNormalClosure, gorilla.CloseNoStatusReceived, gorilla.ClosePolicyViolation} {
+			t.Run(mode+"/"+strconv.Itoa(status), func(t *testing.T) {
+				conn, peerDone := measurementWebSocketPeer(t, func(peer *gorilla.Conn) error {
+					if err := peer.WriteMessage(gorilla.BinaryMessage, []byte("complete payload")); err != nil {
+						return err
+					}
+					// 1005 is never sent on the wire: an empty close payload
+					// represents the native no-status boundary.
+					return peer.WriteControl(gorilla.CloseMessage, gorilla.FormatCloseMessage(status, ""), time.Now().Add(3*time.Second))
+				})
+				wrapped := NewConnection(conn, conn.RemoteAddr(), nil, 0)
+				wrapped.selected = selected
+				payload := make([]byte, len("complete payload"))
+				if _, err := io.ReadFull(wrapped, payload); err != nil || string(payload) != "complete payload" {
+					t.Fatalf("complete message: payload=%q error=%v", payload, err)
+				}
+				n, err := wrapped.Read(make([]byte, 1))
+				if n != 0 {
+					t.Fatalf("close produced bytes: %d", n)
+				}
+				if status == gorilla.ClosePolicyViolation {
+					var closeErr *gorilla.CloseError
+					if !errors.As(err, &closeErr) || closeErr.Code != status {
+						t.Fatalf("abnormal close lost status: %v", err)
+					}
+				} else if err != io.EOF {
+					t.Fatalf("complete close: got %v, want EOF", err)
+				}
+				if err := <-peerDone; err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestMeasurementWebSocketCloseUnblocksIO(t *testing.T) {
+	for _, operation := range []string{"read", "write"} {
+		t.Run(operation, func(t *testing.T) {
+			release, ready := make(chan struct{}), make(chan struct{})
+			releasePeer := sync.OnceFunc(func() { close(release) })
+			conn, peerDone := measurementWebSocketPeer(t, func(peer *gorilla.Conn) error {
+				if err := peer.UnderlyingConn().(*net.TCPConn).SetReadBuffer(1024); err != nil {
+					close(ready)
+					return err
+				}
+				close(ready)
+				<-release
+				return nil
+			})
+			defer releasePeer()
+			<-ready
+			if err := conn.UnderlyingConn().(*net.TCPConn).SetWriteBuffer(1024); err != nil {
+				t.Fatal(err)
+			}
+			wrapped := measurementSelectedWebSocketConnection(conn, nil)
+			done := make(chan error, 1)
+			go func() {
+				if operation == "read" {
+					_, err := wrapped.Read(make([]byte, 1))
+					done <- err
+				} else {
+					_, err := wrapped.Write(make([]byte, 8<<20))
+					done <- err
+				}
+			}()
+			select {
+			case err := <-done:
+				t.Fatalf("I/O completed before socket close: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			closed := make(chan error, 1)
+			go func() { closed <- wrapped.Close() }()
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("selected Close did not close the socket promptly")
+			}
+			select {
+			case err := <-done:
+				var netErr net.Error
+				if err == nil || (errors.As(err, &netErr) && netErr.Timeout()) {
+					t.Fatalf("pending I/O did not observe socket closure: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("selected Close did not unblock pending I/O")
+			}
+			releasePeer()
+			if err := <-peerDone; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

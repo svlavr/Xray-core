@@ -291,7 +291,7 @@ func TestInspectionCursorInterruptPending(t *testing.T) {
 	lower := &inspectionReader{started: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
 	cursor := buf.NewInspectionReader(&buf.BufferedReader{Reader: lower}, receipt, func() { close(lower.release) })
 	mb, err := cursor.ReadMultiBufferTimeout(time.Millisecond)
-	if err != nil || mb.Len() != 0 {
+	if err != buf.ErrReadTimeout || mb.Len() != 0 {
 		t.Fatalf("pending %v %v", mb, err)
 	}
 	<-lower.started

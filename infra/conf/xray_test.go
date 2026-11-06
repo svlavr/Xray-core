@@ -7,9 +7,12 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/xtls/xray-core/app/dispatcher"
+	appdns "github.com/xtls/xray-core/app/dns"
 	"github.com/xtls/xray-core/app/log"
+	apppolicy "github.com/xtls/xray-core/app/policy"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/router"
+	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/geodata"
 	clog "github.com/xtls/xray-core/common/log"
@@ -25,6 +28,34 @@ import (
 	"github.com/xtls/xray-core/transport/internet/websocket"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestConfigBuildInboundAppLast(t *testing.T) {
+	for _, input := range []string{`{}`, `{"dns":{},"routing":{},"policy":{},"stats":{}}`} {
+		t.Run(input, func(t *testing.T) {
+			var c Config
+			if err := json.Unmarshal([]byte(input), &c); err != nil {
+				t.Fatal(err)
+			}
+			built, err := c.Build()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []proto.Message{&log.Config{}, &dispatcher.Config{}, &proxyman.OutboundConfig{}}
+			if c.Stats != nil {
+				want = append(want, &appstats.Config{}, &router.Config{}, &appdns.Config{}, &apppolicy.Config{})
+			}
+			want = append(want, &proxyman.InboundConfig{})
+			if len(built.App) != len(want) {
+				t.Fatalf("apps: %v", built.App)
+			}
+			for i, message := range want {
+				if got, expected := built.App[i].Type, serial.ToTypedMessage(message).Type; got != expected {
+					t.Fatalf("app[%d]=%s, want %s", i, got, expected)
+				}
+			}
+		})
+	}
+}
 
 func TestXrayConfig(t *testing.T) {
 	createParser := func() func(string) (proto.Message, error) {
@@ -42,7 +73,7 @@ func TestXrayConfig(t *testing.T) {
 			Input: `{
 				"log": {
 					"access": "/var/log/xray/access.log",
-					"loglevel": "error",
+					"logLevel": "error",
 					"error": "/var/log/xray/error.log"
 				},
 				"inbounds": [{
@@ -90,7 +121,6 @@ func TestXrayConfig(t *testing.T) {
 						AccessLogPath: "/var/log/xray/access.log",
 					}),
 					serial.ToTypedMessage(&dispatcher.Config{}),
-					serial.ToTypedMessage(&proxyman.InboundConfig{}),
 					serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 					serial.ToTypedMessage(&router.Config{
 						DomainStrategy: router.Config_AsIs,
@@ -111,6 +141,7 @@ func TestXrayConfig(t *testing.T) {
 							},
 						},
 					}),
+					serial.ToTypedMessage(&proxyman.InboundConfig{}),
 				},
 				Inbound: []*core.InboundHandlerConfig{
 					{

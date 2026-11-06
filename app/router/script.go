@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	stderrors "errors"
 	"time"
 
 	"github.com/xtls/xray-core/app/dns"
@@ -107,13 +108,31 @@ func routeOrigin(ctx routing.Context, fallback context.Context) context.Context 
 	}
 }
 
-func (e *scriptEngine) pickRoute(ctx routing.Context) (routing.Route, error) {
+func (e *scriptEngine) pickRoute(ctx routing.Context) (route routing.Route, err error) {
 	var outboundTag, ruleTag string
 	var routeErr error
 
 	caller, finish := e.joinContext(routeOrigin(ctx, e.ctx))
 	defer finish()
-	if err := dns.WithLuaDNS(caller, e.dnsClient.dns, func(bound context.Context, owner any) error {
+	defer func() {
+		cause := caller.Err()
+		if cause == nil {
+			cause = e.ctx.Err()
+		}
+		if cause != nil {
+			route, err = nil, &routing.RouteUnavailableError{Cause: cause}
+		}
+	}()
+	admitted := false
+	if err := dns.WithLuaDNS(caller, e.dnsClient.dns, func(bound context.Context, owner any) (err error) {
+		admitted = true
+		// WithLuaDNS cancels bound during cleanup even on success. Inspect it
+		// here so only actual owner/caller retirement makes the result terminal.
+		defer func() {
+			if cause := bound.Err(); cause != nil {
+				err = &routing.RouteUnavailableError{Cause: cause}
+			}
+		}()
 		for {
 			if err := bound.Err(); err != nil {
 				return err
@@ -145,6 +164,9 @@ func (e *scriptEngine) pickRoute(ctx routing.Context) (routing.Route, error) {
 			}()
 		}
 	}); err != nil {
+		if !admitted && (stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded)) {
+			return nil, &routing.RouteUnavailableError{Cause: err}
+		}
 		return nil, err
 	}
 

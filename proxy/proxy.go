@@ -175,20 +175,19 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 // Note Vision probably only make sense as the inner most layer of reader, since it need assess traffic state from origin proxy traffic
 type VisionReader struct {
 	buf.Reader
-	trafficState    *TrafficState
-	ctx             context.Context
-	isUplink        bool
-	conn            net.Conn
-	input           *bytes.Reader
-	rawInput        *bytes.Buffer
-	rawInputPointer **bytes.Buffer
-	ob              *session.Outbound
+	trafficState *TrafficState
+	ctx          context.Context
+	isUplink     bool
+	conn         net.Conn
+	input        *bytes.Reader
+	rawInput     **bytes.Buffer
+	ob           *session.Outbound
 
 	// internal
 	directReadCounter stats.Counter
 }
 
-func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
+func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput **bytes.Buffer, ob *session.Outbound) *VisionReader {
 	return &VisionReader{
 		Reader:       reader,
 		trafficState: trafficState,
@@ -199,12 +198,6 @@ func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink boo
 		rawInput:     rawInput,
 		ob:           ob,
 	}
-}
-
-// BindRawInputPointer follows a TLS owner that can replace its pooled record
-// buffer between reads. Bind before reading; dereference only at direct handoff.
-func (w *VisionReader) BindRawInputPointer(rawInput **bytes.Buffer) {
-	w.rawInputPointer = rawInput
 }
 
 func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -268,20 +261,16 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
 			buffer, _ = buf.MergeMulti(buffer, inputBuffer)
 		}
-		rawInput := w.rawInput
-		if w.rawInputPointer != nil {
-			rawInput = *w.rawInputPointer
-		}
-		if rawInput != nil {
-			if rawInputBuffer, err := buf.ReadFrom(rawInput); err == nil && !rawInputBuffer.IsEmpty() {
-				buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
-			}
-			*rawInput = bytes.Buffer{} // release memory
-		}
 		*w.input = bytes.Reader{} // release memory
 		w.input = nil
+
+		if raw := *w.rawInput; raw != nil {
+			if rawInputBuffer, err := buf.ReadFrom(raw); err == nil && !rawInputBuffer.IsEmpty() {
+				buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+			}
+			// *raw = bytes.Buffer{} // may not be suitable for Go 1.27.3+
+		}
 		w.rawInput = nil
-		w.rawInputPointer = nil
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
 			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
